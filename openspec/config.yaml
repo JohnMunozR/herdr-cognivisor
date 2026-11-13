@@ -1,0 +1,36 @@
+schema: spec-driven
+
+context: |
+  Herdr Layout & GPUI-kit JavaScript mods package for multi-microservice Agent IDE.
+  Fractal Spec-Graph governance: goal-and-requirements.md, architecture.md, **/SPEC.md.
+  Runtime: Herdr desktop app (gpui-shell 0.7.x) executing GPUI-kit JS views.
+  Shared State: Mod-scoped event bus via shared() and setShared() with mesh.* and mod.* keys.
+  Git access: Strict lock-free flags (--no-optional-locks -c core.fsmonitor=false -c diff.autoRefreshIndex=false).
+  Layouts: layouts/mesh.json is the owned custom layout package.
+
+rules:
+  proposal:
+    - Include impact analysis on existing layout blocks and mod shared-state keys
+    - Detail backwards-compatibility with Herdr default layouts and keys.json
+  specs:
+    - Maintain Fractal Spec-Graph frontmatter (id, type, status, title, parent, covers, tags)
+    - Keep specs lean and intent-driven; link related specs using [[id]] syntax
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY) for requirement statements
+  design:
+    - Document UI view hierarchies with GPUI-kit element trees
+    - Specify shared state contracts, bus keys, and payload formats
+    - Document concurrency, watcher debouncing, and lock-free git safeguards
+  tasks:
+    - Group by phase and maintain hierarchical numbering
+    - Ensure tasks are bounded and verification commands are explicit
+  apply:
+    - Enforce GPUI-kit layout rules (no raw DOM/HTML elements)
+    - Preserve lock-free git inspection flags on all status/diff/rev-parse calls
+    - Update owning SPEC.md whenever public surfaces or state contracts change
+    tdd: false
+  verify:
+    check_command: "herdr-app check mods/files-search && herdr-app check mods/changes-review"
+    syntax_command: "node --check mods/files-search/main.js && node --check mods/changes-review/main.js"
+    json_command: "node -e 'JSON.parse(require(\"fs\").readFileSync(\"keys.json\"))'"
+  archive:
+    - Warn before merging destructive deltas into main specs

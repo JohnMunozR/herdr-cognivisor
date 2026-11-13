@@ -1,0 +1,760 @@
+import { View, div, svg, image } from "gpui-kit";
+import { h_flex, ScrollHandle, InputState, Input } from "gpui-base";
+import {
+  spaces, panes, terminals, exec, hc, run, openOverlay,
+  theme, window, shared, setShared, layout, settings,
+} from "herdr";
+
+const READ_GIT = [
+  "--no-optional-locks",
+  "-c", "core.fsmonitor=false",
+  "-c", "diff.autoRefreshIndex=false",
+];
+
+const PANEL_DEFS = [
+  { id: "files", label: "Files", icon: "mods/mesh-tabs/icons/files.svg" },
+  { id: "changes", label: "Review", icon: "mods/mesh-tabs/icons/changes.svg" },
+  { id: "test", label: "Test", icon: "mods/mesh-tabs/icons/test.svg" },
+  { id: "ship", label: "Ship", icon: "mods/mesh-tabs/icons/ship.svg" },
+];
+
+const STAGE_BADGES = {
+  plan: "Plan",
+  build: "Build",
+  review: "Rev",
+  test: "Test",
+  pr_dev: "PR",
+  promote: "CI",
+};
+
+const PROBE_COOLDOWN_MS = 3000;
+const JIRA_KEY_RE = /\b([A-Z][A-Z0-9]{1,9}-\d+)\b/;
+const NON_TICKET_RE = /^(UTF|ISO|SHA|MD|TLS|SSL)-\d+$/i;
+const DEFAULT_BRANCHES = new Set(["main", "master", "dev", "development", "develop", "ci", "staging", "production", "head"]);
+const ACTIVE_STATUSES = new Set(["working", "done", "blocked"]);
+
+function findNode(node, id) {
+  if (node?.id === id) return node;
+  for (const child of node?.children ?? []) {
+    const found = findNode(child, id);
+    if (found) return found;
+  }
+  return null;
+}
+
+function asPlainObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function isGenericName(name, program) {
+  const s = String(name || "").trim();
+  if (!s) return true;
+  if (/^tb\d+$/.test(s) || /^\d+$/.test(s)) return true;
+  if (s === "Terminal") return true;
+  if (program?.name && s === program.name) return true;
+  return false;
+}
+
+function isGenericTab(tab, program) {
+  if (!tab || tab.named) return false;
+  return isGenericName(tab.name, program);
+}
+
+function findLeadPane(tabId, allPanes, allTerminals, preferredAddress) {
+  const termByAddr = new Map();
+  for (const term of allTerminals || []) {
+    if (term?.address) termByAddr.set(term.address, term);
+  }
+  const isRunner = (pane) => {
+    const term = pane?.terminal ? termByAddr.get(pane.terminal) : null;
+    return pane?.labels?.meshRunner === "true" || term?.labels?.meshRunner === "true";
+  };
+
+  if (preferredAddress) {
+    const pinned = (allPanes || []).find(
+      (p) => p.tab === tabId && p.terminal === preferredAddress && !isRunner(p),
+    );
+    if (pinned) return pinned;
+  }
+
+  const candidates = (allPanes || []).filter(
+    (p) => p.tab === tabId && p.terminal && !isRunner(p),
+  );
+  return candidates.find((p) => p.program?.agent) || candidates[0] || null;
+}
+
+function extractJiraKey(...sources) {
+  for (const src of sources) {
+    if (typeof src !== "string" || !src) continue;
+    const match = JIRA_KEY_RE.exec(src);
+    if (match && !NON_TICKET_RE.test(match[1])) {
+      return match[1];
+    }
+  }
+  return null;
+}
+
+function isBoilerplateLine(line) {
+  if (!line) return true;
+  if (/^[\s─━═\-_=*~·•|+┌┐└┘├┤┬┴┼╭╮╰╯\\/<>]+$/.test(line)) return true;
+  if (/^[>$%❯›#]+$/.test(line)) return true;
+  if (/^[●○✦◆◇✓✔✗×•▸▹↳⚠ℹ]/.test(line)) return true;
+  if (/^[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+:[^$#%]*[$#%]\s*$/.test(line)) return true;
+  if (/^[~./\\][^\s]*$/.test(line)) return true;
+  if (/^\d+\s*(?:ms|s|%|tokens?)\b/i.test(line)) return true;
+  if (/\b(?:ctrl\+[a-z]|shift\+tab|esc to|for shortcuts|accept edits|bypass permissions|auto-accept|context left|% left|thought for|thinking\.\.\.|welcome to|tips for getting started|claude code|gemini cli|openai codex|opencode|antigravity)\b/i.test(line)) {
+    return true;
+  }
+  if (/^(?:claude|gemini|codex|opencode|pi|agy|antigravity|bash|zsh|fish|sh|ls|cd|pwd|clear|exit|\/help|\/clear|\/model|\/status|\/compact)$/i.test(line)) {
+    return true;
+  }
+  if (/^try\s+["']/i.test(line) || /^(?:ask anything|type a message|send a message)\b/i.test(line)) {
+    return true;
+  }
+  return false;
+}
+
+function extractPromptLine(screenText) {
+  if (typeof screenText !== "string" || !screenText.trim()) return "";
+  const lines = screenText
+    .split(/\r?\n/)
+    .map((raw) => raw.replace(/^[\s│┃║|]+|[\s│┃║|]+$/g, "").trim())
+    .filter(Boolean);
+
+  // Pass 1: explicit prompt prefixes (>, ❯, ›, User:)
+  for (const line of lines) {
+    const m = /^(?:>|❯|›|user:)\s*(.+)$/i.exec(line);
+    if (!m) continue;
+    const candidate = m[1].replace(/^[>$%❯›#\s]+/, "").trim();
+    if (!candidate || isBoilerplateLine(candidate)) continue;
+    if (/[a-zA-Z0-9\u00C0-\u024F]{3,}/.test(candidate)) return candidate;
+  }
+
+  // Pass 2: shell command invocations with an inline quoted task (e.g. $ claude "Fix PROJ-412...")
+  for (const line of lines) {
+    const shellCmd = /(?:^|[$#%]\s+)(?:claude|gemini|codex|opencode|pi|agy)\s+["']([^"']{4,})["']/i.exec(line);
+    if (shellCmd && !isBoilerplateLine(shellCmd[1])) {
+      return shellCmd[1].trim();
+    }
+  }
+
+  // Pass 3: first non-boilerplate text line
+  for (const line of lines) {
+    if (isBoilerplateLine(line)) continue;
+    const words = line.split(/\s+/).filter(Boolean);
+    if (words.length >= 2 && /[a-zA-Z\u00C0-\u024F]{3,}/.test(line)) {
+      return line;
+    }
+  }
+  return "";
+}
+
+function trimCleanly(text, maxLen = 28) {
+  const clean = text.replace(/\s+/g, " ").trim();
+  if (clean.length <= maxLen) return clean;
+  const slice = clean.slice(0, maxLen);
+  if (/\s/.test(clean[maxLen])) return slice.trim();
+  const lastSpace = slice.lastIndexOf(" ");
+  if (lastSpace >= Math.floor(maxLen * 0.5)) {
+    return slice.slice(0, lastSpace).trim();
+  }
+  return `${clean.slice(0, maxLen - 1).trim()}…`;
+}
+
+function summarizePrompt(rawText, ticket) {
+  if (typeof rawText !== "string" || !rawText.trim()) return "";
+  let text = rawText
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/^(?:>|❯|›|user:)\s*/i, "")
+    .replace(/[`*_~]/g, " ")
+    .trim();
+
+  if (ticket) {
+    const escaped = ticket.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+    text = text.replace(new RegExp(`\\b${escaped}\\b`, "gi"), " ");
+  }
+
+  const fillerRe = /^(?:hola|hi|hello|hey|buenos\s+dias|buenos\s+días|buenas\s+tardes|buenas\s+noches|buenas|good\s+morning|good\s+afternoon|por\s+favor|please|pls|necesito\s+que|necesito|quiero\s+que|quiero|me\s+ayudes\s+a|ayudame\s+a|ayúdame\s+a|ayudarme\s+a|me\s+puedes\s+ayudar\s+a|puedes\s+ayudarme\s+a|puedes|podrias|podrías|can\s+you|could\s+you|would\s+you|will\s+you|help\s+me\s+to|help\s+me|i\s+need\s+you\s+to|i\s+need\s+to|i\s+need|i\s+want\s+you\s+to|i\s+want\s+to|i\s+want|let'?s|we\s+need\s+to|para\s+el\s+ticket|en\s+el\s+ticket|sobre\s+el\s+ticket|ticket)\b[\s,.:;\-–—!?]*/i;
+
+  let prev;
+  do {
+    prev = text;
+    text = text.replace(/^[,.:;\-–—!?\s]+/, "").replace(fillerRe, "").trim();
+  } while (text !== prev && text.length > 0);
+
+  text = text
+    .replace(/[,.;:!?()[\]{}"'“”«»/\\|`~@#%^&*+=<>]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!text || !/[a-zA-Z0-9\u00C0-\u024F]{2,}/.test(text)) return "";
+  const capped = trimCleanly(text, 28);
+  return capped.replace(/^[a-z\u00e0-\u00f6\u00f8-\u00ff]/, (ch) => ch.toUpperCase());
+}
+
+function cleanBranchSlug(branch, ticket) {
+  if (typeof branch !== "string") return "";
+  let slug = branch.trim();
+  if (!slug || DEFAULT_BRANCHES.has(slug.toLowerCase())) return "";
+  slug = slug.replace(/^(?:feat|feature|fix|bugfix|hotfix|chore|refactor|docs|test|tests|release)\//i, "");
+  if (ticket) {
+    const escaped = ticket.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+    slug = slug.replace(new RegExp(`\\b${escaped}\\b`, "gi"), " ");
+  }
+  slug = slug
+    .replace(/[-_/]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!slug || DEFAULT_BRANCHES.has(slug.toLowerCase())) return "";
+  return trimCleanly(slug, 28);
+}
+
+export default class MeshTabs extends View {
+  init(_props, cx) {
+    this.pressed = null;
+    this.scroll = ScrollHandle.new();
+    this.probeCache = new Map();
+    this.editingTabId = null;
+    this.editingStartedAt = 0;
+
+    this.renameInput = InputState.new({ placeholder: "Tab name" });
+    this.renameInput.on("submit", (_e, cx) => this.commitRename(cx));
+    this.renameInput.on("blur", (_e, cx) => {
+      if (this.editingTabId && Date.now() - this.editingStartedAt > 150) {
+        this.cancelRename(cx);
+      }
+    });
+
+    this.scanUnnamedTabs(cx);
+    cx.timer.every(3500, (cx) => this.scanUnnamedTabs(cx));
+  }
+
+  close() {
+    this.renameInput?.release();
+  }
+
+  startRename(tab, currentName, cx) {
+    this.editingTabId = tab.id;
+    this.editingStartedAt = Date.now();
+    const initial = String(currentName || "").trim();
+    this.renameInput.set_value(initial);
+    if (initial) {
+      this.renameInput.set_selected_range({ start: 0, end: initial.length });
+    }
+    this.renameInput.focus();
+    cx.notify();
+    cx.timer.after(20, () => {
+      if (this.editingTabId === tab.id) {
+        this.renameInput.focus();
+      }
+    });
+  }
+
+  cancelRename(cx) {
+    if (!this.editingTabId) return;
+    this.editingTabId = null;
+    cx.notify();
+  }
+
+  commitRename(cx) {
+    const id = this.editingTabId;
+    if (!id) return;
+    const raw = this.renameInput.value().trim();
+    this.editingTabId = null;
+
+    const ownerSpace = spaces().find((s) => (s.tabs ?? []).some((t) => t.id === id)) || spaces().find((s) => s.active);
+    const flows = asPlainObject(shared("mesh.flows"));
+    const existing = asPlainObject(flows[id]);
+
+    if (raw) {
+      run("tab.rename", { id, name: raw });
+      const ticket = extractJiraKey(raw) || existing.ticket || null;
+      setShared("mesh.flows", {
+        ...flows,
+        [id]: {
+          ...existing,
+          tabId: id,
+          workspaceRoot: ownerSpace?.folder || existing.workspaceRoot || "",
+          stage: existing.stage || "plan",
+          ticket,
+          derivedTitle: existing.derivedTitle ?? null,
+          manualTitle: true,
+          leadTerminal: existing.leadTerminal ?? null,
+          reviewedServices: existing.reviewedServices || {},
+          updatedAt: Date.now(),
+        },
+      });
+    } else {
+      run("tab.rename", { id, name: "" });
+      for (const cacheKey of this.probeCache.keys()) {
+        if (cacheKey.startsWith(`${id}::`)) {
+          this.probeCache.delete(cacheKey);
+        }
+      }
+      setShared("mesh.flows", {
+        ...flows,
+        [id]: {
+          ...existing,
+          tabId: id,
+          workspaceRoot: ownerSpace?.folder || existing.workspaceRoot || "",
+          stage: existing.stage || "plan",
+          ticket: existing.ticket ?? null,
+          derivedTitle: null,
+          autoNamed: false,
+          manualTitle: false,
+          leadTerminal: existing.leadTerminal ?? null,
+          reviewedServices: existing.reviewedServices || {},
+          updatedAt: Date.now(),
+        },
+      });
+    }
+    cx.notify();
+  }
+
+  // Persist per-space panel choices in shared("mesh.spacePanels") without leaving stale transitions.
+  syncPanel(space, panel, body, enabled) {
+    if (!space || !panel) return;
+    const panels = asPlainObject(shared("mesh.spacePanels"));
+    const now = panel.hidden ? null : body?.active ?? null;
+    if (space.id !== this.space) {
+      const first = this.space === undefined;
+      this.space = space.id;
+      this.pending = null;
+      this.editingTabId = null;
+      if (!(first && !(space.id in panels))) {
+        const stored = panels[space.id] ?? null;
+        const want = enabled.includes(stored) ? stored : null;
+        if (want !== now) {
+          this.pending = { want, until: Date.now() + 1000 };
+          if (want) {
+            run("layout.select", { stack: "panel-body", child: want });
+            run("layout.show", { id: "panel" });
+          } else {
+            run("layout.hide", { id: "panel" });
+          }
+          return;
+        }
+      }
+    }
+    // Until the restore lands (or something else won), the old state isn't a choice.
+    if (this.pending) {
+      if (this.pending.want !== now && Date.now() < this.pending.until) return;
+      this.pending = null;
+    }
+    if (Object.prototype.hasOwnProperty.call(panels, space.id) && panels[space.id] === now) return;
+    setShared("mesh.spacePanels", { ...panels, [space.id]: now });
+  }
+
+  scanUnnamedTabs(cx) {
+    const allSpaces = spaces();
+    const allPanes = panes();
+    const allTerminals = terminals();
+    const flows = asPlainObject(shared("mesh.flows"));
+    const now = Date.now();
+
+    for (const space of allSpaces) {
+      for (const tab of space?.tabs ?? []) {
+        if (tab.named || this.editingTabId === tab.id) continue;
+        const flow = asPlainObject(flows[tab.id]);
+        if (flow.manualTitle === true || flow.autoNamed === true) continue;
+
+        const leadPane = findLeadPane(tab.id, allPanes, allTerminals, flow.leadTerminal);
+        if (!leadPane?.terminal) continue;
+        if (!isGenericTab(tab, leadPane.program)) continue;
+
+        const terminal = leadPane.terminal;
+        const cacheKey = `${tab.id}::${terminal}`;
+        const cached = this.probeCache.get(cacheKey);
+        if (cached?.done || cached?.inFlight) continue;
+        if (cached?.lastAttempt && now - cached.lastAttempt < PROBE_COOLDOWN_MS) continue;
+
+        this.probeCache.set(cacheKey, { lastAttempt: now, inFlight: true, done: false });
+        cx.spawn(async (cx) => {
+          await this.probeAndRenameTab({ space, tab, leadPane, terminal, cacheKey }, cx);
+        });
+      }
+    }
+  }
+
+  async probeAndRenameTab({ space, tab, leadPane, terminal, cacheKey }, cx) {
+    let renamed = false;
+    try {
+      const getRes = await hc(["get", terminal, "--json"]).catch(() => null);
+      if (!getRes || getRes.code !== 0 || !getRes.stdout?.trim()) return;
+
+      let info;
+      try {
+        info = JSON.parse(getRes.stdout);
+      } catch {
+        return;
+      }
+      if (!info || info.labels?.meshRunner === "true") return;
+
+      const infoStatus = typeof info.status === "string" ? info.status : info.status?.state;
+      const firstMessage = typeof info.first_message === "string" ? info.first_message.trim() : "";
+      const hasInteracted = Boolean(
+        firstMessage ||
+        (typeof info.turn === "number" && info.turn > 0) ||
+        ACTIVE_STATUSES.has(infoStatus) ||
+        ACTIVE_STATUSES.has(leadPane?.status) ||
+        ACTIVE_STATUSES.has(tab.status),
+      );
+      if (!hasInteracted) return;
+
+      let promptLine = "";
+      if (!firstMessage) {
+        const readRes = await hc(["read", "--lines", "40", terminal]).catch(() => null);
+        if (readRes && readRes.code === 0 && readRes.stdout) {
+          promptLine = extractPromptLine(readRes.stdout);
+        }
+      }
+
+      const gitCwd = info.foreground?.cwd || leadPane.cwd || space?.folder || "";
+      let branch = "";
+      if (gitCwd) {
+        const gitRes = await exec(
+          "git",
+          [...READ_GIT, "rev-parse", "--abbrev-ref", "HEAD"],
+          { cwd: gitCwd, on: space?.machine || null, timeout: 4000 },
+        ).catch(() => null);
+        if (gitRes && gitRes.code === 0) {
+          const out = (gitRes.stdout || "").trim();
+          if (out && out !== "HEAD") branch = out;
+        }
+      }
+      if (!branch && leadPane.branch) {
+        branch = leadPane.branch;
+      }
+
+      const title = typeof info.title === "string" ? info.title.trim() : "";
+      const statusMsg = typeof info.status?.msg === "string" ? info.status.msg.trim() : "";
+      const ticket = extractJiraKey(firstMessage, promptLine, title, branch, statusMsg);
+      const summary = summarizePrompt(firstMessage || promptLine, ticket);
+      const branchSlug = cleanBranchSlug(branch, ticket);
+
+      let derivedName = "";
+      if (ticket && summary) derivedName = `${ticket} · ${summary}`;
+      else if (ticket && branchSlug) derivedName = `${ticket} · ${branchSlug}`;
+      else if (ticket) derivedName = ticket;
+      else if (summary) derivedName = summary;
+      else if (branchSlug) derivedName = branchSlug;
+
+      if (!derivedName || isGenericName(derivedName, leadPane.program)) return;
+
+      // Re-validate current tab and flow state after async awaits so manual renames always win.
+      const freshSpace = spaces().find((s) => s.id === space.id);
+      const freshTab = (freshSpace?.tabs ?? []).find((t) => t.id === tab.id);
+      const freshFlows = asPlainObject(shared("mesh.flows"));
+      const existing = asPlainObject(freshFlows[tab.id]);
+      if (!freshTab || freshTab.named || this.editingTabId === tab.id) return;
+      if (existing.manualTitle === true || existing.autoNamed === true) return;
+
+      if (derivedName !== freshTab.name) {
+        run("tab.rename", { id: tab.id, name: derivedName });
+      }
+      setShared("mesh.flows", {
+        ...freshFlows,
+        [tab.id]: {
+          ...existing,
+          tabId: tab.id,
+          workspaceRoot: freshSpace?.folder || existing.workspaceRoot || "",
+          stage: existing.stage || "plan",
+          ticket: ticket || existing.ticket || null,
+          derivedTitle: derivedName,
+          autoNamed: true,
+          manualTitle: Boolean(existing.manualTitle),
+          leadTerminal: existing.leadTerminal || terminal,
+          reviewedServices: existing.reviewedServices || {},
+          updatedAt: Date.now(),
+        },
+      });
+      renamed = true;
+      cx.notify();
+    } finally {
+      this.probeCache.set(cacheKey, {
+        lastAttempt: Date.now(),
+        inFlight: false,
+        done: renamed,
+      });
+    }
+  }
+
+  render(cx) {
+    const t = theme();
+    const space = spaces().find((p) => p.active);
+    const shown = space?.tabs ?? [];
+    const active = shown.findIndex((tab) => tab.active);
+    const selected = shown[active]?.id;
+    if (selected !== this.selected || active !== this.selectedIndex) {
+      this.selected = selected;
+      this.selectedIndex = active;
+      if (active >= 0) this.scroll.scroll_to_item(active);
+    }
+
+    const flows = asPlainObject(shared("mesh.flows"));
+    const allPanes = panes();
+    const stop = (_e, cx) => cx.stop_propagation();
+    const button = (id, label, action) =>
+      div()
+        .id(id)
+        .size(26)
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(6)
+        .text_color(t.dim)
+        .cursor_pointer()
+        .hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .on_mouse_down("left", stop)
+        .on_click(action)
+        .child(label);
+
+    const item = (c, i) => {
+      const program =
+        allPanes.find((p) => p.tab === c.id && p.program?.agent)?.program ??
+        allPanes.find((p) => p.tab === c.id)?.program;
+      const displayName = /^tb\d+$/.test(c.name) ? (program?.name ?? "Terminal") : c.name;
+      const isEditing = this.editingTabId === c.id;
+
+      return h_flex()
+        .id(`tab-${c.id}`)
+        .h(29)
+        .px(10)
+        .gap(7)
+        .rounded(7)
+        .items_center()
+        .flex_none()
+        .text_size(12.8)
+        // A rename or status dot on this or an earlier tab can push the active one out.
+        .when(i <= active, (el) =>
+          el.on_size_change((_size, cx) => {
+            this.scroll.scroll_to_item(active);
+            cx.notify();
+          }),
+        )
+        .border(1)
+        .border_color(c.active ? t.border : t.chrome)
+        .bg(c.active ? t.raised : t.chrome)
+        .text_color(c.active ? t.foreground : t.muted)
+        .hover((s) => s.bg(t.hover))
+        .on_mouse_down("left", (e, cx) => {
+          cx.stop_propagation();
+          if (isEditing) return;
+          if (e.click_count === 2) {
+            this.pressed = null;
+            this.startRename(c, displayName, cx);
+            return;
+          }
+          this.pressed = i;
+        })
+        .on_mouse_up("left", () => {
+          if (isEditing || this.editingTabId === c.id) {
+            this.pressed = null;
+            return;
+          }
+          const from = this.pressed;
+          this.pressed = null;
+          if (from !== null && from !== i && shown[from]) {
+            run("tab.move", {
+              id: shown[from].id,
+              index: space.tabs.findIndex((x) => x.id === c.id) + 1,
+            });
+          } else if (from === i) {
+            run("tab.select", { id: c.id });
+          }
+        })
+        .on_mouse_down("right", (_e, cx) => {
+          cx.stop_propagation();
+          openOverlay({
+            mod: "menu",
+            kind: "popup",
+            width: 200,
+            props: { tab: "tab", target: { id: c.id, space: space.id } },
+          });
+        })
+        .when(Boolean(program?.icon), (el) =>
+          el.child(
+            program.tint
+              ? svg(program.icon).size(14).text_color(t.muted)
+              : image(program.icon).size(14),
+          ),
+        )
+        .when(isEditing, (el) =>
+          el.child(
+            div()
+              .id(`tab-rename-${c.id}`)
+              .w(150)
+              .h(22)
+              .px(6)
+              .flex()
+              .items_center()
+              .rounded(5)
+              .bg(t.background)
+              .border_1()
+              .border_color(t.accent)
+              .on_mouse_down("left", stop)
+              .on_mouse_up("left", stop)
+              .on_key_down((e, cx) => {
+                if (e.key === "escape") {
+                  cx.stop_propagation();
+                  this.cancelRename(cx);
+                }
+              })
+              .child(
+                Input.new(this.renameInput)
+                  .w_full()
+                  .h_full()
+                  .text_size(12.2)
+                  .text_color(t.foreground),
+              ),
+          ),
+        )
+        .when(!isEditing, (el) =>
+          el.child(div().max_w(170).truncate().child(c.zoomed ? `${displayName} Z` : displayName)),
+        )
+        .when(c.status === "working", (el) =>
+          el.child(svg("mods/mesh-tabs/icons/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)),
+        )
+        .when(c.status === "blocked" || c.status === "done", (el) =>
+          el.child(div().size(6).rounded(3).bg(t[c.status])),
+        )
+        .when(c.active && !isEditing, (el) =>
+          el.child(
+            div()
+              .id(`close-${c.id}`)
+              .text_color(t.dim)
+              .cursor_pointer()
+              .hover((s) => s.text_color(t.foreground))
+              .on_mouse_down("left", stop)
+              .on_click((_e, cx) => {
+                cx.stop_propagation();
+                run("tab.close", { id: c.id });
+              })
+              .child(svg("mods/mesh-tabs/icons/close.svg").size(12)),
+          ),
+        );
+    };
+
+    const root = layout();
+    const sidebar = findNode(root, "sidebar");
+    const w = window();
+    // Old saved rails and a dragged-narrow sidebar can be smaller than the window buttons.
+    const lightsPadding =
+      w?.platform === "macos" && w.titlebar === "none" && !w.fullscreen && root?.traffic_lights
+        ? Math.max(
+            10,
+            (root.traffic_lights[0] + 64) / settings().zoom - (sidebar?.hidden ? 0 : sidebar?.size?.px ?? 0),
+          )
+        : 10;
+
+    const panel = findNode(root, "panel");
+    const body = findNode(root, "panel-body");
+    const enabled = PANEL_DEFS.map((d) => d.id);
+    this.syncPanel(space, panel, body, enabled);
+    this.scanUnnamedTabs(cx);
+
+    const panelButton = (id, label, icon) => {
+      const on = panel && !panel.hidden && body?.active === id;
+      return h_flex()
+        .id(`panel-${id}`)
+        .h(26)
+        .px(8)
+        .gap(5)
+        .flex_none()
+        .items_center()
+        .rounded(6)
+        .text_size(12)
+        .cursor_pointer()
+        .bg(on ? t.selected : t.chrome)
+        .text_color(on ? t.foreground : t.muted)
+        .hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .on_mouse_down("left", stop)
+        .on_click(() => {
+          if (on) {
+            run("layout.hide", { id: "panel" });
+          } else {
+            run("layout.select", { stack: "panel-body", child: id });
+            run("layout.show", { id: "panel" });
+          }
+        })
+        .child(svg(icon).size(14))
+        .child(label);
+    };
+
+    let bar = h_flex()
+      .size_full()
+      .min_w(0)
+      .px(10)
+      .pl(lightsPadding)
+      .gap(3)
+      .items_center()
+      .bg(t.chrome)
+      .border_b(1)
+      .border_color(t.border)
+      .on_mouse_up("left", () => {
+        this.pressed = null;
+      })
+      .on_scroll_wheel((e) => {
+        if (Math.abs(e.delta.y) >= 1) run(e.delta.y > 0 ? "tab.prev" : "tab.next");
+      })
+      .child(
+        h_flex()
+          .id("tab-scroll")
+          .flex_1()
+          .min_w(0)
+          .h_full()
+          .items_center()
+          .gap(3)
+          .overflow_x_scrollbar()
+          .track_scroll(this.scroll)
+          .on_size_change((_size, cx) => {
+            if (active >= 0) {
+              this.scroll.scroll_to_item(active);
+              cx.notify();
+            }
+          })
+          .children(shown.map(item)),
+      )
+      .child(
+        button("tab-new", "+", () =>
+          openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 }),
+        ),
+      );
+
+    for (const def of PANEL_DEFS) {
+      if (enabled.includes(def.id)) {
+        bar = bar.child(panelButton(def.id, def.label, def.icon));
+      }
+    }
+
+    return bar.when(w?.buttons, (el) =>
+      el
+        .child(
+          button(
+            "minimize",
+            w.platform === "windows" ? svg("mods/mesh-tabs/icons/win-min.svg").size(16) : "−",
+            () => run("window.minimize"),
+          ),
+        )
+        .child(
+          button(
+            "maximize",
+            w.platform === "windows"
+              ? svg(`mods/mesh-tabs/${w.maximized ? "icons/win-restore.svg" : "icons/win-max.svg"}`).size(16)
+              : "□",
+            () => run("window.maximize"),
+          ),
+        )
+        .child(
+          button(
+            "close-window",
+            w.platform === "windows"
+              ? svg("mods/mesh-tabs/icons/win-close.svg").size(16)
+              : svg("mods/mesh-tabs/icons/close.svg").size(13),
+            () => run("window.close"),
+          ),
+        ),
+    );
+  }
+}

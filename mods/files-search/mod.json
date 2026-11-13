@@ -1,0 +1,13 @@
+{
+  "place": "none",
+  "title": "Search Everywhere",
+  "overlay": {
+    "kind": "window",
+    "key": "files-search-win",
+    "frame": "none"
+  },
+  "cloned_from": {
+    "name": "files",
+    "version": "0.1.13"
+  }
+}
