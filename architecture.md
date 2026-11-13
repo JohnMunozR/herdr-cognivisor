@@ -58,13 +58,15 @@ The root UI topology is defined by `layouts/mesh.json` (`[[module-layouts]]`), p
 
 ```text
 herdr-mesh/
+├── package.json           <- Zero-dependency test runner entrypoint (`npm test`)
+├── tests/                 <- Native `node --test` unit/regression suites (`*.test.mjs` + `helpers/herdr-mock.mjs`)
 ├── layouts/               <- [[module-layouts]]: Layout recipe (layouts/mesh.json) & SPEC.md
 ├── openspec/specs/        <- [[spec-lifecycle]]: Agent Workspace domain specification
 └── mods/                  <- [[module-mods]]: Independent GPUI-kit mod extensions
     ├── SPEC.md
-    ├── files-search/      <- [[submodule-mod-files-search]]: Search Everywhere & file tree
-    ├── changes-review/    <- [[submodule-mod-changes-review]]: Per-service diff review & Checks
-    ├── mesh-tabs/         <- [[submodule-mod-mesh-tabs]]: Tab strip, auto-naming, mesh.spacePanels
+    ├── files-search/      <- [[submodule-mod-files-search]]: Search Everywhere, indexer engine (`indexer.js`, `search-logic.js`)
+    ├── changes-review/    <- [[submodule-mod-changes-review]]: Per-service diff review, Checks (`review-logic.js`)
+    ├── mesh-tabs/         <- [[submodule-mod-mesh-tabs]]: Tab strip, auto-naming, `mesh.spacePanels` (`tab-logic.js`)
     └── mesh-status/       <- [[submodule-mod-mesh-status]]: Telemetry status bar
 ```
 
@@ -125,3 +127,5 @@ All bus keys outside mod-private namespaces MUST carry the `mesh.*` prefix.
    All UI colors MUST derive dynamically from `theme()`, `settings().colors`, or `layout().colors`. Hardcoded hex color codes are strictly prohibited.
 5. **Spec Consistency:**
    Every structural change to directories, layouts, interfaces, or bus keys MUST be reflected in the owning `SPEC.md` and `openspec/specs/` before or alongside code changes.
+6. **Pure Logic Decoupling & Mandatory Unit Tests:**
+   Testable business logic (indexing, watch filtering, query scoring, Git/diff parsing, command validation, tab naming) MUST reside in zero-UI intra-mod helper modules (`indexer.js`, `*-logic.js`) covered by native `node --test` suites under `tests/*.test.mjs` (`npm test`) whenever developed or fixed.

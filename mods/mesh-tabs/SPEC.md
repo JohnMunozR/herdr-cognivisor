@@ -22,6 +22,7 @@ The `submodule-mod-mesh-tabs` implements the top 42px workspace tab strip (`#tab
 - **Owns:**
   - Manifest: `mods/mesh-tabs/mod.json` (`{ "place": "none", "title": "Mesh Tabs" }`).
   - View implementation: `mods/mesh-tabs/main.js` (`MeshTabs` view).
+  - Pure tab-naming & lead-pane helpers: `mods/mesh-tabs/tab-logic.js`.
   - Self-contained SVG icon assets: `mods/mesh-tabs/icons/*.svg` (`files.svg`, `changes.svg`, `close.svg`, `spinner.svg`, `win-min.svg`, `win-max.svg`, `win-restore.svg`, `win-close.svg`).
 - **Public surface:**
   - Registered mod identifier: `mesh-tabs`.

@@ -18,6 +18,7 @@ The `submodule-mod-changes-review` provides interactive source control inspectio
 - **Owns:**
   - Manifest file: `mods/changes-review/mod.json` (`{ "place": "none", "title": "Changes Review" }`).
   - Main component: `mods/changes-review/main.js`.
+  - Pure diff, syntax lexer, watch filter & checks parser helpers: `mods/changes-review/review-logic.js`.
   - Icon assets: `mods/changes-review/changes.svg` and `mods/changes-review/icons/*.svg`.
   - Type definitions and compiler configuration: `gpui-kit.d.ts`, `jsconfig.json`.
 - **Public surface:**

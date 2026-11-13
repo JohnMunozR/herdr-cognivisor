@@ -86,23 +86,31 @@ All code in this repository runs inside Herdr's native GPUI shell (`gpui-shell 0
 
 ---
 
-## Verification
+## Verification & Mandatory Unit Testing
 
-Before delivering any change, execute the following verification steps:
+Every agent developing, refactoring, or fixing bugs in `herdr-mesh` MUST write or update unit tests in `tests/*.test.mjs` and run the full verification gate before finishing any task:
 
-1. **GPUI Component Materialization Check:**
+1. **Mandatory Test Policy (Unit & Regression Tests):**
+   - **Always write/update tests during development:** New features, refactors, and bug fixes touching business logic, path handling, Git/CLI parsing, watcher filters, indexing, caching, scoring, or tab-naming rules MUST add or update deterministic unit tests under `tests/`. Every bug fix MUST include a regression test that reproduces the prior failure.
+   - **Keep pure logic decoupled from GPUI Views:** Place testable pure functions in intra-mod logic modules (e.g., `mods/files-search/indexer.js`, `mods/files-search/search-logic.js`, `mods/changes-review/review-logic.js`, `mods/mesh-tabs/tab-logic.js`) imported by `main.js`. Keep `gpui-kit` / `gpui-base` rendering in `main.js` so logic modules load cleanly in Node without mocking UI builders. Never use cross-mod `../` relative imports (forbidden by `herdr-app check`).
+   - **Zero-dependency test harness:** Tests MUST use Node's native test runner (`node --test tests/*.test.mjs` via `npm test`) without adding `node_modules` dependencies. Mock `herdr` and `fs/promises` cleanly via `tests/helpers/herdr-mock.mjs` only when testing modules that call host APIs. Keep `tests/` and `package.json` at repository root (never inside `mods/*/` runtime bundles installed by `install.sh`).
+2. **Unit Test Execution (`node --test`):**
+   ```bash
+   npm test
+   ```
+   All unit tests under `tests/*.test.mjs` MUST pass with exit code 0.
+3. **GPUI Component Materialization Check:**
    ```bash
    for d in mods/*/; do herdr-app check "$d" || exit 1; done
    ```
-   All mod checks (including the 4 active layout mods `files-search`, `changes-review`, `mesh-tabs`, `mesh-status`) must pass (exit code 0), verifying that view definitions, eager elements, and manifests materialize without errors.
-2. **Syntax Validation:**
+   All mod checks (including the 4 active layout mods `files-search`, `changes-review`, `mesh-tabs`, `mesh-status`) must pass (exit code 0), verifying that view definitions, intra-mod imports, eager elements, and manifests materialize without errors.
+4. **Syntax Validation:**
    ```bash
-   for f in mods/*/main.js; do node --check "$f" || exit 1; done
+   for f in mods/*/*.js; do node --check "$f" || exit 1; done
    ```
-3. **JSON Structure Integrity:**
+5. **JSON Structure Integrity:**
    ```bash
-   node -e 'JSON.parse(require("fs").readFileSync("keys.json"))'
+   node -e 'for (const p of ["package.json", "layouts/mesh.json", "keys.json"]) JSON.parse(require("fs").readFileSync(p, "utf8"))'
    ```
-   (And similarly validate `layouts/mesh.json` whenever present).
-4. **Spec-Graph Link Consistency:**
+6. **Spec-Graph Link Consistency:**
    Ensure all frontmatter fields (`id`, `parent`, `type`, `status`) and cross-spec wikilinks (`[[id]]`) resolve accurately without orphan references.

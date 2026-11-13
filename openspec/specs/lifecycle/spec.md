@@ -83,3 +83,11 @@ All `herdr-mesh` mods MUST comply with Herdr's native persistence and GPUI-kit i
 - **GIVEN** two spaces `space-a` (active panel `files`) and `space-b` (active panel `changes`)
 - **WHEN** the user switches between `space-a` and `space-b` in `mesh-tabs`
 - **THEN** `mesh-tabs` schedules deferred `syncPanel()` reads and writes via `shared("mesh.spacePanels")` to restore each space's `#panel-body` selection without calling `localStorage`.
+
+---
+
+### Requirement: Pure Mod Logic Separation & Mandatory Unit Test Gate
+
+All `herdr-mesh` mods MUST keep testable non-UI business logic (indexing, watch filtering, query scoring, diff/syntax parsing, check command validation, tab naming) separated into intra-mod logic modules (`indexer.js`, `*-logic.js`) verified by native `node --test` unit suites (`tests/*.test.mjs`).
+
+- Feature development, refactors, and bug fixes affecting mod logic MUST add or update unit/regression tests in `tests/*.test.mjs` and pass `npm test` (`node --test tests/*.test.mjs`) alongside `herdr-app check` before completion (`[[architecture]]`).

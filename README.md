@@ -107,20 +107,25 @@ Run the included installer to install the 4 active mods (`files-search`, `change
 
 ## Development & Verification
 
-Herdr Mesh views are written in native JavaScript using `gpui-kit` and `gpui-base`. Verify all mods, scripts, JSON files, and runtime invariants before delivery:
+Herdr Mesh views are written in native JavaScript using `gpui-kit` and `gpui-base`, with pure business logic decoupled into intra-mod helper modules (`indexer.js`, `*-logic.js`) so core rules can be unit-tested with Node's native test runner (`node --test`). Every feature or bug fix is expected to add or update unit tests in `tests/*.test.mjs`.
+
+Verify unit tests, mods, scripts, JSON files, and runtime invariants before delivery:
 
 ```bash
+# Run zero-dependency unit test suite
+npm test
+
 # Check GPUI view materialization and manifests
 for d in mods/*/; do herdr-app check "$d" || exit 1; done
 
-# Check JavaScript syntax across all mod entrypoints
-for f in mods/*/main.js; do node --check "$f" || exit 1; done
+# Check JavaScript syntax across all mod modules
+for f in mods/*/*.js; do node --check "$f" || exit 1; done
 
 # Verify JSON schema integrity
-node -e 'JSON.parse(require("fs").readFileSync("layouts/mesh.json","utf8")); JSON.parse(require("fs").readFileSync("keys.json","utf8"));'
+node -e 'for (const p of ["package.json", "layouts/mesh.json", "keys.json"]) JSON.parse(require("fs").readFileSync(p, "utf8"));'
 
 # Verify zero localStorage usage across all mod implementations
-! rg -n "localStorage" mods/*/main.js
+! rg -n "localStorage" mods/*/*.js
 
 # Check installer syntax and CLI help
 bash -n install.sh && ./install.sh --help

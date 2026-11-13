@@ -22,6 +22,7 @@ The `submodule-mod-files-search` delivers workspace file tree navigation and rip
   - Manifest file: `mods/files-search/mod.json` (identifies as `files-search`, cloned from `files` v0.1.13, overlay key `files-search-win`).
   - Main component: `mods/files-search/main.js`.
   - Shared indexing & cache engine: `mods/files-search/indexer.js`.
+  - Pure search scoring & parsing helpers: `mods/files-search/search-logic.js`.
   - Icon assets: `mods/files-search/*.svg` (`file.svg`, `folder.svg`, `search.svg`, `preview.svg`, `grip.svg`, etc.).
   - Type definitions and config: `gpui-kit.d.ts`, `jsconfig.json`.
 - **Public surface:**
