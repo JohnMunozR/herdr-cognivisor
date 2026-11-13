@@ -122,6 +122,55 @@ export function parseCascadeStdout(stdout, startPath) {
  * Resolve a cascading single-folder chain completely in memory before committing UI state,
  * so all nested single folders visually expand together once loaded.
  */
+/**
+ * Resolves a single-folder cascade synchronously from an in-memory directory cache.
+ * Returns null for invalid input, or { complete, missingPath, stagedEntries, stagedFolders }.
+ */
+export function resolveCachedCascade({
+  startPath,
+  maxDepth = MAX_CASCADE_DEPTH,
+  getFilterRel,
+  getCachedEntries,
+}) {
+  if (!startPath || !getCachedEntries) return null;
+
+  const stagedEntries = new Map();
+  const stagedFolders = [];
+  const visited = new Set([startPath]);
+  let curPath = startPath;
+
+  for (let depth = 0; depth <= maxDepth; depth++) {
+    const entries = getCachedEntries(curPath);
+    if (!entries) {
+      return {
+        complete: false,
+        missingPath: curPath,
+        stagedEntries,
+        stagedFolders,
+      };
+    }
+
+    stagedEntries.set(curPath, entries);
+    stagedFolders.push(curPath);
+
+    if (depth >= maxDepth) break;
+
+    const filterRel = getFilterRel ? getFilterRel() : null;
+    const nextChild = getCascadeChildPath(curPath, entries, filterRel);
+    if (!nextChild || visited.has(nextChild)) break;
+
+    visited.add(nextChild);
+    curPath = nextChild;
+  }
+
+  return {
+    complete: true,
+    missingPath: null,
+    stagedEntries,
+    stagedFolders,
+  };
+}
+
 export async function runStagedCascade({
   startPath,
   maxDepth = MAX_CASCADE_DEPTH,

@@ -9,7 +9,6 @@ import {
   prepareSearchQuery,
   scoreIndexEntry,
   buildTopFileItems,
-  buildEmptyOverlayItems,
 } from "../mods/files-search/search-logic.js";
 
 describe("files-search search-logic", () => {
@@ -85,16 +84,18 @@ describe("files-search search-logic", () => {
     assert.equal(items[1].kind, "file");
   });
 
-  test("buildEmptyOverlayItems preserves entry kinds and enforces cap", () => {
-    const entries = Array.from({ length: 40 }, (_, i) => ({
-      kind: i % 2 === 0 ? "dir" : "file",
-      path: `dir${i}`,
-      name: `dir${i}`,
-    }));
-    const items = buildEmptyOverlayItems(entries);
-    assert.equal(items.length, 30);
-    assert.equal(items[0].kind, "dir");
-    assert.equal(items[1].kind, "file");
+  test("prepareSearchQuery requires at least one non-whitespace character before matching files", () => {
+    assert.equal(prepareSearchQuery(""), null);
+    assert.equal(prepareSearchQuery("   \t\n "), null);
+
+    const qsSingle = prepareSearchQuery("a");
+    assert.ok(qsSingle);
+    assert.equal(qsSingle.qLen, 1);
+    const hit = scoreIndexEntry(
+      { kind: "file", path: "src/app.js", name: "app.js", lowerPath: "src/app.js", lowerName: "app.js" },
+      qsSingle,
+    );
+    assert.ok(hit.score > -Infinity);
   });
 
   test("parseSearchOutputLines normalizes Windows paths, supports rg/git formats, and truncates long lines near query", () => {

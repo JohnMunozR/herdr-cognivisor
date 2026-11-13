@@ -1,7 +1,6 @@
 // Pure helper logic for files-search: fuzzy scoring, directory-aware query ranking, text-search parsing, and git header parsing.
 
 export const MAX_FILE_RESULTS = 50;
-export const MAX_EMPTY_FILES = 30;
 export const MAX_TEXT_RESULTS = 35;
 export const FILE_SEARCH_CHUNK = 1200;
 export const FILE_SEARCH_BUDGET_MS = 6;
@@ -186,16 +185,5 @@ export function buildTopFileItems(top, q, withHits) {
     name: entry.name,
     score,
     hits: withHits && fromName ? (fuzzy(q, entry.name)?.hits || []) : [],
-  }));
-}
-
-export function buildEmptyOverlayItems(entries) {
-  if (!Array.isArray(entries) || entries.length === 0) return [];
-  return entries.slice(0, MAX_EMPTY_FILES).map(e => ({
-    kind: e.kind === "dir" ? "dir" : "file",
-    path: e.path,
-    name: e.name,
-    score: 0,
-    hits: [],
   }));
 }

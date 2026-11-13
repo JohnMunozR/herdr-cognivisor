@@ -1,6 +1,6 @@
 // FilesSearch: File browser with search button + floating IntelliJ-style Search Everywhere dialog.
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, Editor, EditorState, Input, InputState } from "gpui-base";
+import { v_flex, h_flex, Editor, EditorState, Input, InputState, Scrollbar, VirtualListScrollHandle, v_virtual_list } from "gpui-base";
 import { readdir, exists } from "fs/promises";
 import { join } from "path";
 import {
@@ -39,7 +39,6 @@ import {
 } from "./indexer.js";
 import {
   MAX_FILE_RESULTS,
-  MAX_EMPTY_FILES,
   MAX_TEXT_RESULTS,
   FILE_SEARCH_CHUNK,
   FILE_SEARCH_BUDGET_MS,
@@ -50,9 +49,9 @@ import {
   prepareSearchQuery,
   scoreIndexEntry,
   buildTopFileItems,
-  buildEmptyOverlayItems,
 } from "./search-logic.js";
 import {
+  resolveCachedCascade,
   MAX_CASCADE_DEPTH,
   POSIX_CASCADE_SCRIPT,
   sortDirectoryEntries,
@@ -404,6 +403,9 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
 const key = () => JSON.stringify(location());
 const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
 const PER_FOLDER = 500, TOTAL = 5000;
+const MAX_CACHED_FOLDERS = 400, MAX_CACHED_ENTRIES = 25000;
+const FOLDER_PREWARM_LIMIT = 24, FOLDER_PREWARM_CONCURRENCY = 4, FOLDER_RELOAD_CONCURRENCY = 8;
+const PREWARM_SKIP_DIRS = new Set([".git", "node_modules", "target", "dist", "build", ".next", ".gradle"]);
 
 async function directory(path, on, isWindows = false) {
   if (!on) {
@@ -758,10 +760,16 @@ export default class FilesSearch extends View {
   initPanel(cx) {
     this.saved = new Map();
     this.entries = new Map();
+    this.truncatedFolders = new Set();
+    this.cachedEntryCount = 0;
     this.folders = new Set();
     this.pending = new Set();
     this.pendingTokens = new Map();
     this.pendingSeq = 0;
+    this.prewarmTask = null;
+    this.prewarmSeq = 0;
+    this.treeScrollHandle = VirtualListScrollHandle.new();
+    this.pendingScrollPath = null;
     this.marks = {};
     this.dirCounts = {};
     this.dirMarks = {};
@@ -1003,18 +1011,139 @@ export default class FilesSearch extends View {
     return this.context === context && key() === context.key;
   }
 
+  hasTruncatedOpenFolder() {
+    for (const folder of this.truncatedFolders) {
+      if (!folder || this.folders.has(folder)) return true;
+    }
+    return false;
+  }
+
+  touchCachedEntries(path) {
+    const existing = this.entries.get(path);
+    if (!existing) return undefined;
+    this.entries.delete(path);
+    this.entries.set(path, existing);
+    return existing;
+  }
+
+  setCachedFolderEntries(path, rawEntries) {
+    if (!Array.isArray(rawEntries)) return;
+    const truncated = rawEntries.length > PER_FOLDER;
+    const trimmed = truncated ? rawEntries.slice(0, PER_FOLDER) : rawEntries;
+    const sorted = sortDirectoryEntries(trimmed);
+
+    if (truncated) this.truncatedFolders.add(path);
+    else this.truncatedFolders.delete(path);
+
+    const prev = this.entries.get(path);
+    if (prev) {
+      this.cachedEntryCount -= prev.length;
+      this.entries.delete(path);
+    }
+    this.entries.set(path, sorted);
+    this.cachedEntryCount += sorted.length;
+
+    if (this.entries.size > MAX_CACHED_FOLDERS || this.cachedEntryCount > MAX_CACHED_ENTRIES) {
+      this.pruneEntryCache(path);
+    }
+  }
+
+  pruneEntryCache(protectedPath = null) {
+    for (const [k, list] of this.entries) {
+      if (this.entries.size <= MAX_CACHED_FOLDERS && this.cachedEntryCount <= MAX_CACHED_ENTRIES) break;
+      if (!k || k === protectedPath || this.folders.has(k) || this.pending.has(k)) continue;
+      this.entries.delete(k);
+      this.truncatedFolders.delete(k);
+      this.cachedEntryCount -= list.length;
+    }
+  }
+
+  evictCollapsedEntries() {
+    for (const [k, list] of [...this.entries]) {
+      if (!k || this.folders.has(k) || this.pending.has(k)) continue;
+      this.entries.delete(k);
+      this.truncatedFolders.delete(k);
+      this.cachedEntryCount -= list.length;
+    }
+  }
+
+  evictDirtyCollapsedEntries(dirtyDirs) {
+    if (!dirtyDirs?.size) return;
+    for (const dir of dirtyDirs) {
+      if (!dir || this.folders.has(dir) || this.pending.has(dir)) continue;
+      const prev = this.entries.get(dir);
+      if (!prev) continue;
+      this.entries.delete(dir);
+      this.truncatedFolders.delete(dir);
+      this.cachedEntryCount -= prev.length;
+    }
+  }
+
+  collectPrewarmTargets(filterRel) {
+    const targets = [];
+    const seen = new Set();
+    const expandedParents = ["", ...this.folders];
+    for (const parentPath of expandedParents) {
+      if (parentPath && filterRel && !matchesServiceFilter(parentPath, filterRel)) continue;
+      const children = this.entries.get(parentPath);
+      if (!children?.length) continue;
+      for (const entry of children) {
+        if (!entry.dir || PREWARM_SKIP_DIRS.has(entry.name)) continue;
+        const childPath = parentPath ? `${parentPath}/${entry.name}` : entry.name;
+        if (filterRel && !matchesServiceFilter(childPath, filterRel)) continue;
+        if (this.folders.has(childPath) || this.entries.has(childPath) || this.pending.has(childPath) || seen.has(childPath)) {
+          continue;
+        }
+        seen.add(childPath);
+        targets.push(childPath);
+        if (targets.length >= FOLDER_PREWARM_LIMIT) return targets;
+      }
+    }
+    return targets;
+  }
+
+  schedulePrewarm(cx, context = this.context) {
+    if (!cx?.timer || !cx?.spawn || !context || !this.current(context)) return;
+    if (context.on || !isFilesVisible() || this.file) return;
+    this.prewarmTask?.cancel();
+    const token = ++this.prewarmSeq;
+    this.prewarmTask = cx.timer.after(40, cx => {
+      this.prewarmTask = null;
+      if (token !== this.prewarmSeq || !this.current(context) || !isFilesVisible() || this.file) return;
+      const filterRel = this.activeServiceRelPath();
+      const targets = this.collectPrewarmTargets(filterRel);
+      if (!targets.length) return;
+      const isCancelled = () => token !== this.prewarmSeq || !this.current(context) || !isFilesVisible() || Boolean(this.file);
+      cx.spawn(async () => {
+        await runInBatches(targets, FOLDER_PREWARM_CONCURRENCY, async targetPath => {
+          if (isCancelled() || this.entries.has(targetPath)) return;
+          try {
+            const batch = await directoryCascade(
+              context.cwd,
+              targetPath,
+              context,
+              Math.min(MAX_CASCADE_DEPTH, 12),
+              filterRel,
+              isCancelled,
+            );
+            if (isCancelled() || !batch?.size) return;
+            for (const [relPath, rawEntries] of batch) {
+              if (!this.entries.has(relPath)) {
+                this.setCachedFolderEntries(relPath, rawEntries);
+              }
+            }
+          } catch {}
+        });
+      });
+    });
+  }
+
   async loadFolder(path, context) {
     const { on, cwd: root, isWindows } = context;
     const entries = await directory(joinSubPath(root, path), on, isWindows);
     if (!this.current(context) || (path && !this.folders.has(path))) return;
-    let used = 0;
-    for (const [p, existing] of this.entries) {
-      if (p !== path) used += existing.length;
-    }
-    const limit = Math.max(0, Math.min(PER_FOLDER, TOTAL - used));
-    const trimmed = entries.length > limit ? entries.slice(0, limit) : entries;
-    this.entries.set(path, sortDirectoryEntries(trimmed));
-    if (entries.length > PER_FOLDER || used + entries.length > TOTAL) this.limited = true;
+    this.setCachedFolderEntries(path, entries);
+    if (this.hasTruncatedOpenFolder()) this.limited = true;
   }
 
   refresh(cx, opts = {}) {
@@ -1027,9 +1156,15 @@ export default class FilesSearch extends View {
       this.root = cwd;
       this.on = on;
       this.entries = new Map();
+      this.truncatedFolders = new Set();
+      this.cachedEntryCount = 0;
       this.folders = new Set(saved?.folders);
       this.pending = new Set();
       this.pendingTokens = new Map();
+      this.prewarmTask?.cancel();
+      this.prewarmTask = null;
+      this.prewarmSeq = (this.prewarmSeq || 0) + 1;
+      this.pendingScrollPath = null;
       this.marks = {};
       this.dirCounts = {};
       this.dirMarks = {};
@@ -1111,13 +1246,22 @@ export default class FilesSearch extends View {
           const forceReloadFolders = this.needsFolderReloadOnShow;
           this.needsFolderReloadOnShow = false;
           const shouldReloadAll = !fromWatch || !this.entries.has("") || Boolean(this.error) || watchDirty.has("*") || forceReloadFolders;
+          if (shouldReloadAll) {
+            this.prewarmTask?.cancel();
+            this.prewarmTask = null;
+            this.prewarmSeq = (this.prewarmSeq || 0) + 1;
+            this.evictCollapsedEntries();
+          } else {
+            this.evictDirtyCollapsedEntries(watchDirty);
+          }
           const foldersToLoad = shouldReloadAll
             ? ["", ...this.folders]
             : [...new Set(["", ...this.folders].filter(f => watchDirty.has(f)))];
-          for (const path of foldersToLoad) {
+          await runInBatches(foldersToLoad, FOLDER_RELOAD_CONCURRENCY, async path => {
             if (!this.current(context)) return;
             await this.loadFolder(path, context);
-          }
+          });
+          if (this.current(context)) this.schedulePrewarm(cx, context);
           if (!this.current(context)) return;
           this.error = null;
           if (foldersToLoad.length > 0) cx.notify();
@@ -1353,7 +1497,6 @@ export default class FilesSearch extends View {
   collapseFolderSubtree(path) {
     for (const folder of collectSubtreePaths(this.folders, path)) {
       this.folders.delete(folder);
-      this.entries.delete(folder);
     }
     for (const pendingPath of collectSubtreePaths(this.pending, path)) {
       this.pending.delete(pendingPath);
@@ -1364,23 +1507,18 @@ export default class FilesSearch extends View {
   }
 
   commitStagedCascade({ stagedEntries, stagedFolders }) {
-    let used = 0;
-    for (const [, existing] of this.entries) used += existing.length;
-
     for (const [relPath, rawEntries] of stagedEntries) {
-      if (this.entries.has(relPath)) continue;
-      const limit = Math.max(0, Math.min(PER_FOLDER, TOTAL - used));
-      const trimmed = rawEntries.length > limit ? rawEntries.slice(0, limit) : rawEntries;
-      if (rawEntries.length > PER_FOLDER || used + rawEntries.length > TOTAL) {
-        this.limited = true;
+      if (this.entries.has(relPath)) {
+        this.touchCachedEntries(relPath);
+        continue;
       }
-      this.entries.set(relPath, sortDirectoryEntries(trimmed));
-      used += trimmed.length;
+      this.setCachedFolderEntries(relPath, rawEntries);
     }
 
     for (const folderPath of stagedFolders) {
       this.folders.add(folderPath);
     }
+    if (this.hasTruncatedOpenFolder()) this.limited = true;
   }
 
   toggle(path, cx) {
@@ -1397,6 +1535,20 @@ export default class FilesSearch extends View {
     }
 
     const context = this.context;
+    const filterRel = this.current(context) ? this.activeServiceRelPath() : null;
+    const cachedCascade = resolveCachedCascade({
+      startPath: path,
+      maxDepth: MAX_CASCADE_DEPTH,
+      getFilterRel: () => filterRel,
+      getCachedEntries: p => this.touchCachedEntries(p),
+    });
+    if (cachedCascade?.complete) {
+      this.commitStagedCascade(cachedCascade);
+      this.schedulePrewarm(cx, context);
+      cx.notify();
+      return;
+    }
+
     const cascadeToken = ++this.pendingSeq;
     const isCancelled = () => !this.current(context) || this.pendingTokens.get(path) !== cascadeToken;
 
@@ -1410,7 +1562,7 @@ export default class FilesSearch extends View {
           maxDepth: MAX_CASCADE_DEPTH,
           getFilterRel: () => (this.current(context) ? this.activeServiceRelPath() : null),
           isCancelled,
-          getCachedEntries: p => this.entries.get(p),
+          getCachedEntries: p => this.touchCachedEntries(p),
           fetchCascadeBatch: (curPath, remDepth) =>
             directoryCascade(
               context.cwd,
@@ -1425,6 +1577,7 @@ export default class FilesSearch extends View {
         if (!result || isCancelled()) return;
 
         this.commitStagedCascade(result);
+        this.schedulePrewarm(cx, context);
       } catch (e) {
         if (!isCancelled()) this.error = String(e);
       } finally {
@@ -1486,6 +1639,8 @@ export default class FilesSearch extends View {
       this.loadSingleFolderPending(accum, cx);
     }
     if (kind === "dir") {
+      this.pendingScrollPath = path;
+      this.schedulePrewarm(cx, this.context);
       this.show(null);
     } else {
       this.show(path, cx);
@@ -1526,110 +1681,206 @@ export default class FilesSearch extends View {
       .child(icon);
   }
 
-  rows(prefix, depth, out, t) {
-    if (out.length >= TOTAL || depth > 40) return out;
-
+  collectTreeRows() {
     const selectedService = (this.serviceFilter && this.serviceFilter !== "all")
       ? this.services?.find(s => s.id === this.serviceFilter)
       : null;
+    const out = [];
+    const byKey = new Map();
 
-    if (depth === 0 && selectedService?.isSibling) {
+    if (selectedService?.isSibling) {
       const siblingFiles = this.serviceFiles?.[selectedService.id] ?? [];
-      for (const sf of siblingFiles.slice(0, TOTAL)) {
-        out.push(
-          h_flex().id(`sibling-file-${sf.fullPath}`).h(28).flex_none().pl(8).pr(8).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
-            .on_click((_e, cx) => this.show(sf.fullPath, cx))
-            .child(div().w(12).flex_none())
-            .child(svg("mods/files-search/file.svg").size(14).flex_none().text_color(t.muted))
-            .child(div().flex_1().min_w(0).truncate().child(sf.name))
-            .child(div().flex_none().text_size(11).font_medium().text_color(t.blocked).child(sf.mark))
-        );
+      const capped = siblingFiles.slice(0, TOTAL);
+      for (const sf of capped) {
+        const key = `sibling:${sf.fullPath}`;
+        const row = {
+          key,
+          kind: "sibling",
+          fullPath: sf.fullPath,
+          path: sf.fullPath,
+          name: sf.name,
+          mark: sf.mark,
+        };
+        out.push(row);
+        byKey.set(key, row);
       }
-      return out;
+      return { rows: out, hitVisibleCap: siblingFiles.length > TOTAL, byKey };
     }
 
-    const filterRel = selectedService?.relPath || null;
+    const state = {
+      filterRel: selectedService?.relPath || null,
+      isWin: Boolean(this.context?.isWindows),
+      hitVisibleCap: false,
+    };
+    this.appendTreeRows("", 0, out, byKey, state);
+    return { rows: out, hitVisibleCap: state.hitVisibleCap, byKey };
+  }
 
-    for (const entry of this.entries.get(prefix) ?? []) {
-      if (out.length >= TOTAL) break;
+  appendTreeRows(prefix, depth, out, byKey, state) {
+    if (out.length >= TOTAL) {
+      state.hitVisibleCap = true;
+      return;
+    }
+    if (depth > 40) return;
+
+    const list = this.entries.get(prefix);
+    if (!list?.length) return;
+
+    const { filterRel, isWin } = state;
+    const hasRepos = Boolean(this.repoRoots?.size);
+    const hasDirCounts = Boolean(this.dirCounts);
+    const hasMarks = Boolean(this.marks);
+
+    for (const entry of list) {
+      if (out.length >= TOTAL) {
+        state.hitVisibleCap = true;
+        return;
+      }
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
-
       if (filterRel && !matchesServiceFilter(path, filterRel)) continue;
 
-      const open = this.folders.has(path);
+      const open = Boolean(entry.dir && this.folders.has(path));
       const isLoadingFolder = Boolean(entry.dir && this.pending.has(path));
-      const isWin = Boolean(this.context?.isWindows);
-      const fullPath = joinSubPath(this.root, path);
-      const normFullPath = normPathStr(fullPath);
-      const cmpFullPath = normCmpStr(fullPath, isWin);
-      const isRepo = Boolean(entry.dir && (this.repoRoots?.has(fullPath) || this.repoRoots?.has(normFullPath) || this.repoRoots?.has(cmpFullPath)));
-      const dirCount = entry.dir ? (this.dirCounts?.[fullPath] || this.dirCounts?.[normFullPath] || this.dirCounts?.[cmpFullPath] || 0) : 0;
-      const mark = this.marks[fullPath] || this.marks[normFullPath] || this.marks[cmpFullPath];
 
-      out.push(
-        h_flex().id(`file-${path}`).h(28).w_full().min_w(0).flex_none().pl(8 + depth * 18).pr(10).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
-          .on_click((_e, cx) => (entry.dir ? this.toggle(path, cx) : this.show(path, cx)))
-          .child(entry.dir ? svg(`mods/files-search/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
-          .child(svg(`mods/files-search/${entry.dir ? "folder" : "file"}.svg`).size(14).flex_none().text_color(t.muted))
-          .child(
-            h_flex()
-              .flex_1()
-              .min_w(0)
-              .gap(6)
-              .items_center()
-              .child(div().min_w(0).truncate().child(entry.name))
-              .when(isRepo, el =>
-                el.child(
-                  div()
-                    .flex_none()
-                    .px(4)
-                    .py(0.5)
-                    .rounded(3)
-                    .bg(t.selected)
-                    .border_1()
-                    .border_color(t.accent)
-                    .text_size(9)
-                    .font_medium()
-                    .text_color(t.accent)
-                    .child("repo")
-                )
-              )
-          )
-          .when(entry.dir && dirCount > 0, el =>
+      let isRepo = false;
+      let dirCount = 0;
+      let mark = null;
+      if ((entry.dir && (hasRepos || hasDirCounts)) || (!entry.dir && hasMarks)) {
+        const fullPath = joinSubPath(this.root, path);
+        const normFullPath = normPathStr(fullPath);
+        const cmpFullPath = normCmpStr(fullPath, isWin);
+        if (entry.dir) {
+          if (hasRepos) {
+            isRepo = Boolean(this.repoRoots.has(fullPath) || this.repoRoots.has(normFullPath) || this.repoRoots.has(cmpFullPath));
+          }
+          if (hasDirCounts) {
+            dirCount = this.dirCounts[fullPath] || this.dirCounts[normFullPath] || this.dirCounts[cmpFullPath] || 0;
+          }
+        } else if (hasMarks) {
+          mark = this.marks[fullPath] || this.marks[normFullPath] || this.marks[cmpFullPath] || null;
+        }
+      }
+
+      const row = {
+        key: path,
+        kind: entry.dir ? "dir" : "file",
+        path,
+        depth,
+        entry,
+        open,
+        isLoadingFolder,
+        isRepo,
+        dirCount,
+        mark,
+      };
+      out.push(row);
+      byKey.set(path, row);
+
+      if (open) this.appendTreeRows(path, depth + 1, out, byKey, state);
+    }
+  }
+
+  handleTreeItemClick(itemKey, cx) {
+    const row = this.visibleRowByKey?.get(itemKey);
+    if (!row) return;
+    if (row.kind === "sibling" || row.kind === "file") {
+      this.show(row.kind === "sibling" ? row.fullPath : row.path, cx);
+      return;
+    }
+    this.toggle(row.path, cx);
+  }
+
+  renderTreeRow(row, t) {
+    if (row.kind === "sibling") {
+      return h_flex()
+        .id(row.key)
+        .h(28)
+        .w_full()
+        .min_w(0)
+        .pl(8)
+        .pr(12)
+        .gap(7)
+        .items_center()
+        .rounded(7)
+        .cursor_pointer()
+        .hover(s => s.bg(t.hover))
+        .child(div().w(12).flex_none())
+        .child(svg("mods/files-search/file.svg").size(14).flex_none().text_color(t.muted))
+        .child(div().flex_1().min_w(0).truncate().child(row.name))
+        .child(div().flex_none().text_size(11).font_medium().text_color(t.blocked).child(row.mark));
+    }
+
+    const { path, depth, entry, open, isLoadingFolder, isRepo, dirCount, mark } = row;
+    return h_flex()
+      .id(`file-${path}`)
+      .h(28)
+      .w_full()
+      .min_w(0)
+      .pl(8 + depth * 18)
+      .pr(12)
+      .gap(7)
+      .items_center()
+      .rounded(7)
+      .cursor_pointer()
+      .hover(s => s.bg(t.hover))
+      .child(entry.dir ? svg(`mods/files-search/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
+      .child(svg(`mods/files-search/${entry.dir ? "folder" : "file"}.svg`).size(14).flex_none().text_color(t.muted))
+      .child(
+        h_flex()
+          .flex_1()
+          .min_w(0)
+          .overflow_hidden()
+          .gap(6)
+          .items_center()
+          .child(div().min_w(0).truncate().child(entry.name))
+          .when(isRepo, el =>
             el.child(
               div()
                 .flex_none()
                 .px(4)
                 .py(0.5)
                 .rounded(3)
-                .bg(t.raised)
-                .text_size(9.5)
-                .text_color(t.blocked)
-                .child(String(dirCount))
+                .bg(t.selected)
+                .border_1()
+                .border_color(t.accent)
+                .text_size(9)
+                .font_medium()
+                .text_color(t.accent)
+                .child("repo")
             )
           )
-          .when(!entry.dir && Boolean(mark), el =>
-            el.child(
-              div()
-                .flex_none()
-                .text_size(11)
-                .text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked)
-                .child(mark)
-            )
-          )
-          .when(isLoadingFolder, el =>
-            el.child(
-              svg("mods/files-search/spinner.svg")
-                .size(12)
-                .flex_none()
-                .text_color(t.working || t.accent || t.muted)
-                .spin(900)
-            )
-          )
+      )
+      .when(entry.dir && dirCount > 0, el =>
+        el.child(
+          div()
+            .flex_none()
+            .px(4)
+            .py(0.5)
+            .rounded(3)
+            .bg(t.raised)
+            .text_size(9.5)
+            .text_color(t.blocked)
+            .child(String(dirCount))
+        )
+      )
+      .when(!entry.dir && Boolean(mark), el =>
+        el.child(
+          div()
+            .flex_none()
+            .text_size(11)
+            .text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked)
+            .child(mark)
+        )
+      )
+      .when(isLoadingFolder, el =>
+        el.child(
+          svg("mods/files-search/spinner.svg")
+            .size(12)
+            .flex_none()
+            .text_color(t.working || t.accent || t.muted)
+            .spin(900)
+        )
       );
-      if (entry.dir && open) this.rows(path, depth + 1, out, t);
-    }
-    return out;
   }
 
   renderPanel(cx) {
@@ -1771,23 +2022,77 @@ export default class FilesSearch extends View {
             )
         )
       )
-      .when(!this.file, el =>
-        el.child(
+      .when(!this.file, el => {
+        const { rows: visibleRows, hitVisibleCap, byKey } = this.collectTreeRows();
+        this.visibleRowByKey = byKey;
+        const isLimited = hitVisibleCap || this.hasTruncatedOpenFolder();
+        this.limited = isLimited;
+        if (this.pendingScrollPath && this.treeScrollHandle) {
+          const targetIdx = visibleRows.findIndex(r => r.path === this.pendingScrollPath);
+          if (targetIdx >= 0) {
+            this.treeScrollHandle.scroll_to_item(targetIdx, "center");
+            this.pendingScrollPath = null;
+          }
+        }
+        return el.child(
           v_flex()
-            .id("files-tree")
             .flex_1()
             .min_h(0)
-            .overflow_y_scrollbar()
-            .p(6)
-            .children(this.rows("", 0, [], t))
-            .when(Boolean(this.error) || !this.entries.get("")?.length, el =>
-              el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder")))
+            .w_full()
+            .min_w(0)
+            .px(6)
+            .py(4)
+            .when(visibleRows.length > 0, treeWrap =>
+              treeWrap.child(
+                div()
+                  .flex_1()
+                  .min_h(0)
+                  .w_full()
+                  .min_w(0)
+                  .relative()
+                  .child(
+                    v_virtual_list(
+                      "files-tree",
+                      visibleRows.length,
+                      28,
+                      index => visibleRows[index].key,
+                      range => {
+                        const items = [];
+                        for (let i = range.start; i < range.end; i++) {
+                          items.push(this.renderTreeRow(visibleRows[i], t));
+                        }
+                        return items;
+                      },
+                    )
+                      .size_full()
+                      .track_scroll(this.treeScrollHandle)
+                      .on_item_click((itemKey, cx) => this.handleTreeItemClick(itemKey, cx))
+                  )
+                  .child(Scrollbar.vertical("files-tree").absolute().inset_0())
+              )
             )
-            .when(this.limited, el =>
-              el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total"))
+            .when(Boolean(this.error) || visibleRows.length === 0, emptyWrap =>
+              emptyWrap.child(
+                div()
+                  .p(8)
+                  .flex_none()
+                  .text_size(12)
+                  .text_color(t.dim)
+                  .child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))
+              )
             )
-        )
-      )
+            .when(isLimited, limWrap =>
+              limWrap.child(
+                div()
+                  .p(8)
+                  .flex_none()
+                  .text_size(11)
+                  .text_color(t.dim)
+                  .child("File list limited to 500 entries per folder and 5,000 total")
+              )
+            )
+        );
+      })
       .when(Boolean(this.file), el =>
         el.child(this.code ? Editor.new(this.code).flex_1().min_h(0) : div().p(12).text_color(t.dim).child(this.fileError || "Loading file…"))
       );
@@ -1810,7 +2115,7 @@ export default class FilesSearch extends View {
     const hasCachedIndex = Boolean(cachedIndex && Array.isArray(cachedIndex.entries) && cachedIndex.entries.length > 0);
     this.fileList = hasCachedIndex ? (cachedIndex.files || cachedIndex.list || []) : [];
     this.fileEntries = hasCachedIndex ? cachedIndex.entries : [];
-    this.fileResults = hasCachedIndex ? buildEmptyOverlayItems(this.fileEntries) : [];
+    this.fileResults = [];
 
     this.textResults = [];
     this.isSearchingText = false;
@@ -1822,7 +2127,7 @@ export default class FilesSearch extends View {
     this.textSearchTask = null;
     this.fileSearchTask = null;
     this.previewDebounceTask = null;
-    this._fileResultsVer = hasCachedIndex ? 1 : 0;
+    this._fileResultsVer = 0;
     this._textResultsVer = 0;
     this._combinedCacheKey = null;
     this._combinedResults = [];
@@ -1901,6 +2206,8 @@ export default class FilesSearch extends View {
     this.agentPrewarmTask = null;
     this.pendingPanelSyncTask?.cancel();
     this.pendingPanelSyncTask = null;
+    this.prewarmTask?.cancel();
+    this.prewarmTask = null;
     this.indexerSyncTask?.cancel();
     this.indexerSyncTask = null;
     this.indexerPrewarmTask?.cancel();
@@ -1924,6 +2231,9 @@ export default class FilesSearch extends View {
     }
     this.pending?.clear();
     this.pendingTokens?.clear();
+    this.visibleRowByKey = null;
+    try { this.treeScrollHandle?.release(); } catch {}
+    this.treeScrollHandle = null;
     try { this.input?.release(); } catch {}
     this.input = null;
     this.code?.release();
@@ -1931,6 +2241,7 @@ export default class FilesSearch extends View {
   }
 
   closeOverlay() {
+    if (this._overlayClosed) return;
     this._overlayClosed = true;
     this.focusInputTask?.cancel();
     this.focusInputTask = null;
@@ -2004,6 +2315,9 @@ export default class FilesSearch extends View {
 
   schedulePreview(item, cx, immediate = false) {
     if (!item) {
+      this.previewDebounceTask?.cancel();
+      this.previewDebounceTask = null;
+      this.previewReqSeq++;
       this.previewItem = null;
       this.previewIsDir = false;
       this.previewDirEntries = [];
@@ -2275,7 +2589,7 @@ export default class FilesSearch extends View {
     const qs = prepareSearchQuery(this.query);
     if (!qs) {
       this.isSearchingFiles = false;
-      this.fileResults = buildEmptyOverlayItems(this.fileEntries);
+      this.fileResults = [];
       this._fileResultsVer++;
       this._combinedCacheKey = null;
       return;
@@ -2604,6 +2918,7 @@ export default class FilesSearch extends View {
   // O(1) combiner returning cached precomputed file and text results
   searchResults() {
     const rawQ = this.query.trim().toLowerCase();
+    if (!rawQ) return [];
     const cacheKey = `${this.tab}:${this._fileResultsVer}:${this._textResultsVer}:${rawQ}`;
     if (this._combinedCacheKey === cacheKey && this._combinedResults) {
       return this._combinedResults;
@@ -3252,6 +3567,7 @@ export default class FilesSearch extends View {
         if (this.resizing) {
           this.handleResizeEnd(cx);
         }
+        this.closeOverlay();
       })
       .child(
         v_flex()

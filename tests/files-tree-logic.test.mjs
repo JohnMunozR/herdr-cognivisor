@@ -12,6 +12,7 @@ import {
   getCascadeChildPath,
   collectSubtreePaths,
   parseCascadeStdout,
+  resolveCachedCascade,
   runStagedCascade,
 } from "../mods/files-search/tree-logic.js";
 
@@ -206,5 +207,62 @@ describe("files-search tree-logic", () => {
       fetchSingleEntries: async p => deep.get(p) || [],
     });
     assert.deepEqual(bounded.stagedFolders, ["d0", "d0/d1", "d0/d1/d2"]);
+  });
+
+  test("resolveCachedCascade expands 2-child stop and nested chains synchronously from cache and reports cache misses", () => {
+    assert.equal(resolveCachedCascade({ startPath: "", getCachedEntries: () => [] }), null);
+    assert.equal(resolveCachedCascade({ startPath: "src", getCachedEntries: null }), null);
+
+    const cache = new Map([
+      ["two-children", [{ name: "a", dir: true }, { name: "b", dir: true }]],
+      ["src", [{ name: "main", dir: true }]],
+      ["src/main", [{ name: "java", dir: true }]],
+      ["src/main/java", [{ name: "com", dir: true }, { name: "App.java", dir: false }]],
+      ["apps", [{ name: "api", dir: true }, { name: "web", dir: true }]],
+      ["apps/web", [{ name: "src", dir: true }]],
+      ["apps/web/src", [{ name: "index.ts", dir: false }, { name: "pages", dir: true }]],
+      ["partial", [{ name: "inner", dir: true }]],
+    ]);
+
+    const twoChildren = resolveCachedCascade({
+      startPath: "two-children",
+      getCachedEntries: p => cache.get(p),
+    });
+    assert.equal(twoChildren.complete, true);
+    assert.equal(twoChildren.missingPath, null);
+    assert.deepEqual(twoChildren.stagedFolders, ["two-children"]);
+
+    const nested = resolveCachedCascade({
+      startPath: "src",
+      getCachedEntries: p => cache.get(p),
+    });
+    assert.equal(nested.complete, true);
+    assert.equal(nested.missingPath, null);
+    assert.deepEqual(nested.stagedFolders, ["src", "src/main", "src/main/java"]);
+    assert.equal(nested.stagedEntries.size, 3);
+
+    const filtered = resolveCachedCascade({
+      startPath: "apps",
+      getFilterRel: () => "apps/web",
+      getCachedEntries: p => cache.get(p),
+    });
+    assert.equal(filtered.complete, true);
+    assert.deepEqual(filtered.stagedFolders, ["apps", "apps/web", "apps/web/src"]);
+
+    const partial = resolveCachedCascade({
+      startPath: "partial",
+      getCachedEntries: p => cache.get(p),
+    });
+    assert.equal(partial.complete, false);
+    assert.equal(partial.missingPath, "partial/inner");
+    assert.deepEqual(partial.stagedFolders, ["partial"]);
+
+    const bounded = resolveCachedCascade({
+      startPath: "src",
+      maxDepth: 1,
+      getCachedEntries: p => cache.get(p),
+    });
+    assert.equal(bounded.complete, true);
+    assert.deepEqual(bounded.stagedFolders, ["src", "src/main"]);
   });
 });
