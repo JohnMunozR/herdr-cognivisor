@@ -1,9 +1,11 @@
 // FilesSearch: File browser with search button + floating IntelliJ-style Search Everywhere dialog.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, Input, InputState } from "gpui-base";
+import { readdir, exists } from "fs/promises";
+import { join } from "path";
 import {
   spaces, panes, focused, agents, hc, exec, readTextFile, watchFolder,
-  theme, settings, window, props, openOverlay, closeOverlay,
+  theme, settings, window, layout, props, openOverlay, closeOverlay,
   shared, setShared,
 } from "herdr";
 
@@ -45,31 +47,220 @@ function repoMatchesTranscript(service, files, transcript) {
   return false;
 }
 
-async function attributeSessionServices(tabId, touchedServices, serviceFiles, tabPaneCwds, tabTermAddrs) {
+const DISCOVER_SKIP_DIRS = new Set([
+  ".git", "node_modules", "target", "dist", "build", "vendor",
+  ".venv", "venv", ".next", ".nuxt", ".cache", "__pycache__", "out", "coverage", "logs",
+]);
+
+const WATCH_SKIP_DIRS = new Set([
+  "node_modules", "target", "dist", "build", "vendor", ".venv", "venv",
+  ".next", ".nuxt", ".cache", "__pycache__", "logs", ".gradle", ".idea",
+  ".turbo", ".parcel-cache", "coverage", ".sass-cache", "tmp", ".tmp",
+]);
+
+const WATCH_SKIP_EXTS = [".log", ".tmp", ".swp", ".swo", ".part", ".crdownload"];
+const BASE_BRANCHES = new Set(["main", "master", "development", "develop", "ci", "HEAD", ""]);
+const REPO_CACHE_TTL_MS = 60000;
+const WATCH_DEBOUNCE_MS = 750;
+const TRANSCRIPT_THROTTLE_MS = 4000;
+
+function normPathStr(p) {
+  return String(p || "").replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function findLayoutNode(node, id) {
+  if (!node || typeof node !== "object") return null;
+  if (node.id === id) return node;
+  for (const child of node.children ?? []) {
+    const found = findLayoutNode(child, id);
+    if (found) return found;
+  }
+  return null;
+}
+
+function findFilesBlock(node) {
+  if (!node || typeof node !== "object") return null;
+  if (node.content?.mod === "files-search" && !node.content?.props?.overlay) return node;
+  for (const child of node.children ?? []) {
+    const found = findFilesBlock(child);
+    if (found) return found;
+  }
+  return null;
+}
+
+function isFilesVisible() {
+  const root = layout();
+  if (!root || typeof root !== "object") return false;
+  const panel = findLayoutNode(root, "panel");
+  const body = findLayoutNode(root, "panel-body");
+  if (panel && body) {
+    return !panel.hidden && body.active === "files";
+  }
+  const block = findFilesBlock(root);
+  return block ? !block.hidden : false;
+}
+
+function getRelToWorkspace(changedPath, workspaceRoot) {
+  const normP = normPathStr(changedPath);
+  const normRoot = normPathStr(workspaceRoot);
+  if (!normP || !normRoot) return null;
+  if (normP === normRoot) return "";
+  if (normP.startsWith(normRoot + "/")) return normP.slice(normRoot.length + 1);
+  const lowerP = normP.toLowerCase();
+  const lowerRoot = normRoot.toLowerCase();
+  if (lowerP === lowerRoot) return "";
+  if (lowerP.startsWith(lowerRoot + "/")) return normP.slice(normRoot.length + 1);
+  return null;
+}
+
+function isIgnoredWatchPath(changedPath, workspaceRoot) {
+  const rel = getRelToWorkspace(changedPath, workspaceRoot);
+  const target = rel !== null ? rel : normPathStr(changedPath);
+  if (!target) return false;
+  const segs = target.split("/").filter(Boolean);
+  const segsLower = segs.map(s => s.toLowerCase());
+
+  const gitIdx = segsLower.indexOf(".git");
+  if (gitIdx >= 0) {
+    const afterGit = segsLower.slice(gitIdx + 1).join("/");
+    if (
+      afterGit === "index" ||
+      afterGit === "head" ||
+      afterGit === "merge_head" ||
+      afterGit === "rebase-head" ||
+      afterGit === "cherry_pick_head" ||
+      afterGit.startsWith("refs/") ||
+      afterGit.startsWith("rebase-merge/") ||
+      afterGit.startsWith("rebase-apply/")
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  for (let i = 0; i < segsLower.length - 1; i++) {
+    if (WATCH_SKIP_DIRS.has(segsLower[i])) return true;
+  }
+  const base = segsLower[segsLower.length - 1] || "";
+  if (WATCH_SKIP_DIRS.has(base)) return true;
+  if (base === ".ds_store" || base === "thumbs.db" || base.endsWith("~")) return true;
+  for (const ext of WATCH_SKIP_EXTS) {
+    if (base.endsWith(ext)) return true;
+  }
+  return false;
+}
+
+function analyzeWatchBatch(changedPaths, workspaceRoot, openFolders) {
+  if (!Array.isArray(changedPaths) || changedPaths.length === 0) {
+    return { hasNonIgnored: true, hasGitChange: true, hasNonGitChange: true, invalidateRepos: false, dirtyDirs: new Set(["*"]) };
+  }
+  let hasNonIgnored = false;
+  let hasGitChange = false;
+  let hasNonGitChange = false;
+  let invalidateRepos = false;
+  const dirtyDirs = new Set();
+
+  for (const raw of changedPaths) {
+    if (!raw || isIgnoredWatchPath(raw, workspaceRoot)) continue;
+    hasNonIgnored = true;
+    const rel = getRelToWorkspace(raw, workspaceRoot);
+    if (rel === null) {
+      hasNonGitChange = true;
+      dirtyDirs.add("*");
+      continue;
+    }
+    const segs = rel.split("/").filter(Boolean);
+    if (segs.includes(".git") || segs.some(s => s.toLowerCase() === ".git")) {
+      hasGitChange = true;
+      if (rel.toLowerCase().includes(".git/head") || rel.toLowerCase().includes(".git/refs/")) {
+        invalidateRepos = true;
+      }
+      continue;
+    }
+    hasNonGitChange = true;
+    if (segs.length <= 2) invalidateRepos = true;
+    const parent = segs.slice(0, -1).join("/");
+    dirtyDirs.add(parent);
+    if (segs.length >= 2) {
+      dirtyDirs.add(segs.slice(0, -2).join("/"));
+    }
+    if (openFolders?.has(rel)) dirtyDirs.add(rel);
+  }
+  return { hasNonIgnored, hasGitChange, hasNonGitChange, invalidateRepos, dirtyDirs };
+}
+
+function parsePorcelainHeader(headerLine) {
+  const raw = String(headerLine || "").replace(/^##\s*/, "").trim();
+  if (!raw || raw.startsWith("HEAD (no branch)")) {
+    return { branch: "HEAD", hasUpstream: false, ahead: 0 };
+  }
+  const initMatch = raw.match(/^(?:No commits yet on|Initial commit on)\s+(.+)$/i);
+  if (initMatch) {
+    return { branch: initMatch[1].trim(), hasUpstream: false, ahead: 0 };
+  }
+  const bracketMatch = raw.match(/\[([^\]]+)\]\s*$/);
+  const trackingSpec = bracketMatch ? bracketMatch[1] : "";
+  const withoutBracket = bracketMatch ? raw.slice(0, bracketMatch.index).trim() : raw;
+  const dotIdx = withoutBracket.indexOf("...");
+  const branch = (dotIdx >= 0 ? withoutBracket.slice(0, dotIdx) : withoutBracket).trim() || "HEAD";
+  const hasUpstream = dotIdx >= 0;
+  let ahead = hasUpstream ? 0 : null;
+  if (trackingSpec) {
+    const aheadMatch = trackingSpec.match(/\bahead\s+(\d+)/i);
+    if (aheadMatch) ahead = parseInt(aheadMatch[1], 10) || 0;
+  }
+  return { branch, hasUpstream, ahead };
+}
+
+async function attributeSessionServices(tabId, touchedServices, serviceFiles, tabPaneCwds, tabTermAddrs, transcriptCache = null) {
   if (!tabId || !Array.isArray(touchedServices) || touchedServices.length === 0) return [];
   const flows = shared("mesh.flows");
   const flowObj = flows && typeof flows === "object" ? flows[tabId] : null;
   const prevSessionRepos = new Set(
     Array.isArray(flowObj?.sessionRepos)
-      ? flowObj.sessionRepos.map(r => String(r || "").replace(/\\/g, "/").replace(/\/+$/, ""))
+      ? flowObj.sessionRepos.map(r => normPathStr(r))
       : []
   );
 
-  const reads = await Promise.all(
-    (tabTermAddrs || []).map(addr => hc(["read", "--lines", "400", addr]).catch(() => ""))
-  );
-  const transcript = reads.filter(Boolean).join("\n").replace(/\\/g, "/");
-  const normCwds = (tabPaneCwds || []).map(c => String(c || "").replace(/\\/g, "/").replace(/\/+$/, "")).filter(Boolean);
+  const normCwds = (tabPaneCwds || []).map(c => normPathStr(c)).filter(Boolean);
+  const needTranscript = [];
+  for (const s of touchedServices) {
+    const normRoot = normPathStr(s.root);
+    if (!normRoot) continue;
+    const inPrev = prevSessionRepos.has(normRoot);
+    const inPaneCwd = normCwds.some(c => c === normRoot || c.startsWith(normRoot + "/"));
+    if (!inPrev && !inPaneCwd) needTranscript.push(s);
+  }
+
+  let transcript = "";
+  if (needTranscript.length > 0 && (tabTermAddrs || []).length > 0) {
+    const now = Date.now();
+    const unattrSig = needTranscript.map(s => s.root).sort().join("|") + "::" + (tabTermAddrs || []).join(",");
+    const canReuse = transcriptCache && transcriptCache.sig === unattrSig && (now - transcriptCache.ts) < TRANSCRIPT_THROTTLE_MS;
+    if (canReuse) {
+      transcript = transcriptCache.text;
+    } else {
+      const reads = await Promise.all(
+        (tabTermAddrs || []).map(addr => hc(["read", "--lines", "250", addr]).catch(() => ""))
+      );
+      transcript = reads.filter(Boolean).join("\n").replace(/\\/g, "/");
+      if (transcriptCache) {
+        transcriptCache.sig = unattrSig;
+        transcriptCache.ts = now;
+        transcriptCache.text = transcript;
+      }
+    }
+  }
 
   const attributed = [];
   const nextSessionRepos = new Set(prevSessionRepos);
 
   for (const s of touchedServices) {
-    const normRoot = String(s.root || "").replace(/\\/g, "/").replace(/\/+$/, "");
+    const normRoot = normPathStr(s.root);
     if (!normRoot) continue;
     const inPrev = prevSessionRepos.has(normRoot);
     const inPaneCwd = normCwds.some(c => c === normRoot || c.startsWith(normRoot + "/"));
-    const inTranscript = repoMatchesTranscript(s, serviceFiles[s.id], transcript);
+    const inTranscript = !inPrev && !inPaneCwd && repoMatchesTranscript(s, serviceFiles[s.id], transcript);
 
     if (inPrev || inPaneCwd || inTranscript) {
       attributed.push(s);
@@ -94,18 +285,22 @@ function getParentDir(normPath) {
   return prefix + parts.slice(0, -1).join("/");
 }
 
-async function repoAheadCount(root, on) {
+async function repoAheadCount(root, on, branchHint = "") {
   const flags = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
-  const up = await exec("git", [...flags, "rev-list", "--count", "@{u}..HEAD"], { cwd: root, on }).catch(() => null);
-  if (up && up.code === 0) {
-    const n = parseInt((up.stdout || "").trim(), 10);
-    if (!Number.isNaN(n)) return n;
+  let branch = branchHint;
+  if (!branch) {
+    const br = await exec("git", [...flags, "rev-parse", "--abbrev-ref", "HEAD"], { cwd: root, on }).catch(() => null);
+    branch = br?.code === 0 ? (br.stdout || "").trim() : "";
   }
-  const br = await exec("git", [...flags, "rev-parse", "--abbrev-ref", "HEAD"], { cwd: root, on }).catch(() => null);
-  const branch = br?.code === 0 ? (br.stdout || "").trim() : "";
-  const baseBranches = new Set(["main", "master", "development", "develop", "ci", "HEAD", ""]);
-  if (baseBranches.has(branch)) return 0;
+  if (BASE_BRANCHES.has(branch)) return 0;
+  const refs = await exec(
+    "git",
+    [...flags, "for-each-ref", "--format=%(refname:short)", "refs/heads/development", "refs/heads/main", "refs/heads/master", "refs/heads/ci"],
+    { cwd: root, on }
+  ).catch(() => null);
+  const avail = new Set((refs?.code === 0 ? refs.stdout : "").split(/\r?\n/).map(s => s.trim()).filter(Boolean));
   for (const base of ["development", "main", "master", "ci"]) {
+    if (!avail.has(base)) continue;
     const check = await exec("git", [...flags, "rev-list", "--count", `${base}..HEAD`], { cwd: root, on }).catch(() => null);
     if (check && check.code === 0) {
       const n = parseInt((check.stdout || "").trim(), 10);
@@ -115,12 +310,89 @@ async function repoAheadCount(root, on) {
   return 0;
 }
 
+async function fsScanRepos(targetRoot, depth2 = true) {
+  if (!targetRoot) return [];
+  const found = [];
+  if (await exists(join(targetRoot, ".git")).catch(() => false)) {
+    found.push(targetRoot);
+  }
+  const level1 = await readdir(targetRoot, { withFileTypes: true }).catch(() => []);
+  await Promise.all(
+    level1.map(async e1 => {
+      if (!e1?.isDirectory?.() || !e1.name || DISCOVER_SKIP_DIRS.has(e1.name)) return;
+      const p1 = join(targetRoot, e1.name);
+      if (await exists(join(p1, ".git")).catch(() => false)) {
+        found.push(p1);
+        return;
+      }
+      if (!depth2) return;
+      const level2 = await readdir(p1, { withFileTypes: true }).catch(() => []);
+      await Promise.all(
+        level2.map(async e2 => {
+          if (!e2?.isDirectory?.() || !e2.name || DISCOVER_SKIP_DIRS.has(e2.name)) return;
+          const p2 = join(p1, e2.name);
+          if (await exists(join(p2, ".git")).catch(() => false)) {
+            found.push(p2);
+          }
+        })
+      );
+    })
+  );
+  return found;
+}
+
+async function fsListFiles(root, limit = 20000) {
+  if (!root) return [];
+  const results = [];
+  const queue = [{ abs: root, rel: "" }];
+  while (queue.length > 0 && results.length < limit) {
+    const batch = queue.splice(0, 16);
+    const dirLists = await Promise.all(
+      batch.map(async item => {
+        const entries = await readdir(item.abs, { withFileTypes: true }).catch(() => []);
+        return { item, entries };
+      })
+    );
+    for (const { item, entries } of dirLists) {
+      for (const e of entries) {
+        if (!e?.name || e.name.startsWith(".")) continue;
+        const rel = item.rel ? `${item.rel}/${e.name}` : e.name;
+        if (e.isDirectory?.()) {
+          if (!DISCOVER_SKIP_DIRS.has(e.name)) {
+            queue.push({ abs: join(item.abs, e.name), rel });
+          }
+        } else if (e.isFile?.() || (!e.isSymbolicLink?.() && !e.isDirectory?.())) {
+          results.push(rel);
+          if (results.length >= limit) break;
+        }
+      }
+      if (results.length >= limit) break;
+    }
+  }
+  return results;
+}
+
+async function findLocalGitRoot(startDir, maxDepth = 6) {
+  let cur = normPathStr(startDir);
+  for (let i = 0; i < maxDepth && cur; i++) {
+    if (await exists(join(cur, ".git")).catch(() => false)) return cur;
+    const idx = cur.lastIndexOf("/");
+    if (idx <= 0) break;
+    const parent = cur.slice(0, idx);
+    if (!parent || parent === cur || /^[A-Za-z]:$/.test(parent)) break;
+    cur = parent;
+  }
+  return null;
+}
+
 async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = []) {
   if (!workspaceRoot) return [];
-  const normWorkspace = workspaceRoot.replace(/\\/g, "/").replace(/\/+$/, "");
+  const normWorkspace = normPathStr(workspaceRoot);
 
   const scanRoot = async (targetRoot, depth2 = true) => {
     if (!targetRoot) return [];
+    if (!on) return fsScanRepos(targetRoot, depth2);
+
     const windowsDiscover = async () => {
       const escaped = targetRoot.replace(/['‘’‚‛]/g, "$&$&");
       const depthFlag = depth2 ? "-Depth 2" : "-Depth 1";
@@ -132,9 +404,6 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
       return [];
     };
 
-    if (!on && isWindows) {
-      return windowsDiscover();
-    }
     const script = depth2
       ? 'root="$1"; if [ -e "$root/.git" ]; then printf "%s\\n" "$root"; fi; for d in "$root"/* "$root"/*/*; do [ -e "$d/.git" ] || continue; case "$d" in */node_modules/*|*/target/*|*/dist/*|*/build/*|*/.git/*|*/vendor/*|*/.venv/*) continue ;; esac; printf "%s\\n" "$d"; done'
       : 'root="$1"; for d in "$root"/*; do [ -e "$d/.git" ] || continue; case "$d" in */node_modules/*|*/target/*|*/dist/*|*/build/*|*/.git/*|*/vendor/*|*/.venv/*) continue ;; esac; printf "%s\\n" "$d"; done';
@@ -154,17 +423,22 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
   let rawRoots = await scanRoot(workspaceRoot, true);
 
   // Deduplicate discovered roots
-  const foundRoots = [...new Set(rawRoots.map(r => r.replace(/\\/g, "/").replace(/\/+$/, "")).filter(Boolean))];
+  const foundRoots = [...new Set(rawRoots.map(r => normPathStr(r)).filter(Boolean))];
 
   // If no .git found under workspaceRoot, fall back to git rev-parse --show-toplevel on workspaceRoot
   if (foundRoots.length === 0) {
-    const rev = await exec(
-      "git",
-      ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "rev-parse", "--show-toplevel"],
-      { cwd: workspaceRoot, on }
-    ).catch(() => null);
-    if (rev?.code === 0 && rev.stdout.trim()) {
-      foundRoots.push(rev.stdout.trim().replace(/\\/g, "/").replace(/\/+$/, ""));
+    const localTop = !on ? await findLocalGitRoot(workspaceRoot) : null;
+    if (localTop) {
+      foundRoots.push(localTop);
+    } else {
+      const rev = await exec(
+        "git",
+        ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "rev-parse", "--show-toplevel"],
+        { cwd: workspaceRoot, on }
+      ).catch(() => null);
+      if (rev?.code === 0 && rev.stdout.trim()) {
+        foundRoots.push(normPathStr(rev.stdout.trim()));
+      }
     }
   }
 
@@ -177,7 +451,8 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
     if (parentDir) {
       const siblings = await scanRoot(parentDir, false);
       for (const s of siblings) {
-        if (s && !foundRoots.includes(s)) foundRoots.push(s);
+        const normS = normPathStr(s);
+        if (normS && !foundRoots.includes(normS)) foundRoots.push(normS);
       }
     }
   }
@@ -185,15 +460,20 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
   // Also inspect extra pane cwds in the active space
   for (const extra of extraCwds || []) {
     if (!extra) continue;
-    const normExtra = String(extra).replace(/\\/g, "/").replace(/\/+$/, "");
+    const normExtra = normPathStr(extra);
     if (!normExtra || foundRoots.some(r => normExtra === r || normExtra.startsWith(r + "/"))) continue;
+    const localTop = !on ? await findLocalGitRoot(extra) : null;
+    if (localTop) {
+      if (!foundRoots.includes(localTop)) foundRoots.push(localTop);
+      continue;
+    }
     const rev = await exec(
       "git",
       ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "rev-parse", "--show-toplevel"],
       { cwd: extra, on }
     ).catch(() => null);
     if (rev?.code === 0 && rev.stdout.trim()) {
-      const normTop = rev.stdout.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+      const normTop = normPathStr(rev.stdout.trim());
       if (normTop && !foundRoots.includes(normTop)) foundRoots.push(normTop);
     }
   }
@@ -237,13 +517,27 @@ const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", 
 const PER_FOLDER = 500, TOTAL = 5000;
 
 async function directory(path, on, isWindows = false) {
+  if (!on) {
+    let dirents;
+    try {
+      dirents = await readdir(path, { withFileTypes: true });
+    } catch (e) {
+      throw new Error(String(e?.message || e || "Cannot list this folder"));
+    }
+    const out = [];
+    for (const d of dirents) {
+      if (!d?.name || d.name === ".git") continue;
+      out.push({ name: d.name, dir: Boolean(d.isDirectory?.()) });
+      if (out.length > 500) break;
+    }
+    return out;
+  }
   const windowsDirectory = async () => {
     const r = await exec("powershell", ["-NoProfile", "-Command", "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & { param($p) @(Get-ChildItem -LiteralPath $p -Force -ErrorAction Stop | Where-Object Name -ne '.git' | Select-Object -First 501 | ForEach-Object { @{ name=$_.Name; dir=($_.PSIsContainer -and (-not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not $_.LinkType -or ($_.Target -and [IO.Directory]::Exists(([IO.Path]::Combine([IO.Path]::GetDirectoryName($_.FullName), $_.Target[0])))))) } }) | ConvertTo-Json -Compress } '" + path.replace(/['‘’‚‛]/g, "$&$&") + "'"], { on });
     if (r.code !== 0) throw new Error(r.stderr || "Cannot list this folder");
     const result = JSON.parse(r.stdout || "[]");
     return Array.isArray(result) ? result : [result];
   };
-  if (!on && isWindows) return windowsDirectory();
   const script = 'n=0; for p in "$1"/* "$1"/.[!.]* "$1"/..?*; do [ -e "$p" ] || [ -L "$p" ] || continue; name=${p##*/}; [ "$name" = .git ] && continue; if [ -d "$p" ]; then kind=d; else kind=f; fi; printf "%s\\0%s\\0" "$kind" "$name"; n=$((n+1)); [ "$n" -gt 500 ] && break; done; test -d "$1"';
   let r;
   try { r = await exec("sh", ["-c", script, "files", path], { on }); }
@@ -261,6 +555,21 @@ const CHUNK_SIZE = 120;
 
 // Cross-platform lazy line range reader (Linux, macOS, Windows)
 async function readFileChunk(fullPath, startLine, count, on, isWindows = false) {
+  // Fast native local read via readTextFile (up to 1 MiB, 0 subprocesses)
+  if (!on) {
+    const present = await exists(fullPath).catch(() => false);
+    if (!present) return null;
+    try {
+      const text = await readTextFile(fullPath, { on }).catch(() => null);
+      if (typeof text === "string") {
+        if (text.includes("\0")) return "binary";
+        const allLines = text.replace(/\r\n/g, "\n").split("\n");
+        if (allLines.length > 0 && allLines[allLines.length - 1] === "") allLines.pop();
+        return allLines.slice(Math.max(0, startLine - 1), Math.max(0, startLine - 1) + count);
+      }
+    } catch {}
+  }
+
   if (!on && isWindows) {
     try {
       const escaped = fullPath.replace(/'/g, "''");
@@ -277,7 +586,7 @@ async function readFileChunk(fullPath, startLine, count, on, isWindows = false) 
       }
     } catch {}
   } else {
-    // Linux and macOS (standard POSIX tools)
+    // Linux, macOS, and remote SSH hosts
     try {
       let res;
       if (startLine <= 1) {
@@ -295,13 +604,13 @@ async function readFileChunk(fullPath, startLine, count, on, isWindows = false) 
     } catch {}
   }
 
-  // Universal fallback via readTextFile
+  // Universal fallback via readTextFile (covers remote Windows or fallback)
   try {
     const text = await readTextFile(fullPath, { on }).catch(() => null);
     if (text === null) return null;
     if (text.includes("\0")) return "binary";
-    const allLines = text.split("\n");
-    return allLines.slice(startLine - 1, startLine - 1 + count);
+    const allLines = text.replace(/\r\n/g, "\n").split("\n");
+    return allLines.slice(Math.max(0, startLine - 1), Math.max(0, startLine - 1) + count);
   } catch {
     return null;
   }
@@ -350,6 +659,7 @@ export default class FilesSearch extends View {
     this.dirCounts = {};
     this.dirMarks = {};
     this.serviceCounts = {};
+    this.serviceFiles = {};
     this.services = [];
     this.repoRoots = new Set();
     this.serviceFilter = "all";
@@ -357,9 +667,100 @@ export default class FilesSearch extends View {
     this.lastSelectedTs = 0;
     this.lastActiveServiceTs = 0;
     this.lastShiftPress = 0;
+    this.candidateCache = null;
+    this.dirtyFolders = new Set();
+    this.watchDebounceTask = null;
+    this.pendingRefreshOpts = null;
+    this.pendingPanelSyncTask = null;
+    this.focusInputTask = null;
+    this.wasVisible = isFilesVisible();
+    this.needsFolderReloadOnShow = false;
+    this.lastBgPollAt = Date.now();
+    this.lastTranscriptScan = { ts: 0, sig: "", text: "" };
     this.panelHandle = cx.focus_handle();
     this.refresh(cx);
-    cx.timer.every(10000, cx => this.refresh(cx));
+    cx.timer.every(30000, cx => {
+      const now = Date.now();
+      if (!isFilesVisible() && (now - this.lastBgPollAt) < 60000) return;
+      this.lastBgPollAt = now;
+      this.refresh(cx);
+    });
+  }
+
+  schedulePanelSync(cx) {
+    if (this.pendingPanelSyncTask || !cx?.timer) return;
+    this.pendingPanelSyncTask = cx.timer.after(0, cx => {
+      this.pendingPanelSyncTask = null;
+      this.syncPanelFromRender(cx);
+    });
+  }
+
+  syncPanelFromRender(cx) {
+    let dirty = false;
+    if (key() !== this.context?.key || (isFilesVisible() && (this.needsFolderReloadOnShow || this.dirtyFolders.size > 0))) {
+      this.refresh(cx, { fromWatch: this.dirtyFolders.size > 0 && key() === this.context?.key && !this.needsFolderReloadOnShow });
+      dirty = true;
+    }
+
+    const activeReq = shared("mesh.activeService");
+    if (activeReq && activeReq.ts && activeReq.ts > (this.lastActiveServiceTs || 0)) {
+      this.lastActiveServiceTs = activeReq.ts;
+      const normWorkspace = normPathStr(activeReq.workspaceRoot);
+      const normRoot = normPathStr(this.root);
+      if (!normWorkspace || normWorkspace === normRoot) {
+        const nextFilter = activeReq.serviceId || "all";
+        if (this.serviceFilter !== nextFilter) {
+          this.serviceFilter = nextFilter;
+          dirty = true;
+          if (nextFilter !== "all") {
+            const s = this.services?.find(x => x.id === nextFilter);
+            if (s?.relPath) {
+              const parts = s.relPath.split("/");
+              let accum = "";
+              for (const p of parts) {
+                accum = accum ? `${accum}/${p}` : p;
+                this.folders.add(accum);
+                if (!this.entries.has(accum) && !this.pending.has(accum)) {
+                  const context = this.context;
+                  this.pending.add(accum);
+                  cx.spawn(async cx => {
+                    try { await this.loadFolder(accum, context); }
+                    catch {}
+                    finally { if (this.context === context) this.pending.delete(accum); cx.notify(); }
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const selectReq = shared("files-search.select");
+    if (selectReq && selectReq.ts && selectReq.ts > (this.lastSelectedTs || 0)) {
+      this.lastSelectedTs = selectReq.ts;
+      if (selectReq.path) {
+        let filePath = selectReq.path;
+        const normSelectRoot = normPathStr(selectReq.root);
+        const normPanelRoot = normPathStr(this.root);
+        if (normSelectRoot && normPanelRoot && normSelectRoot !== normPanelRoot && normSelectRoot.startsWith(normPanelRoot + "/")) {
+          const relPrefix = normSelectRoot.slice(normPanelRoot.length + 1);
+          filePath = relPrefix ? `${relPrefix}/${filePath}` : filePath;
+        }
+        if (this.serviceFilter && this.serviceFilter !== "all") {
+          const curService = this.services?.find(s => s.id === this.serviceFilter);
+          if (curService?.relPath) {
+            if (filePath !== curService.relPath && !filePath.startsWith(curService.relPath + "/")) {
+              this.serviceFilter = "all";
+            }
+          }
+        }
+        this.openFromSearch(filePath, cx);
+        return;
+      }
+    }
+
+    if (dirty) cx.notify();
   }
 
   selectService(serviceId, cx) {
@@ -404,18 +805,45 @@ export default class FilesSearch extends View {
     cx.notify();
   }
 
+  scheduleWatchRefresh(cx) {
+    if (this.watchDebounceTask) {
+      try { this.watchDebounceTask.cancel(); } catch {}
+      this.watchDebounceTask = null;
+    }
+    const context = this.context;
+    this.watchDebounceTask = cx.timer.after(WATCH_DEBOUNCE_MS, cx => {
+      this.watchDebounceTask = null;
+      if (!this.current(context)) return;
+      this.refresh(cx, { fromWatch: true });
+    });
+  }
+
   watch(root, cx) {
     if (this.on || this.watched === root) return;
     this.watched = root;
     const context = this.context;
     cx.spawn(async cx => {
-      try {
-        while (this.context === context) {
-          await watchFolder(root);
-          if (this.current(context)) this.refresh(cx);
+      while (this.context === context) {
+        try {
+          const changed = await watchFolder(root);
+          if (!this.current(context)) break;
+          const info = analyzeWatchBatch(changed, root, this.folders);
+          if (!info.hasNonIgnored) continue;
+          if (info.invalidateRepos) this.candidateCache = null;
+          if (info.dirtyDirs.has("*")) {
+            this.dirtyFolders.add("*");
+          } else {
+            for (const d of info.dirtyDirs) this.dirtyFolders.add(d);
+            if (info.hasNonGitChange && info.dirtyDirs.has("")) this.dirtyFolders.add("");
+          }
+          this.scheduleWatchRefresh(cx);
+        } catch {
+          if (!this.current(context)) break;
+          await cx.sleep(3000);
         }
-      } catch {
-        if (this.context === context) this.watched = null;
+      }
+      if (this.watched === root && !this.current(context)) {
+        this.watched = null;
       }
     });
   }
@@ -438,7 +866,7 @@ export default class FilesSearch extends View {
     if (entries.length > PER_FOLDER || used + entries.length > TOTAL) this.limited = true;
   }
 
-  refresh(cx) {
+  refresh(cx, opts = {}) {
     const { cwd, on } = location(), next = key();
     const isWindows = !on && window()?.platform === "windows";
     if (next !== this.context?.key) {
@@ -463,12 +891,32 @@ export default class FilesSearch extends View {
       this.error = null;
       this.limited = false;
       this.loading = false;
+      this.candidateCache = null;
+      this.dirtyFolders = new Set();
+      this.pendingRefreshOpts = null;
+      this.needsFolderReloadOnShow = false;
+      this.lastTranscriptScan = { ts: 0, sig: "", text: "" };
+      if (this.watchDebounceTask) {
+        try { this.watchDebounceTask.cancel(); } catch {}
+        this.watchDebounceTask = null;
+      }
       if (saved?.file) this.show(saved.file, cx);
     } else if (this.context) {
       this.context.isWindows = isWindows;
     }
-    if (!cwd || this.loading) return;
+    if (!cwd) return;
+    if (this.loading) {
+      this.pendingRefreshOpts = {
+        fromWatch: Boolean(opts?.fromWatch && !this.pendingRefreshOpts?.force && this.pendingRefreshOpts?.fromWatch !== false),
+        force: Boolean(opts?.force || this.pendingRefreshOpts?.force),
+      };
+      return;
+    }
     const context = this.context;
+    const fromWatch = Boolean(opts?.fromWatch);
+    const force = Boolean(opts?.force);
+    const watchDirty = new Set(this.dirtyFolders);
+    this.dirtyFolders.clear();
     this.loading = true;
     this.limited = false;
     const activeSpace = spaces().find(s => s.active);
@@ -494,47 +942,84 @@ export default class FilesSearch extends View {
       : [];
     cx.spawn(async cx => {
       try {
-        for (const path of ["", ...this.folders]) {
-          if (!this.current(context)) return;
-          await this.loadFolder(path, context);
+        const visibleNow = isFilesVisible();
+        if (!visibleNow && this.entries.has("")) {
+          this.needsFolderReloadOnShow = true;
+        } else {
+          const forceReloadFolders = this.needsFolderReloadOnShow;
+          this.needsFolderReloadOnShow = false;
+          const shouldReloadAll = !fromWatch || !this.entries.has("") || watchDirty.has("*") || forceReloadFolders;
+          const foldersToLoad = shouldReloadAll
+            ? ["", ...this.folders]
+            : [...new Set(["", ...this.folders].filter(f => watchDirty.has(f)))];
+          for (const path of foldersToLoad) {
+            if (!this.current(context)) return;
+            await this.loadFolder(path, context);
+          }
         }
 
-        const candidateServices = await discoverRepos(cwd, on, isWindows, extraCwds);
-        if (!this.current(context)) return;
+        const now = Date.now();
+        const cacheKey = `${cwd}|${on || ""}|${extraCwds.slice().sort().join(",")}`;
+        let candidateServices;
+        if (!force && this.candidateCache && this.candidateCache.key === cacheKey && (now - this.candidateCache.ts) < REPO_CACHE_TTL_MS) {
+          candidateServices = this.candidateCache.services;
+        } else {
+          candidateServices = await discoverRepos(cwd, on, isWindows, extraCwds);
+          if (!this.current(context)) return;
+          this.candidateCache = { key: cacheKey, services: candidateServices, ts: Date.now() };
+        }
 
         const marks = {};
         const dirCounts = {};
         const serviceCounts = {};
         const serviceFiles = {};
         const serviceAhead = {};
+        const serviceBranches = {};
 
         const statusPromises = candidateServices.map(async s => {
           const res = await exec(
             "git",
-            ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"],
+            ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "status", "--porcelain=v1", "-b", "-z", "--no-renames", "--untracked-files=normal"],
             { cwd: s.root, on }
           ).catch(() => null);
+          let branch = "";
           let ahead = 0;
-          if (!res || res.code !== 0 || !res.stdout) {
-            ahead = await repoAheadCount(s.root, on);
+          const fileEntries = [];
+          if (res && res.code === 0 && typeof res.stdout === "string") {
+            const records = res.stdout.split("\0").filter(Boolean);
+            for (const rec of records) {
+              if (rec.startsWith("## ")) {
+                const parsed = parsePorcelainHeader(rec);
+                branch = parsed.branch;
+                if (parsed.ahead !== null) {
+                  ahead = parsed.ahead;
+                } else if (branch && !BASE_BRANCHES.has(branch)) {
+                  ahead = await repoAheadCount(s.root, on, branch);
+                }
+              } else {
+                fileEntries.push(rec);
+              }
+            }
           }
-          return { service: s, res, ahead };
+          return { service: s, branch, fileEntries, ahead };
         });
 
         const statusResults = await Promise.all(statusPromises);
         if (!this.current(context)) return;
 
-        const normCwd = cwd.replace(/\\/g, "/").replace(/\/+$/, "");
+        const normCwd = normPathStr(cwd);
 
-        for (const { service, res, ahead } of statusResults) {
+        for (const { service, branch, fileEntries, ahead } of statusResults) {
           serviceAhead[service.id] = ahead || 0;
-          if (res?.code !== 0 || !res.stdout) continue;
-          const entries = res.stdout.split("\0").filter(Boolean);
+          serviceBranches[service.id] = branch || "";
+          if (!fileEntries.length) continue;
           let count = 0;
           const touchedList = [];
-          for (const entry of entries.slice(0, TOTAL)) {
+          for (const entry of fileEntries.slice(0, TOTAL)) {
             const xy = entry.slice(0, 2);
-            const relFile = entry.slice(3);
+            const rawRel = entry.slice(3);
+            const relFile = rawRel.replace(/\/+$/, "");
+            if (!relFile) continue;
             const fullPath = `${service.root}/${relFile}`;
             const mark = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
             marks[fullPath] = mark;
@@ -558,12 +1043,12 @@ export default class FilesSearch extends View {
         }
 
         const prevBus = shared("mesh.services");
-        const normBusRoot = prevBus?.workspaceRoot ? prevBus.workspaceRoot.replace(/\\/g, "/").replace(/\/+$/, "") : "";
+        const normBusRoot = prevBus?.workspaceRoot ? normPathStr(prevBus.workspaceRoot) : "";
         const prevByRoot = new Map();
         if (prevBus && normBusRoot === normCwd && Array.isArray(prevBus.services)) {
           for (const ps of prevBus.services) {
             if (ps?.root) {
-              prevByRoot.set(ps.root.replace(/\\/g, "/").replace(/\/+$/, ""), ps);
+              prevByRoot.set(normPathStr(ps.root), ps);
             }
           }
         }
@@ -571,11 +1056,11 @@ export default class FilesSearch extends View {
         // Only expose touched/modified repositories in this session & tab
         const rawTouched = candidateServices
           .map(s => {
-            const normRoot = s.root.replace(/\\/g, "/").replace(/\/+$/, "");
+            const normRoot = normPathStr(s.root);
             const existing = prevByRoot.get(normRoot);
             return {
               ...s,
-              branch: existing?.branch || s.branch || "",
+              branch: serviceBranches[s.id] || existing?.branch || s.branch || "",
               workingCount: serviceCounts[s.id] ?? 0,
               aheadCount: serviceAhead[s.id] ?? existing?.aheadCount ?? 0,
             };
@@ -583,29 +1068,41 @@ export default class FilesSearch extends View {
           .filter(s => (s.workingCount || 0) > 0 || (s.aheadCount || 0) > 0);
 
         const enrichedServices = activeTabId
-          ? await attributeSessionServices(activeTabId, rawTouched, serviceFiles, tabPaneCwds, tabTermAddrs)
+          ? await attributeSessionServices(activeTabId, rawTouched, serviceFiles, tabPaneCwds, tabTermAddrs, this.lastTranscriptScan)
           : rawTouched;
         if (!this.current(context)) return;
 
         this.services = enrichedServices;
-        this.repoRoots = new Set(enrichedServices.map(s => s.root.replace(/\\/g, "/").replace(/\/+$/, "")));
+        this.repoRoots = new Set(enrichedServices.map(s => normPathStr(s.root)));
         enrichedServices.forEach(s => this.repoRoots.add(s.root));
 
         if (this.serviceFilter !== "all" && !enrichedServices.some(s => s.id === this.serviceFilter)) {
           this.serviceFilter = "all";
         }
 
+        const candidateMeta = candidateServices.map(s => ({
+          id: s.id,
+          name: s.name,
+          relPath: s.relPath || "",
+          root: s.root,
+          isSibling: Boolean(s.isSibling),
+          branch: serviceBranches[s.id] || s.branch || "",
+        }));
+
         const busSig = prevBus && (!prevBus.tabId || prevBus.tabId === activeTabId) && normBusRoot === normCwd && Array.isArray(prevBus.services)
-          ? (activeTabId || "") + "::" + cwd + "::" + prevBus.services.map(s => `${s.root}@${s.branch || ""}:${s.workingCount ?? 0}:${s.aheadCount ?? 0}`).join(",")
+          ? (prevBus.sig || ((activeTabId || "") + "::" + normBusRoot + "::" + (prevBus.candidates?.length ?? -1) + "::" + prevBus.services.map(s => `${normPathStr(s.root)}@${s.branch || ""}:${s.workingCount ?? 0}:${s.aheadCount ?? 0}`).join(",")))
           : null;
-        const servicesSig = (activeTabId || "") + "::" + cwd + "::" + enrichedServices.map(s => `${s.root}@${s.branch || ""}:${s.workingCount ?? 0}:${s.aheadCount ?? 0}`).join(",");
-        if (servicesSig !== this.lastPublishedServicesSig && servicesSig !== busSig) {
+        const servicesSig = (activeTabId || "") + "::" + normCwd + "::" + candidateMeta.length + "::" + enrichedServices.map(s => `${normPathStr(s.root)}@${s.branch || ""}:${s.workingCount ?? 0}:${s.aheadCount ?? 0}`).join(",");
+        const busStale = !prevBus || !prevBus.ts || (Date.now() - prevBus.ts) >= 45000;
+        if (servicesSig !== this.lastPublishedServicesSig || servicesSig !== busSig || busStale) {
           this.lastPublishedServicesSig = servicesSig;
           setShared("mesh.services", {
             tabId: activeTabId || null,
             workspaceRoot: cwd,
             on: on || null,
             services: enrichedServices,
+            candidates: candidateMeta,
+            sig: servicesSig,
             ts: Date.now(),
           });
         } else {
@@ -624,6 +1121,13 @@ export default class FilesSearch extends View {
       } finally {
         if (this.context === context) this.loading = false;
         cx.notify();
+        if (this.context === context && this.pendingRefreshOpts) {
+          const pending = this.pendingRefreshOpts;
+          this.pendingRefreshOpts = null;
+          cx.timer.after(150, cx => {
+            if (this.current(context)) this.refresh(cx, pending);
+          });
+        }
       }
     });
   }
@@ -849,64 +1353,22 @@ export default class FilesSearch extends View {
   }
 
   renderPanel(cx) {
-    if (key() !== this.context?.key) this.refresh(cx);
+    const visible = isFilesVisible();
+    const becameVisible = visible && !this.wasVisible;
+    this.wasVisible = visible;
 
-    // Synchronize active service selection from external mods (e.g. changes-review)
     const activeReq = shared("mesh.activeService");
-    if (activeReq && activeReq.ts && activeReq.ts > (this.lastActiveServiceTs || 0)) {
-      this.lastActiveServiceTs = activeReq.ts;
-      const normWorkspace = activeReq.workspaceRoot ? activeReq.workspaceRoot.replace(/\\/g, "/").replace(/\/+$/, "") : "";
-      const normRoot = this.root ? this.root.replace(/\\/g, "/").replace(/\/+$/, "") : "";
-      if (!normWorkspace || normWorkspace === normRoot) {
-        const nextFilter = activeReq.serviceId || "all";
-        if (this.serviceFilter !== nextFilter) {
-          this.serviceFilter = nextFilter;
-          if (nextFilter !== "all") {
-            const s = this.services?.find(x => x.id === nextFilter);
-            if (s?.relPath) {
-              const parts = s.relPath.split("/");
-              let accum = "";
-              for (const p of parts) {
-                accum = accum ? `${accum}/${p}` : p;
-                this.folders.add(accum);
-                if (!this.entries.has(accum) && !this.pending.has(accum)) {
-                  const context = this.context;
-                  this.pending.add(accum);
-                  cx.spawn(async cx => {
-                    try { await this.loadFolder(accum, context); }
-                    catch {}
-                    finally { if (this.context === context) this.pending.delete(accum); cx.notify(); }
-                  });
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // Check if a file was selected from Search Everywhere overlay
+    const hasActiveReq = Boolean(activeReq && activeReq.ts && activeReq.ts > (this.lastActiveServiceTs || 0));
     const selectReq = shared("files-search.select");
-    if (selectReq && selectReq.ts && selectReq.ts > (this.lastSelectedTs || 0)) {
-      this.lastSelectedTs = selectReq.ts;
-      if (selectReq.path) {
-        let filePath = selectReq.path;
-        const normSelectRoot = selectReq.root ? selectReq.root.replace(/\\/g, "/").replace(/\/+$/, "") : "";
-        const normPanelRoot = this.root ? this.root.replace(/\\/g, "/").replace(/\/+$/, "") : "";
-        if (normSelectRoot && normPanelRoot && normSelectRoot !== normPanelRoot && normSelectRoot.startsWith(normPanelRoot + "/")) {
-          const relPrefix = normSelectRoot.slice(normPanelRoot.length + 1);
-          filePath = relPrefix ? `${relPrefix}/${filePath}` : filePath;
-        }
-        if (this.serviceFilter && this.serviceFilter !== "all") {
-          const curService = this.services?.find(s => s.id === this.serviceFilter);
-          if (curService?.relPath) {
-            if (filePath !== curService.relPath && !filePath.startsWith(curService.relPath + "/")) {
-              this.serviceFilter = "all";
-            }
-          }
-        }
-        this.openFromSearch(filePath, cx);
-      }
+    const hasSelectReq = Boolean(selectReq && selectReq.ts && selectReq.ts > (this.lastSelectedTs || 0));
+
+    if (
+      key() !== this.context?.key ||
+      (becameVisible && (this.needsFolderReloadOnShow || this.dirtyFolders.size > 0)) ||
+      hasActiveReq ||
+      hasSelectReq
+    ) {
+      this.schedulePanelSync(cx);
     }
 
     const t = theme();
@@ -1117,22 +1579,35 @@ export default class FilesSearch extends View {
     });
 
     this.input.focus();
-    cx.timer.after(200, () => this.input.focus());
+    this.focusInputTask = cx.timer.after(200, () => {
+      this.focusInputTask = null;
+      try { this.input?.focus(); } catch {}
+    });
 
     // Preload files in workspace
     this.loadWorkspaceFiles(cx);
   }
 
   close(cx) {
+    this.focusInputTask?.cancel();
+    this.focusInputTask = null;
+    this.watchDebounceTask?.cancel();
+    this.watchDebounceTask = null;
+    this.pendingPanelSyncTask?.cancel();
+    this.pendingPanelSyncTask = null;
     this.textSearchTask?.cancel();
     this.textSearchTask = null;
     this.previewDebounceTask?.cancel();
     this.previewDebounceTask = null;
+    try { this.input?.release(); } catch {}
+    this.input = null;
     this.code?.release();
     this.code = null;
   }
 
   closeOverlay() {
+    this.focusInputTask?.cancel();
+    this.focusInputTask = null;
     this.textSearchTask?.cancel();
     this.textSearchTask = null;
     this.previewDebounceTask?.cancel();
@@ -1358,7 +1833,7 @@ export default class FilesSearch extends View {
         const rgRes = await exec(
           "rg",
           [
-            "--files", "--hidden",
+            "--files", "--hidden", "--path-separator", "/",
             "--glob", "!.git", "--glob", "!node_modules", "--glob", "!.cache",
             "--glob", "!target", "--glob", "!build", "--glob", "!.next",
             "--glob", "!.venv", "--glob", "!vendor"
@@ -1367,8 +1842,11 @@ export default class FilesSearch extends View {
         ).catch(() => null);
 
         if (rgRes?.code === 0 && rgRes.stdout.trim()) {
-          list = rgRes.stdout.split("\n").map(s => s.trim().replace(/^\.\//, "")).filter(Boolean);
-        } else {
+          list = rgRes.stdout
+            .split(/\r?\n/)
+            .map(s => s.trim().replace(/\\/g, "/").replace(/^\.\//, ""))
+            .filter(Boolean);
+        } else if (!rgRes || rgRes.code !== 0) {
           // Check if root is a git repository
           const rev = await exec(
             "git",
@@ -1383,11 +1861,22 @@ export default class FilesSearch extends View {
               { cwd: root, on }
             ).catch(() => null);
             if (gitRes?.code === 0 && gitRes.stdout.trim()) {
-              list = gitRes.stdout.split("\n").map(s => s.trim().replace(/^\.\//, "")).filter(Boolean);
+              list = gitRes.stdout
+                .split(/\r?\n/)
+                .map(s => s.trim().replace(/\\/g, "/").replace(/^\.\//, ""))
+                .filter(Boolean);
             }
           } else {
-            // Multi-repo fallback: discoverRepos across searchRoot
-            const services = await discoverRepos(root, on, isWindows);
+            // Multi-repo fallback: reuse mesh.services candidates when matching, else discoverRepos
+            const bus = shared("mesh.services");
+            const hasBusCandidates = Boolean(
+              bus &&
+              normPathStr(bus.workspaceRoot) === normPathStr(root) &&
+              (bus.on || null) === (on || null) &&
+              Array.isArray(bus.candidates) &&
+              bus.candidates.length > 0
+            );
+            const services = hasBusCandidates ? bus.candidates : await discoverRepos(root, on, isWindows);
             if (services && services.length > 0) {
               const perService = await Promise.all(
                 services.map(async s => {
@@ -1399,8 +1888,8 @@ export default class FilesSearch extends View {
                   if (r?.code === 0 && r.stdout.trim()) {
                     const prefix = s.relPath ? `${s.relPath}/` : "";
                     return r.stdout
-                      .split("\n")
-                      .map(line => line.trim().replace(/^\.\//, ""))
+                      .split(/\r?\n/)
+                      .map(line => line.trim().replace(/\\/g, "/").replace(/^\.\//, ""))
                       .filter(Boolean)
                       .map(line => `${prefix}${line}`);
                   }
@@ -1408,15 +1897,20 @@ export default class FilesSearch extends View {
                 })
               );
               list = perService.flat();
+            } else if (!on) {
+              list = await fsListFiles(root, 20000);
             } else {
-              // POSIX find fallback
+              // Remote POSIX find fallback
               const findRes = await exec(
                 "sh",
                 ["-c", 'find . -not -path "*/.*" -not -path "*/target/*" -not -path "*/build/*" -not -path "*/node_modules/*" -not -path "*/.venv/*" -type f | sed "s|^./||"'],
                 { cwd: root, on }
               ).catch(() => null);
               if (findRes?.code === 0 && findRes.stdout.trim()) {
-                list = findRes.stdout.split("\n").map(s => s.trim().replace(/^\.\//, "")).filter(Boolean);
+                list = findRes.stdout
+                  .split(/\r?\n/)
+                  .map(s => s.trim().replace(/\\/g, "/").replace(/^\.\//, ""))
+                  .filter(Boolean);
               }
             }
           }
@@ -1472,37 +1966,45 @@ export default class FilesSearch extends View {
     this.textSearchTask = cx.timer.after(160, cx => {
       cx.spawn(async cx => {
         try {
-          let res = await exec(
-            "rg",
-            [
-              "--vimgrep", "--no-heading", "--color=never", "--smart-case",
-              "--max-count=35", "--max-columns=200",
-              "--glob", "!.git", "--glob", "!node_modules", "--glob", "!.cache",
-              "--glob", "!target", "--glob", "!build", "--glob", "!.next", "--glob", "!.venv",
-              "--", q
-            ],
-            { cwd: root, on }
-          ).catch(() => null);
-
-          let results = [];
-          if (res && res.code === 0 && res.stdout) {
-            const lines = res.stdout.split("\n");
-            for (const line of lines) {
+          const rgBaseArgs = [
+            "--vimgrep", "--no-heading", "--color=never", "--smart-case",
+            "--path-separator", "/", "--max-count=8", "--max-columns=200",
+            "--glob", "!.git", "--glob", "!node_modules", "--glob", "!.cache",
+            "--glob", "!target", "--glob", "!build", "--glob", "!.next", "--glob", "!.venv",
+          ];
+          const parseSearchLines = (stdout, prefix = "", cap = 35, out = []) => {
+            for (const line of String(stdout || "").split(/\r?\n/)) {
               if (!line.trim()) continue;
               const m = line.match(/^([^:]+):(\d+):(?:(\d+):)?(.*)$/);
               if (m) {
-                results.push({
+                const normRel = m[1].replace(/\\/g, "/").replace(/^\.\//, "");
+                out.push({
                   kind: "text",
-                  path: m[1].replace(/^\.\//, ""),
+                  path: `${prefix}${normRel}`,
                   line: parseInt(m[2], 10),
                   content: m[4].trim(),
                   matchedQuery: q,
                 });
               }
-              if (results.length >= 35) break;
+              if (out.length >= cap) break;
             }
+            return out;
+          };
+
+          let res = await exec("rg", [...rgBaseArgs, "--", q], { cwd: root, on }).catch(() => null);
+          if (res && res.code === 2) {
+            // Query contains unescaped regex characters; retry as literal fixed string.
+            res = await exec("rg", [...rgBaseArgs, "-F", "--", q], { cwd: root, on }).catch(() => null);
+          }
+
+          let results = [];
+          if (res && res.code === 0) {
+            if (res.stdout) parseSearchLines(res.stdout, "", 35, results);
+          } else if (res && res.code === 1) {
+            // Ripgrep exit code 1 means zero matches (not missing ripgrep).
+            results = [];
           } else {
-            // Check if root is a git repository
+            // Fallback when rg is unavailable or failed unexpectedly
             const rev = await exec(
               "git",
               ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "rev-parse", "--show-toplevel"],
@@ -1512,54 +2014,41 @@ export default class FilesSearch extends View {
             if (rev?.code === 0) {
               const gitRes = await exec(
                 "git",
-                ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "grep", "-nI", "-i", "-m", "35", "--", q],
+                ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "grep", "-nI", "-F", "-i", "-m", "8", "--", q],
                 { cwd: root, on }
               ).catch(() => null);
               if (gitRes && gitRes.stdout) {
-                for (const line of gitRes.stdout.split("\n")) {
-                  if (!line.trim()) continue;
-                  const m = line.match(/^([^:]+):(\d+):(?:(\d+):)?(.*)$/);
-                  if (m) {
-                    results.push({
-                      kind: "text",
-                      path: m[1].replace(/^\.\//, ""),
-                      line: parseInt(m[2], 10),
-                      content: m[4].trim(),
-                      matchedQuery: q,
-                    });
-                  }
-                  if (results.length >= 35) break;
-                }
+                parseSearchLines(gitRes.stdout, "", 35, results);
               }
             } else {
-              // Multi-repo fallback: discoverRepos across searchRoot
-              const services = await discoverRepos(root, on, isWindows);
+              const bus = shared("mesh.services");
+              const hasBusCandidates = Boolean(
+                bus &&
+                normPathStr(bus.workspaceRoot) === normPathStr(root) &&
+                (bus.on || null) === (on || null) &&
+                Array.isArray(bus.candidates) &&
+                bus.candidates.length > 0
+              );
+              const services = hasBusCandidates ? bus.candidates : await discoverRepos(root, on, isWindows);
               if (services && services.length > 0) {
-                for (const s of services) {
-                  if (results.length >= 35) break;
-                  const remaining = 35 - results.length;
-                  const sRes = await exec(
-                    "git",
-                    ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "grep", "-nI", "-i", "-m", String(remaining), "--", q],
-                    { cwd: s.root, on }
-                  ).catch(() => null);
-                  if (sRes && sRes.stdout) {
+                const perRepo = await Promise.all(
+                  services.map(async s => {
+                    const sRes = await exec(
+                      "git",
+                      ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "grep", "-nI", "-F", "-i", "-m", "8", "--", q],
+                      { cwd: s.root, on }
+                    ).catch(() => null);
+                    if (!sRes || !sRes.stdout) return [];
                     const prefix = s.relPath ? `${s.relPath}/` : "";
-                    for (const line of sRes.stdout.split("\n")) {
-                      if (!line.trim()) continue;
-                      const m = line.match(/^([^:]+):(\d+):(?:(\d+):)?(.*)$/);
-                      if (m) {
-                        results.push({
-                          kind: "text",
-                          path: `${prefix}${m[1].replace(/^\.\//, "")}`,
-                          line: parseInt(m[2], 10),
-                          content: m[4].trim(),
-                          matchedQuery: q,
-                        });
-                      }
-                      if (results.length >= 35) break;
-                    }
+                    return parseSearchLines(sRes.stdout, prefix, 35, []);
+                  })
+                );
+                for (const batch of perRepo) {
+                  for (const item of batch) {
+                    results.push(item);
+                    if (results.length >= 35) break;
                   }
+                  if (results.length >= 35) break;
                 }
               }
             }
@@ -2080,9 +2569,10 @@ export default class FilesSearch extends View {
     let leftW = 644;
     let previewW = 520;
     if (this.showPreview) {
-      const remainingW = availableContentW - 12;
-      leftW = Math.max(400, Math.min(620, Math.round(remainingW * 0.44)));
-      previewW = Math.max(480, remainingW - leftW);
+      const remainingW = Math.max(300, availableContentW - 12);
+      const minLeft = Math.min(360, Math.floor(remainingW * 0.44));
+      leftW = Math.max(minLeft, Math.min(620, Math.round(remainingW * 0.44)));
+      previewW = Math.max(240, remainingW - leftW);
     } else {
       leftW = availableContentW;
     }

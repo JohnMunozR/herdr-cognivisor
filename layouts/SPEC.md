@@ -5,15 +5,15 @@ status: active
 title: Herdr Mesh Layout Definition (layouts/mesh.json)
 parent: architecture
 references: [module-mods, submodule-mod-changes-review, submodule-mod-files-search, spec-lifecycle]
-covers: [layout-tree, panel-stack, workspace-blocks, lifecycle-flow-bar, status-bar]
+covers: [layout-tree, panel-stack, workspace-blocks, status-bar]
 tags: [layout, herdr, ui-shell, lifecycle]
 ---
 
 ## Responsibility
 
-The `module-layouts` defines the declarative user interface tree for Herdr in `layouts/mesh.json`. It coordinates the top-level spatial arrangement of the desktop application shell, partitioning screen real estate between the global navigation sidebar (`#sidebar`), organic workspace tabs (`#tabs`), tab-scoped 6-stage lifecycle bar (`#flow`), primary terminal execution canvas (`#main`), collapsible multi-stage side-panel stack (`#panel`), and lifecycle status bar (`#status`).
+The `module-layouts` defines the declarative user interface tree for Herdr in `layouts/mesh.json`. It coordinates the top-level spatial arrangement of the desktop application shell, partitioning screen real estate between the global navigation sidebar (`#sidebar`), organic workspace tabs (`#tabs`), primary terminal execution canvas (`#main`), collapsible multi-service side-panel stack (`#panel`), and telemetry status bar (`#status`).
 
-In the `mesh` layout, the shell chrome and side-panel stack bind natively to the complete Agent IDE Lifecycle suite (`[[module-mods]]`, `[[spec-lifecycle]]`): `mesh-tabs`, `mesh-flow`, `files-search`, `changes-review`, `mesh-test`, `mesh-ship`, and `mesh-status`.
+In the `mesh` layout, the shell chrome and side-panel stack bind natively to the 4 active workspace mods (`[[module-mods]]`, `[[spec-lifecycle]]`): `mesh-tabs`, `files-search`, `changes-review`, and `mesh-status`.
 
 ## Boundary
 
@@ -26,22 +26,19 @@ In the `mesh` layout, the shell chrome and side-panel stack bind natively to the
   - Controllable element IDs:
     - `#sidebar`: Collapsible left navigation drawer.
     - `#tabs`: Top workspace tab strip (`mod: "mesh-tabs"`).
-    - `#flow`: 38px 6-stage tab-scoped pipeline bar (`mod: "mesh-flow"`) mounted directly above `#work-body`.
     - `#main`: Primary terminal pane container.
     - `#panel`: Collapsible auxiliary side drawer.
-    - `#panel-body`: Mutually exclusive view stack housing `#files`, `#changes`, `#test`, and `#ship`.
-    - `#status`: Bottom lifecycle telemetry bar (`mod: "mesh-status"`).
+    - `#panel-body`: Mutually exclusive view stack housing `#files` and `#changes`.
+    - `#status`: Bottom telemetry bar (`mod: "mesh-status"`).
   - Command targets:
     - `layout.show --id panel` / `layout.hide --id panel`
     - `layout.select --stack panel-body --child files`
     - `layout.select --stack panel-body --child changes`
-    - `layout.select --stack panel-body --child test`
-    - `layout.select --stack panel-body --child ship`
 - **Allowed deps:**
   - Core Herdr built-in mods: `workspace-chrome`, `spaces`, `agents`, `pane`.
-  - Mesh extension mods (`[[module-mods]]`): `mesh-tabs`, `mesh-flow`, `[[submodule-mod-files-search]]`, `[[submodule-mod-changes-review]]`, `mesh-test`, `mesh-ship`, `mesh-status`.
+  - Active Mesh extension mods (`[[module-mods]]`): `[[submodule-mod-mesh-tabs]]`, `[[submodule-mod-files-search]]`, `[[submodule-mod-changes-review]]`, `[[submodule-mod-mesh-status]]`.
 - **Forbidden:**
-  - Renaming child block IDs inside `#panel-body` away from `"files"`, `"changes"`, `"test"`, and `"ship"` (breaks `mesh-flow` stage coupling, `mesh-tabs` drawer toggles, and backwards compatibility with Herdr's core `"files"`/`"changes"` toggle handlers).
+  - Renaming child block IDs inside `#panel-body` away from `"files"` and `"changes"` (breaks `mesh-tabs` drawer toggles and backwards compatibility with Herdr's core `"files"`/`"changes"` toggle handlers).
   - Removing `"window_drag": true` from `#brand` or `#tabs` (breaks window moving on frameless window managers).
   - Mutating Herdr's shipped immutable layouts (`main.json`, `terminals.json`, `win98.json`).
   - Hardcoding absolute window coordinates or breaking responsive flex layouts.
@@ -65,9 +62,7 @@ root (row)
     │   └── panel (column, width: 420px, min: 300px, max: 960px, hidden: true)
     │       └── panel-body (stack, active: "files")
     │           ├── files (block, mod: "files-search")
-    │           ├── changes (block, mod: "changes-review")
-    │           ├── test (block, mod: "mesh-test")
-    │           └── ship (block, mod: "mesh-ship")
+    │           └── changes (block, mod: "changes-review")
     └── status (block, height: 28px, mod: "mesh-status")
 ```
 
@@ -81,21 +76,19 @@ root (row)
 | `spaces` | `block` | `weight: 1`, `min: 90` | Active workspace list and space switcher |
 | `agents` | `block` | `weight: 1`, `min: 90` | Active subagent roster, status indicators, and process monitors |
 | `sidebar-footer` | `block` | `px: 69` | Preferences, layout switchers, and profile status |
-| `tabs` | `block` | `px: 42` | `mesh-tabs` — workspace tab bar, auto-naming, inline rename, `files`/`changes`/`test`/`ship` toggles, `mesh.spacePanels` sync, and window drag |
+| `tabs` | `block` | `px: 42` | `mesh-tabs` — workspace tab bar, auto-naming, inline rename, `files`/`changes` toggles, `mesh.spacePanels` sync, and window drag |
 | `work-body` | `row` | Flex remaining | Horizontal split containing main terminal canvas and side drawer |
-| `main` | `block` | Flex 1 | Primary active terminal and service-runner split panes with rounded corners and focus borders |
+| `main` | `block` | Flex 1 | Primary active terminal and split panes with rounded corners and focus borders |
 | `panel` | `column` | `px: 420` (300-960 bounds) | Collapsible side panel drawer (defaults to `hidden: true`) |
-| `panel-body` | `stack` | 100% of panel | Mutually exclusive stack switching between `#files`, `#changes`, `#test`, and `#ship` |
+| `panel-body` | `stack` | 100% of panel | Mutually exclusive stack switching between `#files` and `#changes` |
 | `files` | `block` | Stack item | Renders `files-search` in docked file-tree mode |
 | `changes` | `block` | Stack item | Renders `changes-review` per-service diff, checklist, and `Checks` inspector |
-| `test` | `block` | Stack item | Renders `mesh-test` live test plan, `ss -tln` ports, `+ Service Runner`, and Playwright PNGs |
-| `ship` | `block` | Stack item | Renders `mesh-ship` PR template editor, live `gh` PR monitoring, and branch promotion |
 | `status` | `block` | `px: 28` | Bottom telemetry bar rendering `mesh-status` |
 
 ## Invariants
 
 1. **Stack Child ID Preservation:**
-   The child blocks within `#panel-body` MUST maintain exact IDs `"files"`, `"changes"`, `"test"`, and `"ship"`. Preserving `"files"` and `"changes"` guarantees backwards compatibility with Herdr's core `tabs` toggle contract, while `"test"` and `"ship"` bind `mesh-flow` stage selection (`test`, `pr_dev`, `promote`) and `mesh-tabs` panel buttons.
+   The child blocks within `#panel-body` MUST maintain exact IDs `"files"` and `"changes"`. Preserving `"files"` and `"changes"` guarantees backwards compatibility with Herdr's core `tabs` toggle contract and `mesh-tabs` panel buttons.
 2. **Stack Mutual Exclusion:**
    `#panel-body` MUST remain `type: "stack"`. Only one child view is mounted and rendered at any given moment, conserving rendering cycles and GPU resources.
 3. **Flow Bar Placement Above `#work-body`:**

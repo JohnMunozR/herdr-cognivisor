@@ -1,5 +1,7 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, Scrollbar, ScrollHandle } from "gpui-base";
+import { readdir, exists } from "fs/promises";
+import { join } from "path";
 import {
   spaces, panes, focused, agents, terminals, exec, readTextFile, watchFolder,
   theme, settings, notify, hc, run, layout, shared, setShared, window,
@@ -92,6 +94,140 @@ function diffRows(lines) {
   });
 }
 
+const DISCOVER_SKIP_DIRS = new Set([
+  ".git", "node_modules", "target", "dist", "build", "vendor",
+  ".venv", "venv", ".next", ".nuxt", ".cache", "__pycache__", "out", "coverage", "logs",
+]);
+
+const WATCH_SKIP_DIRS = new Set([
+  "node_modules", "target", "dist", "build", "vendor", ".venv", "venv",
+  ".next", ".nuxt", ".cache", "__pycache__", "logs", ".gradle", ".idea",
+  ".turbo", ".parcel-cache", "coverage", ".sass-cache", "tmp", ".tmp",
+]);
+
+const WATCH_SKIP_EXTS = [".log", ".tmp", ".swp", ".swo", ".part", ".crdownload"];
+const BASE_BRANCHES = new Set(["main", "master", "development", "develop", "ci", "HEAD", ""]);
+const REPO_CACHE_TTL_MS = 60000;
+const BUS_MAX_AGE_MS = 90000;
+const WATCH_DEBOUNCE_MS = 800;
+const TRANSCRIPT_THROTTLE_MS = 4000;
+
+function normPathStr(p) {
+  return String(p || "").replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function findLayoutNode(node, id) {
+  if (!node || typeof node !== "object") return null;
+  if (node.id === id) return node;
+  for (const child of node.children ?? []) {
+    const found = findLayoutNode(child, id);
+    if (found) return found;
+  }
+  return null;
+}
+
+function findChangesBlock(node) {
+  if (!node || typeof node !== "object") return null;
+  if (node.content?.mod === "changes-review") return node;
+  for (const child of node.children ?? []) {
+    const found = findChangesBlock(child);
+    if (found) return found;
+  }
+  return null;
+}
+
+function isChangesVisible() {
+  const root = layout();
+  if (!root || typeof root !== "object") return false;
+  const panel = findLayoutNode(root, "panel");
+  const body = findLayoutNode(root, "panel-body");
+  if (panel && body) {
+    return !panel.hidden && body.active === "changes";
+  }
+  const block = findChangesBlock(root);
+  return block ? !block.hidden : false;
+}
+
+function getRelToRepo(changedPath, repoRoot) {
+  const normP = normPathStr(changedPath);
+  const normRoot = normPathStr(repoRoot);
+  if (!normP || !normRoot) return null;
+  if (normP === normRoot) return "";
+  if (normP.startsWith(normRoot + "/")) return normP.slice(normRoot.length + 1);
+  if (normP.toLowerCase().startsWith(normRoot.toLowerCase() + "/")) {
+    return normP.slice(normRoot.length + 1);
+  }
+  return null;
+}
+
+function isIgnoredWatchPath(changedPath, repoRoot) {
+  const rel = getRelToRepo(changedPath, repoRoot);
+  const target = rel !== null ? rel : normPathStr(changedPath);
+  if (!target) return false;
+  const segs = target.split("/").filter(Boolean);
+  const segsLower = segs.map((s) => s.toLowerCase());
+
+  const gitIdx = segsLower.indexOf(".git");
+  if (gitIdx >= 0) {
+    const afterGit = segsLower.slice(gitIdx + 1).join("/");
+    if (
+      afterGit === "index" ||
+      afterGit === "head" ||
+      afterGit === "merge_head" ||
+      afterGit === "rebase-head" ||
+      afterGit === "cherry_pick_head" ||
+      afterGit.startsWith("refs/") ||
+      afterGit.startsWith("rebase-merge/") ||
+      afterGit.startsWith("rebase-apply/")
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  for (let i = 0; i < segsLower.length - 1; i++) {
+    if (WATCH_SKIP_DIRS.has(segsLower[i])) return true;
+  }
+  const base = segsLower[segsLower.length - 1] || "";
+  if (WATCH_SKIP_DIRS.has(base)) return true;
+  if (base === ".ds_store" || base === "thumbs.db" || base.endsWith("~")) return true;
+  for (const ext of WATCH_SKIP_EXTS) {
+    if (base.endsWith(ext)) return true;
+  }
+  return false;
+}
+
+function hasRelevantWatchChange(changedPaths, repoRoot) {
+  if (!Array.isArray(changedPaths) || changedPaths.length === 0) return true;
+  for (const p of changedPaths) {
+    if (p && !isIgnoredWatchPath(p, repoRoot)) return true;
+  }
+  return false;
+}
+
+function parsePorcelainHeader(headerLine) {
+  const raw = String(headerLine || "").replace(/^##\s*/, "").trim();
+  if (!raw || raw.startsWith("HEAD (no branch)")) {
+    return { branch: "HEAD", hasUpstream: false, ahead: 0 };
+  }
+  const initMatch = raw.match(/^(?:No commits yet on|Initial commit on)\s+(.+)$/i);
+  if (initMatch) {
+    return { branch: initMatch[1].trim(), hasUpstream: false, ahead: 0 };
+  }
+  const bracketMatch = raw.match(/\[([^\]]+)\]\s*$/);
+  const trackingSpec = bracketMatch ? bracketMatch[1] : "";
+  const withoutBracket = bracketMatch ? raw.slice(0, bracketMatch.index).trim() : raw;
+  const dotIdx = withoutBracket.indexOf("...");
+  const branch = (dotIdx >= 0 ? withoutBracket.slice(0, dotIdx) : withoutBracket).trim() || "HEAD";
+  const hasUpstream = dotIdx >= 0;
+  let ahead = hasUpstream ? 0 : null;
+  if (trackingSpec) {
+    const aheadMatch = trackingSpec.match(/\bahead\s+(\d+)/i);
+    if (aheadMatch) ahead = parseInt(aheadMatch[1], 10) || 0;
+  }
+  return { branch, hasUpstream, ahead };
+}
+
 function getParentDir(normPath) {
   const parts = String(normPath || "").split("/").filter(Boolean);
   if (parts.length < 3) return null;
@@ -99,15 +235,61 @@ function getParentDir(normPath) {
   return prefix + parts.slice(0, -1).join("/");
 }
 
+async function fsScanRepos(targetRoot, depth2 = true) {
+  if (!targetRoot) return [];
+  const found = [];
+  if (await exists(join(targetRoot, ".git")).catch(() => false)) {
+    found.push(targetRoot);
+  }
+  const level1 = await readdir(targetRoot, { withFileTypes: true }).catch(() => []);
+  await Promise.all(
+    level1.map(async (e1) => {
+      if (!e1?.isDirectory?.() || !e1.name || DISCOVER_SKIP_DIRS.has(e1.name)) return;
+      const p1 = join(targetRoot, e1.name);
+      if (await exists(join(p1, ".git")).catch(() => false)) {
+        found.push(p1);
+        return;
+      }
+      if (!depth2) return;
+      const level2 = await readdir(p1, { withFileTypes: true }).catch(() => []);
+      await Promise.all(
+        level2.map(async (e2) => {
+          if (!e2?.isDirectory?.() || !e2.name || DISCOVER_SKIP_DIRS.has(e2.name)) return;
+          const p2 = join(p1, e2.name);
+          if (await exists(join(p2, ".git")).catch(() => false)) {
+            found.push(p2);
+          }
+        })
+      );
+    })
+  );
+  return found;
+}
+
+async function findLocalGitRoot(startDir, maxDepth = 6) {
+  let cur = normPathStr(startDir);
+  for (let i = 0; i < maxDepth && cur; i++) {
+    if (await exists(join(cur, ".git")).catch(() => false)) return cur;
+    const idx = cur.lastIndexOf("/");
+    if (idx <= 0) break;
+    const parent = cur.slice(0, idx);
+    if (!parent || parent === cur || /^[A-Za-z]:$/.test(parent)) break;
+    cur = parent;
+  }
+  return null;
+}
+
 async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = []) {
   if (!workspaceRoot) return [];
 
   let discovered = [];
-  const normWorkspace = workspaceRoot.replace(/\\/g, "/").replace(/\/+$/, "");
+  const normWorkspace = normPathStr(workspaceRoot);
 
   const scanRoot = async (targetRoot, depth2 = true) => {
     if (!targetRoot) return [];
-    if (!on && isWindows) {
+    if (!on) return fsScanRepos(targetRoot, depth2);
+
+    if (isWindows) {
       try {
         const escaped = targetRoot.replace(/'/g, "''");
         const depthFlag = depth2 ? "-Depth 2" : "-Depth 1";
@@ -141,12 +323,17 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
 
   discovered = await scanRoot(workspaceRoot, true);
 
-  let repoPaths = Array.from(new Set(discovered.map(p => p.replace(/\\/g, "/").replace(/\/+$/, ""))));
+  let repoPaths = Array.from(new Set(discovered.map(p => normPathStr(p)).filter(Boolean)));
 
   if (repoPaths.length === 0) {
-    const top = await exec("git", [...READ, "rev-parse", "--show-toplevel"], { cwd: workspaceRoot, on }).catch(() => null);
-    if (top && top.code === 0 && top.stdout.trim()) {
-      repoPaths = [top.stdout.trim().replace(/\\/g, "/").replace(/\/+$/, "")];
+    const localTop = !on ? await findLocalGitRoot(workspaceRoot) : null;
+    if (localTop) {
+      repoPaths = [localTop];
+    } else {
+      const top = await exec("git", [...READ, "rev-parse", "--show-toplevel"], { cwd: workspaceRoot, on }).catch(() => null);
+      if (top && top.code === 0 && top.stdout.trim()) {
+        repoPaths = [normPathStr(top.stdout.trim())];
+      }
     }
   }
 
@@ -159,7 +346,7 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
     if (parentDir) {
       const siblings = await scanRoot(parentDir, false);
       for (const s of siblings) {
-        const normS = s.replace(/\\/g, "/").replace(/\/+$/, "");
+        const normS = normPathStr(s);
         if (normS && !repoPaths.includes(normS)) repoPaths.push(normS);
       }
     }
@@ -168,11 +355,16 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
   // Also check any extra pane cwds in the active space that may point to other modified repos
   for (const extra of extraCwds || []) {
     if (!extra) continue;
-    const normExtra = String(extra).replace(/\\/g, "/").replace(/\/+$/, "");
+    const normExtra = normPathStr(extra);
     if (!normExtra || repoPaths.some(r => normExtra === r || normExtra.startsWith(r + "/"))) continue;
+    const localTop = !on ? await findLocalGitRoot(extra) : null;
+    if (localTop) {
+      if (!repoPaths.includes(localTop)) repoPaths.push(localTop);
+      continue;
+    }
     const top = await exec("git", [...READ, "rev-parse", "--show-toplevel"], { cwd: extra, on }).catch(() => null);
     if (top && top.code === 0 && top.stdout.trim()) {
-      const normTop = top.stdout.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+      const normTop = normPathStr(top.stdout.trim());
       if (normTop && !repoPaths.includes(normTop)) repoPaths.push(normTop);
     }
   }
@@ -219,33 +411,57 @@ function repoMatchesTranscript(service, files, transcript) {
   return false;
 }
 
-async function attributeSessionRepos(tabId, touchedResults, tabPaneCwds, tabTermAddrs) {
+async function attributeSessionRepos(tabId, touchedResults, tabPaneCwds, tabTermAddrs, transcriptCache = null) {
   if (!tabId || !Array.isArray(touchedResults) || touchedResults.length === 0) return [];
   const flows = shared("mesh.flows");
   const flowObj = flows && typeof flows === "object" ? flows[tabId] : null;
   const prevSessionRepos = new Set(
     Array.isArray(flowObj?.sessionRepos)
-      ? flowObj.sessionRepos.map((r) => String(r || "").replace(/\\/g, "/").replace(/\/+$/, ""))
+      ? flowObj.sessionRepos.map((r) => normPathStr(r))
       : []
   );
 
-  const reads = await Promise.all(
-    (tabTermAddrs || []).map((addr) =>
-      hc(["read", "--lines", "400", addr]).catch(() => "")
-    )
-  );
-  const transcript = reads.filter(Boolean).join("\n").replace(/\\/g, "/");
-  const normCwds = (tabPaneCwds || []).map((c) => String(c || "").replace(/\\/g, "/").replace(/\/+$/, "")).filter(Boolean);
+  const normCwds = (tabPaneCwds || []).map((c) => normPathStr(c)).filter(Boolean);
+  const needTranscript = [];
+  for (const res of touchedResults) {
+    const normRoot = normPathStr(res.service?.root);
+    if (!normRoot) continue;
+    const inPrev = prevSessionRepos.has(normRoot);
+    const inPaneCwd = normCwds.some((c) => c === normRoot || c.startsWith(normRoot + "/"));
+    if (!inPrev && !inPaneCwd) needTranscript.push(res);
+  }
+
+  let transcript = "";
+  if (needTranscript.length > 0 && (tabTermAddrs || []).length > 0) {
+    const now = Date.now();
+    const unattrSig = needTranscript.map((r) => r.service?.root || "").sort().join("|") + "::" + (tabTermAddrs || []).join(",");
+    const canReuse = transcriptCache && transcriptCache.sig === unattrSig && (now - transcriptCache.ts) < TRANSCRIPT_THROTTLE_MS;
+    if (canReuse) {
+      transcript = transcriptCache.text;
+    } else {
+      const reads = await Promise.all(
+        (tabTermAddrs || []).map((addr) =>
+          hc(["read", "--lines", "250", addr]).catch(() => "")
+        )
+      );
+      transcript = reads.filter(Boolean).join("\n").replace(/\\/g, "/");
+      if (transcriptCache) {
+        transcriptCache.sig = unattrSig;
+        transcriptCache.ts = now;
+        transcriptCache.text = transcript;
+      }
+    }
+  }
 
   const attributed = [];
   const nextSessionRepos = new Set(prevSessionRepos);
 
   for (const res of touchedResults) {
-    const normRoot = String(res.service?.root || "").replace(/\\/g, "/").replace(/\/+$/, "");
+    const normRoot = normPathStr(res.service?.root);
     if (!normRoot) continue;
     const inPrev = prevSessionRepos.has(normRoot);
     const inPaneCwd = normCwds.some((c) => c === normRoot || c.startsWith(normRoot + "/"));
-    const inTranscript = repoMatchesTranscript(res.service, res.files, transcript);
+    const inTranscript = !inPrev && !inPaneCwd && repoMatchesTranscript(res.service, res.files, transcript);
 
     if (inPrev || inPaneCwd || inTranscript) {
       attributed.push(res);
@@ -264,15 +480,15 @@ async function attributeSessionRepos(tabId, touchedResults, tabPaneCwds, tabTerm
 }
 
 async function repoAheadCount(root, branch, on) {
-  const up = await exec("git", [...READ, "rev-list", "--count", "@{u}..HEAD"], { cwd: root, on }).catch(() => null);
-  if (up && up.code === 0) {
-    const n = parseInt((up.stdout || "").trim(), 10);
-    if (!Number.isNaN(n) && n > 0) return n;
-    if (!Number.isNaN(n)) return 0;
-  }
-  const baseBranches = new Set(["main", "master", "development", "develop", "ci", "HEAD"]);
-  if (!branch || baseBranches.has(branch)) return 0;
+  if (!branch || BASE_BRANCHES.has(branch)) return 0;
+  const refs = await exec(
+    "git",
+    [...READ, "for-each-ref", "--format=%(refname:short)", "refs/heads/development", "refs/heads/main", "refs/heads/master", "refs/heads/ci"],
+    { cwd: root, on }
+  ).catch(() => null);
+  const avail = new Set((refs?.code === 0 ? refs.stdout : "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
   for (const base of ["development", "main", "master", "ci"]) {
+    if (!avail.has(base)) continue;
     const check = await exec("git", [...READ, "rev-list", "--count", `${base}..HEAD`], { cwd: root, on }).catch(() => null);
     if (check && check.code === 0) {
       const n = parseInt((check.stdout || "").trim(), 10);
@@ -280,13 +496,6 @@ async function repoAheadCount(root, branch, on) {
     }
   }
   return 0;
-}
-
-async function currentBranch(root, on) {
-  const r = await exec("git", [...READ, "branch", "--show-current"], { cwd: root, on }).catch(() => null);
-  if (r && r.code === 0 && r.stdout.trim()) return r.stdout.trim();
-  const h = await exec("git", [...READ, "rev-parse", "--abbrev-ref", "HEAD"], { cwd: root, on }).catch(() => null);
-  return (h && h.code === 0 && h.stdout.trim()) ? h.stdout.trim() : "HEAD";
 }
 
 async function listCommits(root, ref, on, service) {
@@ -439,15 +648,18 @@ function extractDocChecks(text, sourceName) {
   return found;
 }
 
+const WIN_CMD_SHIMS = new Set(["npm", "pnpm", "yarn", "npx", "bun", "ng", "mvnw", "gradlew"]);
+
 function tokenizeCheckCommand(rawCmd, isWindows) {
   const command = rawCmd.trim();
-  const needsShell = /['"&|;$*?()~]/.test(command);
+  const parts = command.split(/\s+/).filter(Boolean);
+  const head = (parts[0] || "").toLowerCase().replace(/\.(?:cmd|bat|exe)$/, "");
+  const needsShell = /['"&|;$*?()~]/.test(command) || (isWindows && WIN_CMD_SHIMS.has(head));
   if (needsShell) {
     return isWindows
-      ? { command, cmd: "powershell", args: ["-NoProfile", "-Command", command], useShell: true }
+      ? { command, cmd: "cmd", args: ["/c", command], useShell: true }
       : { command, cmd: "sh", args: ["-c", command], useShell: true };
   }
-  const parts = command.split(/\s+/).filter(Boolean);
   return {
     command,
     cmd: parts[0] || command,
@@ -574,7 +786,17 @@ export default class ChangesReview extends View {
     this.activeService = "all"; // "all" | service.id
     this.lastPublishedServicesSig = null;
     this.lastActiveServiceTs = 0;
-    this.watchedSig = null;
+    this.hostIsWindows = window()?.platform === "windows";
+    this.watchedRoots = new Map();
+    this.watchDebounceTask = null;
+    this.candidateCache = null;
+    this.lastTranscriptScan = { ts: 0, sig: "", text: "" };
+    this.lastConsumedBusTs = 0;
+    this.lastConsumedBusSig = "";
+    this.renderRefreshTask = null;
+    this.wasVisible = isChangesVisible();
+    this.hasLoadedOnce = false;
+    this.needsRefreshOnShow = false;
 
     // Repo standards & checks runner state
     this.checksOpen = false;
@@ -586,7 +808,6 @@ export default class ChangesReview extends View {
     this.checksScroll = ScrollHandle.new();
 
     this.viewMode = "working"; // "working" | "commit"
-    this.currentBranch = "main";
     this.commits = [];
     this.allCommits = [];
     this.serviceCommitsMap = new Map();
@@ -620,15 +841,32 @@ export default class ChangesReview extends View {
     this.commentInput.on("focus", (_e, cx) => { this.typingComment = true; cx.notify(); });
     this.commentInput.on("blur", (_e, cx) => { this.typingComment = false; cx.notify(); });
 
-    this.refresh(cx);
-    cx.timer.every(10000, (cx) => this.refresh(cx));
+    if (this.wasVisible) this.refresh(cx);
+    cx.timer.every(30000, (cx) => {
+      if (isChangesVisible()) this.refresh(cx);
+    });
   }
 
   close() {
+    this.renderRefreshTask?.cancel();
+    this.renderRefreshTask = null;
+    this.watchDebounceTask?.cancel();
+    this.watchDebounceTask = null;
+    this.stopAllWatchers();
     try { this.input?.release(); } catch {}
     try { this.commentInput?.release(); } catch {}
     try { this.serviceFilterScroll?.release(); } catch {}
     try { this.checksScroll?.release(); } catch {}
+  }
+
+  scheduleRenderRefresh(cx) {
+    if (this.renderRefreshTask || !cx?.timer) return;
+    this.renderRefreshTask = cx.timer.after(0, (cx) => {
+      this.renderRefreshTask = null;
+      if (isChangesVisible()) {
+        this.refresh(cx);
+      }
+    });
   }
 
   getComment(fileKey, line) {
@@ -672,7 +910,7 @@ export default class ChangesReview extends View {
     const flow = flows[activeTabId];
     const currentStatus = flow?.reviewedServices?.[serviceId]?.status;
     const svc = (this.services || []).find((s) => s.id === serviceId);
-    const branch = svc?.branch || svc?.currentBranch || "";
+    const branch = svc?.branch || "";
 
     if (hasNotes && currentStatus !== "has_notes") {
       updateTabFlow(
@@ -786,6 +1024,7 @@ export default class ChangesReview extends View {
         try {
           await this.load(targetKey, context);
         } catch {}
+        if (key() !== context) return;
         const cur = this.getComment(latest.fileKey || latest.file, latest.line) || latest;
         const file = (this.files || []).find((f) => f.key === targetKey) || (this.allWorkingFiles || []).find((f) => f.key === targetKey);
         this.openCommentEditor(file, cur.line, cur.snippet || "", cur.text);
@@ -949,16 +1188,6 @@ export default class ChangesReview extends View {
     return "pending";
   }
 
-  isReadyForTest(flow) {
-    const services = this.services || [];
-    if (services.length === 0 || this.reviews.length > 0) return false;
-    const dirty = services.filter((s) => (s.workingCount || 0) > 0);
-    if (dirty.length > 0) {
-      return dirty.every((s) => this.getServiceReviewStatus(s.id, flow) === "approved");
-    }
-    return services.some((s) => this.getServiceReviewStatus(s.id, flow) === "approved");
-  }
-
   toggleServiceApproval(service, currentStatus, cx) {
     if (!service) return;
     if (currentStatus === "has_notes") {
@@ -981,7 +1210,7 @@ export default class ChangesReview extends View {
     }
 
     const nextStatus = currentStatus === "approved" ? "pending" : "approved";
-    const branch = service.branch || service.currentBranch || "";
+    const branch = service.branch || "";
     const updatedFlow = updateTabFlow(
       activeTabId,
       (prev) => ({
@@ -1017,20 +1246,6 @@ export default class ChangesReview extends View {
       }
     }
 
-    cx.notify();
-  }
-
-  goToTest(cx) {
-    const { activeSpace, activeTabId } = getActiveSpaceAndTab();
-    if (activeTabId) {
-      updateTabFlow(
-        activeTabId,
-        { stage: "test" },
-        this.workspaceRoot || activeSpace?.folder || "",
-      );
-    }
-    run("layout.select", { stack: "panel-body", child: "test" });
-    run("layout.show", { id: "panel" });
     cx.notify();
   }
 
@@ -1186,6 +1401,7 @@ export default class ChangesReview extends View {
           }
         }
       } finally {
+        if (key() !== context) return;
         if (this.runningAllTarget === targetId) {
           this.runningAllTarget = null;
         }
@@ -1492,38 +1708,84 @@ export default class ChangesReview extends View {
         if (key() === context) this.note = `Commit failed:\n${e.message || e}`;
       } finally {
         this.busy = false;
-        this.refresh(cx);
+        this.candidateCache = null;
+        this.refresh(cx, { force: true });
         cx.notify();
       }
     });
     cx.notify();
   }
 
+  stopAllWatchers() {
+    if (this.watchedRoots) this.watchedRoots.clear();
+    if (this.watchDebounceTask) {
+      try { this.watchDebounceTask.cancel(); } catch {}
+      this.watchDebounceTask = null;
+    }
+  }
+
+  scheduleRefresh(cx, delayMs = WATCH_DEBOUNCE_MS) {
+    if (this.watchDebounceTask) {
+      try { this.watchDebounceTask.cancel(); } catch {}
+      this.watchDebounceTask = null;
+    }
+    const ctx = this.context;
+    this.watchDebounceTask = cx.timer.after(delayMs, (cx) => {
+      this.watchDebounceTask = null;
+      if (key() !== ctx) return;
+      if (!isChangesVisible()) {
+        this.needsRefreshOnShow = true;
+        return;
+      }
+      this.refresh(cx, { fromWatch: true });
+    });
+  }
+
   watch(services, cx) {
-    if (this.on || !services || services.length === 0) return;
-    const sig = services.map((s) => s.root).sort().join(";");
-    if (this.watchedSig === sig) return;
-    this.watchedSig = sig;
-    for (const service of services) {
-      const root = service.root;
+    if (this.on || !Array.isArray(services) || services.length === 0) {
+      this.stopAllWatchers();
+      return;
+    }
+    const desired = new Map();
+    for (const s of services) {
+      if (!s?.root) continue;
+      const norm = normPathStr(s.root);
+      if (norm && !desired.has(norm)) desired.set(norm, s.root);
+    }
+    for (const existingNorm of [...this.watchedRoots.keys()]) {
+      if (!desired.has(existingNorm)) this.watchedRoots.delete(existingNorm);
+    }
+    for (const [normRoot, rawRoot] of desired.entries()) {
+      if (this.watchedRoots.has(normRoot)) continue;
+      const token = Symbol(normRoot);
+      this.watchedRoots.set(normRoot, token);
+      const ctx = this.context;
       cx.spawn(async (cx) => {
-        try {
-          while (this.watchedSig === sig) {
-            await watchFolder(root);
-            if (this.watchedSig === sig) this.refresh(cx);
+        while (this.watchedRoots.get(normRoot) === token && this.context === ctx) {
+          try {
+            const changed = await watchFolder(rawRoot);
+            if (this.watchedRoots.get(normRoot) !== token || this.context !== ctx) break;
+            if (!hasRelevantWatchChange(changed, rawRoot)) continue;
+            if (!isChangesVisible()) {
+              this.needsRefreshOnShow = true;
+              continue;
+            }
+            this.scheduleRefresh(cx, WATCH_DEBOUNCE_MS);
+          } catch {
+            if (this.watchedRoots.get(normRoot) !== token || this.context !== ctx) break;
+            await cx.sleep(3000);
           }
-        } catch {
-          this.watchedSig = null;
         }
       });
     }
   }
 
-  refresh(cx) {
+  refresh(cx, opts = {}) {
     if (this.loading || this.busy) return;
     const loc = location(), context = key();
     const workspaceRoot = loc.cwd;
     const on = loc.on;
+    const force = Boolean(opts?.force);
 
     if (context !== this.context) {
       this.context = context;
@@ -1541,7 +1803,13 @@ export default class ChangesReview extends View {
       this.input.set_value("");
       this.error = null;
       this.note = null;
-      this.watchedSig = null;
+      this.stopAllWatchers();
+      this.candidateCache = null;
+      this.lastTranscriptScan = { ts: 0, sig: "", text: "" };
+      this.lastConsumedBusTs = 0;
+      this.lastConsumedBusSig = "";
+      this.hasLoadedOnce = false;
+      this.needsRefreshOnShow = false;
       this.closed = false;
       this.limited = false;
       this.expandedFiles.clear();
@@ -1556,18 +1824,75 @@ export default class ChangesReview extends View {
       this.sendingCheckFailures = false;
     }
 
-    this.isWindows = !on && window()?.platform === "windows";
+    this.isWindows = !on && this.hostIsWindows;
 
     if (!workspaceRoot) {
       this.error = "No folder";
       return;
     }
 
-    this.loading = true;
-    const isWindows = this.isWindows;
+    this.hasLoadedOnce = true;
     const activeSpace = spaces().find((s) => s.active);
     const activeTab = (activeSpace?.tabs || []).find((t) => t.active) || null;
     const activeTabId = activeTab?.id || null;
+    const normWs = normPathStr(workspaceRoot);
+    const bus = !force ? shared("mesh.services") : null;
+    if (typeof bus?.ts === "number") {
+      this.lastConsumedBusTs = bus.ts;
+      this.lastConsumedBusSig = bus.sig || String(bus.ts);
+    } else if (bus?.sig) {
+      this.lastConsumedBusSig = bus.sig;
+    }
+
+    const busFresh = Boolean(
+      bus &&
+      typeof bus.ts === "number" &&
+      (Date.now() - bus.ts) < BUS_MAX_AGE_MS &&
+      normPathStr(bus.workspaceRoot) === normWs &&
+      (bus.tabId || null) === (activeTabId || null) &&
+      (bus.on || null) === (on || null) &&
+      Array.isArray(bus.services)
+    );
+
+    if (busFresh && Array.isArray(bus.candidates) && bus.candidates.length === 0) {
+      this.workspaceRoot = workspaceRoot;
+      this.services = [];
+      this.root = workspaceRoot;
+      this.allWorkingFiles = [];
+      this.workingFiles = [];
+      this.workingFilesCount = 0;
+      this.allCommits = [];
+      this.serviceCommitsMap.clear();
+      this.files = [];
+      this.open = null;
+      this.setLines([]);
+      this.stopAllWatchers();
+      this.error = "Not a git repository";
+      cx.notify();
+      return;
+    }
+
+    if (busFresh && Array.isArray(bus.candidates) && bus.candidates.length > 0 && bus.services.length === 0) {
+      this.workspaceRoot = workspaceRoot;
+      this.services = [];
+      this.root = workspaceRoot;
+      this.allWorkingFiles = [];
+      this.workingFiles = [];
+      this.workingFilesCount = 0;
+      this.allCommits = [];
+      this.serviceCommitsMap.clear();
+      this.files = [];
+      this.open = null;
+      this.setLines([]);
+      this.stopAllWatchers();
+      this.error = null;
+      this.applyServiceFilter();
+      cx.notify();
+      return;
+    }
+
+    this.loading = true;
+    const isWindows = this.isWindows;
     const activeTabIds = new Set((activeSpace?.tabs || []).map((t) => t.id));
     const allPanesList = panes() || [];
     const extraCwds = Array.from(
@@ -1590,61 +1915,115 @@ export default class ChangesReview extends View {
           ])
         )
       : [];
+
     cx.spawn(async (cx) => {
       try {
-        const candidateServices = await discoverRepos(workspaceRoot, on, isWindows, extraCwds);
-        if (key() !== context) return;
+        let candidateServices;
+        const usingBusServices = Boolean(busFresh && Array.isArray(bus?.services) && bus.services.length > 0);
+        if (usingBusServices) {
+          candidateServices = bus.services.map((s) => ({ ...s }));
+        } else {
+          const cacheKey = `${workspaceRoot}|${on || ""}|${extraCwds.slice().sort().join(",")}`;
+          const now = Date.now();
+          if (!force && this.candidateCache && this.candidateCache.key === cacheKey && (now - this.candidateCache.ts) < REPO_CACHE_TTL_MS) {
+            candidateServices = this.candidateCache.services.map((s) => ({ ...s }));
+          } else {
+            candidateServices = await discoverRepos(workspaceRoot, on, isWindows, extraCwds);
+            if (key() !== context) return;
+            this.candidateCache = { key: cacheKey, services: candidateServices.map((s) => ({ ...s })), ts: Date.now() };
+          }
+        }
+
         if (!candidateServices || candidateServices.length === 0) {
           this.services = [];
           this.allWorkingFiles = [];
           this.files = [];
           this.setLines([]);
           this.open = null;
+          this.stopAllWatchers();
           this.error = "Not a git repository";
           return;
         }
 
-        // Query all candidate services in parallel to keep only touched/modified repositories
+        // Query target services in parallel with single git status -b call per repo
         const serviceResults = await Promise.all(
           candidateServices.map(async (service) => {
             try {
-              const branch = await currentBranch(service.root, on);
               const git = (args) => exec("git", [...READ, ...args], { cwd: service.root, on });
-              const status = await git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]);
+              const status = await git(["status", "--porcelain=v1", "-b", "-z", "--no-renames", "--untracked-files=normal"]);
               if (status.code !== 0) throw new Error(status.stderr || `status failed on ${service.name}`);
 
-              const entries = status.stdout.split("\0").filter(Boolean);
-              const aheadCount = entries.length === 0 ? await repoAheadCount(service.root, branch, on) : 0;
-              if (entries.length === 0 && aheadCount === 0) {
+              const records = status.stdout.split("\0").filter(Boolean);
+              let branch = service.branch || "HEAD";
+              let parsedAhead = null;
+              const rawEntries = [];
+              for (const rec of records) {
+                if (rec.startsWith("## ")) {
+                  const parsed = parsePorcelainHeader(rec);
+                  branch = parsed.branch || branch;
+                  parsedAhead = parsed.ahead;
+                } else {
+                  rawEntries.push(rec);
+                }
+              }
+
+              const aheadCount = parsedAhead !== null
+                ? parsedAhead
+                : await repoAheadCount(service.root, branch, on);
+
+              if (rawEntries.length === 0 && aheadCount === 0) {
                 service.workingCount = 0;
                 service.aheadCount = 0;
                 service.branch = branch;
-                service.currentBranch = branch;
-                return { service, files: [], commits: [], branch, touched: false };
+                return { service, files: [], commits: [], branch, rawCount: 0, touched: false };
+              }
+
+              // Expand untracked directory entries (?? dir/) cleanly for individual file review
+              const dirEntries = [];
+              const fileEntries = [];
+              for (const entry of rawEntries) {
+                const xy = entry.slice(0, 2);
+                const p = entry.slice(3);
+                if (!p) continue;
+                if (xy === "??" && p.endsWith("/")) {
+                  dirEntries.push(p.replace(/\/+$/, ""));
+                } else {
+                  fileEntries.push({ xy, path: p.replace(/\/+$/, "") });
+                }
+              }
+              if (dirEntries.length > 0) {
+                const ls = await git(["ls-files", "--others", "--exclude-standard", "-z", "--", ...dirEntries]).catch(() => null);
+                if (ls?.code === 0 && ls.stdout) {
+                  for (const expandedPath of ls.stdout.split("\0").filter(Boolean)) {
+                    fileEntries.push({ xy: "??", path: expandedPath });
+                  }
+                }
               }
 
               const commits = await listCommits(service.root, branch, on, service);
-              const head = await git(["rev-parse", "--verify", "HEAD"]);
-              const serviceHasHead = head.code === 0;
-
+              let serviceHasHead = true;
               const stats = {};
-              const results = serviceHasHead
-                ? [await git(["diff", "HEAD", "--numstat", "-z", "--no-renames"])]
-                : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]), await git(["diff", "--numstat", "-z", "--no-renames"])];
+              if (fileEntries.length > 0) {
+                const head = await git(["rev-parse", "--verify", "HEAD"]);
+                serviceHasHead = head.code === 0;
+                const results = serviceHasHead
+                  ? [await git(["diff", "HEAD", "--numstat", "-z", "--no-renames"])]
+                  : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]), await git(["diff", "--numstat", "-z", "--no-renames"])];
 
-              for (const result of results) {
-                if (result.code !== 0) throw new Error(result.stderr || `diff failed on ${service.name}`);
-                for (const entry of result.stdout.split("\0")) {
-                  const [a, d, ...parts] = entry.split("\t");
-                  if (!parts.length) continue;
-                  const p = parts.join("\t"), old = stats[p] ?? { add: 0, del: 0 };
-                  stats[p] = { add: old.add + (Number(a) || 0), del: old.del + (Number(d) || 0), binary: a === "-" };
+                for (const result of results) {
+                  if (result.code !== 0) throw new Error(result.stderr || `diff failed on ${service.name}`);
+                  for (const entry of result.stdout.split("\0")) {
+                    const [a, d, ...parts] = entry.split("\t");
+                    if (!parts.length) continue;
+                    const p = parts.join("\t"), old = stats[p] ?? { add: 0, del: 0 };
+                    stats[p] = { add: old.add + (Number(a) || 0), del: old.del + (Number(d) || 0), binary: a === "-" };
+                  }
                 }
               }
 
               const files = [];
-              for (const entry of entries) {
-                const xy = entry.slice(0, 2), path = entry.slice(3), fresh = xy === "??";
+              for (const { xy, path } of fileEntries) {
+                const fresh = xy === "??";
                 const conflict = xy.includes("U") || xy === "AA" || xy === "DD";
                 const s = conflict ? "U" : xy.includes("D") ? "D" : fresh || xy.includes("A") ? "A" : "M";
                 const stat = stats[path] ?? { add: 0, del: 0 };
@@ -1663,17 +2042,15 @@ export default class ChangesReview extends View {
                 });
               }
 
-              service.workingCount = files.length;
+              service.workingCount = rawEntries.length;
               service.aheadCount = aheadCount;
               service.branch = branch;
-              service.currentBranch = branch;
-              return { service, files, commits, branch, touched: true };
+              return { service, files, commits, branch, rawCount: rawEntries.length, touched: true };
             } catch (e) {
               service.workingCount = 0;
               service.aheadCount = 0;
               service.branch = service.branch || "HEAD";
-              service.currentBranch = service.branch;
-              return { service, files: [], commits: [], branch: service.branch, touched: false, error: e };
+              return { service, files: [], commits: [], branch: service.branch, rawCount: 0, touched: false, error: e };
             }
           })
         );
@@ -1681,8 +2058,8 @@ export default class ChangesReview extends View {
         if (key() !== context) return;
 
         const rawTouched = serviceResults.filter((r) => r.touched);
-        const touchedResults = activeTabId
-          ? await attributeSessionRepos(activeTabId, rawTouched, tabPaneCwds, tabTermAddrs)
+        const touchedResults = (activeTabId && !usingBusServices)
+          ? await attributeSessionRepos(activeTabId, rawTouched, tabPaneCwds, tabTermAddrs, this.lastTranscriptScan)
           : rawTouched;
         if (key() !== context) return;
         const services = touchedResults.map((r) => r.service);
@@ -1694,8 +2071,7 @@ export default class ChangesReview extends View {
         // Check external mesh.activeService
         const prevActiveService = this.activeService;
         const sharedActive = shared("mesh.activeService");
-        const normWs = (s) => String(s || "").replace(/\\/g, "/").replace(/\/+$/, "");
-        if (sharedActive && normWs(sharedActive.workspaceRoot) === normWs(workspaceRoot) && typeof sharedActive.ts === "number") {
+        if (sharedActive && normPathStr(sharedActive.workspaceRoot) === normWs && typeof sharedActive.ts === "number") {
           if (!this.lastActiveServiceTs || sharedActive.ts > this.lastActiveServiceTs) {
             this.lastActiveServiceTs = sharedActive.ts;
             if (sharedActive.serviceId && (sharedActive.serviceId === "all" || services.some((s) => s.id === sharedActive.serviceId))) {
@@ -1707,9 +2083,24 @@ export default class ChangesReview extends View {
           this.activeService = "all";
         }
 
-        const servicesSig = (activeTabId || "") + "::" + workspaceRoot + "::" + services.map((s) => `${s.root}@${s.branch || ""}:${s.workingCount || 0}:${s.aheadCount || 0}`).join(",");
-        if (servicesSig !== this.lastPublishedServicesSig) {
+        const existingBus = shared("mesh.services");
+        const nextCandidates = existingBus?.candidates || candidateServices.map((s) => ({
+          id: s.id,
+          name: s.name,
+          relPath: s.relPath || "",
+          root: s.root,
+          isSibling: Boolean(s.isSibling),
+          branch: s.branch || "",
+        }));
+        const servicesSig = (activeTabId || "") + "::" + normWs + "::" + nextCandidates.length + "::" + services.map((s) => `${normPathStr(s.root)}@${s.branch || ""}:${s.workingCount || 0}:${s.aheadCount || 0}`).join(",");
+        const existingBusSig = existingBus && normPathStr(existingBus.workspaceRoot) === normWs && (existingBus.tabId || null) === (activeTabId || null)
+          ? (existingBus.sig || ((activeTabId || "") + "::" + normWs + "::" + (existingBus.candidates?.length ?? -1) + "::" + (existingBus.services || []).map((s) => `${normPathStr(s.root)}@${s.branch || ""}:${s.workingCount || 0}:${s.aheadCount || 0}`).join(",")))
+          : null;
+        if ((!usingBusServices || force || servicesSig !== existingBusSig) && servicesSig !== this.lastPublishedServicesSig) {
           this.lastPublishedServicesSig = servicesSig;
+          const pubTs = Date.now();
+          this.lastConsumedBusTs = pubTs;
+          this.lastConsumedBusSig = servicesSig;
           setShared("mesh.services", {
             tabId: activeTabId || null,
             workspaceRoot,
@@ -1724,8 +2115,13 @@ export default class ChangesReview extends View {
               workingCount: s.workingCount || 0,
               aheadCount: s.aheadCount || 0,
             })),
-            ts: Date.now(),
+            candidates: nextCandidates,
+            sig: servicesSig,
+            ts: pubTs,
           });
+        } else {
+          this.lastPublishedServicesSig = servicesSig;
+          if (existingBusSig) this.lastConsumedBusSig = existingBusSig;
         }
 
         const allFiles = [];
@@ -1743,8 +2139,6 @@ export default class ChangesReview extends View {
         this.allWorkingFiles = allFiles;
         this.workingFiles = allFiles;
         this.workingFilesCount = allFiles.length;
-
-        this.currentBranch = services[0]?.branch || services[0]?.currentBranch || "main";
 
         this.watch(services, cx);
         this.applyServiceFilter();
@@ -2118,7 +2512,7 @@ export default class ChangesReview extends View {
               const entry = this.checksByService.get(svc.id);
               const docs = entry?.standardsDocs || [];
               const checks = entry?.checks || [];
-              const branchLabel = svc.branch || svc.currentBranch || "";
+              const branchLabel = svc.branch || "";
               const svcRunning = this.runningAllTarget === svc.id || this.runningAllTarget === "__all__";
 
               return v_flex()
@@ -2346,7 +2740,20 @@ export default class ChangesReview extends View {
   }
 
   render(cx) {
-    if (key() !== this.context) this.refresh(cx);
+    const visible = isChangesVisible();
+    const bus = shared("mesh.services");
+    const busTs = typeof bus?.ts === "number" ? bus.ts : 0;
+    const busSig = bus?.sig || (busTs > 0 ? String(busTs) : "");
+    const busChanged = Boolean(busSig && busSig !== this.lastConsumedBusSig);
+    if (busTs > 0) this.lastConsumedBusTs = busTs;
+    const becameVisible = visible && !this.wasVisible;
+    this.wasVisible = visible;
+    if (visible && (key() !== this.context || becameVisible || this.needsRefreshOnShow || !this.hasLoadedOnce || busChanged)) {
+      this.needsRefreshOnShow = false;
+      this.scheduleRenderRefresh(cx);
+    } else if (!visible && busChanged) {
+      this.needsRefreshOnShow = true;
+    }
     const t = theme();
     const addCount = this.files.reduce((n, f) => n + f.add, 0);
     const delCount = this.files.reduce((n, f) => n + f.del, 0);
@@ -2363,7 +2770,6 @@ export default class ChangesReview extends View {
     const focusedService = this.activeService !== "all"
       ? (this.services.find((s) => s.id === this.activeService) || null)
       : (this.services.length === 1 ? this.services[0] : null);
-    const readyForTest = this.isReadyForTest(flow);
 
     const checkTargetServices = this.getCheckTargetServices();
     const failedChecks = this.getFailedChecksForTargets();
@@ -2553,7 +2959,7 @@ export default class ChangesReview extends View {
                 const svcStatus = this.getServiceReviewStatus(s.id, flow);
                 const glyph = svcStatus === "approved" ? "✓" : svcStatus === "has_notes" ? "✎" : "○";
                 const glyphColor = svcStatus === "approved" ? passColor : svcStatus === "has_notes" ? noteColor : t.dim;
-                const branchLabel = s.branch || s.currentBranch || "";
+                const branchLabel = s.branch || "";
                 return h_flex().id(`service-pill-${s.id}`).h(22).flex_none().px(7).gap(5).items_center().rounded(4).cursor_pointer()
                   .when(isCur, (p) => p.bg(t.background).border_1().border_color(t.border).text_color(t.foreground).font_medium(), (p) => p.bg(t.raised).text_color(t.muted).hover((h) => h.bg(t.hover).text_color(t.foreground)))
                   .on_click((_e, cx) => this.selectService(s.id, cx))
@@ -2574,7 +2980,7 @@ export default class ChangesReview extends View {
       .when(Boolean(focusedService), (el) => {
         const svc = focusedService;
         const svcStatus = this.getServiceReviewStatus(svc.id, flow);
-        const branchLabel = svc.branch || svc.currentBranch || "HEAD";
+        const branchLabel = svc.branch || "HEAD";
         const statusText = svcStatus === "approved" ? "Approved ✓" : svcStatus === "has_notes" ? "Has notes" : "Pending";
         const statusColor = svcStatus === "approved" ? passColor : svcStatus === "has_notes" ? noteColor : t.muted;
         const isApproved = svcStatus === "approved";
@@ -2665,70 +3071,10 @@ export default class ChangesReview extends View {
                     )
                     .on_click((_e, cx) => this.toggleServiceApproval(svc, svcStatus, cx))
                     .child(isApproved ? "Unapprove" : "Approve Service ✓"),
-                )
-                .when(readyForTest, (b) =>
-                  b.child(
-                    h_flex()
-                      .id("go-to-test-btn")
-                      .h(22)
-                      .px(9)
-                      .flex_none()
-                      .items_center()
-                      .rounded(5)
-                      .bg(t.accent)
-                      .text_color(t.accent_foreground || t.solid_foreground)
-                      .text_size(10.5)
-                      .font_semibold()
-                      .cursor_pointer()
-                      .on_click((_e, cx) => this.goToTest(cx))
-                      .child("→ Go to Test"),
-                  ),
                 ),
             ),
         );
       })
-
-      // Ready-for-test bar when All is selected and every dirty service is approved
-      .when(!focusedService && readyForTest, (el) =>
-        el.child(
-          h_flex()
-            .id("ready-for-test-bar")
-            .h(32)
-            .flex_none()
-            .px(10)
-            .gap(8)
-            .items_center()
-            .justify_between()
-            .border_b(1)
-            .border_color(t.border)
-            .bg(hexWithAlpha(passColor, "14"))
-            .child(
-              div()
-                .min_w(0)
-                .truncate()
-                .text_size(11)
-                .font_medium()
-                .text_color(passColor)
-                .child("All dirty services approved ✓"),
-            )
-            .child(
-              h_flex()
-                .id("go-to-test-btn")
-                .h(22)
-                .px(9)
-                .flex_none()
-                .items_center()
-                .rounded(5)
-                .bg(t.accent)
-                .text_color(t.accent_foreground || t.solid_foreground)
-                .text_size(10.5)
-                .font_semibold()
-                .cursor_pointer()
-                .on_click((_e, cx) => this.goToTest(cx))
-                .child("→ Go to Test"),
-            ),
-        ),
-      )
 
       // Collapsible Repo Checks Drawer
       .when(this.checksOpen, (el) =>

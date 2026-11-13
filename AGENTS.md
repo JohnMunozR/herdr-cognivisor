@@ -77,7 +77,7 @@ All code in this repository runs inside Herdr's native GPUI shell (`gpui-shell 0
 3. **Shared State Bus Key Isolation:**
    - All shared state bus operations via `shared(key)` and `setShared(key, value)` MUST follow prefix namespacing:
      - Mod-private keys: `<mod-name>.*` (e.g., `files-search.select`, `changes-review.active_file`).
-     - Mesh-wide cross-service keys: `mesh.*` (`mesh.services`, `mesh.activeService`, `mesh.flows`, `mesh.pipelineConfig`, `mesh.spacePanels`, `mesh.testAlert`).
+     - Mesh-wide cross-service keys: `mesh.*` (`mesh.services`, `mesh.activeService`, `mesh.flows`, `mesh.spacePanels`).
    - Unprefixed global keys are strictly forbidden.
 4. **Layout Immutability & Ownership:**
    - Herdr's default shipped layouts (`main.json`, `terminals.json`, `win98.json`) are immutable and restored on startup.
@@ -94,7 +94,7 @@ Before delivering any change, execute the following verification steps:
    ```bash
    for d in mods/*/; do herdr-app check "$d" || exit 1; done
    ```
-   All 7 mod checks must pass (exit code 0), verifying that view definitions, eager elements, and manifests materialize without errors.
+   All mod checks (including the 4 active layout mods `files-search`, `changes-review`, `mesh-tabs`, `mesh-status`) must pass (exit code 0), verifying that view definitions, eager elements, and manifests materialize without errors.
 2. **Syntax Validation:**
    ```bash
    for f in mods/*/main.js; do node --check "$f" || exit 1; done

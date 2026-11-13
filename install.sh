@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# herdr-mesh: installer for the Herdr Agent IDE Lifecycle mesh layout package
-# Integrates the 6-stage Agent IDE Lifecycle layout and all 7 mods.
+# herdr-mesh: installer for the Herdr Multi-Repo Agent IDE mesh layout package
+# Integrates the mesh layout and 4 active mods (files-search, changes-review, mesh-tabs, mesh-status).
 #
 # Usage:
 #   ./install.sh [--home DIR] [--app-bin PATH]
@@ -9,12 +9,13 @@
 # Options:
 #   --home DIR        Herdr configuration directory (default: $HERDR_APP_HOME or ~/.config/herdr-app)
 #   --app-bin PATH    Path to herdr-app executable
-#   --uninstall       Revert to standard layout, remove mesh layout, shortcuts, and all 7 mods
+#   --uninstall       Revert to standard layout, remove mesh layout, shortcuts, and all mods
 #   -h, --help        Show this help message
 
 set -euo pipefail
 
-MODS=(files-search changes-review mesh-tabs mesh-test mesh-ship mesh-status)
+MODS=(files-search changes-review mesh-tabs mesh-status)
+LEGACY_MODS=(mesh-flow mesh-test mesh-ship)
 
 here="$(cd "$(dirname "$0")" && pwd)"
 pkg_root="$here"
@@ -104,8 +105,8 @@ except Exception:
 '
   fi
 
-  # 4. Remove all mod directories (including legacy mesh-flow if present)
-  for mod in "${MODS[@]}" mesh-flow; do
+  # 4. Remove all mod directories (including legacy mesh-flow, mesh-test, and mesh-ship if present)
+  for mod in "${MODS[@]}" "${LEGACY_MODS[@]}"; do
     target_mod="$target_mods/$mod"
     if [ -d "$target_mod" ]; then
       rm -rf "$target_mod"
@@ -118,7 +119,7 @@ except Exception:
 fi
 
 # Mode: install
-say "Installing Herdr Mesh layout and 7 mods into: $home"
+say "Installing Herdr Mesh layout and ${#MODS[@]} mods into: $home"
 
 tmp_dir=""
 cleanup() {
@@ -181,9 +182,12 @@ copy_mod_clean() {
 }
 
 mkdir -p "$target_mods"
-if [ -d "$target_mods/mesh-flow" ]; then
-  rm -rf "$target_mods/mesh-flow"
-fi
+for legacy_mod in "${LEGACY_MODS[@]}"; do
+  if [ -d "$target_mods/$legacy_mod" ]; then
+    rm -rf "$target_mods/$legacy_mod"
+    say "Removed obsolete $legacy_mod mod"
+  fi
+done
 for mod in "${MODS[@]}"; do
   say "Installing $mod mod..."
   copy_mod_clean "$pkg_root/mods/$mod" "$target_mods/$mod"
@@ -248,4 +252,4 @@ if [ -n "$HERDR_BIN" ]; then
   "$HERDR_BIN" do layout.show --id panel 2>/dev/null || true
 fi
 
-say "✓ Herdr Mesh layout and 7 mods installed successfully!"
+say "✓ Herdr Mesh layout and ${#MODS[@]} mods installed successfully!"

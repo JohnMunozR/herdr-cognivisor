@@ -160,20 +160,6 @@
                       "content": {
                         "mod": "changes-review"
                       }
-                    },
-                    {
-                      "id": "test",
-                      "type": "block",
-                      "content": {
-                        "mod": "mesh-test"
-                      }
-                    },
-                    {
-                      "id": "ship",
-                      "type": "block",
-                      "content": {
-                        "mod": "mesh-ship"
-                      }
                     }
                   ]
                 }

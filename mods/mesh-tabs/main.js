@@ -14,20 +14,9 @@ const READ_GIT = [
 const PANEL_DEFS = [
   { id: "files", label: "Files", icon: "mods/mesh-tabs/icons/files.svg" },
   { id: "changes", label: "Review", icon: "mods/mesh-tabs/icons/changes.svg" },
-  { id: "test", label: "Test", icon: "mods/mesh-tabs/icons/test.svg" },
-  { id: "ship", label: "Ship", icon: "mods/mesh-tabs/icons/ship.svg" },
 ];
 
-const STAGE_BADGES = {
-  plan: "Plan",
-  build: "Build",
-  review: "Rev",
-  test: "Test",
-  pr_dev: "PR",
-  promote: "CI",
-};
-
-const PROBE_COOLDOWN_MS = 3000;
+const PROBE_COOLDOWN_MS = 8000;
 const JIRA_KEY_RE = /\b([A-Z][A-Z0-9]{1,9}-\d+)\b/;
 const NON_TICKET_RE = /^(UTF|ISO|SHA|MD|TLS|SSL)-\d+$/i;
 const DEFAULT_BRANCHES = new Set(["main", "master", "dev", "development", "develop", "ci", "staging", "production", "head"]);
@@ -216,6 +205,10 @@ export default class MeshTabs extends View {
     this.probeCache = new Map();
     this.editingTabId = null;
     this.editingStartedAt = 0;
+    this.knownTabIds = new Set();
+    this.focusRenameTask = null;
+    this.pendingPanelSyncTask = null;
+    this.pendingTabScanTask = null;
 
     this.renameInput = InputState.new({ placeholder: "Tab name" });
     this.renameInput.on("submit", (_e, cx) => this.commitRename(cx));
@@ -226,11 +219,18 @@ export default class MeshTabs extends View {
     });
 
     this.scanUnnamedTabs(cx);
-    cx.timer.every(3500, (cx) => this.scanUnnamedTabs(cx));
+    cx.timer.every(5000, (cx) => this.scanUnnamedTabs(cx));
   }
 
   close() {
-    this.renameInput?.release();
+    try { this.focusRenameTask?.cancel(); } catch {}
+    try { this.pendingPanelSyncTask?.cancel(); } catch {}
+    try { this.pendingTabScanTask?.cancel(); } catch {}
+    this.focusRenameTask = null;
+    this.pendingPanelSyncTask = null;
+    this.pendingTabScanTask = null;
+    try { this.renameInput?.release(); } catch {}
+    try { this.scroll?.release(); } catch {}
   }
 
   startRename(tab, currentName, cx) {
@@ -243,9 +243,11 @@ export default class MeshTabs extends View {
     }
     this.renameInput.focus();
     cx.notify();
-    cx.timer.after(20, () => {
+    try { this.focusRenameTask?.cancel(); } catch {}
+    this.focusRenameTask = cx.timer.after(20, () => {
+      this.focusRenameTask = null;
       if (this.editingTabId === tab.id) {
-        this.renameInput.focus();
+        this.renameInput?.focus();
       }
     });
   }
@@ -312,8 +314,8 @@ export default class MeshTabs extends View {
   }
 
   // Persist per-space panel choices in shared("mesh.spacePanels") without leaving stale transitions.
-  syncPanel(space, panel, body, enabled) {
-    if (!space || !panel) return;
+  syncPanel(space, panel, body, enabled, cx) {
+    if (!space || !panel || !cx) return;
     const panels = asPlainObject(shared("mesh.spacePanels"));
     const now = panel.hidden ? null : body?.active ?? null;
     if (space.id !== this.space) {
@@ -326,12 +328,16 @@ export default class MeshTabs extends View {
         const want = enabled.includes(stored) ? stored : null;
         if (want !== now) {
           this.pending = { want, until: Date.now() + 1000 };
-          if (want) {
-            run("layout.select", { stack: "panel-body", child: want });
-            run("layout.show", { id: "panel" });
-          } else {
-            run("layout.hide", { id: "panel" });
-          }
+          try { this.pendingPanelSyncTask?.cancel(); } catch {}
+          this.pendingPanelSyncTask = cx.timer.after(0, () => {
+            this.pendingPanelSyncTask = null;
+            if (want) {
+              run("layout.select", { stack: "panel-body", child: want });
+              run("layout.show", { id: "panel" });
+            } else {
+              run("layout.hide", { id: "panel" });
+            }
+          });
           return;
         }
       }
@@ -342,7 +348,14 @@ export default class MeshTabs extends View {
       this.pending = null;
     }
     if (Object.prototype.hasOwnProperty.call(panels, space.id) && panels[space.id] === now) return;
-    setShared("mesh.spacePanels", { ...panels, [space.id]: now });
+    const spaceId = space.id;
+    try { this.pendingPanelSyncTask?.cancel(); } catch {}
+    this.pendingPanelSyncTask = cx.timer.after(0, () => {
+      this.pendingPanelSyncTask = null;
+      const latestPanels = asPlainObject(shared("mesh.spacePanels"));
+      if (Object.prototype.hasOwnProperty.call(latestPanels, spaceId) && latestPanels[spaceId] === now) return;
+      setShared("mesh.spacePanels", { ...latestPanels, [spaceId]: now });
+    });
   }
 
   scanUnnamedTabs(cx) {
@@ -491,7 +504,6 @@ export default class MeshTabs extends View {
       if (active >= 0) this.scroll.scroll_to_item(active);
     }
 
-    const flows = asPlainObject(shared("mesh.flows"));
     const allPanes = panes();
     const stop = (_e, cx) => cx.stop_propagation();
     const button = (id, label, action) =>
@@ -651,8 +663,21 @@ export default class MeshTabs extends View {
     const panel = findNode(root, "panel");
     const body = findNode(root, "panel-body");
     const enabled = PANEL_DEFS.map((d) => d.id);
-    this.syncPanel(space, panel, body, enabled);
-    this.scanUnnamedTabs(cx);
+    this.syncPanel(space, panel, body, enabled, cx);
+
+    let hasNewUnseenTab = false;
+    for (const tab of shown) {
+      if (tab?.id && !this.knownTabIds.has(tab.id)) {
+        this.knownTabIds.add(tab.id);
+        hasNewUnseenTab = true;
+      }
+    }
+    if (hasNewUnseenTab && !this.pendingTabScanTask) {
+      this.pendingTabScanTask = cx.timer.after(0, (cx) => {
+        this.pendingTabScanTask = null;
+        this.scanUnnamedTabs(cx);
+      });
+    }
 
     const panelButton = (id, label, icon) => {
       const on = panel && !panel.hidden && body?.active === id;
