@@ -52,6 +52,12 @@ import {
   buildTopFileItems,
   buildEmptyOverlayItems,
 } from "./search-logic.js";
+import {
+  MAX_CASCADE_DEPTH,
+  matchesServiceFilter,
+  collectSubtreePaths,
+  runFolderCascade,
+} from "./tree-logic.js";
 
 function location() {
   const space = spaces().find(s => s.active), f = focused();
@@ -667,6 +673,9 @@ export default class FilesSearch extends View {
     this.entries = new Map();
     this.folders = new Set();
     this.pending = new Set();
+    this.pendingTokens = new Map();
+    this.folderTokens = new Map();
+    this.pendingSeq = 0;
     this.marks = {};
     this.dirCounts = {};
     this.dirMarks = {};
@@ -741,15 +750,7 @@ export default class FilesSearch extends View {
               for (const p of parts) {
                 accum = accum ? `${accum}/${p}` : p;
                 this.folders.add(accum);
-                if (!this.entries.has(accum) && !this.pending.has(accum)) {
-                  const context = this.context;
-                  this.pending.add(accum);
-                  cx.spawn(async cx => {
-                    try { await this.loadFolder(accum, context); }
-                    catch {}
-                    finally { if (this.context === context) this.pending.delete(accum); cx.notify(); }
-                  });
-                }
+                this.loadSingleFolderPending(accum, cx);
               }
             }
           }
@@ -794,15 +795,7 @@ export default class FilesSearch extends View {
         for (const p of parts) {
           accum = accum ? `${accum}/${p}` : p;
           this.folders.add(accum);
-          if (!this.entries.has(accum) && !this.pending.has(accum)) {
-            const context = this.context;
-            this.pending.add(accum);
-            cx.spawn(async cx => {
-              try { await this.loadFolder(accum, context); }
-              catch {}
-              finally { if (this.context === context) this.pending.delete(accum); cx.notify(); }
-            });
-          }
+          this.loadSingleFolderPending(accum, cx);
         }
       }
     }
@@ -950,6 +943,8 @@ export default class FilesSearch extends View {
       this.entries = new Map();
       this.folders = new Set(saved?.folders);
       this.pending = new Set();
+      this.pendingTokens = new Map();
+      this.folderTokens = new Map();
       this.marks = {};
       this.dirCounts = {};
       this.dirMarks = {};
@@ -1231,31 +1226,103 @@ export default class FilesSearch extends View {
     });
   }
 
+  activeServiceRelPath() {
+    if (!this.serviceFilter || this.serviceFilter === "all") return null;
+    const selectedService = this.services?.find(s => s.id === this.serviceFilter);
+    return selectedService?.relPath || null;
+  }
+
+  acquireFolderPending(path, token = ++this.pendingSeq) {
+    if (this.pending.has(path)) {
+      return this.pendingTokens.get(path) === token;
+    }
+    this.pending.add(path);
+    this.pendingTokens.set(path, token);
+    return true;
+  }
+
+  clearFolderPending(path, token, context) {
+    if (this.context !== context) return;
+    if (this.pendingTokens.get(path) === token) {
+      this.pending.delete(path);
+      this.pendingTokens.delete(path);
+    }
+  }
+
+  loadSingleFolderPending(path, cx) {
+    if (this.entries.has(path) || this.pending.has(path)) return;
+    const context = this.context;
+    const token = ++this.pendingSeq;
+    this.acquireFolderPending(path, token);
+    cx.spawn(async cx => {
+      try {
+        await this.loadFolder(path, context);
+      } catch {
+      } finally {
+        this.clearFolderPending(path, token, context);
+        cx.notify();
+      }
+    });
+  }
+
+  collapseFolderSubtree(path) {
+    for (const folder of collectSubtreePaths(this.folders, path)) {
+      this.folders.delete(folder);
+      this.entries.delete(folder);
+    }
+    for (const pendingPath of collectSubtreePaths(this.pending, path)) {
+      this.pending.delete(pendingPath);
+    }
+    for (const tokenPath of collectSubtreePaths(this.pendingTokens.keys(), path)) {
+      this.pendingTokens.delete(tokenPath);
+    }
+    for (const tokenPath of collectSubtreePaths(this.folderTokens.keys(), path)) {
+      this.folderTokens.delete(tokenPath);
+    }
+  }
+
   toggle(path, cx) {
     if (this.folders.has(path)) {
-      for (const folder of [...this.folders]) {
-        if (folder === path || folder.startsWith(path + "/")) {
-          this.folders.delete(folder);
-          this.entries.delete(folder);
-        }
-      }
-    } else {
-      this.folders.add(path);
-      if (!this.entries.has(path) && !this.pending.has(path)) {
-        const context = this.context;
-        this.pending.add(path);
-        cx.spawn(async cx => {
-          try {
-            await this.loadFolder(path, context);
-          } catch (e) {
-            if (this.current(context)) this.error = String(e);
-          } finally {
-            if (this.context === context) this.pending.delete(path);
-            cx.notify();
-          }
-        });
-      }
+      this.collapseFolderSubtree(path);
+      cx.notify();
+      return;
     }
+
+    const context = this.context;
+    const cascadeToken = ++this.pendingSeq;
+    this.folders.add(path);
+    this.folderTokens.set(path, cascadeToken);
+    if (!this.entries.has(path) && !this.pending.has(path)) {
+      this.acquireFolderPending(path, cascadeToken);
+    }
+
+    cx.spawn(async cx => {
+      await runFolderCascade({
+        startPath: path,
+        maxDepth: MAX_CASCADE_DEPTH,
+        getFilterRel: () => (this.current(context) ? this.activeServiceRelPath() : null),
+        isActive: p => this.current(context) && this.folders.has(p) && this.folderTokens.get(p) === cascadeToken,
+        hasEntries: p => this.entries.has(p),
+        getEntries: p => this.entries.get(p),
+        acquirePending: p => this.acquireFolderPending(p, cascadeToken),
+        clearPending: p => this.clearFolderPending(p, cascadeToken, context),
+        expandFolder: p => {
+          this.folders.add(p);
+          this.folderTokens.set(p, cascadeToken);
+        },
+        loadFolder: async p => {
+          await this.loadFolder(p, context);
+          return this.entries.has(p);
+        },
+        onError: e => {
+          if (this.current(context)) this.error = String(e);
+        },
+        onStep: () => {
+          cx.notify();
+        },
+      });
+    });
+
     cx.notify();
   }
 
@@ -1308,15 +1375,7 @@ export default class FilesSearch extends View {
     for (let i = 0; i < expandLimit; i++) {
       accum = accum ? `${accum}/${segments[i]}` : segments[i];
       this.folders.add(accum);
-      if (!this.entries.has(accum) && !this.pending.has(accum)) {
-        const context = this.context;
-        this.pending.add(accum);
-        cx.spawn(async cx => {
-          try { await this.loadFolder(accum, context); }
-          catch {}
-          finally { if (this.context === context) this.pending.delete(accum); cx.notify(); }
-        });
-      }
+      this.loadSingleFolderPending(accum, cx);
     }
     if (kind === "dir") {
       this.show(null);
@@ -1387,12 +1446,10 @@ export default class FilesSearch extends View {
       if (out.length >= TOTAL) break;
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
 
-      if (filterRel) {
-        const matches = path === filterRel || path.startsWith(filterRel + "/") || filterRel.startsWith(path + "/");
-        if (!matches) continue;
-      }
+      if (filterRel && !matchesServiceFilter(path, filterRel)) continue;
 
       const open = this.folders.has(path);
+      const isLoadingFolder = Boolean(entry.dir && this.pending.has(path));
       const isWin = Boolean(this.context?.isWindows);
       const fullPath = joinSubPath(this.root, path);
       const normFullPath = normPathStr(fullPath);
@@ -1450,6 +1507,15 @@ export default class FilesSearch extends View {
                 .text_size(11)
                 .text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked)
                 .child(mark)
+            )
+          )
+          .when(isLoadingFolder, el =>
+            el.child(
+              svg("mods/files-search/spinner.svg")
+                .size(12)
+                .flex_none()
+                .text_color(t.working || t.accent || t.muted)
+                .spin(900)
             )
           )
       );
@@ -1748,6 +1814,9 @@ export default class FilesSearch extends View {
       this.panelWatchKey = null;
       this.panelWatchToken = null;
     }
+    this.pending?.clear();
+    this.pendingTokens?.clear();
+    this.folderTokens?.clear();
     try { this.input?.release(); } catch {}
     this.input = null;
     this.code?.release();

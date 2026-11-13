@@ -20,7 +20,7 @@ Mods run as QuickJS JavaScript modules utilizing `gpui-kit` and `gpui-base` decl
 - **Owns:**
   - Active mod packages under `mods/*` (`files-search`, `changes-review`, `mesh-tabs`, `mesh-status`; legacy `mods/mesh-flow` excluded from `layouts/mesh.json` and cleaned up on install).
   - Manifest definitions (`mod.json`) and mod registration schemas.
-  - Mod view components (`main.js`) and intra-mod pure logic modules (`indexer.js`, `search-logic.js`, `review-logic.js`, `tab-logic.js`).
+  - Mod view components (`main.js`) and intra-mod pure logic modules (`indexer.js`, `search-logic.js`, `tree-logic.js`, `review-logic.js`, `tab-logic.js`).
   - Shared state event namespaces (`mesh.*`, `files-search.*`, `changes-review.*`) and cross-mod protocol contracts.
 - **Public surface:**
   - Active mod directories installed into `$HERDR_APP_HOME/mods/`:

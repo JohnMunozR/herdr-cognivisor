@@ -23,7 +23,8 @@ The `submodule-mod-files-search` delivers workspace file tree navigation and rip
   - Main component: `mods/files-search/main.js`.
   - Shared indexing & cache engine: `mods/files-search/indexer.js`.
   - Pure search scoring & parsing helpers: `mods/files-search/search-logic.js`.
-  - Icon assets: `mods/files-search/*.svg` (`file.svg`, `folder.svg`, `search.svg`, `preview.svg`, `grip.svg`, etc.).
+  - Pure tree cascade & subtree filtering helpers: `mods/files-search/tree-logic.js`.
+  - Icon assets: `mods/files-search/*.svg` (`file.svg`, `folder.svg`, `spinner.svg`, `search.svg`, `preview.svg`, `grip.svg`, etc.).
   - Type definitions and config: `gpui-kit.d.ts`, `jsconfig.json`.
 - **Public surface:**
   - Registered mod identifier: `files-search`.
@@ -86,7 +87,10 @@ The mod detects its operational mode during initialization via `props()`:
   - Clicking a service pill toggles `this.serviceFilter`, automatically expands the service's relative path in `this.folders` (fetching unloaded directory entries), scopes visible top-level tree rows to that service's subtree, and broadcasts `setShared("mesh.activeService", { workspaceRoot, serviceId, ts })`.
   - Listens to `shared("mesh.activeService")` (using timestamp check `ts > this.lastActiveServiceTs`) inside a deferred `schedulePanelSync(cx)` callback to synchronize active service selection from sibling mods like `changes-review` without triggering re-entrant event loops.
 - **Debounced Watching, Cross-Platform Directory Listing & Hidden-Panel Throttling:** Lists local directory entries via `fs/promises` `readdir` inside `$HOME` and falls back to PowerShell (`windowsDirectory`) on Windows or POSIX `sh` outside `$HOME` or on runtime errors (`directory`), notifying immediately once folder entries load. Sets up non-blocking directory observers using `watchFolder(root)`, debouncing `750ms` and filtering build/dependency churn (`node_modules`, `target`, `.git` internal locks) via `analyzeWatchBatch`, incrementally reloading only dirty expanded folders. Skips folder listings and throttles background polling intervals to `60000ms` when `#files` is hidden (`isFilesVisible()`), recovering via `!this.entries.has("") || Boolean(this.error) || needsFolderReloadOnShow` on show.
-- Renders hierarchical tree nodes with lazy folder expansion and caching.
+- **Cascading Single-Folder Expansion & Right-Aligned Loading Spinner:**
+  - Expanding a collapsed folder in `#files` (`toggle`) executes `runFolderCascade` (bounded by `MAX_CASCADE_DEPTH = 32` and cycle tracking): whenever a folder's visible contents (`getCascadeChildPath` filtered by active `serviceFilter` when set) consist of strictly one directory and zero files, that child folder automatically expands as well until a folder is empty, contains a file, or contains multiple visible items.
+  - While any directory is actively fetching its contents (`this.pending.has(path)`), the folder row displays an animated `mods/files-search/spinner.svg` (`.spin(900)`) flush on the right edge of the row.
+  - Collapsing a folder subtree (`collapseFolderSubtree` using `collectSubtreePaths`) clears subtree `pending` entries and invalidates per-folder/pending tokens (`folderTokens` / `pendingTokens`), aborting in-flight cascades safely without clobbering subsequent re-opens.
 - Listens to `shared("files-search.select")`: When a file is selected from the overlay search, unpacks the file path, expands all ancestor directories, scrolls the file into view, and highlights it. If the target file resides outside the active `serviceFilter`, resets `serviceFilter` to `"all"`. Prepend any relative root prefix if the selection payload root differs from the panel root.
 
 ### 2. Search Everywhere Overlay Mode (`isOverlay: true`)
@@ -121,7 +125,7 @@ The mod detects its operational mode during initialization via `props()`:
 6. **Deep Path & Directory Auto-Expansion:**
    When `openFromSearch(path, cx, kind)` receives a file or directory selected externally, it iteratively builds and adds all intermediate folder paths (plus the directory itself when `kind === "dir"`) to `this.folders` before rendering, ensuring the target node is immediately visible in the tree.
 7. **Graceful Teardown:**
-   Upon overlay close or view/indexer release, `_overlayClosed` / `_indexerClosed` is set and all background tasks (`focusInputTask`, `watchDebounceTask`, `pendingPanelSyncTask`, `fileSearchTask`, `textSearchTask`, `previewDebounceTask`, `indexerSyncTask`, `indexerReindexTask`, `indexerWatchDebounceTask`) and allocated resources (`this.input?.release()`, `this.code?.release()`, `releaseRootWatcher(...)`) must be cleanly disposed of.
+   Upon overlay close or view/indexer release, `_overlayClosed` / `_indexerClosed` is set and all background tasks (`focusInputTask`, `watchDebounceTask`, `pendingPanelSyncTask`, `fileSearchTask`, `textSearchTask`, `previewDebounceTask`, `indexerSyncTask`, `indexerReindexTask`, `indexerWatchDebounceTask`), pending folder tokens (`pending`, `pendingTokens`, `folderTokens`), and allocated resources (`this.input?.release()`, `this.code?.release()`, `releaseRootWatcher(...)`) must be cleanly disposed of.
 
 ## Multi-Repo & Mesh Architecture
 
