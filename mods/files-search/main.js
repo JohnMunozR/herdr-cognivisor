@@ -54,9 +54,13 @@ import {
 } from "./search-logic.js";
 import {
   MAX_CASCADE_DEPTH,
+  POSIX_CASCADE_SCRIPT,
+  sortDirectoryEntries,
   matchesServiceFilter,
+  getCascadeChildPath,
   collectSubtreePaths,
-  runFolderCascade,
+  parseCascadeStdout,
+  runStagedCascade,
 } from "./tree-logic.js";
 
 function location() {
@@ -436,6 +440,89 @@ async function directory(path, on, isWindows = false) {
   return out;
 }
 
+async function windowsDirectoryCascade(root, startPath, on, maxDepth = MAX_CASCADE_DEPTH) {
+  const targetAbs = joinSubPath(root, startPath);
+  const escaped = targetAbs.replace(/['‘’‚‛]/g, "$&$&");
+  const script = `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & { param($p, $max) $cur=$p; $rel=''; $levels=@(); for ($d=0; $d -le $max; $d++) { $items=@(Get-ChildItem -LiteralPath $cur -Force -ErrorAction Stop | Where-Object Name -ne '.git' | Select-Object -First 501 | ForEach-Object { @{ name=$_.Name; dir=($_.PSIsContainer -and (-not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not $_.LinkType -or ($_.Target -and [IO.Directory]::Exists(([IO.Path]::Combine([IO.Path]::GetDirectoryName($_.FullName), $_.Target[0])))))) } }); $levels += @{ rel=$rel; entries=$items }; if ($items.Count -ne 1 -or -not $items[0].dir -or $d -ge $max) { break }; $only=$items[0].name; $rel = if ($rel) { "$rel/$only" } else { $only }; $cur = Join-Path $cur $only }; $levels | ConvertTo-Json -Compress -Depth 4 } '${escaped}' ${maxDepth}`;
+  const r = await exec("powershell", ["-NoProfile", "-Command", script], { on });
+  if (r.code !== 0) throw new Error(r.stderr || "Cannot list this folder");
+  const raw = JSON.parse(r.stdout || "[]");
+  const list = Array.isArray(raw) ? raw : [raw];
+  const out = new Map();
+  for (const lvl of list) {
+    if (!lvl) continue;
+    const fullRel = lvl.rel ? (startPath ? `${startPath}/${lvl.rel}` : lvl.rel) : startPath;
+    const rawEntries = Array.isArray(lvl.entries) ? lvl.entries : (lvl.entries ? [lvl.entries] : []);
+    out.set(fullRel, rawEntries);
+  }
+  return out;
+}
+
+async function posixDirectoryCascade(root, startPath, on, maxDepth = MAX_CASCADE_DEPTH) {
+  const targetAbs = joinSubPath(root, startPath);
+  let r;
+  try {
+    r = await exec("sh", ["-c", POSIX_CASCADE_SCRIPT, "files", targetAbs, String(maxDepth)], { on });
+  } catch (e) {
+    if (on && String(e).includes("cannot start sh: program not found")) {
+      return windowsDirectoryCascade(root, startPath, on, maxDepth);
+    }
+    throw e;
+  }
+  if (r.code !== 0) throw new Error(r.stderr || "Cannot list this folder");
+  return parseCascadeStdout(r.stdout, startPath);
+}
+
+async function directoryCascade(root, startPath, context, maxDepth = MAX_CASCADE_DEPTH, filterRel = null, isCancelled = null) {
+  const { on, isWindows } = context;
+  if (isWindows) return windowsDirectoryCascade(root, startPath, on, maxDepth);
+  if (on) return posixDirectoryCascade(root, startPath, on, maxDepth);
+
+  const out = new Map();
+  const seen = new Set([startPath]);
+  let curRel = startPath;
+
+  for (let depth = 0; depth <= maxDepth; depth++) {
+    if (isCancelled?.()) return out;
+    let dirents;
+    let supported = false;
+    try {
+      dirents = await readdir(joinSubPath(root, curRel), { withFileTypes: true });
+      supported = isSupportedDirentList(dirents);
+    } catch {
+      supported = false;
+    }
+
+    if (!supported) {
+      const remMax = Math.max(0, maxDepth - depth);
+      try {
+        const fallback = await posixDirectoryCascade(root, curRel, on, remMax);
+        for (const [k, v] of fallback) out.set(k, v);
+        return out;
+      } catch (err) {
+        if (depth === 0) throw err;
+        return out;
+      }
+    }
+
+    const list = [];
+    for (const d of dirents) {
+      if (!d?.name || d.name === ".git") continue;
+      list.push({ name: d.name, dir: direntIsDir(d) });
+      if (list.length > PER_FOLDER) break;
+    }
+    out.set(curRel, list);
+
+    if (depth >= maxDepth) break;
+    const nextChild = getCascadeChildPath(curRel, list, filterRel);
+    if (!nextChild || seen.has(nextChild)) break;
+    seen.add(nextChild);
+    curRel = nextChild;
+  }
+
+  return out;
+}
+
 const CHUNK_SIZE = 120;
 
 // Cross-platform lazy line range reader (Linux, macOS, Windows)
@@ -674,7 +761,6 @@ export default class FilesSearch extends View {
     this.folders = new Set();
     this.pending = new Set();
     this.pendingTokens = new Map();
-    this.folderTokens = new Map();
     this.pendingSeq = 0;
     this.marks = {};
     this.dirCounts = {};
@@ -921,13 +1007,13 @@ export default class FilesSearch extends View {
     const { on, cwd: root, isWindows } = context;
     const entries = await directory(joinSubPath(root, path), on, isWindows);
     if (!this.current(context) || (path && !this.folders.has(path))) return;
-    const used = [...this.entries.entries()].filter(([p]) => p !== path).reduce((n, [, e]) => n + e.length, 0);
-    this.entries.set(
-      path,
-      entries
-        .slice(0, Math.max(0, Math.min(PER_FOLDER, TOTAL - used)))
-        .sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name))
-    );
+    let used = 0;
+    for (const [p, existing] of this.entries) {
+      if (p !== path) used += existing.length;
+    }
+    const limit = Math.max(0, Math.min(PER_FOLDER, TOTAL - used));
+    const trimmed = entries.length > limit ? entries.slice(0, limit) : entries;
+    this.entries.set(path, sortDirectoryEntries(trimmed));
     if (entries.length > PER_FOLDER || used + entries.length > TOTAL) this.limited = true;
   }
 
@@ -944,7 +1030,6 @@ export default class FilesSearch extends View {
       this.folders = new Set(saved?.folders);
       this.pending = new Set();
       this.pendingTokens = new Map();
-      this.folderTokens = new Map();
       this.marks = {};
       this.dirCounts = {};
       this.dirMarks = {};
@@ -1276,12 +1361,35 @@ export default class FilesSearch extends View {
     for (const tokenPath of collectSubtreePaths(this.pendingTokens.keys(), path)) {
       this.pendingTokens.delete(tokenPath);
     }
-    for (const tokenPath of collectSubtreePaths(this.folderTokens.keys(), path)) {
-      this.folderTokens.delete(tokenPath);
+  }
+
+  commitStagedCascade({ stagedEntries, stagedFolders }) {
+    let used = 0;
+    for (const [, existing] of this.entries) used += existing.length;
+
+    for (const [relPath, rawEntries] of stagedEntries) {
+      if (this.entries.has(relPath)) continue;
+      const limit = Math.max(0, Math.min(PER_FOLDER, TOTAL - used));
+      const trimmed = rawEntries.length > limit ? rawEntries.slice(0, limit) : rawEntries;
+      if (rawEntries.length > PER_FOLDER || used + rawEntries.length > TOTAL) {
+        this.limited = true;
+      }
+      this.entries.set(relPath, sortDirectoryEntries(trimmed));
+      used += trimmed.length;
+    }
+
+    for (const folderPath of stagedFolders) {
+      this.folders.add(folderPath);
     }
   }
 
   toggle(path, cx) {
+    if (this.pending.has(path)) {
+      this.pending.delete(path);
+      this.pendingTokens.delete(path);
+      cx.notify();
+      return;
+    }
     if (this.folders.has(path)) {
       this.collapseFolderSubtree(path);
       cx.notify();
@@ -1290,40 +1398,40 @@ export default class FilesSearch extends View {
 
     const context = this.context;
     const cascadeToken = ++this.pendingSeq;
-    this.folders.add(path);
-    this.folderTokens.set(path, cascadeToken);
-    if (!this.entries.has(path) && !this.pending.has(path)) {
-      this.acquireFolderPending(path, cascadeToken);
-    }
+    const isCancelled = () => !this.current(context) || this.pendingTokens.get(path) !== cascadeToken;
+
+    this.acquireFolderPending(path, cascadeToken);
+    cx.notify();
 
     cx.spawn(async cx => {
-      await runFolderCascade({
-        startPath: path,
-        maxDepth: MAX_CASCADE_DEPTH,
-        getFilterRel: () => (this.current(context) ? this.activeServiceRelPath() : null),
-        isActive: p => this.current(context) && this.folders.has(p) && this.folderTokens.get(p) === cascadeToken,
-        hasEntries: p => this.entries.has(p),
-        getEntries: p => this.entries.get(p),
-        acquirePending: p => this.acquireFolderPending(p, cascadeToken),
-        clearPending: p => this.clearFolderPending(p, cascadeToken, context),
-        expandFolder: p => {
-          this.folders.add(p);
-          this.folderTokens.set(p, cascadeToken);
-        },
-        loadFolder: async p => {
-          await this.loadFolder(p, context);
-          return this.entries.has(p);
-        },
-        onError: e => {
-          if (this.current(context)) this.error = String(e);
-        },
-        onStep: () => {
-          cx.notify();
-        },
-      });
-    });
+      try {
+        const result = await runStagedCascade({
+          startPath: path,
+          maxDepth: MAX_CASCADE_DEPTH,
+          getFilterRel: () => (this.current(context) ? this.activeServiceRelPath() : null),
+          isCancelled,
+          getCachedEntries: p => this.entries.get(p),
+          fetchCascadeBatch: (curPath, remDepth) =>
+            directoryCascade(
+              context.cwd,
+              curPath,
+              context,
+              remDepth,
+              this.current(context) ? this.activeServiceRelPath() : null,
+              isCancelled,
+            ),
+          fetchSingleEntries: curPath => directory(joinSubPath(context.cwd, curPath), context.on, context.isWindows),
+        });
+        if (!result || isCancelled()) return;
 
-    cx.notify();
+        this.commitStagedCascade(result);
+      } catch (e) {
+        if (!isCancelled()) this.error = String(e);
+      } finally {
+        this.clearFolderPending(path, cascadeToken, context);
+        cx.notify();
+      }
+    });
   }
 
   show(path, cx) {
@@ -1459,7 +1567,7 @@ export default class FilesSearch extends View {
       const mark = this.marks[fullPath] || this.marks[normFullPath] || this.marks[cmpFullPath];
 
       out.push(
-        h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
+        h_flex().id(`file-${path}`).h(28).w_full().min_w(0).flex_none().pl(8 + depth * 18).pr(10).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
           .on_click((_e, cx) => (entry.dir ? this.toggle(path, cx) : this.show(path, cx)))
           .child(entry.dir ? svg(`mods/files-search/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
           .child(svg(`mods/files-search/${entry.dir ? "folder" : "file"}.svg`).size(14).flex_none().text_color(t.muted))
@@ -1469,7 +1577,7 @@ export default class FilesSearch extends View {
               .min_w(0)
               .gap(6)
               .items_center()
-              .child(div().truncate().child(entry.name))
+              .child(div().min_w(0).truncate().child(entry.name))
               .when(isRepo, el =>
                 el.child(
                   div()
@@ -1816,7 +1924,6 @@ export default class FilesSearch extends View {
     }
     this.pending?.clear();
     this.pendingTokens?.clear();
-    this.folderTokens?.clear();
     try { this.input?.release(); } catch {}
     this.input = null;
     this.code?.release();
