@@ -14,10 +14,11 @@ function location() {
   const activeTab = (space?.tabs || []).find(t => t.active) || null;
   const pane = f?.pane ? panes().find(p => p.pane === f.pane) : null;
   const on = f?.pane === null ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null) : space?.machine ?? null;
+  const isWin = !on && window()?.platform === "windows";
   let cwd;
   const spaceFolder = space?.folder;
   const paneCwd = pane?.cwd;
-  if (spaceFolder && (!paneCwd || paneCwd === spaceFolder || paneCwd.startsWith(spaceFolder + "/") || paneCwd.startsWith(spaceFolder + "\\"))) {
+  if (spaceFolder && (!paneCwd || isSameOrChildPath(paneCwd, spaceFolder, isWin))) {
     cwd = spaceFolder;
   } else {
     cwd = paneCwd || f?.cwd || spaceFolder;
@@ -68,6 +69,45 @@ function normPathStr(p) {
   return String(p || "").replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
+function normCmpStr(p, isWindows = false) {
+  const s = normPathStr(p);
+  return isWindows ? s.toLowerCase() : s;
+}
+
+function isSameOrChildPath(child, parent, isWindows = false) {
+  const c = normCmpStr(child, isWindows);
+  const p = normCmpStr(parent, isWindows);
+  if (!c || !p) return false;
+  return c === p || c.startsWith(p + "/");
+}
+
+function joinSubPath(root, rel) {
+  if (!rel) return root;
+  if (root === "/") return `/${rel}`;
+  if (/^[A-Za-z]:[\\/]?$/.test(root)) {
+    return `${root.slice(0, 2)}/${rel}`;
+  }
+  return `${root.replace(/[\\/]+$/, "")}/${rel}`;
+}
+
+function isSupportedDirentList(entries) {
+  if (!Array.isArray(entries)) return false;
+  if (entries.length === 0) return true;
+  const first = entries[0];
+  return (
+    typeof first === "object" &&
+    first !== null &&
+    "name" in first &&
+    (typeof first.isDirectory === "function" || typeof first.isDirectory === "boolean")
+  );
+}
+
+function direntIsDir(entry) {
+  return typeof entry?.isDirectory === "function"
+    ? Boolean(entry.isDirectory())
+    : Boolean(entry?.isDirectory);
+}
+
 function findLayoutNode(node, id) {
   if (!node || typeof node !== "object") return null;
   if (node.id === id) return node;
@@ -90,14 +130,14 @@ function findFilesBlock(node) {
 
 function isFilesVisible() {
   const root = layout();
-  if (!root || typeof root !== "object") return false;
+  if (!root || typeof root !== "object") return true;
   const panel = findLayoutNode(root, "panel");
   const body = findLayoutNode(root, "panel-body");
   if (panel && body) {
     return !panel.hidden && body.active === "files";
   }
   const block = findFilesBlock(root);
-  return block ? !block.hidden : false;
+  return block ? !block.hidden : true;
 }
 
 function getRelToWorkspace(changedPath, workspaceRoot) {
@@ -312,14 +352,20 @@ async function repoAheadCount(root, on, branchHint = "") {
 
 async function fsScanRepos(targetRoot, depth2 = true) {
   if (!targetRoot) return [];
+  let level1;
+  try {
+    level1 = await readdir(targetRoot, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  if (!isSupportedDirentList(level1)) return null;
   const found = [];
   if (await exists(join(targetRoot, ".git")).catch(() => false)) {
     found.push(targetRoot);
   }
-  const level1 = await readdir(targetRoot, { withFileTypes: true }).catch(() => []);
   await Promise.all(
     level1.map(async e1 => {
-      if (!e1?.isDirectory?.() || !e1.name || DISCOVER_SKIP_DIRS.has(e1.name)) return;
+      if (!direntIsDir(e1) || !e1.name || DISCOVER_SKIP_DIRS.has(e1.name)) return;
       const p1 = join(targetRoot, e1.name);
       if (await exists(join(p1, ".git")).catch(() => false)) {
         found.push(p1);
@@ -327,9 +373,10 @@ async function fsScanRepos(targetRoot, depth2 = true) {
       }
       if (!depth2) return;
       const level2 = await readdir(p1, { withFileTypes: true }).catch(() => []);
+      if (!isSupportedDirentList(level2)) return;
       await Promise.all(
         level2.map(async e2 => {
-          if (!e2?.isDirectory?.() || !e2.name || DISCOVER_SKIP_DIRS.has(e2.name)) return;
+          if (!direntIsDir(e2) || !e2.name || DISCOVER_SKIP_DIRS.has(e2.name)) return;
           const p2 = join(p1, e2.name);
           if (await exists(join(p2, ".git")).catch(() => false)) {
             found.push(p2);
@@ -343,8 +390,30 @@ async function fsScanRepos(targetRoot, depth2 = true) {
 
 async function fsListFiles(root, limit = 20000) {
   if (!root) return [];
+  let rootEntries;
+  try {
+    rootEntries = await readdir(root, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  if (!isSupportedDirentList(rootEntries)) return null;
   const results = [];
-  const queue = [{ abs: root, rel: "" }];
+  const queue = [];
+  const pushEntries = (parentAbs, parentRel, entries) => {
+    for (const e of entries) {
+      if (!e?.name || e.name.startsWith(".")) continue;
+      const rel = parentRel ? `${parentRel}/${e.name}` : e.name;
+      if (direntIsDir(e)) {
+        if (!DISCOVER_SKIP_DIRS.has(e.name)) {
+          queue.push({ abs: join(parentAbs, e.name), rel });
+        }
+      } else if (e.isFile?.() || (!e.isSymbolicLink?.() && !direntIsDir(e))) {
+        results.push(rel);
+        if (results.length >= limit) break;
+      }
+    }
+  };
+  pushEntries(root, "", rootEntries);
   while (queue.length > 0 && results.length < limit) {
     const batch = queue.splice(0, 16);
     const dirLists = await Promise.all(
@@ -354,18 +423,8 @@ async function fsListFiles(root, limit = 20000) {
       })
     );
     for (const { item, entries } of dirLists) {
-      for (const e of entries) {
-        if (!e?.name || e.name.startsWith(".")) continue;
-        const rel = item.rel ? `${item.rel}/${e.name}` : e.name;
-        if (e.isDirectory?.()) {
-          if (!DISCOVER_SKIP_DIRS.has(e.name)) {
-            queue.push({ abs: join(item.abs, e.name), rel });
-          }
-        } else if (e.isFile?.() || (!e.isSymbolicLink?.() && !e.isDirectory?.())) {
-          results.push(rel);
-          if (results.length >= limit) break;
-        }
-      }
+      if (!isSupportedDirentList(entries)) continue;
+      pushEntries(item.abs, item.rel, entries);
       if (results.length >= limit) break;
     }
   }
@@ -391,7 +450,10 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
 
   const scanRoot = async (targetRoot, depth2 = true) => {
     if (!targetRoot) return [];
-    if (!on) return fsScanRepos(targetRoot, depth2);
+    if (!on) {
+      const fsResult = await fsScanRepos(targetRoot, depth2);
+      if (fsResult !== null) return fsResult;
+    }
 
     const windowsDiscover = async () => {
       const escaped = targetRoot.replace(/['‘’‚‛]/g, "$&$&");
@@ -403,6 +465,8 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
       }
       return [];
     };
+
+    if (isWindows) return windowsDiscover();
 
     const script = depth2
       ? 'root="$1"; if [ -e "$root/.git" ]; then printf "%s\\n" "$root"; fi; for d in "$root"/* "$root"/*/*; do [ -e "$d/.git" ] || continue; case "$d" in */node_modules/*|*/target/*|*/dist/*|*/build/*|*/.git/*|*/vendor/*|*/.venv/*) continue ;; esac; printf "%s\\n" "$d"; done'
@@ -445,14 +509,16 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
   // If workspaceRoot is a single repo (or inside one), also scan immediate sibling repos in parentDir
   const isSingleRepoRoot =
     foundRoots.length === 1 &&
-    (foundRoots[0] === normWorkspace || normWorkspace.startsWith(foundRoots[0] + "/"));
+    isSameOrChildPath(normWorkspace, foundRoots[0], isWindows);
   if (isSingleRepoRoot) {
     const parentDir = getParentDir(foundRoots[0]);
     if (parentDir) {
       const siblings = await scanRoot(parentDir, false);
       for (const s of siblings) {
         const normS = normPathStr(s);
-        if (normS && !foundRoots.includes(normS)) foundRoots.push(normS);
+        if (normS && !foundRoots.some(r => normCmpStr(r, isWindows) === normCmpStr(normS, isWindows))) {
+          foundRoots.push(normS);
+        }
       }
     }
   }
@@ -461,10 +527,10 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
   for (const extra of extraCwds || []) {
     if (!extra) continue;
     const normExtra = normPathStr(extra);
-    if (!normExtra || foundRoots.some(r => normExtra === r || normExtra.startsWith(r + "/"))) continue;
+    if (!normExtra || foundRoots.some(r => isSameOrChildPath(normExtra, r, isWindows))) continue;
     const localTop = !on ? await findLocalGitRoot(extra) : null;
     if (localTop) {
-      if (!foundRoots.includes(localTop)) foundRoots.push(localTop);
+      if (!foundRoots.some(r => normCmpStr(r, isWindows) === normCmpStr(localTop, isWindows))) foundRoots.push(localTop);
       continue;
     }
     const rev = await exec(
@@ -474,25 +540,26 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
     ).catch(() => null);
     if (rev?.code === 0 && rev.stdout.trim()) {
       const normTop = normPathStr(rev.stdout.trim());
-      if (normTop && !foundRoots.includes(normTop)) foundRoots.push(normTop);
+      if (normTop && !foundRoots.some(r => normCmpStr(r, isWindows) === normCmpStr(normTop, isWindows))) foundRoots.push(normTop);
     }
   }
 
   const services = [];
   const seenRoots = new Set();
   for (const repoRoot of foundRoots) {
-    const normRepo = repoRoot.replace(/\\/g, "/").replace(/\/+$/, "");
-    if (seenRoots.has(normRepo)) continue;
-    seenRoots.add(normRepo);
+    const normRepo = normPathStr(repoRoot);
+    const cmpRepo = normCmpStr(normRepo, isWindows);
+    if (seenRoots.has(cmpRepo)) continue;
+    seenRoots.add(cmpRepo);
 
-    const isInsideWorkspace = normRepo === normWorkspace || normRepo.startsWith(normWorkspace + "/");
+    const isInsideWorkspace = isSameOrChildPath(normRepo, normWorkspace, isWindows);
     let relPath = "";
-    if (normRepo !== normWorkspace && isInsideWorkspace) {
+    if (cmpRepo !== normCmpStr(normWorkspace, isWindows) && isInsideWorkspace) {
       relPath = normRepo.slice(normWorkspace.length + 1);
     }
 
     const name = repoRoot.split(/[\\/]/).filter(Boolean).pop() || "root";
-    const id = relPath || (normRepo === normWorkspace ? "." : (isInsideWorkspace ? name : `../${name}`));
+    const id = relPath || (cmpRepo === normCmpStr(normWorkspace, isWindows) ? "." : (isInsideWorkspace ? name : `../${name}`));
     services.push({
       id,
       name,
@@ -518,19 +585,18 @@ const PER_FOLDER = 500, TOTAL = 5000;
 
 async function directory(path, on, isWindows = false) {
   if (!on) {
-    let dirents;
     try {
-      dirents = await readdir(path, { withFileTypes: true });
-    } catch (e) {
-      throw new Error(String(e?.message || e || "Cannot list this folder"));
-    }
-    const out = [];
-    for (const d of dirents) {
-      if (!d?.name || d.name === ".git") continue;
-      out.push({ name: d.name, dir: Boolean(d.isDirectory?.()) });
-      if (out.length > 500) break;
-    }
-    return out;
+      const dirents = await readdir(path, { withFileTypes: true });
+      if (isSupportedDirentList(dirents)) {
+        const out = [];
+        for (const d of dirents) {
+          if (!d?.name || d.name === ".git") continue;
+          out.push({ name: d.name, dir: direntIsDir(d) });
+          if (out.length > 500) break;
+        }
+        return out;
+      }
+    } catch {}
   }
   const windowsDirectory = async () => {
     const r = await exec("powershell", ["-NoProfile", "-Command", "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & { param($p) @(Get-ChildItem -LiteralPath $p -Force -ErrorAction Stop | Where-Object Name -ne '.git' | Select-Object -First 501 | ForEach-Object { @{ name=$_.Name; dir=($_.PSIsContainer -and (-not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not $_.LinkType -or ($_.Target -and [IO.Directory]::Exists(([IO.Path]::Combine([IO.Path]::GetDirectoryName($_.FullName), $_.Target[0])))))) } }) | ConvertTo-Json -Compress } '" + path.replace(/['‘’‚‛]/g, "$&$&") + "'"], { on });
@@ -538,6 +604,7 @@ async function directory(path, on, isWindows = false) {
     const result = JSON.parse(r.stdout || "[]");
     return Array.isArray(result) ? result : [result];
   };
+  if (isWindows) return windowsDirectory();
   const script = 'n=0; for p in "$1"/* "$1"/.[!.]* "$1"/..?*; do [ -e "$p" ] || [ -L "$p" ] || continue; name=${p##*/}; [ "$name" = .git ] && continue; if [ -d "$p" ]; then kind=d; else kind=f; fi; printf "%s\\0%s\\0" "$kind" "$name"; n=$((n+1)); [ "$n" -gt 500 ] && break; done; test -d "$1"';
   let r;
   try { r = await exec("sh", ["-c", script, "files", path], { on }); }
@@ -557,8 +624,6 @@ const CHUNK_SIZE = 120;
 async function readFileChunk(fullPath, startLine, count, on, isWindows = false) {
   // Fast native local read via readTextFile (up to 1 MiB, 0 subprocesses)
   if (!on) {
-    const present = await exists(fullPath).catch(() => false);
-    if (!present) return null;
     try {
       const text = await readTextFile(fullPath, { on }).catch(() => null);
       if (typeof text === "string") {
@@ -697,16 +762,20 @@ export default class FilesSearch extends View {
 
   syncPanelFromRender(cx) {
     let dirty = false;
-    if (key() !== this.context?.key || (isFilesVisible() && (this.needsFolderReloadOnShow || this.dirtyFolders.size > 0))) {
-      this.refresh(cx, { fromWatch: this.dirtyFolders.size > 0 && key() === this.context?.key && !this.needsFolderReloadOnShow });
+    if (
+      key() !== this.context?.key ||
+      (isFilesVisible() && (!this.entries.has("") || Boolean(this.error) || this.needsFolderReloadOnShow || this.dirtyFolders.size > 0))
+    ) {
+      this.refresh(cx, { fromWatch: this.dirtyFolders.size > 0 && key() === this.context?.key && this.entries.has("") && !this.error && !this.needsFolderReloadOnShow });
       dirty = true;
     }
 
     const activeReq = shared("mesh.activeService");
     if (activeReq && activeReq.ts && activeReq.ts > (this.lastActiveServiceTs || 0)) {
       this.lastActiveServiceTs = activeReq.ts;
-      const normWorkspace = normPathStr(activeReq.workspaceRoot);
-      const normRoot = normPathStr(this.root);
+      const isWin = Boolean(this.context?.isWindows);
+      const normWorkspace = normCmpStr(activeReq.workspaceRoot, isWin);
+      const normRoot = normCmpStr(this.root, isWin);
       if (!normWorkspace || normWorkspace === normRoot) {
         const nextFilter = activeReq.serviceId || "all";
         if (this.serviceFilter !== nextFilter) {
@@ -854,7 +923,7 @@ export default class FilesSearch extends View {
 
   async loadFolder(path, context) {
     const { on, cwd: root, isWindows } = context;
-    const entries = await directory(path ? `${root}/${path}` : root, on, isWindows);
+    const entries = await directory(joinSubPath(root, path), on, isWindows);
     if (!this.current(context) || (path && !this.folders.has(path))) return;
     const used = [...this.entries.entries()].filter(([p]) => p !== path).reduce((n, [, e]) => n + e.length, 0);
     this.entries.set(
@@ -943,12 +1012,12 @@ export default class FilesSearch extends View {
     cx.spawn(async cx => {
       try {
         const visibleNow = isFilesVisible();
-        if (!visibleNow && this.entries.has("")) {
+        if (!visibleNow && this.entries.has("") && !this.error) {
           this.needsFolderReloadOnShow = true;
         } else {
           const forceReloadFolders = this.needsFolderReloadOnShow;
           this.needsFolderReloadOnShow = false;
-          const shouldReloadAll = !fromWatch || !this.entries.has("") || watchDirty.has("*") || forceReloadFolders;
+          const shouldReloadAll = !fromWatch || !this.entries.has("") || Boolean(this.error) || watchDirty.has("*") || forceReloadFolders;
           const foldersToLoad = shouldReloadAll
             ? ["", ...this.folders]
             : [...new Set(["", ...this.folders].filter(f => watchDirty.has(f)))];
@@ -956,6 +1025,9 @@ export default class FilesSearch extends View {
             if (!this.current(context)) return;
             await this.loadFolder(path, context);
           }
+          if (!this.current(context)) return;
+          this.error = null;
+          if (foldersToLoad.length > 0) cx.notify();
         }
 
         const now = Date.now();
@@ -1021,20 +1093,24 @@ export default class FilesSearch extends View {
             const relFile = rawRel.replace(/\/+$/, "");
             if (!relFile) continue;
             const fullPath = `${service.root}/${relFile}`;
+            const cmpFile = normCmpStr(fullPath, isWindows);
             const mark = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
             marks[fullPath] = mark;
+            marks[cmpFile] = mark;
             count++;
             touchedList.push({ name: relFile, fullPath, mark });
 
-            const normFile = fullPath.replace(/\\/g, "/");
-            if (normFile.startsWith(normCwd + "/")) {
-              const relToWorkspace = normFile.slice(normCwd.length + 1);
+            const cmpCwd = normCmpStr(cwd, isWindows);
+            if (cmpFile.startsWith(cmpCwd + "/")) {
+              const relToWorkspace = fullPath.replace(/\\/g, "/").slice(normCwd.length + 1);
               const segs = relToWorkspace.split("/");
               let accum = "";
               for (let i = 0; i < segs.length - 1; i++) {
                 accum = accum ? `${accum}/${segs[i]}` : segs[i];
                 const dirFullPath = `${cwd}/${accum}`;
+                const cmpDir = normCmpStr(dirFullPath, isWindows);
                 dirCounts[dirFullPath] = (dirCounts[dirFullPath] || 0) + 1;
+                if (cmpDir !== dirFullPath) dirCounts[cmpDir] = (dirCounts[cmpDir] || 0) + 1;
               }
             }
           }
@@ -1073,8 +1149,11 @@ export default class FilesSearch extends View {
         if (!this.current(context)) return;
 
         this.services = enrichedServices;
-        this.repoRoots = new Set(enrichedServices.map(s => normPathStr(s.root)));
-        enrichedServices.forEach(s => this.repoRoots.add(s.root));
+        this.repoRoots = new Set(enrichedServices.map(s => normCmpStr(s.root, isWindows)));
+        enrichedServices.forEach(s => {
+          this.repoRoots.add(normPathStr(s.root));
+          this.repoRoots.add(s.root);
+        });
 
         if (this.serviceFilter !== "all" && !enrichedServices.some(s => s.id === this.serviceFilter)) {
           this.serviceFilter = "all";
@@ -1117,7 +1196,7 @@ export default class FilesSearch extends View {
         this.error = null;
         this.watch(cwd, cx);
       } catch (e) {
-        if (this.current(context)) this.error = String(e);
+        if (this.current(context) && !this.entries.has("")) this.error = String(e);
       } finally {
         if (this.context === context) this.loading = false;
         cx.notify();
@@ -1289,11 +1368,13 @@ export default class FilesSearch extends View {
       }
 
       const open = this.folders.has(path);
-      const fullPath = `${this.root}/${path}`;
-      const normFullPath = fullPath.replace(/\\/g, "/").replace(/\/+$/, "");
-      const isRepo = Boolean(entry.dir && (this.repoRoots?.has(fullPath) || this.repoRoots?.has(normFullPath)));
-      const dirCount = entry.dir ? (this.dirCounts?.[fullPath] || this.dirCounts?.[normFullPath] || 0) : 0;
-      const mark = this.marks[fullPath] || this.marks[normFullPath];
+      const isWin = Boolean(this.context?.isWindows);
+      const fullPath = joinSubPath(this.root, path);
+      const normFullPath = normPathStr(fullPath);
+      const cmpFullPath = normCmpStr(fullPath, isWin);
+      const isRepo = Boolean(entry.dir && (this.repoRoots?.has(fullPath) || this.repoRoots?.has(normFullPath) || this.repoRoots?.has(cmpFullPath)));
+      const dirCount = entry.dir ? (this.dirCounts?.[fullPath] || this.dirCounts?.[normFullPath] || this.dirCounts?.[cmpFullPath] || 0) : 0;
+      const mark = this.marks[fullPath] || this.marks[normFullPath] || this.marks[cmpFullPath];
 
       out.push(
         h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
@@ -1364,7 +1445,7 @@ export default class FilesSearch extends View {
 
     if (
       key() !== this.context?.key ||
-      (becameVisible && (this.needsFolderReloadOnShow || this.dirtyFolders.size > 0)) ||
+      (becameVisible && (!this.entries.has("") || Boolean(this.error) || this.needsFolderReloadOnShow || this.dirtyFolders.size > 0)) ||
       hasActiveReq ||
       hasSelectReq
     ) {
@@ -1417,11 +1498,11 @@ export default class FilesSearch extends View {
             el.child(this.button("files-back", div().child("←"), (_e, cx) => { this.show(null); cx.notify(); }))
           )
           .child(div().font_semibold().child("Files"))
-          .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(this.file ?? this.root?.split(/[\\/]/).pop() ?? ""))
+          .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(this.file ?? (this.root?.split(/[\\/]/).filter(Boolean).pop() || this.root || "")))
           .child(this.button("files-search-btn", svg("mods/files-search/search.svg").size(14), () => this.openSearchOverlay()))
       )
       // Compact horizontal scrollable service quick-filter bar
-      .when(Boolean(this.services?.length > 1 && !this.file), el =>
+      .when(Boolean((this.services?.length > 1 || (this.serviceFilter && this.serviceFilter !== "all")) && !this.file), el =>
         el.child(
           h_flex()
             .h(30)
@@ -1897,20 +1978,33 @@ export default class FilesSearch extends View {
                 })
               );
               list = perService.flat();
-            } else if (!on) {
-              list = await fsListFiles(root, 20000);
             } else {
-              // Remote POSIX find fallback
-              const findRes = await exec(
-                "sh",
-                ["-c", 'find . -not -path "*/.*" -not -path "*/target/*" -not -path "*/build/*" -not -path "*/node_modules/*" -not -path "*/.venv/*" -type f | sed "s|^./||"'],
-                { cwd: root, on }
-              ).catch(() => null);
-              if (findRes?.code === 0 && findRes.stdout.trim()) {
-                list = findRes.stdout
-                  .split(/\r?\n/)
-                  .map(s => s.trim().replace(/\\/g, "/").replace(/^\.\//, ""))
-                  .filter(Boolean);
+              const fsFiles = !on ? await fsListFiles(root, 20000) : null;
+              if (Array.isArray(fsFiles)) {
+                list = fsFiles;
+              } else if (!on && isWindows) {
+                const escaped = root.replace(/['‘’‚‛]/g, "$&$&");
+                const cmd = `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & { param($p) $n = $p.TrimEnd('\\','/'); Get-ChildItem -LiteralPath $p -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '[\\\\/](\\.(git|cache|next|nuxt|venv)|node_modules|target|dist|build|vendor|out|coverage|logs)([\\\\/]|$)' } | Select-Object -First 20000 -ExpandProperty FullName | ForEach-Object { $_.Substring($n.Length).TrimStart('\\','/') -replace '\\\\','/' } } '${escaped}'`;
+                const psRes = await exec("powershell", ["-NoProfile", "-Command", cmd], { on }).catch(() => null);
+                if (psRes?.code === 0 && psRes.stdout.trim()) {
+                  list = psRes.stdout
+                    .split(/\r?\n/)
+                    .map(s => s.trim())
+                    .filter(Boolean);
+                }
+              } else {
+                // Remote or POSIX find fallback
+                const findRes = await exec(
+                  "sh",
+                  ["-c", 'find . -not -path "*/.*" -not -path "*/target/*" -not -path "*/build/*" -not -path "*/node_modules/*" -not -path "*/.venv/*" -type f | sed "s|^./||"'],
+                  { cwd: root, on }
+                ).catch(() => null);
+                if (findRes?.code === 0 && findRes.stdout.trim()) {
+                  list = findRes.stdout
+                    .split(/\r?\n/)
+                    .map(s => s.trim().replace(/\\/g, "/").replace(/^\.\//, ""))
+                    .filter(Boolean);
+                }
               }
             }
           }

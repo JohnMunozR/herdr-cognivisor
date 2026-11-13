@@ -15,13 +15,14 @@ function location() {
   const spacePanes = allPanes.filter((p) => spaceTabs.has(p.tab));
   const pane = (f?.pane ? spacePanes.find((p) => p.pane === f.pane) : null) || spacePanes.find((p) => p.cwd) || null;
   const on = pane?.machine || space?.machine || null;
+  const isWin = !on && window()?.platform === "windows";
 
   let workspaceRoot = null;
   if (space?.folder) {
     workspaceRoot = space.folder;
     if (pane?.cwd) {
-      const normSpace = space.folder.replace(/\\/g, "/").replace(/\/+$/, "");
-      const normPane = pane.cwd.replace(/\\/g, "/").replace(/\/+$/, "");
+      const normSpace = normCmpStr(space.folder, isWin);
+      const normPane = normCmpStr(pane.cwd, isWin);
       if (normPane !== normSpace && !normPane.startsWith(normSpace + "/")) {
         workspaceRoot = pane.cwd;
       }
@@ -114,6 +115,36 @@ const TRANSCRIPT_THROTTLE_MS = 4000;
 
 function normPathStr(p) {
   return String(p || "").replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function normCmpStr(p, isWindows = false) {
+  const s = normPathStr(p);
+  return isWindows ? s.toLowerCase() : s;
+}
+
+function isSameOrChildPath(child, parent, isWindows = false) {
+  const c = normCmpStr(child, isWindows);
+  const p = normCmpStr(parent, isWindows);
+  if (!c || !p) return false;
+  return c === p || c.startsWith(p + "/");
+}
+
+function isSupportedDirentList(entries) {
+  if (!Array.isArray(entries)) return false;
+  if (entries.length === 0) return true;
+  const first = entries[0];
+  return (
+    typeof first === "object" &&
+    first !== null &&
+    "name" in first &&
+    (typeof first.isDirectory === "function" || typeof first.isDirectory === "boolean")
+  );
+}
+
+function direntIsDir(entry) {
+  return typeof entry?.isDirectory === "function"
+    ? Boolean(entry.isDirectory())
+    : Boolean(entry?.isDirectory);
 }
 
 function findLayoutNode(node, id) {
@@ -237,14 +268,20 @@ function getParentDir(normPath) {
 
 async function fsScanRepos(targetRoot, depth2 = true) {
   if (!targetRoot) return [];
+  let level1;
+  try {
+    level1 = await readdir(targetRoot, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  if (!isSupportedDirentList(level1)) return null;
   const found = [];
   if (await exists(join(targetRoot, ".git")).catch(() => false)) {
     found.push(targetRoot);
   }
-  const level1 = await readdir(targetRoot, { withFileTypes: true }).catch(() => []);
   await Promise.all(
     level1.map(async (e1) => {
-      if (!e1?.isDirectory?.() || !e1.name || DISCOVER_SKIP_DIRS.has(e1.name)) return;
+      if (!direntIsDir(e1) || !e1.name || DISCOVER_SKIP_DIRS.has(e1.name)) return;
       const p1 = join(targetRoot, e1.name);
       if (await exists(join(p1, ".git")).catch(() => false)) {
         found.push(p1);
@@ -252,9 +289,10 @@ async function fsScanRepos(targetRoot, depth2 = true) {
       }
       if (!depth2) return;
       const level2 = await readdir(p1, { withFileTypes: true }).catch(() => []);
+      if (!isSupportedDirentList(level2)) return;
       await Promise.all(
         level2.map(async (e2) => {
-          if (!e2?.isDirectory?.() || !e2.name || DISCOVER_SKIP_DIRS.has(e2.name)) return;
+          if (!direntIsDir(e2) || !e2.name || DISCOVER_SKIP_DIRS.has(e2.name)) return;
           const p2 = join(p1, e2.name);
           if (await exists(join(p2, ".git")).catch(() => false)) {
             found.push(p2);
@@ -287,7 +325,10 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
 
   const scanRoot = async (targetRoot, depth2 = true) => {
     if (!targetRoot) return [];
-    if (!on) return fsScanRepos(targetRoot, depth2);
+    if (!on) {
+      const fsResult = await fsScanRepos(targetRoot, depth2);
+      if (fsResult !== null) return fsResult;
+    }
 
     if (isWindows) {
       try {
@@ -323,7 +364,13 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
 
   discovered = await scanRoot(workspaceRoot, true);
 
-  let repoPaths = Array.from(new Set(discovered.map(p => normPathStr(p)).filter(Boolean)));
+  let repoPaths = [];
+  for (const p of discovered) {
+    const norm = normPathStr(p);
+    if (norm && !repoPaths.some(r => normCmpStr(r, isWindows) === normCmpStr(norm, isWindows))) {
+      repoPaths.push(norm);
+    }
+  }
 
   if (repoPaths.length === 0) {
     const localTop = !on ? await findLocalGitRoot(workspaceRoot) : null;
@@ -340,14 +387,16 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
   // If workspaceRoot itself is a single repo (or inside one), also check sibling repos in its parent folder
   const isSingleRepoRoot =
     repoPaths.length === 1 &&
-    (repoPaths[0] === normWorkspace || normWorkspace.startsWith(repoPaths[0] + "/"));
+    isSameOrChildPath(normWorkspace, repoPaths[0], isWindows);
   if (isSingleRepoRoot) {
     const parentDir = getParentDir(repoPaths[0]);
     if (parentDir) {
       const siblings = await scanRoot(parentDir, false);
       for (const s of siblings) {
         const normS = normPathStr(s);
-        if (normS && !repoPaths.includes(normS)) repoPaths.push(normS);
+        if (normS && !repoPaths.some(r => normCmpStr(r, isWindows) === normCmpStr(normS, isWindows))) {
+          repoPaths.push(normS);
+        }
       }
     }
   }
@@ -356,27 +405,27 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
   for (const extra of extraCwds || []) {
     if (!extra) continue;
     const normExtra = normPathStr(extra);
-    if (!normExtra || repoPaths.some(r => normExtra === r || normExtra.startsWith(r + "/"))) continue;
+    if (!normExtra || repoPaths.some(r => isSameOrChildPath(normExtra, r, isWindows))) continue;
     const localTop = !on ? await findLocalGitRoot(extra) : null;
     if (localTop) {
-      if (!repoPaths.includes(localTop)) repoPaths.push(localTop);
+      if (!repoPaths.some(r => normCmpStr(r, isWindows) === normCmpStr(localTop, isWindows))) repoPaths.push(localTop);
       continue;
     }
     const top = await exec("git", [...READ, "rev-parse", "--show-toplevel"], { cwd: extra, on }).catch(() => null);
     if (top && top.code === 0 && top.stdout.trim()) {
       const normTop = normPathStr(top.stdout.trim());
-      if (normTop && !repoPaths.includes(normTop)) repoPaths.push(normTop);
+      if (normTop && !repoPaths.some(r => normCmpStr(r, isWindows) === normCmpStr(normTop, isWindows))) repoPaths.push(normTop);
     }
   }
 
   const services = repoPaths.map(repoRoot => {
-    const isInsideWorkspace = repoRoot === normWorkspace || repoRoot.startsWith(normWorkspace + "/");
+    const isInsideWorkspace = isSameOrChildPath(repoRoot, normWorkspace, isWindows);
     let relPath = "";
-    if (repoRoot !== normWorkspace && isInsideWorkspace) {
+    if (normCmpStr(repoRoot, isWindows) !== normCmpStr(normWorkspace, isWindows) && isInsideWorkspace) {
       relPath = repoRoot.slice(normWorkspace.length + 1);
     }
     const name = repoRoot.split("/").filter(Boolean).pop() || "root";
-    const id = relPath || (repoRoot === normWorkspace ? "." : (isInsideWorkspace ? name : `../${name}`));
+    const id = relPath || (normCmpStr(repoRoot, isWindows) === normCmpStr(normWorkspace, isWindows) ? "." : (isInsideWorkspace ? name : `../${name}`));
     return {
       id,
       name,
