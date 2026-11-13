@@ -87,16 +87,16 @@ The mod detects its operational mode during initialization via `props()`:
 - **Workspace-Wide Root Resolution:** Resolves search root via `props().root || shared("mesh.services")?.workspaceRoot || location().cwd`.
 - **IntelliJ-Style Floating Dialog with Segmented Category Tabs:**
   - **All:** Combined filename and content matches.
-  - **Files:** Rapid in-memory fuzzy matching against workspace file lists (`rg --files --path-separator /`, `git ls-files`, `mesh.services.candidates`, or native `fsListFiles` falling back to Windows PowerShell `Get-ChildItem -Recurse` or POSIX `find` outside `$HOME`).
-  - **Text:** Asynchronous live search executing `rg --vimgrep --path-separator / --max-count=8` (handling `code === 1` empty matches without fallback, retrying regex-syntax `code === 2` with `-F`, and falling back to parallel `git grep -F` across `candidates` only when `rg` is missing/broken), normalizing Windows backslashes cleanly.
+  - **Files:** Time-sliced chunked fuzzy matching (`triggerFileSearch` / `fileSearchTask` with `scoreSubseqFast`, monotonic prefix narrowing, and bounded top-50 scoring so `renderOverlay()` stays O(1) without QuickJS `interrupted` timeouts) against cached workspace file lists (`OVERLAY_INDEX_CACHE` refreshed via `rg --files --path-separator /`, `git ls-files`, `mesh.services.candidates` in bounded batches, or native `fsListFiles` falling back to Windows PowerShell `Get-ChildItem -Recurse` or POSIX `find`).
+  - **Text:** Debounced asynchronous search (`160ms`/`260ms`) with session query cache executing `rg --vimgrep --path-separator / --max-count=3 --max-filesize 512K --threads 4` (caching ripgrep availability via `RG_AVAILABLE_CACHE`, handling `code === 1` empty matches without fallback, retrying regex-syntax `code === 2` with `-F`, and falling back to bounded-concurrency `git grep -F -m 3` across active-first `candidates` only when `rg` is missing/broken), normalizing Windows backslashes cleanly.
 - **Microservice Prefix Badges:** When the workspace contains multiple microservices (`mesh.services.services.length > 1`), search result rows display a distinctive badge identifying the microservice to which each matched file or text line belongs.
 - Features an optional live code preview pane with viewport-clamped column widths (never overflowing down to `winW = 860`) that reads file chunks via `readFileChunk` and centers on matching line numbers.
 - Allows resizing via grip controls, persisting geometry across sessions via `setShared("files-search.customSize", ...)`.
 
 ## Invariants
 
-1. **Subprocess Throttling and Cancellation:**
-   Entering characters into the search field triggers a debounced search task. Any previously running `textSearchTask` MUST be cancelled via `this.textSearchTask?.cancel()` before launching a subsequent query, guaranteeing that slow subprocesses do not overwrite newer results.
+1. **Subprocess Throttling, Chunked File Matching, and Cancellation:**
+   Entering characters into the search field triggers time-sliced file matching (`triggerFileSearch` / `fileSearchTask`) and a debounced text search task. `renderOverlay()` only reads precomputed `searchResults()`. Any previously running `fileSearchTask` or `textSearchTask` MUST be cancelled via `.cancel()` before launching a subsequent query, guaranteeing that slow work never blocks `render()` or overwrites newer results.
 2. **Lock-Free Multi-Repository Git Operations:**
    Every read-only Git status, diff, ls-files, or grep command executed across discovered services MUST supply `--no-optional-locks -c core.fsmonitor=false -c diff.autoRefreshIndex=false` to prevent touching `.git/index.lock` or tripping filesystem watchers.
 3. **Workspace Root Stability:**
@@ -106,7 +106,7 @@ The mod detects its operational mode during initialization via `props()`:
 5. **Deep Path Auto-Expansion:**
    When `openFromSearch(path)` receives a file selected externally, it iteratively builds and adds all intermediate folder paths to `this.folders` before rendering, ensuring the target node is immediately visible in the tree.
 6. **Graceful Teardown:**
-   Upon overlay close or view release, all background tasks (`focusInputTask`, `watchDebounceTask`, `pendingPanelSyncTask`, `textSearchTask`, `previewDebounceTask`) and allocated resources (`this.input?.release()`, `this.code?.release()`) must be cleanly disposed of.
+   Upon overlay close or view release, `_overlayClosed` is set and all background tasks (`focusInputTask`, `watchDebounceTask`, `pendingPanelSyncTask`, `fileSearchTask`, `textSearchTask`, `previewDebounceTask`) and allocated resources (`this.input?.release()`, `this.code?.release()`) must be cleanly disposed of.
 
 ## Multi-Repo & Mesh Architecture
 

@@ -681,7 +681,126 @@ async function readFileChunk(fullPath, startLine, count, on, isWindows = false) 
   }
 }
 
-// Fuzzy score and hit indices for file matching
+const MAX_OVERLAY_FILES = 20000;
+const MAX_FILE_RESULTS = 50;
+const MAX_EMPTY_FILES = 30;
+const MAX_TEXT_RESULTS = 35;
+const FILE_SEARCH_CHUNK = 1200;
+const FILE_SEARCH_BUDGET_MS = 6;
+const OVERLAY_INDEX_FRESH_MS = 8000;
+const OVERLAY_INDEX_CACHE = new Map();
+const RG_AVAILABLE_CACHE = new Map();
+
+const COMMON_IGNORE_GLOBS = [
+  "--glob", "!.git",
+  "--glob", "!node_modules",
+  "--glob", "!.cache",
+  "--glob", "!target",
+  "--glob", "!build",
+  "--glob", "!.next",
+  "--glob", "!.nuxt",
+  "--glob", "!.svelte-kit",
+  "--glob", "!.turbo",
+  "--glob", "!.parcel-cache",
+  "--glob", "!.venv",
+  "--glob", "!venv",
+  "--glob", "!vendor",
+  "--glob", "!dist",
+  "--glob", "!coverage",
+  "--glob", "!.gradle",
+  "--glob", "!.idea",
+  "--glob", "!.vs",
+  "--glob", "!__pycache__",
+  "--glob", "!.pytest_cache",
+  "--glob", "!.mypy_cache",
+  "--glob", "!obj",
+  "--glob", "!.terraform",
+  "--glob", "!.angular",
+  "--glob", "!.nx",
+];
+
+function parseIndexedPaths(stdout, cap = MAX_OVERLAY_FILES, prefix = "") {
+  const out = [];
+  if (!stdout) return out;
+  let start = 0;
+  const len = stdout.length;
+  while (start < len && out.length < cap) {
+    let nl = stdout.indexOf("\n", start);
+    if (nl === -1) nl = len;
+    let line = stdout.slice(start, nl).trim();
+    start = nl + 1;
+    if (!line) continue;
+    if (line.indexOf("\\") !== -1) line = line.replace(/\\/g, "/");
+    if (line.startsWith("./")) line = line.slice(2);
+    if (!line) continue;
+    out.push(prefix ? `${prefix}${line}` : line);
+  }
+  return out;
+}
+
+function parseSearchOutputLines(stdout, q, prefix = "", cap = MAX_TEXT_RESULTS, out = []) {
+  if (!stdout || out.length >= cap) return out;
+  const lowerQ = q ? q.toLowerCase() : "";
+  let start = 0;
+  const len = stdout.length;
+  while (start < len && out.length < cap) {
+    let nl = stdout.indexOf("\n", start);
+    if (nl === -1) nl = len;
+    const rawLine = stdout.slice(start, nl);
+    start = nl + 1;
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (!line.trim()) continue;
+    const m = line.match(/^([^:]+):(\d+):(?:(\d+):)?(.*)$/);
+    if (!m) continue;
+    let normRel = m[1];
+    if (normRel.indexOf("\\") !== -1) normRel = normRel.replace(/\\/g, "/");
+    if (normRel.startsWith("./")) normRel = normRel.slice(2);
+    let content = m[4].trim();
+    if (content.length > 260) {
+      const idx = lowerQ ? content.toLowerCase().indexOf(lowerQ) : -1;
+      if (idx > 140) {
+        const sliceStart = Math.max(0, idx - 60);
+        content = (sliceStart > 0 ? "…" : "") + content.slice(sliceStart, sliceStart + 240) + "…";
+      } else {
+        content = content.slice(0, 240) + "…";
+      }
+    }
+    out.push({
+      kind: "text",
+      path: prefix ? `${prefix}${normRel}` : normRel,
+      line: parseInt(m[2], 10),
+      content,
+      matchedQuery: q,
+    });
+  }
+  return out;
+}
+
+// Fast zero-allocation subsequence scorer matching fuzzy()'s ranking weights
+function scoreSubseqFast(lower, qChars, qLen) {
+  if (qLen >= 3 && lower.indexOf(qChars[qLen - 1]) === -1) return -Infinity;
+  let score = 0;
+  let at = 0;
+  let run = 0;
+  let matchedAny = false;
+  for (let j = 0; j < qLen; j++) {
+    const i = lower.indexOf(qChars[j], at);
+    if (i < 0) return -Infinity;
+    let start = i === 0;
+    if (!start) {
+      const prev = lower.charCodeAt(i - 1);
+      start = prev === 47 || prev === 92 || prev === 95 || prev === 45 || prev === 46 || prev === 32 || prev === 58 || prev === 9;
+    }
+    run = matchedAny && i === at ? run + 1 : 0;
+    matchedAny = true;
+    const gap = i - at;
+    score += 1 + (start ? 6 : 0) + run * 3 - (gap < 6 ? gap : 6) * 0.3;
+    at = i + 1;
+  }
+  return score - lower.length * 0.02;
+}
+
+// Fuzzy score and hit indices for file matching (run on top winning rows)
 function fuzzy(q, text) {
   const t = text.toLowerCase();
   let score = 0, at = 0, run = 0;
@@ -696,6 +815,29 @@ function fuzzy(q, text) {
     at = i + 1;
   }
   return { score: score - text.length * 0.02, hits };
+}
+
+function buildTopFileItems(top, q, withHits) {
+  if (!top.length) return [];
+  const sorted = top.slice().sort((a, b) => b.score - a.score);
+  return sorted.map(({ entry, score, fromName }) => ({
+    kind: "file",
+    path: entry.path,
+    name: entry.name,
+    score,
+    hits: withHits && fromName ? (fuzzy(q, entry.name)?.hits || []) : [],
+  }));
+}
+
+async function runInBatches(items, concurrency, fn, shouldStop) {
+  const results = [];
+  for (let i = 0; i < items.length; i += concurrency) {
+    if (shouldStop && shouldStop()) break;
+    const chunk = items.slice(i, i + concurrency);
+    const batchOut = await Promise.all(chunk.map(fn));
+    results.push(...batchOut);
+  }
+  return results;
 }
 
 const SHOWN = 9;
@@ -1602,18 +1744,41 @@ export default class FilesSearch extends View {
     this.searchRoot = p?.root || shared("mesh.services")?.workspaceRoot || location().cwd;
     this.searchOn = p?.on || location().on;
     this.searchIsWindows = !this.searchOn && window()?.platform === "windows";
+    this._overlayClosed = false;
     this.tab = "all"; // "all" | "files" | "text"
     this.query = "";
-    this.fileList = [];
+
+    const indexKey = `${normPathStr(this.searchRoot)}::${this.searchOn || ""}`;
+    const cachedIndex = OVERLAY_INDEX_CACHE.get(indexKey);
+    const hasCachedIndex = Boolean(cachedIndex && Array.isArray(cachedIndex.entries) && cachedIndex.entries.length > 0);
+    this.fileList = hasCachedIndex ? cachedIndex.list : [];
+    this.fileEntries = hasCachedIndex ? cachedIndex.entries : [];
+    this.fileResults = hasCachedIndex
+      ? cachedIndex.entries.slice(0, MAX_EMPTY_FILES).map(e => ({
+          kind: "file",
+          path: e.path,
+          name: e.name,
+          score: 0,
+          hits: [],
+        }))
+      : [];
+
     this.textResults = [];
     this.isSearchingText = false;
+    this.isSearchingFiles = false;
     this.searchSeq = 0;
+    this.fileSearchSeq = 0;
     this.previewReqSeq = 0;
     this.textSearchTask = null;
+    this.fileSearchTask = null;
     this.previewDebounceTask = null;
-    this.fileEntries = [];
-    this._cachedResults = null;
-    this._lastSearchKey = null;
+    this._fileResultsVer = hasCachedIndex ? 1 : 0;
+    this._textResultsVer = 0;
+    this._combinedCacheKey = null;
+    this._combinedResults = [];
+    this._fileQueryCache = new Map();
+    this._narrowHistory = [];
+    this.textQueryCache = new Map();
     this._currentPreviewKey = null;
     this.at = 0;
     this.scroll = 0;
@@ -1645,8 +1810,8 @@ export default class FilesSearch extends View {
       this.query = this.input.value();
       this.at = 0;
       this.scroll = 0;
-      this._lastSearchKey = null;
-      this._cachedResults = null;
+      this._combinedCacheKey = null;
+      this.triggerFileSearch(cx);
       this.triggerTextSearch(cx);
       if (this.showPreview) {
         const items = this.searchResults();
@@ -1665,17 +1830,22 @@ export default class FilesSearch extends View {
       try { this.input?.focus(); } catch {}
     });
 
-    // Preload files in workspace
-    this.loadWorkspaceFiles(cx);
+    // Preload or refresh stale workspace file index asynchronously
+    if (!hasCachedIndex || (Date.now() - cachedIndex.ts) >= OVERLAY_INDEX_FRESH_MS) {
+      this.loadWorkspaceFiles(cx);
+    }
   }
 
   close(cx) {
+    this._overlayClosed = true;
     this.focusInputTask?.cancel();
     this.focusInputTask = null;
     this.watchDebounceTask?.cancel();
     this.watchDebounceTask = null;
     this.pendingPanelSyncTask?.cancel();
     this.pendingPanelSyncTask = null;
+    this.fileSearchTask?.cancel();
+    this.fileSearchTask = null;
     this.textSearchTask?.cancel();
     this.textSearchTask = null;
     this.previewDebounceTask?.cancel();
@@ -1687,8 +1857,11 @@ export default class FilesSearch extends View {
   }
 
   closeOverlay() {
+    this._overlayClosed = true;
     this.focusInputTask?.cancel();
     this.focusInputTask = null;
+    this.fileSearchTask?.cancel();
+    this.fileSearchTask = null;
     this.textSearchTask?.cancel();
     this.textSearchTask = null;
     this.previewDebounceTask?.cancel();
@@ -1906,46 +2079,50 @@ export default class FilesSearch extends View {
     const on = this.searchOn;
     const isWindows = this.searchIsWindows ?? (!on && window()?.platform === "windows");
     if (!root) return;
+    const onKey = on || "local";
+    const indexKey = `${normPathStr(root)}::${on || ""}`;
 
     cx.spawn(async cx => {
       try {
         let list = [];
         // Fast ripgrep file list (rg traverses sub-repositories and respects their .gitignores)
-        const rgRes = await exec(
-          "rg",
-          [
-            "--files", "--hidden", "--path-separator", "/",
-            "--glob", "!.git", "--glob", "!node_modules", "--glob", "!.cache",
-            "--glob", "!target", "--glob", "!build", "--glob", "!.next",
-            "--glob", "!.venv", "--glob", "!vendor"
-          ],
-          { cwd: root, on }
-        ).catch(() => null);
+        let rgRes = null;
+        if (RG_AVAILABLE_CACHE.get(onKey) !== false) {
+          rgRes = await exec(
+            "rg",
+            ["--files", "--hidden", "--path-separator", "/", "--threads", "4", ...COMMON_IGNORE_GLOBS],
+            { cwd: root, on, timeout: 10000 }
+          ).catch(() => null);
+          if (this._overlayClosed) return;
+          if (rgRes) {
+            RG_AVAILABLE_CACHE.set(onKey, true);
+          } else {
+            const probe = await exec("rg", ["--version"], { on, timeout: 2500 }).catch(() => null);
+            if (this._overlayClosed) return;
+            RG_AVAILABLE_CACHE.set(onKey, Boolean(probe && probe.code === 0));
+          }
+        }
 
-        if (rgRes?.code === 0 && rgRes.stdout.trim()) {
-          list = rgRes.stdout
-            .split(/\r?\n/)
-            .map(s => s.trim().replace(/\\/g, "/").replace(/^\.\//, ""))
-            .filter(Boolean);
-        } else if (!rgRes || rgRes.code !== 0) {
+        if (rgRes?.code === 0 && rgRes.stdout) {
+          list = parseIndexedPaths(rgRes.stdout, MAX_OVERLAY_FILES);
+        } else if (!rgRes || rgRes.code !== 0 || !list.length) {
           // Check if root is a git repository
           const rev = await exec(
             "git",
             ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "rev-parse", "--show-toplevel"],
-            { cwd: root, on }
+            { cwd: root, on, timeout: 5000 }
           ).catch(() => null);
+          if (this._overlayClosed) return;
 
           if (rev?.code === 0) {
             const gitRes = await exec(
               "git",
               ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "ls-files", "--cached", "--others", "--exclude-standard"],
-              { cwd: root, on }
+              { cwd: root, on, timeout: 8000 }
             ).catch(() => null);
-            if (gitRes?.code === 0 && gitRes.stdout.trim()) {
-              list = gitRes.stdout
-                .split(/\r?\n/)
-                .map(s => s.trim().replace(/\\/g, "/").replace(/^\.\//, ""))
-                .filter(Boolean);
+            if (this._overlayClosed) return;
+            if (gitRes?.code === 0 && gitRes.stdout) {
+              list = parseIndexedPaths(gitRes.stdout, MAX_OVERLAY_FILES);
             }
           } else {
             // Multi-repo fallback: reuse mesh.services candidates when matching, else discoverRepos
@@ -1958,28 +2135,32 @@ export default class FilesSearch extends View {
               bus.candidates.length > 0
             );
             const services = hasBusCandidates ? bus.candidates : await discoverRepos(root, on, isWindows);
+            if (this._overlayClosed) return;
             if (services && services.length > 0) {
-              const perService = await Promise.all(
-                services.map(async s => {
+              const collected = [];
+              await runInBatches(
+                services,
+                4,
+                async s => {
                   const r = await exec(
                     "git",
                     ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "ls-files", "--cached", "--others", "--exclude-standard"],
-                    { cwd: s.root, on }
+                    { cwd: s.root, on, timeout: 6000 }
                   ).catch(() => null);
-                  if (r?.code === 0 && r.stdout.trim()) {
+                  if (r?.code === 0 && r.stdout && collected.length < MAX_OVERLAY_FILES) {
                     const prefix = s.relPath ? `${s.relPath}/` : "";
-                    return r.stdout
-                      .split(/\r?\n/)
-                      .map(line => line.trim().replace(/\\/g, "/").replace(/^\.\//, ""))
-                      .filter(Boolean)
-                      .map(line => `${prefix}${line}`);
+                    const parsed = parseIndexedPaths(r.stdout, MAX_OVERLAY_FILES - collected.length, prefix);
+                    for (let i = 0; i < parsed.length && collected.length < MAX_OVERLAY_FILES; i++) {
+                      collected.push(parsed[i]);
+                    }
                   }
-                  return [];
-                })
+                },
+                () => this._overlayClosed || collected.length >= MAX_OVERLAY_FILES
               );
-              list = perService.flat();
+              list = collected;
             } else {
-              const fsFiles = !on ? await fsListFiles(root, 20000) : null;
+              const fsFiles = !on ? await fsListFiles(root, MAX_OVERLAY_FILES) : null;
+              if (this._overlayClosed) return;
               if (Array.isArray(fsFiles)) {
                 list = fsFiles;
               } else if (!on && isWindows) {
@@ -1996,49 +2177,243 @@ export default class FilesSearch extends View {
                 // Remote or POSIX find fallback
                 const findRes = await exec(
                   "sh",
-                  ["-c", 'find . -not -path "*/.*" -not -path "*/target/*" -not -path "*/build/*" -not -path "*/node_modules/*" -not -path "*/.venv/*" -type f | sed "s|^./||"'],
-                  { cwd: root, on }
+                  ["-c", 'find . -not -path "*/.*" -not -path "*/target/*" -not -path "*/build/*" -not -path "*/node_modules/*" -not -path "*/.venv/*" -type f | head -n 20000 | sed "s|^./||"'],
+                  { cwd: root, on, timeout: 10000 }
                 ).catch(() => null);
-                if (findRes?.code === 0 && findRes.stdout.trim()) {
-                  list = findRes.stdout
-                    .split(/\r?\n/)
-                    .map(s => s.trim().replace(/\\/g, "/").replace(/^\.\//, ""))
-                    .filter(Boolean);
+                if (this._overlayClosed) return;
+                if (findRes?.code === 0 && findRes.stdout) {
+                  list = parseIndexedPaths(findRes.stdout, MAX_OVERLAY_FILES);
                 }
               }
             }
           }
         }
 
-        const sliced = list.slice(0, 20000);
-        this.fileList = sliced;
-        this.fileEntries = sliced.map(path => {
-          const name = path.includes("/") ? path.slice(path.lastIndexOf("/") + 1) : path;
-          return {
+        if (this._overlayClosed) return;
+        const sliced = list.length > MAX_OVERLAY_FILES ? list.slice(0, MAX_OVERLAY_FILES) : list;
+        const builtEntries = [];
+        for (let i = 0; i < sliced.length; i++) {
+          if (i > 0 && i % 4000 === 0) {
+            await cx.sleep(0);
+            if (this._overlayClosed) return;
+          }
+          const path = sliced[i];
+          const slash = path.lastIndexOf("/");
+          const name = slash >= 0 ? path.slice(slash + 1) : path;
+          builtEntries.push({
             path,
             name,
             lowerPath: path.toLowerCase(),
             lowerName: name.toLowerCase(),
-          };
-        });
-        this._lastSearchKey = null;
-        this._cachedResults = null;
-      } catch (err) {
-        this.fileList = [];
-        this.fileEntries = [];
+          });
+        }
+
+        if (OVERLAY_INDEX_CACHE.size >= 6) {
+          const oldestKey = OVERLAY_INDEX_CACHE.keys().next().value;
+          if (oldestKey !== undefined) OVERLAY_INDEX_CACHE.delete(oldestKey);
+        }
+        OVERLAY_INDEX_CACHE.set(indexKey, { list: sliced, entries: builtEntries, ts: Date.now() });
+
+        this.fileList = sliced;
+        this.fileEntries = builtEntries;
+        this._fileQueryCache.clear();
+        this._narrowHistory = [];
+        this._combinedCacheKey = null;
+
+        if (this.tab !== "text") {
+          this.triggerFileSearch(cx);
+        }
+      } catch {
+        if (!this._overlayClosed && !this.fileEntries.length) {
+          this.fileList = [];
+          this.fileEntries = [];
+          this.fileResults = [];
+          this._fileResultsVer++;
+          this._combinedCacheKey = null;
+        }
       } finally {
-        cx.notify();
+        if (!this._overlayClosed) cx.notify();
       }
     });
   }
 
+  triggerFileSearch(cx) {
+    this.fileSearchTask?.cancel();
+    this.fileSearchTask = null;
+    const seq = ++this.fileSearchSeq;
+
+    if (this._overlayClosed || this.tab === "text") {
+      this.isSearchingFiles = false;
+      if (this.tab === "text") {
+        this.fileResults = [];
+        this._fileResultsVer++;
+        this._combinedCacheKey = null;
+      }
+      return;
+    }
+
+    const rawQ = this.query.trim().toLowerCase();
+    const q = rawQ.replace(/\s+/g, "");
+    if (!q) {
+      this.isSearchingFiles = false;
+      this.fileResults = this.fileEntries.slice(0, MAX_EMPTY_FILES).map(e => ({
+        kind: "file",
+        path: e.path,
+        name: e.name,
+        score: 0,
+        hits: [],
+      }));
+      this._fileResultsVer++;
+      this._combinedCacheKey = null;
+      return;
+    }
+
+    const cached = this._fileQueryCache.get(q);
+    if (cached) {
+      this.isSearchingFiles = false;
+      this.fileResults = cached;
+      this._fileResultsVer++;
+      this._combinedCacheKey = null;
+      return;
+    }
+
+    let source = this.fileEntries;
+    for (let i = this._narrowHistory.length - 1; i >= 0; i--) {
+      const prev = this._narrowHistory[i];
+      if (q.startsWith(prev.q) && prev.matchedEntries.length < source.length) {
+        source = prev.matchedEntries;
+      }
+    }
+
+    if (!source.length) {
+      this.isSearchingFiles = false;
+      this.fileResults = [];
+      this._fileResultsVer++;
+      this._combinedCacheKey = null;
+      return;
+    }
+
+    const qChars = Array.from(q);
+    const qLen = qChars.length;
+    const hasSlash = q.indexOf("/") !== -1;
+    const matchedEntries = [];
+    const top = [];
+    let minTopScore = -Infinity;
+    let minTopIdx = 0;
+    let cursor = 0;
+
+    const scanBatch = () => {
+      const batchStart = Date.now();
+      let count = 0;
+      const len = source.length;
+      while (cursor < len) {
+        const entry = source[cursor++];
+        let score = -Infinity;
+        let fromName = false;
+        if (!hasSlash) {
+          const ns = scoreSubseqFast(entry.lowerName, qChars, qLen);
+          if (ns > -Infinity) {
+            score = ns + 15;
+            fromName = true;
+          } else {
+            score = scoreSubseqFast(entry.lowerPath, qChars, qLen);
+          }
+        } else {
+          score = scoreSubseqFast(entry.lowerPath, qChars, qLen);
+        }
+
+        if (score > -Infinity) {
+          matchedEntries.push(entry);
+          if (top.length < MAX_FILE_RESULTS) {
+            top.push({ entry, score, fromName });
+            if (top.length === MAX_FILE_RESULTS) {
+              minTopScore = top[0].score;
+              minTopIdx = 0;
+              for (let k = 1; k < top.length; k++) {
+                if (top[k].score < minTopScore) {
+                  minTopScore = top[k].score;
+                  minTopIdx = k;
+                }
+              }
+            }
+          } else if (score > minTopScore) {
+            top[minTopIdx] = { entry, score, fromName };
+            minTopScore = top[0].score;
+            minTopIdx = 0;
+            for (let k = 1; k < top.length; k++) {
+              if (top[k].score < minTopScore) {
+                minTopScore = top[k].score;
+                minTopIdx = k;
+              }
+            }
+          }
+        }
+
+        count++;
+        if (count >= FILE_SEARCH_CHUNK && cursor < len) {
+          if (count >= FILE_SEARCH_CHUNK * 2 || (Date.now() - batchStart) >= FILE_SEARCH_BUDGET_MS) {
+            return false;
+          }
+        }
+        if ((count & 255) === 0 && cursor < len && (Date.now() - batchStart) >= FILE_SEARCH_BUDGET_MS) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    const finishScan = (stepCx, shouldNotify) => {
+      const finalResults = buildTopFileItems(top, q, true);
+      if (this._fileQueryCache.size > 40) this._fileQueryCache.clear();
+      this._fileQueryCache.set(q, finalResults);
+      if (this._narrowHistory.length >= 8) this._narrowHistory.shift();
+      this._narrowHistory.push({ q, matchedEntries });
+
+      this.fileResults = finalResults;
+      this.isSearchingFiles = false;
+      this._fileResultsVer++;
+      this._combinedCacheKey = null;
+      if (this.showPreview) {
+        const items = this.searchResults();
+        this.schedulePreview(items[0], stepCx, false);
+      }
+      if (shouldNotify) stepCx.notify();
+    };
+
+    // Execute first bounded batch right away; yield across chunks if source is large
+    if (scanBatch()) {
+      finishScan(cx, false);
+      return;
+    }
+
+    if (top.length > 0) {
+      this.fileResults = buildTopFileItems(top, q, false);
+      this._fileResultsVer++;
+      this._combinedCacheKey = null;
+    }
+    this.isSearchingFiles = true;
+
+    const scheduleNext = (timerCx) => {
+      this.fileSearchTask = timerCx.timer.after(0, nextCx => {
+        this.fileSearchTask = null;
+        if (this._overlayClosed || seq !== this.fileSearchSeq) return;
+        if (scanBatch()) {
+          finishScan(nextCx, true);
+        } else {
+          scheduleNext(nextCx);
+        }
+      });
+    };
+    scheduleNext(cx);
+  }
+
   triggerTextSearch(cx) {
     const q = this.query.trim();
-    if (this.tab === "files" || !q || q.length < 2) {
+    if (this._overlayClosed || this.tab === "files" || !q || q.length < 2) {
       this.textResults = [];
       this.isSearchingText = false;
-      this._lastSearchKey = null;
-      this._cachedResults = null;
+      this._textResultsVer++;
+      this._combinedCacheKey = null;
       if (this.textSearchTask) {
         this.textSearchTask.cancel();
         this.textSearchTask = null;
@@ -2046,9 +2421,23 @@ export default class FilesSearch extends View {
       return;
     }
 
+    if (this.textQueryCache.has(q)) {
+      if (this.textSearchTask) {
+        this.textSearchTask.cancel();
+        this.textSearchTask = null;
+      }
+      this.searchSeq++;
+      this.textResults = this.textQueryCache.get(q);
+      this.isSearchingText = false;
+      this._textResultsVer++;
+      this._combinedCacheKey = null;
+      return;
+    }
+
     const seq = ++this.searchSeq;
     const root = this.searchRoot;
     const on = this.searchOn;
+    const onKey = on || "local";
     const isWindows = this.searchIsWindows ?? (!on && window()?.platform === "windows");
     this.isSearchingText = true;
 
@@ -2057,62 +2446,63 @@ export default class FilesSearch extends View {
       this.textSearchTask = null;
     }
 
-    this.textSearchTask = cx.timer.after(160, cx => {
+    const delay = q.length <= 2 ? 260 : 160;
+    this.textSearchTask = cx.timer.after(delay, cx => {
+      this.textSearchTask = null;
+      if (this._overlayClosed || seq !== this.searchSeq) return;
       cx.spawn(async cx => {
         try {
+          const results = [];
           const rgBaseArgs = [
             "--vimgrep", "--no-heading", "--color=never", "--smart-case",
-            "--path-separator", "/", "--max-count=8", "--max-columns=200",
-            "--glob", "!.git", "--glob", "!node_modules", "--glob", "!.cache",
-            "--glob", "!target", "--glob", "!build", "--glob", "!.next", "--glob", "!.venv",
+            "--path-separator", "/", "--max-count=3", "--max-columns=200",
+            "--max-filesize", "512K", "--threads", "4",
+            ...COMMON_IGNORE_GLOBS,
+            "--glob", "!*.min.js", "--glob", "!*.min.css", "--glob", "!*.map",
           ];
-          const parseSearchLines = (stdout, prefix = "", cap = 35, out = []) => {
-            for (const line of String(stdout || "").split(/\r?\n/)) {
-              if (!line.trim()) continue;
-              const m = line.match(/^([^:]+):(\d+):(?:(\d+):)?(.*)$/);
-              if (m) {
-                const normRel = m[1].replace(/\\/g, "/").replace(/^\.\//, "");
-                out.push({
-                  kind: "text",
-                  path: `${prefix}${normRel}`,
-                  line: parseInt(m[2], 10),
-                  content: m[4].trim(),
-                  matchedQuery: q,
-                });
-              }
-              if (out.length >= cap) break;
-            }
-            return out;
-          };
 
-          let res = await exec("rg", [...rgBaseArgs, "--", q], { cwd: root, on }).catch(() => null);
-          if (res && res.code === 2) {
-            // Query contains unescaped regex characters; retry as literal fixed string.
-            res = await exec("rg", [...rgBaseArgs, "-F", "--", q], { cwd: root, on }).catch(() => null);
+          let res = null;
+          let rgChecked = false;
+          if (RG_AVAILABLE_CACHE.get(onKey) !== false) {
+            rgChecked = true;
+            res = await exec("rg", [...rgBaseArgs, "--", q], { cwd: root, on, timeout: 8000 }).catch(() => null);
+            if (this._overlayClosed || seq !== this.searchSeq) return;
+            if (res && res.code === 2) {
+              // Query contains unescaped regex characters; retry as literal fixed string.
+              res = await exec("rg", [...rgBaseArgs, "-F", "--", q], { cwd: root, on, timeout: 8000 }).catch(() => null);
+              if (this._overlayClosed || seq !== this.searchSeq) return;
+            }
+            if (res) {
+              RG_AVAILABLE_CACHE.set(onKey, true);
+            } else {
+              const probe = await exec("rg", ["--version"], { on, timeout: 2500 }).catch(() => null);
+              if (this._overlayClosed || seq !== this.searchSeq) return;
+              RG_AVAILABLE_CACHE.set(onKey, Boolean(probe && probe.code === 0));
+            }
           }
 
-          let results = [];
           if (res && res.code === 0) {
-            if (res.stdout) parseSearchLines(res.stdout, "", 35, results);
+            if (res.stdout) parseSearchOutputLines(res.stdout, q, "", MAX_TEXT_RESULTS, results);
           } else if (res && res.code === 1) {
             // Ripgrep exit code 1 means zero matches (not missing ripgrep).
-            results = [];
-          } else {
+          } else if (!rgChecked || !res) {
             // Fallback when rg is unavailable or failed unexpectedly
             const rev = await exec(
               "git",
               ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "rev-parse", "--show-toplevel"],
-              { cwd: root, on }
+              { cwd: root, on, timeout: 4000 }
             ).catch(() => null);
+            if (this._overlayClosed || seq !== this.searchSeq) return;
 
             if (rev?.code === 0) {
               const gitRes = await exec(
                 "git",
-                ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "grep", "-nI", "-F", "-i", "-m", "8", "--", q],
-                { cwd: root, on }
+                ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "grep", "-nI", "-F", "-i", "-m", "3", "--", q],
+                { cwd: root, on, timeout: 6000 }
               ).catch(() => null);
+              if (this._overlayClosed || seq !== this.searchSeq) return;
               if (gitRes && gitRes.stdout) {
-                parseSearchLines(gitRes.stdout, "", 35, results);
+                parseSearchOutputLines(gitRes.stdout, q, "", MAX_TEXT_RESULTS, results);
               }
             } else {
               const bus = shared("mesh.services");
@@ -2124,43 +2514,53 @@ export default class FilesSearch extends View {
                 bus.candidates.length > 0
               );
               const services = hasBusCandidates ? bus.candidates : await discoverRepos(root, on, isWindows);
+              if (this._overlayClosed || seq !== this.searchSeq) return;
               if (services && services.length > 0) {
-                const perRepo = await Promise.all(
-                  services.map(async s => {
+                const activeId = shared("mesh.activeService")?.serviceId;
+                const ordered = activeId
+                  ? [...services].sort((a, b) => (b.id === activeId ? 1 : 0) - (a.id === activeId ? 1 : 0))
+                  : services;
+                await runInBatches(
+                  ordered,
+                  4,
+                  async s => {
                     const sRes = await exec(
                       "git",
-                      ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "grep", "-nI", "-F", "-i", "-m", "8", "--", q],
-                      { cwd: s.root, on }
+                      ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "grep", "-nI", "-F", "-i", "-m", "3", "--", q],
+                      { cwd: s.root, on, timeout: 6000 }
                     ).catch(() => null);
-                    if (!sRes || !sRes.stdout) return [];
+                    if (this._overlayClosed || seq !== this.searchSeq || !sRes || !sRes.stdout) return;
                     const prefix = s.relPath ? `${s.relPath}/` : "";
-                    return parseSearchLines(sRes.stdout, prefix, 35, []);
-                  })
+                    parseSearchOutputLines(sRes.stdout, q, prefix, MAX_TEXT_RESULTS, results);
+                  },
+                  () => this._overlayClosed || seq !== this.searchSeq || results.length >= MAX_TEXT_RESULTS
                 );
-                for (const batch of perRepo) {
-                  for (const item of batch) {
-                    results.push(item);
-                    if (results.length >= 35) break;
-                  }
-                  if (results.length >= 35) break;
-                }
               }
             }
           }
 
-          if (seq !== this.searchSeq) return;
+          if (this._overlayClosed || seq !== this.searchSeq) return;
+          if (this.textQueryCache.size >= 24) {
+            const oldestQ = this.textQueryCache.keys().next().value;
+            if (oldestQ !== undefined) this.textQueryCache.delete(oldestQ);
+          }
+          this.textQueryCache.set(q, results);
           this.textResults = results;
-          this._lastSearchKey = null;
-          this._cachedResults = null;
+          this._textResultsVer++;
+          this._combinedCacheKey = null;
         } catch {
-          if (seq === this.searchSeq) {
+          if (!this._overlayClosed && seq === this.searchSeq) {
             this.textResults = [];
-            this._lastSearchKey = null;
-            this._cachedResults = null;
+            this._textResultsVer++;
+            this._combinedCacheKey = null;
           }
         } finally {
-          if (seq === this.searchSeq) {
+          if (!this._overlayClosed && seq === this.searchSeq) {
             this.isSearchingText = false;
+            if (this.showPreview) {
+              const items = this.searchResults();
+              this.schedulePreview(items[0], cx, false);
+            }
             cx.notify();
           }
         }
@@ -2169,13 +2569,24 @@ export default class FilesSearch extends View {
   }
 
   setTab(tab, cx) {
+    if (this.tab === tab) return;
     this.tab = tab;
     this.at = 0;
     this.scroll = 0;
-    this._lastSearchKey = null;
-    this._cachedResults = null;
+    this._combinedCacheKey = null;
+    if (tab === "all" || tab === "files") {
+      this.triggerFileSearch(cx);
+    } else {
+      this.fileSearchTask?.cancel();
+      this.fileSearchTask = null;
+      this.isSearchingFiles = false;
+    }
     if (tab === "text" || tab === "all") {
       this.triggerTextSearch(cx);
+    } else {
+      this.textSearchTask?.cancel();
+      this.textSearchTask = null;
+      this.isSearchingText = false;
     }
     if (this.showPreview) {
       const items = this.searchResults();
@@ -2191,102 +2602,25 @@ export default class FilesSearch extends View {
     this.setTab(tabs[nextIdx], cx);
   }
 
-  // Returns array of items: { kind: 'file'|'text', path, name, hits, score, line?, content?, matchedQuery? }
+  // O(1) combiner returning cached precomputed file and text results
   searchResults() {
     const rawQ = this.query.trim().toLowerCase();
-    const cacheKey = `${this.tab}:${rawQ}:${this.textResults.length}`;
-    if (this._lastSearchKey === cacheKey && this._cachedResults) {
-      return this._cachedResults;
+    const cacheKey = `${this.tab}:${this._fileResultsVer}:${this._textResultsVer}:${rawQ}`;
+    if (this._combinedCacheKey === cacheKey && this._combinedResults) {
+      return this._combinedResults;
     }
 
-    const q = rawQ.replace(/\s+/g, "");
-
-    // 1. Matched files
-    let matchedFiles = [];
-    if (this.tab === "all" || this.tab === "files") {
-      const entries = this.fileEntries && this.fileEntries.length ? this.fileEntries : this.fileList.map(path => {
-        const name = path.includes("/") ? path.slice(path.lastIndexOf("/") + 1) : path;
-        return { path, name, lowerPath: path.toLowerCase(), lowerName: name.toLowerCase() };
-      });
-
-      if (!rawQ) {
-        matchedFiles = entries.slice(0, 30).map(e => ({
-          kind: "file",
-          path: e.path,
-          name: e.name,
-          score: 0,
-          hits: [],
-        }));
-      } else {
-        const qLen = q.length;
-        const hasSlash = q.includes("/");
-        const scored = [];
-
-        for (let i = 0; i < entries.length; i++) {
-          const entry = entries[i];
-          const targetStr = hasSlash ? entry.lowerPath : entry.lowerName;
-          let at = 0;
-          let match = true;
-          for (let j = 0; j < qLen; j++) {
-            at = targetStr.indexOf(q[j], at);
-            if (at === -1) {
-              match = false;
-              break;
-            }
-            at++;
-          }
-          if (!match && !hasSlash) {
-            at = 0;
-            match = true;
-            for (let j = 0; j < qLen; j++) {
-              at = entry.lowerPath.indexOf(q[j], at);
-              if (at === -1) {
-                match = false;
-                break;
-              }
-              at++;
-            }
-          }
-          if (!match) continue;
-
-          const matchName = fuzzy(q, entry.name);
-          if (matchName) {
-            scored.push({
-              kind: "file",
-              path: entry.path,
-              name: entry.name,
-              score: matchName.score + 15,
-              hits: matchName.hits,
-            });
-          } else {
-            const matchPath = fuzzy(q, entry.path);
-            if (matchPath) {
-              scored.push({
-                kind: "file",
-                path: entry.path,
-                name: entry.name,
-                score: matchPath.score,
-                hits: [],
-              });
-            }
-          }
-          if (scored.length >= 250 && qLen <= 2) break;
-        }
-        scored.sort((a, b) => b.score - a.score);
-        matchedFiles = scored.slice(0, 50);
-      }
+    let out = [];
+    if (this.tab === "files") {
+      out = this.fileResults;
+    } else if (this.tab === "text") {
+      out = this.textResults;
+    } else {
+      out = [...this.fileResults.slice(0, 25), ...this.textResults.slice(0, 25)];
     }
 
-    // 2. Matched text
-    const textItems = (this.tab === "all" || this.tab === "text") ? this.textResults : [];
-
-    let out;
-    if (this.tab === "files") out = matchedFiles;
-    else if (this.tab === "text") out = textItems;
-    else out = [...matchedFiles.slice(0, 25), ...textItems.slice(0, 25)];
-
-    this._lastSearchKey = cacheKey;
-    this._cachedResults = out;
+    this._combinedCacheKey = cacheKey;
+    this._combinedResults = out;
     return out;
   }
 
@@ -2341,6 +2675,9 @@ export default class FilesSearch extends View {
 
   renderSyntaxLine(t, text, ext, query, isTarget) {
     if (!text) return div().child("\u00a0");
+    if (text.length > 600) {
+      return this.renderHighlightedCodeLine(t, text.slice(0, 600) + "…", query);
+    }
     const clean = text.replace(/\t/g, "    ");
 
     const tokenRegex = /(\/\/.*$|#.*$|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|\b(?:class|public|private|protected|static|final|abstract|interface|extends|implements|import|package|return|new|this|super|if|else|for|while|do|switch|case|default|break|continue|try|catch|finally|throw|throws|void|int|long|short|byte|float|double|boolean|char|const|let|var|function|def|fn|async|await|export|from|as|type|struct|impl|trait|pub|mut|match|enum|select|defer|go)\b|\b[a-zA-Z_$][a-zA-Z0-9_$]*(?=\s*\()|\b[A-Z][a-zA-Z0-9_]*\b|\b(?:true|false|null|nil|None|undefined|[A-Z0-9_]{2,})\b|\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)?)\b)/g;
@@ -2931,8 +3268,13 @@ export default class FilesSearch extends View {
               )
           )
           .child(div().flex_1())
-          .when(this.isSearchingText, el =>
-            el.child(div().text_size(11).text_color(t.dim).child("Searching text…"))
+          .when(this.isSearchingFiles || this.isSearchingText, el =>
+            el.child(
+              div()
+                .text_size(11)
+                .text_color(t.dim)
+                .child(this.isSearchingText ? "Searching text…" : "Searching files…")
+            )
           )
           // Preview Toggle Button
           .child(
@@ -3044,7 +3386,9 @@ export default class FilesSearch extends View {
                       .text_color(t.dim)
                       .child(
                         this.query.trim()
-                          ? `No matches found for "${this.query}".`
+                          ? (this.isSearchingFiles || (this.tab !== "files" && this.isSearchingText)
+                              ? `Searching for "${this.query}"…`
+                              : `No matches found for "${this.query}".`)
                           : "Type to search files or text across workspace..."
                       )
               )
