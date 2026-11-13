@@ -176,6 +176,19 @@
           "content": {
             "mod": "mesh-status"
           }
+        },
+        {
+          "id": "files-indexer",
+          "type": "block",
+          "size": {
+            "px": 0
+          },
+          "content": {
+            "mod": "files-search",
+            "props": {
+              "role": "indexer"
+            }
+          }
         }
       ]
     }

@@ -42,15 +42,16 @@ This specification defines the active **Agent Workspace Lifecycle** for Herdr Me
 
 `layouts/mesh.json` (`[[module-layouts]]`) and `mods/mesh-tabs` SHALL organize workspace drawers concisely without removed E2E test or PR pipeline chrome (`mesh-test`, `mesh-ship`, `#flow`).
 
-- `layouts/mesh.json` MUST mount `#tabs` (`42px`, `mod: "mesh-tabs"`), `#work-body` (`#main` + collapsible `#panel`), `#panel-body` stack with child IDs `"files"` (`files-search`) and `"changes"` (`changes-review`), and `#status` (`28px`, `mod: "mesh-status"`), while preserving `"window_drag": true` on `#brand` and `#tabs`.
+- `layouts/mesh.json` MUST mount `#tabs` (`42px`, `mod: "mesh-tabs"`), `#work-body` (`#main` + collapsible `#panel`), `#panel-body` stack with child IDs `"files"` (`files-search`) and `"changes"` (`changes-review`), `#status` (`28px`, `mod: "mesh-status"`), and 0px headless `#files-indexer` (`mod: "files-search"`, `props: { role: "indexer" }`), while preserving `"window_drag": true` on `#brand` and `#tabs`.
 
 ---
 
-### Requirement: Session-Scoped Multi-Repository Discovery & Cross-Platform Performance
+### Requirement: Session-Scoped Multi-Repository Discovery, Agent-Gated Workspace Indexing & Cross-Platform Performance
 
 `mods/files-search` (`[[submodule-mod-files-search]]`) and `mods/changes-review` (`[[submodule-mod-changes-review]]`) SHALL expose only repositories touched or attributed to the active tab's session while minimizing OS process spawning across Windows, Linux, and macOS.
 
 - `files-search` MUST debounce `watchFolder` events (`750ms`), ignore build/dependency churn (`node_modules/`, `target/`, `.git/` internal locks), cache `discoverRepos` results (`60000ms`), run `git status --untracked-files=normal`, throttle background scans when `#files` is hidden, and use native `fs/promises` scans on local filesystems.
+- `files-search` MUST index both workspace files and directories (deriving parent directories + folder listing previews and trailing `/` folder search matching), persist workspace index snapshots under `${appHome()}/mesh/workspaces/<slug>-<fnv1a8>/files-index.json`, hydrate cold starts immediately from disk before verifying cleanly, and gate automatic background pre-warming + headless root `watchFolder` invalidation strictly on an open non-runner coding agent (`hasOpenAgentInSpace()`, zero background pre-indexing when only plain shell terminals are open).
 - `files-search` MUST attribute touched repositories to the active tab session in `mesh.flows[tabId].sessionRepos` and publish `mesh.services` with a `sig` change key so `changes-review` reuses fresh `mesh.services` entries (`BUS_MAX_AGE_MS = 90000`) and wakes only when `bus.sig` changes.
 - Search Everywhere (`files-search`) MUST pass `--path-separator /` to `rg`, normalize backslashes on Windows, treat `rg` exit code `1` cleanly as zero matches without triggering `git grep` fallback, retry invalid regex exit code `2` with `-F`, clamp split-pane widths without horizontal overflow, and defer panel state sync outside `renderPanel()`.
 

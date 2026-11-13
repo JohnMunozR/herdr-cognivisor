@@ -63,7 +63,8 @@ root (row)
     │       └── panel-body (stack, active: "files")
     │           ├── files (block, mod: "files-search")
     │           └── changes (block, mod: "changes-review")
-    └── status (block, height: 28px, mod: "mesh-status")
+    ├── status (block, height: 28px, mod: "mesh-status")
+    └── files-indexer (block, height: 0px, mod: "files-search", props: { role: "indexer" })
 ```
 
 ### Detailed Component Roles
@@ -84,6 +85,7 @@ root (row)
 | `files` | `block` | Stack item | Renders `files-search` in docked file-tree mode |
 | `changes` | `block` | Stack item | Renders `changes-review` per-service diff, checklist, and `Checks` inspector |
 | `status` | `block` | `px: 28` | Bottom telemetry bar rendering `mesh-status` |
+| `files-indexer` | `block` | `px: 0` | Headless `files-search` (`props.role = "indexer"`) agent-gated workspace file+directory indexer |
 
 ## Invariants
 
@@ -91,8 +93,8 @@ root (row)
    The child blocks within `#panel-body` MUST maintain exact IDs `"files"` and `"changes"`. Preserving `"files"` and `"changes"` guarantees backwards compatibility with Herdr's core `tabs` toggle contract and `mesh-tabs` panel buttons.
 2. **Stack Mutual Exclusion:**
    `#panel-body` MUST remain `type: "stack"`. Only one child view is mounted and rendered at any given moment, conserving rendering cycles and GPU resources.
-3. **Flow Bar Placement Above `#work-body`:**
-   `#flow` (`38px`, `mod: "mesh-flow"`) MUST sit inside `#work` immediately between `#tabs` and `#work-body` so stage navigation remains visible across tab switches even when `#panel` is collapsed.
+3. **Zero-Height Headless Indexer Slot:**
+   `#files-indexer` (`px: 0`, `mod: "files-search"`, `props: { role: "indexer" }`) MUST stay visible in layout terms (`hidden` omitted) so the agent-gated workspace indexer runs even while `#panel` starts collapsed (`hidden: true`).
 4. **Pane Header and Frame Contract:**
    The `#main` block MUST declare `lone: true` and retain its header configuration targeting the `pane` mod (`reveal: "always"`, `height: 30`) to render terminal breadcrumbs, close buttons, and process status indicators across agent and service-runner splits.
 5. **Frameless Drag Compliance:**

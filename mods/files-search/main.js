@@ -4,10 +4,39 @@ import { v_flex, h_flex, Editor, EditorState, Input, InputState } from "gpui-bas
 import { readdir, exists } from "fs/promises";
 import { join } from "path";
 import {
-  spaces, panes, focused, agents, hc, exec, readTextFile, watchFolder,
+  spaces, panes, focused, agents, terminals, hc, exec, readTextFile, watchFolder,
   theme, settings, window, layout, props, openOverlay, closeOverlay,
-  shared, setShared,
+  shared, setShared, run,
 } from "herdr";
+import {
+  DISCOVER_SKIP_DIRS,
+  COMMON_IGNORE_GLOBS,
+  MAX_OVERLAY_FILES,
+  INDEX_REBUILD_DEBOUNCE_MS,
+  AGENT_PREWARM_DEBOUNCE_MS,
+  RG_AVAILABLE_CACHE,
+  normPathStr,
+  normCmpStr,
+  isSameOrChildPath,
+  joinSubPath,
+  isSupportedDirentList,
+  direntIsDir,
+  analyzeWatchBatch,
+  runInBatches,
+  makeIndexKey,
+  getCachedIndex,
+  isIndexInFlight,
+  hasOpenAgentInSpace,
+  restoreDiskIndex,
+  shouldRefreshIndex,
+  handleWatchForIndex,
+  ensureWorkspaceIndex,
+  claimRootWatcher,
+  ownsRootWatcher,
+  hasActiveRootWatcher,
+  releaseRootWatcher,
+  setIndexWatching,
+} from "./indexer.js";
 
 function location() {
   const space = spaces().find(s => s.active), f = focused();
@@ -48,65 +77,10 @@ function repoMatchesTranscript(service, files, transcript) {
   return false;
 }
 
-const DISCOVER_SKIP_DIRS = new Set([
-  ".git", "node_modules", "target", "dist", "build", "vendor",
-  ".venv", "venv", ".next", ".nuxt", ".cache", "__pycache__", "out", "coverage", "logs",
-]);
-
-const WATCH_SKIP_DIRS = new Set([
-  "node_modules", "target", "dist", "build", "vendor", ".venv", "venv",
-  ".next", ".nuxt", ".cache", "__pycache__", "logs", ".gradle", ".idea",
-  ".turbo", ".parcel-cache", "coverage", ".sass-cache", "tmp", ".tmp",
-]);
-
-const WATCH_SKIP_EXTS = [".log", ".tmp", ".swp", ".swo", ".part", ".crdownload"];
 const BASE_BRANCHES = new Set(["main", "master", "development", "develop", "ci", "HEAD", ""]);
 const REPO_CACHE_TTL_MS = 60000;
 const WATCH_DEBOUNCE_MS = 750;
 const TRANSCRIPT_THROTTLE_MS = 4000;
-
-function normPathStr(p) {
-  return String(p || "").replace(/\\/g, "/").replace(/\/+$/, "");
-}
-
-function normCmpStr(p, isWindows = false) {
-  const s = normPathStr(p);
-  return isWindows ? s.toLowerCase() : s;
-}
-
-function isSameOrChildPath(child, parent, isWindows = false) {
-  const c = normCmpStr(child, isWindows);
-  const p = normCmpStr(parent, isWindows);
-  if (!c || !p) return false;
-  return c === p || c.startsWith(p + "/");
-}
-
-function joinSubPath(root, rel) {
-  if (!rel) return root;
-  if (root === "/") return `/${rel}`;
-  if (/^[A-Za-z]:[\\/]?$/.test(root)) {
-    return `${root.slice(0, 2)}/${rel}`;
-  }
-  return `${root.replace(/[\\/]+$/, "")}/${rel}`;
-}
-
-function isSupportedDirentList(entries) {
-  if (!Array.isArray(entries)) return false;
-  if (entries.length === 0) return true;
-  const first = entries[0];
-  return (
-    typeof first === "object" &&
-    first !== null &&
-    "name" in first &&
-    (typeof first.isDirectory === "function" || typeof first.isDirectory === "boolean")
-  );
-}
-
-function direntIsDir(entry) {
-  return typeof entry?.isDirectory === "function"
-    ? Boolean(entry.isDirectory())
-    : Boolean(entry?.isDirectory);
-}
 
 function findLayoutNode(node, id) {
   if (!node || typeof node !== "object") return null;
@@ -120,7 +94,7 @@ function findLayoutNode(node, id) {
 
 function findFilesBlock(node) {
   if (!node || typeof node !== "object") return null;
-  if (node.content?.mod === "files-search" && !node.content?.props?.overlay) return node;
+  if (node.content?.mod === "files-search" && !node.content?.props?.overlay && node.content?.props?.role !== "indexer") return node;
   for (const child of node.children ?? []) {
     const found = findFilesBlock(child);
     if (found) return found;
@@ -138,95 +112,6 @@ function isFilesVisible() {
   }
   const block = findFilesBlock(root);
   return block ? !block.hidden : true;
-}
-
-function getRelToWorkspace(changedPath, workspaceRoot) {
-  const normP = normPathStr(changedPath);
-  const normRoot = normPathStr(workspaceRoot);
-  if (!normP || !normRoot) return null;
-  if (normP === normRoot) return "";
-  if (normP.startsWith(normRoot + "/")) return normP.slice(normRoot.length + 1);
-  const lowerP = normP.toLowerCase();
-  const lowerRoot = normRoot.toLowerCase();
-  if (lowerP === lowerRoot) return "";
-  if (lowerP.startsWith(lowerRoot + "/")) return normP.slice(normRoot.length + 1);
-  return null;
-}
-
-function isIgnoredWatchPath(changedPath, workspaceRoot) {
-  const rel = getRelToWorkspace(changedPath, workspaceRoot);
-  const target = rel !== null ? rel : normPathStr(changedPath);
-  if (!target) return false;
-  const segs = target.split("/").filter(Boolean);
-  const segsLower = segs.map(s => s.toLowerCase());
-
-  const gitIdx = segsLower.indexOf(".git");
-  if (gitIdx >= 0) {
-    const afterGit = segsLower.slice(gitIdx + 1).join("/");
-    if (
-      afterGit === "index" ||
-      afterGit === "head" ||
-      afterGit === "merge_head" ||
-      afterGit === "rebase-head" ||
-      afterGit === "cherry_pick_head" ||
-      afterGit.startsWith("refs/") ||
-      afterGit.startsWith("rebase-merge/") ||
-      afterGit.startsWith("rebase-apply/")
-    ) {
-      return false;
-    }
-    return true;
-  }
-
-  for (let i = 0; i < segsLower.length - 1; i++) {
-    if (WATCH_SKIP_DIRS.has(segsLower[i])) return true;
-  }
-  const base = segsLower[segsLower.length - 1] || "";
-  if (WATCH_SKIP_DIRS.has(base)) return true;
-  if (base === ".ds_store" || base === "thumbs.db" || base.endsWith("~")) return true;
-  for (const ext of WATCH_SKIP_EXTS) {
-    if (base.endsWith(ext)) return true;
-  }
-  return false;
-}
-
-function analyzeWatchBatch(changedPaths, workspaceRoot, openFolders) {
-  if (!Array.isArray(changedPaths) || changedPaths.length === 0) {
-    return { hasNonIgnored: true, hasGitChange: true, hasNonGitChange: true, invalidateRepos: false, dirtyDirs: new Set(["*"]) };
-  }
-  let hasNonIgnored = false;
-  let hasGitChange = false;
-  let hasNonGitChange = false;
-  let invalidateRepos = false;
-  const dirtyDirs = new Set();
-
-  for (const raw of changedPaths) {
-    if (!raw || isIgnoredWatchPath(raw, workspaceRoot)) continue;
-    hasNonIgnored = true;
-    const rel = getRelToWorkspace(raw, workspaceRoot);
-    if (rel === null) {
-      hasNonGitChange = true;
-      dirtyDirs.add("*");
-      continue;
-    }
-    const segs = rel.split("/").filter(Boolean);
-    if (segs.includes(".git") || segs.some(s => s.toLowerCase() === ".git")) {
-      hasGitChange = true;
-      if (rel.toLowerCase().includes(".git/head") || rel.toLowerCase().includes(".git/refs/")) {
-        invalidateRepos = true;
-      }
-      continue;
-    }
-    hasNonGitChange = true;
-    if (segs.length <= 2) invalidateRepos = true;
-    const parent = segs.slice(0, -1).join("/");
-    dirtyDirs.add(parent);
-    if (segs.length >= 2) {
-      dirtyDirs.add(segs.slice(0, -2).join("/"));
-    }
-    if (openFolders?.has(rel)) dirtyDirs.add(rel);
-  }
-  return { hasNonIgnored, hasGitChange, hasNonGitChange, invalidateRepos, dirtyDirs };
 }
 
 function parsePorcelainHeader(headerLine) {
@@ -386,49 +271,6 @@ async function fsScanRepos(targetRoot, depth2 = true) {
     })
   );
   return found;
-}
-
-async function fsListFiles(root, limit = 20000) {
-  if (!root) return [];
-  let rootEntries;
-  try {
-    rootEntries = await readdir(root, { withFileTypes: true });
-  } catch {
-    return null;
-  }
-  if (!isSupportedDirentList(rootEntries)) return null;
-  const results = [];
-  const queue = [];
-  const pushEntries = (parentAbs, parentRel, entries) => {
-    for (const e of entries) {
-      if (!e?.name || e.name.startsWith(".")) continue;
-      const rel = parentRel ? `${parentRel}/${e.name}` : e.name;
-      if (direntIsDir(e)) {
-        if (!DISCOVER_SKIP_DIRS.has(e.name)) {
-          queue.push({ abs: join(parentAbs, e.name), rel });
-        }
-      } else if (e.isFile?.() || (!e.isSymbolicLink?.() && !direntIsDir(e))) {
-        results.push(rel);
-        if (results.length >= limit) break;
-      }
-    }
-  };
-  pushEntries(root, "", rootEntries);
-  while (queue.length > 0 && results.length < limit) {
-    const batch = queue.splice(0, 16);
-    const dirLists = await Promise.all(
-      batch.map(async item => {
-        const entries = await readdir(item.abs, { withFileTypes: true }).catch(() => []);
-        return { item, entries };
-      })
-    );
-    for (const { item, entries } of dirLists) {
-      if (!isSupportedDirentList(entries)) continue;
-      pushEntries(item.abs, item.rel, entries);
-      if (results.length >= limit) break;
-    }
-  }
-  return results;
 }
 
 async function findLocalGitRoot(startDir, maxDepth = 6) {
@@ -681,62 +523,11 @@ async function readFileChunk(fullPath, startLine, count, on, isWindows = false) 
   }
 }
 
-const MAX_OVERLAY_FILES = 20000;
 const MAX_FILE_RESULTS = 50;
 const MAX_EMPTY_FILES = 30;
 const MAX_TEXT_RESULTS = 35;
 const FILE_SEARCH_CHUNK = 1200;
 const FILE_SEARCH_BUDGET_MS = 6;
-const OVERLAY_INDEX_FRESH_MS = 8000;
-const OVERLAY_INDEX_CACHE = new Map();
-const RG_AVAILABLE_CACHE = new Map();
-
-const COMMON_IGNORE_GLOBS = [
-  "--glob", "!.git",
-  "--glob", "!node_modules",
-  "--glob", "!.cache",
-  "--glob", "!target",
-  "--glob", "!build",
-  "--glob", "!.next",
-  "--glob", "!.nuxt",
-  "--glob", "!.svelte-kit",
-  "--glob", "!.turbo",
-  "--glob", "!.parcel-cache",
-  "--glob", "!.venv",
-  "--glob", "!venv",
-  "--glob", "!vendor",
-  "--glob", "!dist",
-  "--glob", "!coverage",
-  "--glob", "!.gradle",
-  "--glob", "!.idea",
-  "--glob", "!.vs",
-  "--glob", "!__pycache__",
-  "--glob", "!.pytest_cache",
-  "--glob", "!.mypy_cache",
-  "--glob", "!obj",
-  "--glob", "!.terraform",
-  "--glob", "!.angular",
-  "--glob", "!.nx",
-];
-
-function parseIndexedPaths(stdout, cap = MAX_OVERLAY_FILES, prefix = "") {
-  const out = [];
-  if (!stdout) return out;
-  let start = 0;
-  const len = stdout.length;
-  while (start < len && out.length < cap) {
-    let nl = stdout.indexOf("\n", start);
-    if (nl === -1) nl = len;
-    let line = stdout.slice(start, nl).trim();
-    start = nl + 1;
-    if (!line) continue;
-    if (line.indexOf("\\") !== -1) line = line.replace(/\\/g, "/");
-    if (line.startsWith("./")) line = line.slice(2);
-    if (!line) continue;
-    out.push(prefix ? `${prefix}${line}` : line);
-  }
-  return out;
-}
 
 function parseSearchOutputLines(stdout, q, prefix = "", cap = MAX_TEXT_RESULTS, out = []) {
   if (!stdout || out.length >= cap) return out;
@@ -821,7 +612,7 @@ function buildTopFileItems(top, q, withHits) {
   if (!top.length) return [];
   const sorted = top.slice().sort((a, b) => b.score - a.score);
   return sorted.map(({ entry, score, fromName }) => ({
-    kind: "file",
+    kind: entry.kind === "dir" ? "dir" : "file",
     path: entry.path,
     name: entry.name,
     score,
@@ -829,15 +620,15 @@ function buildTopFileItems(top, q, withHits) {
   }));
 }
 
-async function runInBatches(items, concurrency, fn, shouldStop) {
-  const results = [];
-  for (let i = 0; i < items.length; i += concurrency) {
-    if (shouldStop && shouldStop()) break;
-    const chunk = items.slice(i, i + concurrency);
-    const batchOut = await Promise.all(chunk.map(fn));
-    results.push(...batchOut);
-  }
-  return results;
+function buildEmptyOverlayItems(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return [];
+  return entries.slice(0, MAX_EMPTY_FILES).map(e => ({
+    kind: e.kind === "dir" ? "dir" : "file",
+    path: e.path,
+    name: e.name,
+    score: 0,
+    hits: [],
+  }));
 }
 
 const SHOWN = 9;
@@ -846,12 +637,164 @@ const LIST_H = SHOWN * ROW_H;
 
 export default class FilesSearch extends View {
   init(_props, cx) {
-    this.isOverlay = Boolean(props()?.overlay);
+    const roleProps = props() || {};
+    this.isOverlay = Boolean(roleProps.overlay);
+    this.isIndexer = !this.isOverlay && roleProps.role === "indexer";
     if (this.isOverlay) {
       this.initOverlay(cx);
+    } else if (this.isIndexer) {
+      this.initIndexer(cx);
     } else {
       this.initPanel(cx);
     }
+  }
+
+  // ==========================================
+  // HEADLESS AGENT-TRIGGERED INDEXER MODE
+  // ==========================================
+  initIndexer(cx) {
+    this._indexerClosed = false;
+    this.indexerSyncTask = null;
+    this.indexerPrewarmTask = null;
+    this.indexerReindexTask = null;
+    this.indexerWatchToken = null;
+    this.indexerWatchKey = null;
+    this.indexerWatchSeq = 0;
+    this.indexerBuildKey = null;
+    this.scheduleIndexerSync(cx, 50);
+  }
+
+  scheduleIndexerSync(cx, delayMs = AGENT_PREWARM_DEBOUNCE_MS) {
+    if (this._indexerClosed || this.indexerSyncTask || !cx?.timer) return;
+    this.indexerSyncTask = cx.timer.after(delayMs, cx => {
+      this.indexerSyncTask = null;
+      this.syncIndexer(cx);
+    });
+  }
+
+  stopIndexerWatching() {
+    if (this.indexerWatchKey && this.indexerWatchToken) {
+      const prevKey = this.indexerWatchKey;
+      releaseRootWatcher(prevKey, this.indexerWatchToken);
+      setIndexWatching(prevKey, hasActiveRootWatcher(prevKey));
+    }
+    this.indexerWatchKey = null;
+    this.indexerWatchToken = null;
+  }
+
+  watchForIndex(root, on, isWindows, indexKey, cx) {
+    if (on || this._indexerClosed || hasActiveRootWatcher(indexKey)) return;
+    const token = `idx-${++this.indexerWatchSeq}`;
+    if (!claimRootWatcher(indexKey, token, false)) return;
+    if (this.indexerWatchKey && this.indexerWatchKey !== indexKey) {
+      this.stopIndexerWatching();
+      if (!claimRootWatcher(indexKey, token, false)) return;
+    }
+    this.indexerWatchKey = indexKey;
+    this.indexerWatchToken = token;
+    setIndexWatching(indexKey, true);
+
+    cx.spawn(async cx => {
+      try {
+        while (!this._indexerClosed && ownsRootWatcher(indexKey, token)) {
+          try {
+            const changed = await watchFolder(root);
+            if (this._indexerClosed || !ownsRootWatcher(indexKey, token)) break;
+            if (!hasOpenAgentInSpace()) break;
+            const info = analyzeWatchBatch(changed, root, null);
+            if (!info.hasNonIgnored) continue;
+            const dirty = await handleWatchForIndex(root, on, isWindows, info, changed);
+            if (dirty && !this._indexerClosed && ownsRootWatcher(indexKey, token) && hasOpenAgentInSpace()) {
+              this.scheduleIndexerReindex(root, on, isWindows, indexKey, cx);
+            }
+          } catch {
+            if (this._indexerClosed || !ownsRootWatcher(indexKey, token)) break;
+            await cx.sleep(3000);
+          }
+        }
+      } finally {
+        releaseRootWatcher(indexKey, token);
+        setIndexWatching(indexKey, hasActiveRootWatcher(indexKey));
+        if (this.indexerWatchToken === token) {
+          this.indexerWatchToken = null;
+          this.indexerWatchKey = null;
+        }
+      }
+    });
+  }
+
+  scheduleIndexerReindex(root, on, isWindows, indexKey, cx) {
+    if (this._indexerClosed) return;
+    if (this.indexerReindexTask) {
+      try { this.indexerReindexTask.cancel(); } catch {}
+      this.indexerReindexTask = null;
+    }
+    this.indexerReindexTask = cx.timer.after(INDEX_REBUILD_DEBOUNCE_MS, cx => {
+      this.indexerReindexTask = null;
+      if (this._indexerClosed || !hasOpenAgentInSpace()) return;
+      const curLoc = location();
+      const curIsWin = !curLoc.on && window()?.platform === "windows";
+      if (!curLoc.cwd || makeIndexKey(curLoc.cwd, curLoc.on, curIsWin) !== indexKey) return;
+      this.runAgentPrewarm(root, on, isWindows, indexKey, cx);
+    });
+  }
+
+  runAgentPrewarm(root, on, isWindows, indexKey, cx) {
+    if (this._indexerClosed || !root || this.indexerBuildKey === indexKey) return;
+    this.indexerBuildKey = indexKey;
+    cx.spawn(async cx => {
+      try {
+        if (!getCachedIndex(indexKey)) {
+          await restoreDiskIndex(root, on, isWindows, cx);
+        }
+        if (this._indexerClosed || !hasOpenAgentInSpace()) return;
+        const curLoc = location();
+        const curIsWin = !curLoc.on && window()?.platform === "windows";
+        if (!curLoc.cwd || makeIndexKey(curLoc.cwd, curLoc.on, curIsWin) !== indexKey) return;
+
+        const cached = getCachedIndex(indexKey);
+        if (shouldRefreshIndex(cached, on)) {
+          await ensureWorkspaceIndex({ root, on, isWindows, discoverRepos, cx });
+        }
+      } catch {
+        // Prewarm failures remain silent and retry on next agent/watch trigger or manual overlay open.
+      } finally {
+        if (this.indexerBuildKey === indexKey) {
+          this.indexerBuildKey = null;
+        }
+      }
+    });
+  }
+
+  syncIndexer(cx) {
+    if (this._indexerClosed) return;
+    const { cwd, on } = location();
+    const isWindows = !on && window()?.platform === "windows";
+    const agentOpen = Boolean(cwd && hasOpenAgentInSpace());
+
+    if (!agentOpen) {
+      try { this.indexerPrewarmTask?.cancel(); } catch {}
+      this.indexerPrewarmTask = null;
+      try { this.indexerReindexTask?.cancel(); } catch {}
+      this.indexerReindexTask = null;
+      this.stopIndexerWatching();
+      return;
+    }
+
+    const indexKey = makeIndexKey(cwd, on, isWindows);
+    if (!on && !hasActiveRootWatcher(indexKey)) {
+      this.watchForIndex(cwd, on, isWindows, indexKey, cx);
+    }
+
+    const cached = getCachedIndex(indexKey);
+    if (shouldRefreshIndex(cached, on) && !isIndexInFlight(indexKey) && this.indexerBuildKey !== indexKey) {
+      this.runAgentPrewarm(cwd, on, isWindows, indexKey, cx);
+    }
+  }
+
+  renderIndexer(cx) {
+    this.scheduleIndexerSync(cx);
+    return div().h(0).w(0);
   }
 
   // ==========================================
@@ -877,6 +820,11 @@ export default class FilesSearch extends View {
     this.candidateCache = null;
     this.dirtyFolders = new Set();
     this.watchDebounceTask = null;
+    this.watchReindexTask = null;
+    this.agentPrewarmTask = null;
+    this.panelWatchSeq = 0;
+    this.panelWatchToken = null;
+    this.panelWatchKey = null;
     this.pendingRefreshOpts = null;
     this.pendingPanelSyncTask = null;
     this.focusInputTask = null;
@@ -966,7 +914,7 @@ export default class FilesSearch extends View {
             }
           }
         }
-        this.openFromSearch(filePath, cx);
+        this.openFromSearch(filePath, cx, selectReq.kind || "file");
         return;
       }
     }
@@ -1029,32 +977,83 @@ export default class FilesSearch extends View {
     });
   }
 
+  scheduleWatchReindex(cx, delayMs = INDEX_REBUILD_DEBOUNCE_MS) {
+    if (this.watchReindexTask) {
+      try { this.watchReindexTask.cancel(); } catch {}
+      this.watchReindexTask = null;
+    }
+    const context = this.context;
+    this.watchReindexTask = cx.timer.after(delayMs, cx => {
+      this.watchReindexTask = null;
+      if (!this.current(context) || !hasOpenAgentInSpace()) return;
+      const { cwd, on, isWindows } = context;
+      if (!cwd) return;
+      cx.spawn(async cx => {
+        try {
+          if (!getCachedIndex(makeIndexKey(cwd, on, isWindows))) {
+            await restoreDiskIndex(cwd, on, isWindows, cx);
+          }
+          if (!this.current(context) || !hasOpenAgentInSpace()) return;
+          const cached = getCachedIndex(makeIndexKey(cwd, on, isWindows));
+          if (shouldRefreshIndex(cached, on)) {
+            await ensureWorkspaceIndex({ root: cwd, on, isWindows, discoverRepos, cx });
+          }
+        } catch {}
+      });
+    });
+  }
+
   watch(root, cx) {
     if (this.on || this.watched === root) return;
     this.watched = root;
     const context = this.context;
+    const isWindows = Boolean(context?.isWindows);
+    const indexKey = makeIndexKey(root, this.on, isWindows);
+    if (this.panelWatchKey && this.panelWatchToken) {
+      releaseRootWatcher(this.panelWatchKey, this.panelWatchToken);
+      setIndexWatching(this.panelWatchKey, hasActiveRootWatcher(this.panelWatchKey));
+    }
+    const token = `panel-${++this.panelWatchSeq}`;
+    this.panelWatchKey = indexKey;
+    this.panelWatchToken = token;
+    claimRootWatcher(indexKey, token, true);
+    setIndexWatching(indexKey, true);
+
     cx.spawn(async cx => {
-      while (this.context === context) {
-        try {
-          const changed = await watchFolder(root);
-          if (!this.current(context)) break;
-          const info = analyzeWatchBatch(changed, root, this.folders);
-          if (!info.hasNonIgnored) continue;
-          if (info.invalidateRepos) this.candidateCache = null;
-          if (info.dirtyDirs.has("*")) {
-            this.dirtyFolders.add("*");
-          } else {
-            for (const d of info.dirtyDirs) this.dirtyFolders.add(d);
-            if (info.hasNonGitChange && info.dirtyDirs.has("")) this.dirtyFolders.add("");
+      try {
+        while (this.context === context) {
+          try {
+            const changed = await watchFolder(root);
+            if (!this.current(context)) break;
+            const info = analyzeWatchBatch(changed, root, this.folders);
+            if (!info.hasNonIgnored) continue;
+            if (info.invalidateRepos) this.candidateCache = null;
+            if (info.dirtyDirs.has("*")) {
+              this.dirtyFolders.add("*");
+            } else {
+              for (const d of info.dirtyDirs) this.dirtyFolders.add(d);
+              if (info.hasNonGitChange && info.dirtyDirs.has("")) this.dirtyFolders.add("");
+            }
+            this.scheduleWatchRefresh(cx);
+            const indexDirty = await handleWatchForIndex(root, null, isWindows, info, changed);
+            if (indexDirty && this.current(context) && hasOpenAgentInSpace()) {
+              this.scheduleWatchReindex(cx);
+            }
+          } catch {
+            if (!this.current(context)) break;
+            await cx.sleep(3000);
           }
-          this.scheduleWatchRefresh(cx);
-        } catch {
-          if (!this.current(context)) break;
-          await cx.sleep(3000);
         }
-      }
-      if (this.watched === root && !this.current(context)) {
-        this.watched = null;
+      } finally {
+        if (this.watched === root && !this.current(context)) {
+          this.watched = null;
+        }
+        releaseRootWatcher(indexKey, token);
+        setIndexWatching(indexKey, hasActiveRootWatcher(indexKey));
+        if (this.panelWatchToken === token) {
+          this.panelWatchToken = null;
+          this.panelWatchKey = null;
+        }
       }
     });
   }
@@ -1110,6 +1109,16 @@ export default class FilesSearch extends View {
       if (this.watchDebounceTask) {
         try { this.watchDebounceTask.cancel(); } catch {}
         this.watchDebounceTask = null;
+      }
+      if (this.watchReindexTask) {
+        try { this.watchReindexTask.cancel(); } catch {}
+        this.watchReindexTask = null;
+      }
+      if (this.panelWatchKey && this.panelWatchToken) {
+        releaseRootWatcher(this.panelWatchKey, this.panelWatchToken);
+        setIndexWatching(this.panelWatchKey, hasActiveRootWatcher(this.panelWatchKey));
+        this.panelWatchKey = null;
+        this.panelWatchToken = null;
       }
       if (saved?.file) this.show(saved.file, cx);
     } else if (this.context) {
@@ -1337,6 +1346,13 @@ export default class FilesSearch extends View {
         this.serviceFiles = serviceFiles;
         this.error = null;
         this.watch(cwd, cx);
+        if (hasOpenAgentInSpace()) {
+          const indexKey = makeIndexKey(cwd, on, isWindows);
+          const cached = getCachedIndex(indexKey);
+          if (shouldRefreshIndex(cached, on) && !isIndexInFlight(indexKey) && !this.watchReindexTask) {
+            this.scheduleWatchReindex(cx, AGENT_PREWARM_DEBOUNCE_MS);
+          }
+        }
       } catch (e) {
         if (this.current(context) && !this.entries.has("")) this.error = String(e);
       } finally {
@@ -1421,12 +1437,13 @@ export default class FilesSearch extends View {
     });
   }
 
-  // Open a file from external/search selection and expand its parent folders in the tree
-  openFromSearch(path, cx) {
+  // Open a file or directory from external/search selection and expand its path in the tree
+  openFromSearch(path, cx, kind = "file") {
     if (!path) return;
-    const segments = path.split("/");
+    const segments = path.split("/").filter(Boolean);
+    const expandLimit = kind === "dir" ? segments.length : Math.max(0, segments.length - 1);
     let accum = "";
-    for (let i = 0; i < segments.length - 1; i++) {
+    for (let i = 0; i < expandLimit; i++) {
       accum = accum ? `${accum}/${segments[i]}` : segments[i];
       this.folders.add(accum);
       if (!this.entries.has(accum) && !this.pending.has(accum)) {
@@ -1439,7 +1456,11 @@ export default class FilesSearch extends View {
         });
       }
     }
-    this.show(path, cx);
+    if (kind === "dir") {
+      this.show(null);
+    } else {
+      this.show(path, cx);
+    }
     cx.notify();
   }
 
@@ -1748,24 +1769,17 @@ export default class FilesSearch extends View {
     this.tab = "all"; // "all" | "files" | "text"
     this.query = "";
 
-    const indexKey = `${normPathStr(this.searchRoot)}::${this.searchOn || ""}`;
-    const cachedIndex = OVERLAY_INDEX_CACHE.get(indexKey);
+    const indexKey = makeIndexKey(this.searchRoot, this.searchOn, this.searchIsWindows);
+    const cachedIndex = getCachedIndex(indexKey);
     const hasCachedIndex = Boolean(cachedIndex && Array.isArray(cachedIndex.entries) && cachedIndex.entries.length > 0);
-    this.fileList = hasCachedIndex ? cachedIndex.list : [];
+    this.fileList = hasCachedIndex ? (cachedIndex.files || cachedIndex.list || []) : [];
     this.fileEntries = hasCachedIndex ? cachedIndex.entries : [];
-    this.fileResults = hasCachedIndex
-      ? cachedIndex.entries.slice(0, MAX_EMPTY_FILES).map(e => ({
-          kind: "file",
-          path: e.path,
-          name: e.name,
-          score: 0,
-          hits: [],
-        }))
-      : [];
+    this.fileResults = hasCachedIndex ? buildEmptyOverlayItems(this.fileEntries) : [];
 
     this.textResults = [];
     this.isSearchingText = false;
     this.isSearchingFiles = false;
+    this.isIndexingFiles = false;
     this.searchSeq = 0;
     this.fileSearchSeq = 0;
     this.previewReqSeq = 0;
@@ -1788,6 +1802,8 @@ export default class FilesSearch extends View {
     const savedPreview = shared("files-search.preview");
     this.showPreview = savedPreview !== null && savedPreview !== undefined ? Boolean(savedPreview) : true;
     this.previewItem = null;
+    this.previewIsDir = false;
+    this.previewDirEntries = [];
     this.previewLines = [];
     this.previewStartLine = 1;
     this.previewHasMore = false;
@@ -1830,26 +1846,46 @@ export default class FilesSearch extends View {
       try { this.input?.focus(); } catch {}
     });
 
-    // Preload or refresh stale workspace file index asynchronously
-    if (!hasCachedIndex || (Date.now() - cachedIndex.ts) >= OVERLAY_INDEX_FRESH_MS) {
+    // Restore disk cache if cold in RAM, then refresh in background only when stale/dirty/unwatched
+    if (!hasCachedIndex || shouldRefreshIndex(cachedIndex, this.searchOn)) {
       this.loadWorkspaceFiles(cx);
     }
   }
 
   close(cx) {
     this._overlayClosed = true;
+    this._indexerClosed = true;
     this.focusInputTask?.cancel();
     this.focusInputTask = null;
     this.watchDebounceTask?.cancel();
     this.watchDebounceTask = null;
+    this.watchReindexTask?.cancel();
+    this.watchReindexTask = null;
+    this.agentPrewarmTask?.cancel();
+    this.agentPrewarmTask = null;
     this.pendingPanelSyncTask?.cancel();
     this.pendingPanelSyncTask = null;
+    this.indexerSyncTask?.cancel();
+    this.indexerSyncTask = null;
+    this.indexerPrewarmTask?.cancel();
+    this.indexerPrewarmTask = null;
+    this.indexerReindexTask?.cancel();
+    this.indexerReindexTask = null;
     this.fileSearchTask?.cancel();
     this.fileSearchTask = null;
     this.textSearchTask?.cancel();
     this.textSearchTask = null;
     this.previewDebounceTask?.cancel();
     this.previewDebounceTask = null;
+    if (this.indexerWatchKey && this.indexerWatchToken) {
+      this.stopIndexerWatching();
+    }
+    if (this.panelWatchKey && this.panelWatchToken) {
+      releaseRootWatcher(this.panelWatchKey, this.panelWatchToken);
+      setIndexWatching(this.panelWatchKey, hasActiveRootWatcher(this.panelWatchKey));
+      this.panelWatchKey = null;
+      this.panelWatchToken = null;
+    }
     try { this.input?.release(); } catch {}
     this.input = null;
     this.code?.release();
@@ -1916,9 +1952,14 @@ export default class FilesSearch extends View {
     setShared("files-search.select", {
       root: this.searchRoot,
       path: item.path,
+      kind: item.kind || "file",
       line: item.line || null,
       ts: Date.now(),
     });
+    if (!isFilesVisible()) {
+      run("layout.select", { stack: "panel-body", child: "files" });
+      run("layout.show", { id: "panel" });
+    }
     this.closeOverlay();
     cx.notify();
   }
@@ -1926,6 +1967,8 @@ export default class FilesSearch extends View {
   schedulePreview(item, cx, immediate = false) {
     if (!item) {
       this.previewItem = null;
+      this.previewIsDir = false;
+      this.previewDirEntries = [];
       this.previewLines = [];
       this.previewStartLine = 1;
       this.previewHasMore = false;
@@ -1936,30 +1979,49 @@ export default class FilesSearch extends View {
       return;
     }
 
-    const itemKey = `${item.path}:${item.line || 0}`;
-    if (this._currentPreviewKey === itemKey && (this.previewLines.length > 0 || this.previewError)) {
+    const itemKey = `${item.kind || "file"}:${item.path}:${item.line || 0}`;
+    if (
+      this._currentPreviewKey === itemKey &&
+      (this.previewLines.length > 0 || this.previewDirEntries.length > 0 || this.previewError || this.previewIsDir)
+    ) {
       return;
     }
     this._currentPreviewKey = itemKey;
     this.previewItem = item;
+    this.previewIsDir = item.kind === "dir";
 
     // Check memory cache first
     const cached = this.previewCache.get(itemKey);
     if (cached) {
       this.previewDebounceTask?.cancel();
       this.previewDebounceTask = null;
-      this.previewLines = cached.lines;
-      this.previewStartLine = cached.startLine;
-      this.previewHasMore = cached.hasMore;
+      if (cached.kind === "dir") {
+        this.previewIsDir = true;
+        this.previewDirEntries = cached.dirEntries;
+        this.previewLines = [];
+        this.previewStartLine = 1;
+        this.previewHasMore = false;
+        this.previewScroll = 0;
+      } else {
+        this.previewIsDir = false;
+        this.previewDirEntries = [];
+        this.previewLines = cached.lines;
+        this.previewStartLine = cached.startLine;
+        this.previewHasMore = cached.hasMore;
+        this.previewScroll = cached.scroll;
+      }
       this.previewError = null;
       this.previewLoading = false;
       this.previewLoadingMore = false;
-      this.previewScroll = cached.scroll;
       return;
     }
 
     this.previewLoading = true;
     this.previewError = null;
+    if (this.previewIsDir) {
+      this.previewDirEntries = [];
+      this.previewLines = [];
+    }
 
     if (this.previewDebounceTask) {
       this.previewDebounceTask.cancel();
@@ -1971,12 +2033,33 @@ export default class FilesSearch extends View {
     const on = this.searchOn;
     const isWindows = this.searchIsWindows ?? (!on && window()?.platform === "windows");
     const targetPath = item.path;
+    const isDir = item.kind === "dir";
     const targetLine = item.kind === "text" && item.line ? item.line : null;
     const startLine = targetLine ? Math.max(1, targetLine - 20) : 1;
 
     const fetchAction = (asyncCx) => {
       asyncCx.spawn(async cx => {
         try {
+          if (isDir) {
+            const rawEntries = await directory(joinSubPath(root, targetPath), on, isWindows);
+            if (reqSeq !== this.previewReqSeq) return;
+            const sorted = (rawEntries || [])
+              .slice()
+              .sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name));
+            this.previewIsDir = true;
+            this.previewDirEntries = sorted;
+            this.previewLines = [];
+            this.previewHasMore = false;
+            this.previewScroll = 0;
+
+            if (this.previewCache.size > 80) {
+              const firstKey = this.previewCache.keys().next().value;
+              this.previewCache.delete(firstKey);
+            }
+            this.previewCache.set(itemKey, { kind: "dir", dirEntries: sorted });
+            return;
+          }
+
           const fullPath = `${root}/${targetPath}`;
           const lines = await readFileChunk(fullPath, startLine, CHUNK_SIZE, on, isWindows);
           if (reqSeq !== this.previewReqSeq) return;
@@ -1991,6 +2074,8 @@ export default class FilesSearch extends View {
             return;
           }
 
+          this.previewIsDir = false;
+          this.previewDirEntries = [];
           this.previewLines = lines;
           this.previewStartLine = startLine;
           this.previewHasMore = lines.length >= CHUNK_SIZE;
@@ -2005,6 +2090,7 @@ export default class FilesSearch extends View {
             this.previewCache.delete(firstKey);
           }
           this.previewCache.set(itemKey, {
+            kind: "file",
             lines: [...lines],
             startLine,
             hasMore: this.previewHasMore,
@@ -2012,8 +2098,9 @@ export default class FilesSearch extends View {
           });
         } catch {
           if (reqSeq === this.previewReqSeq) {
-            this.previewError = "Cannot preview this file";
+            this.previewError = isDir ? "Cannot list this folder" : "Cannot preview this file";
             this.previewLines = [];
+            this.previewDirEntries = [];
           }
         } finally {
           if (reqSeq === this.previewReqSeq) {
@@ -2032,7 +2119,7 @@ export default class FilesSearch extends View {
   }
 
   loadNextPreviewChunk(cx) {
-    if (!this.previewItem || !this.previewHasMore || this.previewLoadingMore || this.previewLoading) return;
+    if (!this.previewItem || this.previewIsDir || this.previewItem.kind === "dir" || !this.previewHasMore || this.previewLoadingMore || this.previewLoading) return;
     this.previewLoadingMore = true;
 
     const reqSeq = this.previewReqSeq;
@@ -2079,149 +2166,41 @@ export default class FilesSearch extends View {
     const on = this.searchOn;
     const isWindows = this.searchIsWindows ?? (!on && window()?.platform === "windows");
     if (!root) return;
-    const onKey = on || "local";
-    const indexKey = `${normPathStr(root)}::${on || ""}`;
+    const indexKey = makeIndexKey(root, on, isWindows);
+    this.isIndexingFiles = true;
 
     cx.spawn(async cx => {
       try {
-        let list = [];
-        // Fast ripgrep file list (rg traverses sub-repositories and respects their .gitignores)
-        let rgRes = null;
-        if (RG_AVAILABLE_CACHE.get(onKey) !== false) {
-          rgRes = await exec(
-            "rg",
-            ["--files", "--hidden", "--path-separator", "/", "--threads", "4", ...COMMON_IGNORE_GLOBS],
-            { cwd: root, on, timeout: 10000 }
-          ).catch(() => null);
+        if (!this.fileEntries.length) {
+          const diskCached = await restoreDiskIndex(root, on, isWindows, cx);
           if (this._overlayClosed) return;
-          if (rgRes) {
-            RG_AVAILABLE_CACHE.set(onKey, true);
-          } else {
-            const probe = await exec("rg", ["--version"], { on, timeout: 2500 }).catch(() => null);
-            if (this._overlayClosed) return;
-            RG_AVAILABLE_CACHE.set(onKey, Boolean(probe && probe.code === 0));
+          if (diskCached && Array.isArray(diskCached.entries) && diskCached.entries.length > 0) {
+            this.fileList = diskCached.files || diskCached.list || [];
+            this.fileEntries = diskCached.entries;
+            this._fileQueryCache.clear();
+            this._narrowHistory = [];
+            this._combinedCacheKey = null;
+            if (this.tab !== "text") {
+              this.triggerFileSearch(cx);
+            }
+            cx.notify();
           }
         }
 
-        if (rgRes?.code === 0 && rgRes.stdout) {
-          list = parseIndexedPaths(rgRes.stdout, MAX_OVERLAY_FILES);
-        } else if (!rgRes || rgRes.code !== 0 || !list.length) {
-          // Check if root is a git repository
-          const rev = await exec(
-            "git",
-            ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "rev-parse", "--show-toplevel"],
-            { cwd: root, on, timeout: 5000 }
-          ).catch(() => null);
+        const latestCached = getCachedIndex(indexKey);
+        if (!latestCached || shouldRefreshIndex(latestCached, on)) {
+          const record = await ensureWorkspaceIndex({ root, on, isWindows, discoverRepos, cx });
           if (this._overlayClosed) return;
-
-          if (rev?.code === 0) {
-            const gitRes = await exec(
-              "git",
-              ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "ls-files", "--cached", "--others", "--exclude-standard"],
-              { cwd: root, on, timeout: 8000 }
-            ).catch(() => null);
-            if (this._overlayClosed) return;
-            if (gitRes?.code === 0 && gitRes.stdout) {
-              list = parseIndexedPaths(gitRes.stdout, MAX_OVERLAY_FILES);
-            }
-          } else {
-            // Multi-repo fallback: reuse mesh.services candidates when matching, else discoverRepos
-            const bus = shared("mesh.services");
-            const hasBusCandidates = Boolean(
-              bus &&
-              normPathStr(bus.workspaceRoot) === normPathStr(root) &&
-              (bus.on || null) === (on || null) &&
-              Array.isArray(bus.candidates) &&
-              bus.candidates.length > 0
-            );
-            const services = hasBusCandidates ? bus.candidates : await discoverRepos(root, on, isWindows);
-            if (this._overlayClosed) return;
-            if (services && services.length > 0) {
-              const collected = [];
-              await runInBatches(
-                services,
-                4,
-                async s => {
-                  const r = await exec(
-                    "git",
-                    ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "ls-files", "--cached", "--others", "--exclude-standard"],
-                    { cwd: s.root, on, timeout: 6000 }
-                  ).catch(() => null);
-                  if (r?.code === 0 && r.stdout && collected.length < MAX_OVERLAY_FILES) {
-                    const prefix = s.relPath ? `${s.relPath}/` : "";
-                    const parsed = parseIndexedPaths(r.stdout, MAX_OVERLAY_FILES - collected.length, prefix);
-                    for (let i = 0; i < parsed.length && collected.length < MAX_OVERLAY_FILES; i++) {
-                      collected.push(parsed[i]);
-                    }
-                  }
-                },
-                () => this._overlayClosed || collected.length >= MAX_OVERLAY_FILES
-              );
-              list = collected;
-            } else {
-              const fsFiles = !on ? await fsListFiles(root, MAX_OVERLAY_FILES) : null;
-              if (this._overlayClosed) return;
-              if (Array.isArray(fsFiles)) {
-                list = fsFiles;
-              } else if (!on && isWindows) {
-                const escaped = root.replace(/['‘’‚‛]/g, "$&$&");
-                const cmd = `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & { param($p) $n = $p.TrimEnd('\\','/'); Get-ChildItem -LiteralPath $p -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '[\\\\/](\\.(git|cache|next|nuxt|venv)|node_modules|target|dist|build|vendor|out|coverage|logs)([\\\\/]|$)' } | Select-Object -First 20000 -ExpandProperty FullName | ForEach-Object { $_.Substring($n.Length).TrimStart('\\','/') -replace '\\\\','/' } } '${escaped}'`;
-                const psRes = await exec("powershell", ["-NoProfile", "-Command", cmd], { on }).catch(() => null);
-                if (psRes?.code === 0 && psRes.stdout.trim()) {
-                  list = psRes.stdout
-                    .split(/\r?\n/)
-                    .map(s => s.trim())
-                    .filter(Boolean);
-                }
-              } else {
-                // Remote or POSIX find fallback
-                const findRes = await exec(
-                  "sh",
-                  ["-c", 'find . -not -path "*/.*" -not -path "*/target/*" -not -path "*/build/*" -not -path "*/node_modules/*" -not -path "*/.venv/*" -type f | head -n 20000 | sed "s|^./||"'],
-                  { cwd: root, on, timeout: 10000 }
-                ).catch(() => null);
-                if (this._overlayClosed) return;
-                if (findRes?.code === 0 && findRes.stdout) {
-                  list = parseIndexedPaths(findRes.stdout, MAX_OVERLAY_FILES);
-                }
-              }
+          if (record && Array.isArray(record.entries)) {
+            this.fileList = record.files || record.list || [];
+            this.fileEntries = record.entries;
+            this._fileQueryCache.clear();
+            this._narrowHistory = [];
+            this._combinedCacheKey = null;
+            if (this.tab !== "text") {
+              this.triggerFileSearch(cx);
             }
           }
-        }
-
-        if (this._overlayClosed) return;
-        const sliced = list.length > MAX_OVERLAY_FILES ? list.slice(0, MAX_OVERLAY_FILES) : list;
-        const builtEntries = [];
-        for (let i = 0; i < sliced.length; i++) {
-          if (i > 0 && i % 4000 === 0) {
-            await cx.sleep(0);
-            if (this._overlayClosed) return;
-          }
-          const path = sliced[i];
-          const slash = path.lastIndexOf("/");
-          const name = slash >= 0 ? path.slice(slash + 1) : path;
-          builtEntries.push({
-            path,
-            name,
-            lowerPath: path.toLowerCase(),
-            lowerName: name.toLowerCase(),
-          });
-        }
-
-        if (OVERLAY_INDEX_CACHE.size >= 6) {
-          const oldestKey = OVERLAY_INDEX_CACHE.keys().next().value;
-          if (oldestKey !== undefined) OVERLAY_INDEX_CACHE.delete(oldestKey);
-        }
-        OVERLAY_INDEX_CACHE.set(indexKey, { list: sliced, entries: builtEntries, ts: Date.now() });
-
-        this.fileList = sliced;
-        this.fileEntries = builtEntries;
-        this._fileQueryCache.clear();
-        this._narrowHistory = [];
-        this._combinedCacheKey = null;
-
-        if (this.tab !== "text") {
-          this.triggerFileSearch(cx);
         }
       } catch {
         if (!this._overlayClosed && !this.fileEntries.length) {
@@ -2232,7 +2211,10 @@ export default class FilesSearch extends View {
           this._combinedCacheKey = null;
         }
       } finally {
-        if (!this._overlayClosed) cx.notify();
+        if (!this._overlayClosed) {
+          this.isIndexingFiles = false;
+          cx.notify();
+        }
       }
     });
   }
@@ -2256,13 +2238,7 @@ export default class FilesSearch extends View {
     const q = rawQ.replace(/\s+/g, "");
     if (!q) {
       this.isSearchingFiles = false;
-      this.fileResults = this.fileEntries.slice(0, MAX_EMPTY_FILES).map(e => ({
-        kind: "file",
-        path: e.path,
-        name: e.name,
-        score: 0,
-        hits: [],
-      }));
+      this.fileResults = buildEmptyOverlayItems(this.fileEntries);
       this._fileResultsVer++;
       this._combinedCacheKey = null;
       return;
@@ -2295,6 +2271,10 @@ export default class FilesSearch extends View {
 
     const qChars = Array.from(q);
     const qLen = qChars.length;
+    const qEndsSlash = q.endsWith("/") && q.length > 1;
+    const dirQ = qEndsSlash ? q.slice(0, -1) : q;
+    const dirQChars = qEndsSlash ? Array.from(dirQ) : qChars;
+    const dirQLen = dirQChars.length;
     const hasSlash = q.indexOf("/") !== -1;
     const matchedEntries = [];
     const top = [];
@@ -2308,18 +2288,25 @@ export default class FilesSearch extends View {
       const len = source.length;
       while (cursor < len) {
         const entry = source[cursor++];
+        const isDir = entry.kind === "dir";
+        const useChars = isDir ? dirQChars : qChars;
+        const useLen = isDir ? dirQLen : qLen;
+        const useHasSlash = isDir ? (dirQ.indexOf("/") !== -1) : hasSlash;
         let score = -Infinity;
         let fromName = false;
-        if (!hasSlash) {
-          const ns = scoreSubseqFast(entry.lowerName, qChars, qLen);
+        if (!useHasSlash) {
+          const ns = scoreSubseqFast(entry.lowerName, useChars, useLen);
           if (ns > -Infinity) {
             score = ns + 15;
             fromName = true;
           } else {
-            score = scoreSubseqFast(entry.lowerPath, qChars, qLen);
+            score = scoreSubseqFast(entry.lowerPath, useChars, useLen);
           }
         } else {
-          score = scoreSubseqFast(entry.lowerPath, qChars, qLen);
+          score = scoreSubseqFast(entry.lowerPath, useChars, useLen);
+        }
+        if (score > -Infinity) {
+          score += isDir ? (qEndsSlash ? 12 : -0.5) : 0.5;
         }
 
         if (score > -Infinity) {
@@ -2363,7 +2350,8 @@ export default class FilesSearch extends View {
     };
 
     const finishScan = (stepCx, shouldNotify) => {
-      const finalResults = buildTopFileItems(top, q, true);
+      const matchKey = qEndsSlash ? dirQ : q;
+      const finalResults = buildTopFileItems(top, matchKey, true);
       if (this._fileQueryCache.size > 40) this._fileQueryCache.clear();
       this._fileQueryCache.set(q, finalResults);
       if (this._narrowHistory.length >= 8) this._narrowHistory.shift();
@@ -2387,7 +2375,7 @@ export default class FilesSearch extends View {
     }
 
     if (top.length > 0) {
-      this.fileResults = buildTopFileItems(top, q, false);
+      this.fileResults = buildTopFileItems(top, qEndsSlash ? dirQ : q, false);
       this._fileResultsVer++;
       this._combinedCacheKey = null;
     }
@@ -2801,6 +2789,7 @@ export default class FilesSearch extends View {
         .child(div().text_size(12).text_color(t.dim).child("Select an item to preview"));
     }
 
+    const isDirItem = item.kind === "dir";
     const isTextMatch = item.kind === "text" && item.line;
     const targetLine = isTextMatch ? item.line : null;
     const fileName = item.path.split("/").pop() || item.path;
@@ -2809,6 +2798,105 @@ export default class FilesSearch extends View {
 
     const LINE_H = 21;
     const VISIBLE_ROWS = Math.max(5, Math.floor((listH + 12) / LINE_H));
+
+    if (isDirItem) {
+      const dirTotal = this.previewDirEntries.length;
+      const maxDirScroll = Math.max(0, dirTotal - VISIBLE_ROWS);
+      this.previewScroll = Math.max(0, Math.min(this.previewScroll, maxDirScroll));
+      const startIdx = this.previewScroll;
+      const endIdx = Math.min(dirTotal, startIdx + VISIBLE_ROWS);
+      const visibleDirRows = [];
+      for (let i = startIdx; i < endIdx; i++) {
+        const child = this.previewDirEntries[i];
+        const childPath = `${item.path}/${child.name}`.replace(/^\/+/, "");
+        visibleDirRows.push(
+          h_flex()
+            .id(`dir-prev-${i}`)
+            .h(LINE_H)
+            .flex_none()
+            .items_center()
+            .px(10)
+            .gap(8)
+            .cursor_pointer()
+            .hover(s => s.bg(t.hover))
+            .on_click(() => this.selectResult({ kind: child.dir ? "dir" : "file", path: childPath, name: child.name }, cx))
+            .child(svg(`mods/files-search/${child.dir ? "folder" : "file"}.svg`).size(13).flex_none().text_color(child.dir ? t.ansi4 : t.muted))
+            .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).child(child.dir ? `${child.name}/` : child.name))
+        );
+      }
+
+      return v_flex()
+        .w(previewW)
+        .h(listH + 46)
+        .flex_none()
+        .rounded(8)
+        .border_1()
+        .border_color(t.border)
+        .bg(t.background)
+        .overflow_hidden()
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .child(
+          h_flex()
+            .h(34)
+            .flex_none()
+            .px(10)
+            .gap(7)
+            .items_center()
+            .border_b(1)
+            .border_color(t.border)
+            .bg(t.raised)
+            .child(svg("mods/files-search/folder.svg").size(13).flex_none().text_color(t.ansi4))
+            .child(div().text_size(12).font_semibold().text_color(t.foreground).child(`${fileName}/`))
+            .when(Boolean(dirPath), el =>
+              el.child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(dirPath))
+            )
+            .when(!dirPath, el => el.child(div().flex_1()))
+            .when(dirTotal > 0, el =>
+              el.child(div().text_size(11).text_color(t.dim).child(`${dirTotal} item${dirTotal === 1 ? "" : "s"}`))
+            )
+            .child(
+              div()
+                .px(7)
+                .py(1.5)
+                .rounded(4)
+                .bg(t.background)
+                .border_1()
+                .border_color(t.border)
+                .text_size(11)
+                .text_color(t.dim)
+                .cursor_pointer()
+                .hover(s => s.bg(t.hover).text_color(t.foreground))
+                .on_click(() => this.selectResult(item, cx))
+                .child("Open ↵")
+            )
+        )
+        .child(
+          v_flex()
+            .flex_1()
+            .min_h(0)
+            .overflow_hidden()
+            .when(this.previewLoading && dirTotal === 0, el =>
+              el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child("Loading folder…"))
+            )
+            .when(!this.previewLoading && Boolean(this.previewError) && dirTotal === 0, el =>
+              el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child(this.previewError))
+            )
+            .when(dirTotal > 0, el =>
+              el
+                .py(4)
+                .on_scroll_wheel((e, cx) => {
+                  const delta = e.delta.y > 0 ? -3 : 3;
+                  this.previewScroll = Math.max(0, Math.min(this.previewScroll + delta, maxDirScroll));
+                  cx.notify();
+                })
+                .children(visibleDirRows)
+            )
+            .when(!this.previewLoading && !this.previewError && dirTotal === 0, el =>
+              el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child("Empty folder"))
+            )
+        );
+    }
+
     const maxScroll = Math.max(0, this.previewLines.length - VISIBLE_ROWS);
     this.previewScroll = Math.max(0, Math.min(this.previewScroll, maxScroll));
 
@@ -2977,7 +3065,7 @@ export default class FilesSearch extends View {
     this.at = Math.min(this.at, Math.max(0, results.length - 1));
     const currentItem = results[this.at];
     if (this.showPreview && currentItem) {
-      const itemKey = `${currentItem.path}:${currentItem.line || 0}`;
+      const itemKey = `${currentItem.kind || "file"}:${currentItem.path}:${currentItem.line || 0}`;
       if (this._currentPreviewKey !== itemKey) {
         this.schedulePreview(currentItem, cx, false);
       }
@@ -3048,7 +3136,9 @@ export default class FilesSearch extends View {
       if (!visible(rowStart, rowEnd)) return;
 
       const on = i === this.at;
-      const isFile = item.kind === "file";
+      const isText = item.kind === "text";
+      const isDir = item.kind === "dir";
+      const isFile = !isText && !isDir;
       const matchedService = findServiceForPath(item.path);
 
       list.push(
@@ -3073,12 +3163,12 @@ export default class FilesSearch extends View {
             }
           })
           .child(
-            svg(`mods/files-search/${isFile ? "file" : "search"}.svg`)
+            svg(`mods/files-search/${isDir ? "folder" : isFile ? "file" : "search"}.svg`)
               .size(13)
               .flex_none()
-              .text_color(isFile ? t.muted : t.ansi4)
+              .text_color(isDir || isText ? t.ansi4 : t.muted)
           )
-          .when(isFile, el =>
+          .when(isFile || isDir, el =>
             el
               .child(
                 h_flex()
@@ -3101,11 +3191,11 @@ export default class FilesSearch extends View {
                         .child(matchedService.name)
                     )
                   )
-                  .child(div().min_w(0).child(this.renderHighlightedTitle(t, item.name, item.hits, on)))
+                  .child(div().min_w(0).child(this.renderHighlightedTitle(t, isDir ? `${item.name}/` : item.name, item.hits, on)))
               )
-              .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(item.path.includes("/") ? item.path : ""))
+              .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(item.path.includes("/") ? item.path : (isDir ? "folder" : "")))
           )
-          .when(!isFile, el =>
+          .when(isText, el =>
             el
               .child(
                 h_flex()
@@ -3268,12 +3358,12 @@ export default class FilesSearch extends View {
               )
           )
           .child(div().flex_1())
-          .when(this.isSearchingFiles || this.isSearchingText, el =>
+          .when(this.isSearchingFiles || this.isSearchingText || this.isIndexingFiles, el =>
             el.child(
               div()
                 .text_size(11)
                 .text_color(t.dim)
-                .child(this.isSearchingText ? "Searching text…" : "Searching files…")
+                .child(this.isSearchingText ? "Searching text…" : this.isSearchingFiles ? "Searching files…" : "Indexing…")
             )
           )
           // Preview Toggle Button
@@ -3388,8 +3478,12 @@ export default class FilesSearch extends View {
                         this.query.trim()
                           ? (this.isSearchingFiles || (this.tab !== "files" && this.isSearchingText)
                               ? `Searching for "${this.query}"…`
-                              : `No matches found for "${this.query}".`)
-                          : "Type to search files or text across workspace..."
+                              : this.isIndexingFiles && !this.fileEntries.length
+                                ? "Indexing workspace files & folders…"
+                                : `No matches found for "${this.query}".`)
+                          : (this.isIndexingFiles
+                              ? "Indexing workspace files & folders…"
+                              : "Type to search files, folders, or text…")
                       )
               )
           )
@@ -3510,6 +3604,9 @@ export default class FilesSearch extends View {
   render(cx) {
     if (this.isOverlay) {
       return this.renderOverlay(cx);
+    }
+    if (this.isIndexer) {
+      return this.renderIndexer(cx);
     }
     return this.renderPanel(cx);
   }
