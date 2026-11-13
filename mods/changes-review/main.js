@@ -81,16 +81,325 @@ function getDiffTheme(t) {
   };
 }
 
-// Numbers each diff line once, so a frame only draws the rows on screen.
-function diffRows(lines) {
+const DIFF_KEYWORDS = new Set([
+  "abstract", "as", "async", "await", "break", "case", "catch", "class", "const", "continue",
+  "crate", "default", "defer", "def", "delete", "do", "elif", "else", "enum", "except",
+  "export", "extends", "final", "finally", "fn", "for", "from", "function", "fun", "go",
+  "if", "impl", "implements", "import", "in", "instanceof", "interface", "is", "lambda",
+  "let", "match", "mod", "mut", "namespace", "new", "not", "or", "and", "override",
+  "package", "pass", "private", "protected", "pub", "public", "raise", "return", "select",
+  "self", "static", "struct", "super", "switch", "this", "throw", "throws", "trait", "try",
+  "type", "typeof", "use", "using", "val", "var", "virtual", "where", "while", "with", "yield",
+  "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "ON", "GROUP", "BY",
+  "ORDER", "HAVING", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "CREATE", "ALTER",
+  "DROP", "TABLE", "INDEX", "AS", "AND", "OR", "NOT", "IN", "IS", "NULL", "CASE", "WHEN",
+  "THEN", "ELSE", "END", "DISTINCT", "LIMIT", "OFFSET", "UNION", "EXISTS", "RETURNING",
+]);
+
+const DIFF_CONSTANTS = new Set([
+  "true", "false", "null", "nil", "None", "True", "False", "undefined", "NaN", "Infinity",
+]);
+
+const DIFF_TYPES = new Set([
+  "void", "int", "long", "short", "byte", "float", "double", "boolean", "bool", "char",
+  "string", "number", "any", "unknown", "never", "object", "symbol", "bigint", "str",
+  "usize", "isize", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "f32", "f64",
+  "String", "Integer", "Long", "Double", "Boolean", "List", "Map", "Set", "Optional",
+  "Promise", "Array", "Record", "Vec", "Option", "Result", "Box", "Arc", "Error",
+]);
+
+const HASH_COMMENT_EXTS = new Set([
+  "py", "rb", "sh", "bash", "zsh", "fish", "yml", "yaml", "toml", "ps1", "psm1", "psd1",
+  "r", "pl", "pm", "mk", "makefile", "dockerfile", "env", "ini", "conf", "cfg", "properties",
+  "tf", "tfvars", "gitignore",
+]);
+
+const SLASH_COMMENT_EXTS = new Set([
+  "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "java", "kt", "kts", "cs",
+  "go", "rs", "c", "cpp", "cc", "cxx", "h", "hpp", "swift", "scala", "groovy", "gradle",
+  "php", "css", "scss", "less", "jsonc", "json5", "dart", "proto",
+]);
+
+const MARKUP_EXTS = new Set(["html", "htm", "xml", "svg", "vue", "svelte"]);
+
+function getFileExt(filePath) {
+  if (!filePath) return "";
+  const slash = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"));
+  const base = (slash >= 0 ? filePath.slice(slash + 1) : filePath).toLowerCase();
+  if (base === "dockerfile") return "dockerfile";
+  if (base === "makefile" || base === "gnumakefile") return "makefile";
+  if (base === ".gitignore" || base === ".dockerignore") return "gitignore";
+  if (base.startsWith(".env")) return "env";
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(dot + 1) : "";
+}
+
+function pushSyntaxToken(tokens, kind, text) {
+  if (!text) return;
+  const last = tokens.length ? tokens[tokens.length - 1] : null;
+  if (last && last[0] === kind) {
+    last[1] += text;
+  } else {
+    tokens.push([kind, text]);
+  }
+}
+
+function isIdentStart(ch) {
+  const c = ch.charCodeAt(0);
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36;
+}
+
+function isIdentPart(ch) {
+  const c = ch.charCodeAt(0);
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 36;
+}
+
+function isDigit(ch) {
+  const c = ch.charCodeAt(0);
+  return c >= 48 && c <= 57;
+}
+
+// Linear single-pass lexer that preserves exact characters and avoids regex backtracking
+function tokenizeDiffLine(rawText, ext) {
+  if (!rawText) return null;
+  const text = rawText.indexOf("\t") !== -1 ? rawText.replace(/\t/g, "    ") : rawText;
+  if (text.length > 500 || ext === "txt" || ext === "log") return null;
+
+  const tokens = [];
+  const len = text.length;
+  const hashComments = HASH_COMMENT_EXTS.has(ext);
+  const slashComments = !ext || SLASH_COMMENT_EXTS.has(ext);
+  const markup = MARKUP_EXTS.has(ext);
+  const isJson = ext === "json" || ext === "jsonc" || ext === "json5";
+  const isYaml = ext === "yml" || ext === "yaml";
+  const isCss = ext === "css" || ext === "scss" || ext === "less";
+  const isSql = ext === "sql";
+  const isRust = ext === "rs";
+  const isMd = ext === "md" || ext === "mdx";
+
+  if (isMd && /^\s*#{1,6}\s/.test(text)) {
+    return [["keyword", text]];
+  }
+
+  let i = 0;
+  let plainStart = 0;
+  const flushPlain = (end) => {
+    if (end > plainStart) {
+      pushSyntaxToken(tokens, "plain", text.slice(plainStart, end));
+    }
+    plainStart = end;
+  };
+
+  while (i < len) {
+    const ch = text[i];
+
+    // Markup <!-- comment -->
+    if (markup && ch === "<" && text.startsWith("<!--", i)) {
+      flushPlain(i);
+      const close = text.indexOf("-->", i + 4);
+      const end = close >= 0 ? close + 3 : len;
+      pushSyntaxToken(tokens, "comment", text.slice(i, end));
+      i = plainStart = end;
+      continue;
+    }
+
+    // Line & block comments
+    if (slashComments && ch === "/" && i + 1 < len) {
+      const next = text[i + 1];
+      if (next === "/") {
+        flushPlain(i);
+        pushSyntaxToken(tokens, "comment", text.slice(i));
+        return tokens;
+      }
+      if (next === "*") {
+        flushPlain(i);
+        const close = text.indexOf("*/", i + 2);
+        const end = close >= 0 ? close + 2 : len;
+        pushSyntaxToken(tokens, "comment", text.slice(i, end));
+        i = plainStart = end;
+        continue;
+      }
+    }
+
+    if (hashComments && ch === "#") {
+      flushPlain(i);
+      pushSyntaxToken(tokens, "comment", text.slice(i));
+      return tokens;
+    }
+
+    if (isSql && ch === "-" && text[i + 1] === "-") {
+      flushPlain(i);
+      pushSyntaxToken(tokens, "comment", text.slice(i));
+      return tokens;
+    }
+
+    // Strings ("...", '...', `...`)
+    if (ch === '"' || ch === "'" || ch === "`") {
+      // Avoid treating Rust lifetimes ('a, 'static) as unclosed strings
+      if (isRust && ch === "'" && i + 1 < len && isIdentStart(text[i + 1]) && text.indexOf("'", i + 2) === -1) {
+        i++;
+        continue;
+      }
+      // Avoid treating English apostrophes inside comments/markdown prose as strings
+      if (ch === "'" && (isMd || (i > 0 && isIdentPart(text[i - 1])))) {
+        i++;
+        continue;
+      }
+      let end = i + 1;
+      while (end < len) {
+        if (text[end] === "\\") {
+          end = end + 1 < len ? end + 2 : len;
+          continue;
+        }
+        if (text[end] === ch) {
+          end++;
+          break;
+        }
+        end++;
+      }
+      flushPlain(i);
+      // Highlight JSON object keys in function/constant tint so keys stand out from string values
+      let kind = "string";
+      if (isJson && ch === '"') {
+        let look = end;
+        while (look < len && text[look] === " ") look++;
+        if (look < len && text[look] === ":") kind = "function";
+      }
+      pushSyntaxToken(tokens, kind, text.slice(i, end));
+      i = plainStart = end;
+      continue;
+    }
+
+    // CSS #hex color literals
+    if (isCss && ch === "#" && i + 1 < len && /[0-9a-fA-F]/.test(text[i + 1])) {
+      let end = i + 1;
+      while (end < len && /[0-9a-fA-F]/.test(text[end])) end++;
+      flushPlain(i);
+      pushSyntaxToken(tokens, "number", text.slice(i, end));
+      i = plainStart = end;
+      continue;
+    }
+
+    // Decorators / Annotations (@Override, @RestController)
+    if (ch === "@" && i + 1 < len && isIdentStart(text[i + 1]) && (i === 0 || !isIdentPart(text[i - 1]))) {
+      let end = i + 2;
+      while (end < len && (isIdentPart(text[end]) || text[end] === ".")) end++;
+      flushPlain(i);
+      pushSyntaxToken(tokens, "type", text.slice(i, end));
+      i = plainStart = end;
+      continue;
+    }
+
+    // Markup / JSX tags (<div, </div, <MyComponent)
+    if (ch === "<" && i + 1 < len && (markup || ext === "jsx" || ext === "tsx")) {
+      let tagStart = i + 1;
+      if (text[tagStart] === "/") tagStart++;
+      if (tagStart < len && /[A-Za-z]/.test(text[tagStart])) {
+        let end = tagStart + 1;
+        while (end < len && (isIdentPart(text[end]) || text[end] === "-" || text[end] === ":" || text[end] === ".")) end++;
+        flushPlain(tagStart);
+        const tagName = text.slice(tagStart, end);
+        const isComponent = tagName[0] >= "A" && tagName[0] <= "Z";
+        pushSyntaxToken(tokens, isComponent ? "type" : "keyword", tagName);
+        i = plainStart = end;
+        continue;
+      }
+    }
+
+    // Numbers (only standalone, not trailing digits inside foo123)
+    if (isDigit(ch) && (i === 0 || !isIdentPart(text[i - 1]))) {
+      let end = i + 1;
+      if (ch === "0" && end < len && (text[end] === "x" || text[end] === "X" || text[end] === "b" || text[end] === "B")) {
+        end++;
+        while (end < len && /[0-9a-fA-F_]/.test(text[end])) end++;
+      } else {
+        while (end < len && /[0-9._]/.test(text[end])) end++;
+        if (end < len && (text[end] === "e" || text[end] === "E") && end + 1 < len && /[0-9+\-]/.test(text[end + 1])) {
+          end += 2;
+          while (end < len && /[0-9_]/.test(text[end])) end++;
+        }
+        // Optional CSS/Rust numeric suffix (px, rem, em, u32, usize, f64, L)
+        while (end < len && /[a-zA-Z%]/.test(text[end])) end++;
+      }
+      flushPlain(i);
+      pushSyntaxToken(tokens, "number", text.slice(i, end));
+      i = plainStart = end;
+      continue;
+    }
+
+    // Identifiers / Keywords / Types / Constants / Function calls / YAML keys
+    if (isIdentStart(ch)) {
+      let end = i + 1;
+      while (end < len && (isIdentPart(text[end]) || (isYaml && text[end] === "-"))) end++;
+      const word = text.slice(i, end);
+      let kind = "plain";
+      let look = end;
+      while (look < len && text[look] === " ") look++;
+
+      if (isYaml && text[look] === ":" && (look + 1 === len || text[look + 1] === " ")) {
+        kind = "function";
+      } else if (DIFF_KEYWORDS.has(word)) {
+        kind = "keyword";
+      } else if (DIFF_CONSTANTS.has(word) || (word.length > 1 && /^[A-Z][A-Z0-9_]+$/.test(word))) {
+        kind = "constant";
+      } else if (DIFF_TYPES.has(word) || /^[A-Z][a-zA-Z0-9_]*$/.test(word)) {
+        kind = "type";
+      } else if (text[look] === "(") {
+        kind = "function";
+      }
+
+      if (kind !== "plain") {
+        flushPlain(i);
+        pushSyntaxToken(tokens, kind, word);
+        i = plainStart = end;
+        continue;
+      }
+      i = end;
+      continue;
+    }
+
+    i++;
+  }
+
+  flushPlain(len);
+  return tokens;
+}
+
+function syntaxTokenColor(kind, t) {
+  switch (kind) {
+    case "keyword": return t.ansi5 || t.accent || t.foreground;
+    case "string": return t.ansi2 || t.accent || t.foreground;
+    case "comment": return t.dim || t.muted;
+    case "function": return t.ansi4 || t.accent || t.foreground;
+    case "type": return t.ansi3 || t.accent || t.foreground;
+    case "number": return t.ansi1 || t.accent || t.foreground;
+    case "constant": return t.ansi6 || t.accent || t.foreground;
+    default: return t.foreground;
+  }
+}
+
+// Numbers and syntax-tokenizes each diff line once, so a frame only draws the rows on screen.
+function diffRows(lines, filePath = "") {
+  const ext = getFileExt(filePath);
   let old = 0, next = 0;
-  return lines.map((line) => {
+  return lines.map((rawLine) => {
+    const line = typeof rawLine === "string" && rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
     const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)/.exec(line);
     if (match) { old = +match[1]; next = +match[2]; return { kind: "@", text: line }; }
     const kind = line[0];
-    if (kind === "-") return { kind, number: old++, text: line.slice(1) || " " };
-    if (kind === "+") return { kind, number: next++, text: line.slice(1) || " " };
-    if (kind === " ") { old++; return { kind, number: next++, text: line.slice(1) || " " }; }
+    if (kind === "-") {
+      const code = line.slice(1) || " ";
+      return { kind, number: old++, text: code, tokens: tokenizeDiffLine(code, ext) };
+    }
+    if (kind === "+") {
+      const code = line.slice(1) || " ";
+      return { kind, number: next++, text: code, tokens: tokenizeDiffLine(code, ext) };
+    }
+    if (kind === " ") {
+      old++;
+      const code = line.slice(1) || " ";
+      return { kind, number: next++, text: code, tokens: tokenizeDiffLine(code, ext) };
+    }
     return { kind: "", text: line };
   });
 }
@@ -592,6 +901,7 @@ function updateTabFlow(tabId, mutator, workspaceRoot = "") {
     manualTitle: false,
     leadTerminal: null,
     reviewedServices: {},
+    reviewedFiles: {},
     updatedAt: 0,
   };
   const patch = typeof mutator === "function" ? mutator(prev) : mutator;
@@ -828,6 +1138,7 @@ export default class ChangesReview extends View {
     this.sendingReview = false;
     this.busy = false;
     this.expandedFiles = new Set();
+    this.localReviewedFiles = new Set();
 
     // Multi-repository & Git inspection state
     this.workspaceRoot = null;
@@ -1298,6 +1609,114 @@ export default class ChangesReview extends View {
     cx.notify();
   }
 
+  fileReviewScope() {
+    if (this.viewMode === "commit" && this.selectedCommit?.hash) {
+      return `commit:${this.selectedCommit.hash}`;
+    }
+    return "working";
+  }
+
+  fileReviewKey(file) {
+    const fileKey = typeof file === "string" ? file : file?.key;
+    if (!fileKey) return null;
+    return `${this.fileReviewScope()}::${fileKey}`;
+  }
+
+  isFileReviewed(file, flow) {
+    const rk = this.fileReviewKey(file);
+    if (!rk) return false;
+    return Boolean(flow?.reviewedFiles?.[rk] || this.localReviewedFiles?.has(rk));
+  }
+
+  toggleFileReviewed(file, cx, advanceToNext = false) {
+    const fileKey = typeof file === "string" ? file : file?.key;
+    const rk = this.fileReviewKey(file);
+    if (!rk || !fileKey) return;
+
+    const { activeSpace, activeTabId } = getActiveSpaceAndTab();
+    const flows = readFlows();
+    const curFlow = activeTabId ? (flows[activeTabId] || {}) : {};
+    const nextReviewed = !this.isFileReviewed(file, curFlow);
+
+    if (nextReviewed) this.localReviewedFiles.add(rk);
+    else this.localReviewedFiles.delete(rk);
+
+    let updatedFlow = curFlow;
+    if (activeTabId) {
+      updatedFlow = updateTabFlow(
+        activeTabId,
+        (prev) => {
+          const nextMap = { ...(prev.reviewedFiles || {}) };
+          if (nextReviewed) nextMap[rk] = true;
+          else delete nextMap[rk];
+          return { reviewedFiles: nextMap };
+        },
+        this.workspaceRoot || activeSpace?.folder || "",
+      );
+    }
+
+    if (advanceToNext && nextReviewed && this.files.length > 1) {
+      const curIdx = this.files.findIndex((f) => f.key === fileKey);
+      const start = curIdx >= 0 ? curIdx : 0;
+      let nextFile = null;
+      for (let offset = 1; offset < this.files.length; offset++) {
+        const cand = this.files[(start + offset) % this.files.length];
+        if (!this.isFileReviewed(cand, updatedFlow)) {
+          nextFile = cand;
+          break;
+        }
+      }
+      if (nextFile && nextFile.key !== this.open) {
+        const context = this.context;
+        this.open = nextFile.key;
+        this.closed = false;
+        this.note = null;
+        this.setLines([]);
+        cx.spawn(async (cx) => {
+          try {
+            await this.load(nextFile.key, context);
+          } catch (e) {
+            if (key() === context && this.open === nextFile.key) {
+              this.note = `Cannot preview this diff (too large or unreadable): ${e.message || e}`;
+            }
+          }
+          cx.notify();
+        });
+      }
+    }
+
+    cx.notify();
+  }
+
+  clearCommittedReviewedFiles(serviceIds) {
+    if (!Array.isArray(serviceIds) || serviceIds.length === 0) return;
+    const prefixes = serviceIds.map((id) => `working::${id}::`);
+    for (const rk of [...this.localReviewedFiles]) {
+      if (prefixes.some((p) => rk.startsWith(p))) {
+        this.localReviewedFiles.delete(rk);
+      }
+    }
+    const { activeSpace, activeTabId } = getActiveSpaceAndTab();
+    if (!activeTabId) return;
+    updateTabFlow(
+      activeTabId,
+      (prev) => {
+        const prevMap = prev.reviewedFiles || {};
+        const nextMap = {};
+        let changed = false;
+        for (const [k, v] of Object.entries(prevMap)) {
+          if (prefixes.some((p) => k.startsWith(p))) {
+            changed = true;
+          } else {
+            nextMap[k] = v;
+          }
+        }
+        return changed ? { reviewedFiles: nextMap } : null;
+      },
+      this.workspaceRoot || activeSpace?.folder || "",
+    );
+  }
+
   checkKey(serviceId, command) {
     return `${serviceId}::${command}`;
   }
@@ -1735,16 +2154,23 @@ export default class ChangesReview extends View {
     this.note = null;
     cx.spawn(async (cx) => {
       const errors = [];
+      const committedIds = [];
       try {
         for (const repo of targetRepos) {
           const root = repo.root;
+          let repoOk = true;
           for (const args of [["add", "-A"], ["commit", "-m", message]]) {
             const r = await exec("git", args, { cwd: root, on });
             if (r.code !== 0) {
               errors.push(`[${repo.name}]: ${(r.stderr || r.stdout).trim()}`);
+              repoOk = false;
               break;
             }
           }
+          if (repoOk && repo.id) committedIds.push(repo.id);
+        }
+        if (committedIds.length > 0) {
+          this.clearCommittedReviewedFiles(committedIds);
         }
         if (errors.length > 0) {
           throw new Error(errors.join("\n"));
@@ -2264,12 +2690,15 @@ export default class ChangesReview extends View {
         finalLines = finalLines.slice(0, maxLines);
         finalLines.push(`@@ -0,0 +0,0 @@ [Diff preview truncated: showing first ${maxLines} lines. ${remaining} more lines hidden. ${isExpanded ? "File is very large." : "Click Expand context above for more."}]`);
       }
-      this.setLines(finalLines.map((line) => (line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line)));
+      this.setLines(
+        finalLines.map((line) => (line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line)),
+        path,
+      );
     }
   }
 
-  setLines(lines) {
-    this.rows = diffRows(lines);
+  setLines(lines, filePath = "") {
+    this.rows = diffRows(lines, filePath);
     this.diffWidth = Math.max(300, ...lines.map((line) => line.length * 7 + 50));
   }
 
@@ -2313,7 +2742,7 @@ export default class ChangesReview extends View {
     cx.notify();
   }
 
-  diffRow({ kind, number, text }, t, dt, commentMap) {
+  diffRow({ kind, number, text, tokens }, t, dt, commentMap) {
     if (kind === "@") {
       const isExpanded = Boolean(this.expandedFiles && this.expandedFiles.has(this.open));
       return h_flex().w_full().px(12).h(20).flex_none().items_center().justify_between()
@@ -2337,8 +2766,25 @@ export default class ChangesReview extends View {
     const diffColor = isAdd ? dt.add : isDel ? dt.del : null;
     const rowBg = isAdd ? dt.addBg : isDel ? dt.delBg : null;
     const hoverBg = isAdd ? dt.addHover : isDel ? dt.delHover : t.hover;
+    const gutterSign = isAdd ? "+" : isDel ? "-" : " ";
 
-    const row = h_flex().w_full().h(20).flex_none().gap(10).cursor_pointer()
+    const codeCell = tokens && tokens.length
+      ? h_flex().flex_1().min_w(0).overflow_hidden().items_center().children(
+          tokens.map(([tokKind, tokText]) =>
+            div()
+              .flex_none()
+              .whitespace_nowrap()
+              .text_color(syntaxTokenColor(tokKind, t))
+              .child(tokText.replace(/ /g, "\u00a0"))
+          )
+        )
+      : div().flex_1().min_w(0).truncate()
+          .text_color(diffColor || t.foreground)
+          .child(text);
+
+    const row = h_flex().w_full().h(20).flex_none().items_center().gap(6).cursor_pointer()
+      .border_l(2)
+      .border_color(diffColor || t.background)
       .when(Boolean(rowBg), (e) => e.bg(rowBg))
       .when(Boolean(existing) || Boolean(isActive), (e) => e.bg(t.selected))
       .hover((s) => s.bg(hoverBg))
@@ -2346,15 +2792,16 @@ export default class ChangesReview extends View {
         if (isCommentable) this.startComment(this.open, number, text, cx);
       })
       .child(
-        div().w(30).flex_none().text_right()
+        div().w(32).flex_none().text_right()
           .text_color(existing || isActive ? t.foreground : diffColor || t.dim)
           .child(number === undefined ? "" : String(number))
       )
       .child(
-        div().flex_1().min_w(0).truncate()
-          .text_color(diffColor || t.foreground)
-          .child(text)
-      );
+        div().w(10).flex_none().text_center().font_semibold()
+          .text_color(diffColor || t.dim)
+          .child(gutterSign)
+      )
+      .child(codeCell);
 
     if (!isActive && !existing) {
       return row;
@@ -2838,6 +3285,10 @@ export default class ChangesReview extends View {
     const agent = this.findActiveAgent();
     const agentName = agent ? (agent.title || agent.app || agent.address) : null;
     const mono = settings()?.font_family ?? "JetBrains Mono";
+    const openFile = this.open ? (this.files.find((f) => f.key === this.open) || null) : null;
+    const openFileReviewed = openFile ? this.isFileReviewed(openFile, flow) : false;
+    const reviewedFilesCount = this.files.reduce((n, f) => n + (this.isFileReviewed(f, flow) ? 1 : 0), 0);
+    const allFilesReviewed = this.files.length > 0 && reviewedFilesCount === this.files.length;
 
     const commentMap = new Map();
     if (this.open && this.reviews.length > 0) {
@@ -2878,6 +3329,20 @@ export default class ChangesReview extends View {
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().flex_none().font_semibold().child("Changes"))
         .child(div().flex_none().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(`${this.files.length} files`))
+        .when(this.files.length > 0 && reviewedFilesCount > 0, (el) => el.child(
+          div()
+            .flex_none()
+            .px(5)
+            .py(1)
+            .rounded(4)
+            .border_1()
+            .border_color(allFilesReviewed ? hexWithAlpha(passColor, "77") : t.border)
+            .when(allFilesReviewed, (b) => b.bg(hexWithAlpha(passColor, "22")))
+            .text_size(10)
+            .font_medium()
+            .text_color(allFilesReviewed ? passColor : t.muted)
+            .child(`${reviewedFilesCount}/${this.files.length} ✓`)
+        ))
 
         // Commit selector dropdown button right beside "Changes" and file counter
         .child(
@@ -3133,29 +3598,122 @@ export default class ChangesReview extends View {
       // File list (changes-list)
       .child(v_flex().id("changes-list").flex_none().h(Math.min(this.checksOpen ? 96 : 160, Math.max(44, this.files.length * 28 + 12))).overflow_y_scrollbar().p(6).border_b(1).border_color(t.border).children(this.files.map((f) => {
         const parts = f.path.split("/"), name = parts.pop();
-        return h_flex().id(`change-${f.key}`).h(28).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer()
-          .when(this.open === f.key, (e) => e.bg(t.selected))
+        const isReviewed = this.isFileReviewed(f, flow);
+        const isOpen = this.open === f.key;
+        return h_flex().id(`change-${f.key}`).h(28).flex_none().px(8).gap(7).items_center().rounded(7).cursor_pointer()
+          .when(isOpen, (e) => e.bg(t.selected))
           .hover((s) => s.bg(t.hover))
           .on_click((_e, cx) => this.pick(f.key, cx))
+          .child(
+            h_flex()
+              .id(`file-check-${f.key}`)
+              .w(15)
+              .h(15)
+              .flex_none()
+              .items_center()
+              .justify_center()
+              .rounded(4)
+              .border_1()
+              .cursor_pointer()
+              .tooltip(isReviewed ? "Mark file as unreviewed" : "Mark file as reviewed")
+              .when(isReviewed, (cb) => cb.bg(passColor).border_color(passColor).text_color(t.background))
+              .when(!isReviewed, (cb) => cb.bg(t.background).border_color(t.border).hover((s) => s.border_color(passColor)))
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .on_click((_e, cx) => {
+                cx.stop_propagation();
+                this.toggleFileReviewed(f, cx, false);
+              })
+              .child(div().text_size(9.5).font_semibold().child(isReviewed ? "✓" : ""))
+          )
           .child(div().w(14).text_size(11).text_color(f.status === "A" ? add : f.status === "D" || f.status === "U" ? del : t.blocked).child(f.status))
           .when(this.services.length > 1 && this.activeService === "all", (e) => e.child(
             div().flex_none().px(4).py(0.5).rounded(3).bg(t.raised).border_1().border_color(t.border).text_size(9.5).text_color(t.muted).child(f.serviceName)
           ))
-          .child(h_flex().flex_1().min_w(0).child(div().text_color(t.dim).truncate().child(parts.length ? parts.join("/") + "/" : "")).child(div().max_w(260).min_w(0).truncate().child(name)))
-          .when(f.add > 0, (e) => e.child(div().text_size(11).text_color(add).child(`+${f.add}`)))
-          .when(f.del > 0, (e) => e.child(div().text_size(11).text_color(del).child(`−${f.del}`)));
+          .child(
+            h_flex().flex_1().min_w(0)
+              .child(div().text_color(t.dim).truncate().child(parts.length ? parts.join("/") + "/" : ""))
+              .child(div().max_w(260).min_w(0).truncate().text_color(isReviewed ? (isOpen ? t.muted : t.dim) : t.foreground).child(name))
+          )
+          .when(f.add > 0, (e) => e.child(div().text_size(11).text_color(isReviewed ? t.dim : add).child(`+${f.add}`)))
+          .when(f.del > 0, (e) => e.child(div().text_size(11).text_color(isReviewed ? t.dim : del).child(`−${f.del}`)));
       })).when(!this.files.length, (e) => e.child(div().p(8).text_color(t.dim).child(
         this.error || (this.loading ? "Loading changes…" : this.services.length ? (this.viewMode === "commit" ? "No files changed in this commit" : "No uncommitted changes") : "No folder")
       ))))
 
       .when(this.limited, (el) => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files")))
 
-      // Diff area
-      .child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(11)
-        .child(v_flex().id("changes-diff-lines").size_full().overflow_y_scrollbar().children(
-          this.rows.map((row) => this.diffRow(row, t, dt, commentMap))
-        ))
-        .when(!this.open && this.files.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child("Select a file to view its changes"))))
+      // Diff area with active-file Viewed/Reviewed bar
+      .child(
+        v_flex().flex_1().min_h(0).relative()
+          .when(Boolean(openFile), (el) => el.child(
+            h_flex()
+              .id("diff-file-review-bar")
+              .h(28)
+              .flex_none()
+              .px(10)
+              .gap(8)
+              .items_center()
+              .justify_between()
+              .border_b(1)
+              .border_color(t.border)
+              .bg(t.raised)
+              .child(
+                h_flex().flex_1().min_w(0).gap(6).items_center()
+                  .child(
+                    div().min_w(0).truncate().text_size(11).font_medium()
+                      .text_color(openFileReviewed ? t.muted : t.foreground)
+                      .child(openFile.displayPath || openFile.path)
+                  )
+                  .when(this.files.length > 0, (b) => b.child(
+                    div().flex_none().text_size(10).text_color(allFilesReviewed ? passColor : t.dim)
+                      .child(`${reviewedFilesCount}/${this.files.length} reviewed`)
+                  ))
+              )
+              .child(
+                h_flex()
+                  .id("diff-viewed-btn")
+                  .h(20)
+                  .px(8)
+                  .gap(5)
+                  .flex_none()
+                  .items_center()
+                  .rounded(4)
+                  .border_1()
+                  .cursor_pointer()
+                  .tooltip(openFileReviewed ? "Unmark reviewed" : "Mark reviewed & open next unreviewed file")
+                  .when(openFileReviewed, (btn) =>
+                    btn
+                      .bg(hexWithAlpha(passColor, "22"))
+                      .border_color(hexWithAlpha(passColor, "77"))
+                      .text_color(passColor)
+                      .hover((s) => s.bg(hexWithAlpha(passColor, "33")))
+                  )
+                  .when(!openFileReviewed, (btn) =>
+                    btn
+                      .bg(t.background)
+                      .border_color(t.border)
+                      .text_color(t.muted)
+                      .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                  )
+                  .on_click((_e, cx) => this.toggleFileReviewed(openFile, cx, !openFileReviewed))
+                  .child(
+                    h_flex().w(12).h(12).flex_none().items_center().justify_center().rounded(3).border_1()
+                      .when(openFileReviewed, (c) => c.bg(passColor).border_color(passColor).text_color(t.background))
+                      .when(!openFileReviewed, (c) => c.bg(t.background).border_color(t.border))
+                      .text_size(8.5).font_semibold()
+                      .child(openFileReviewed ? "✓" : "")
+                  )
+                  .child(div().text_size(10.5).font_medium().child(openFileReviewed ? "Reviewed" : "Mark reviewed"))
+              )
+          ))
+          .child(
+            div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(11)
+              .child(v_flex().id("changes-diff-lines").size_full().overflow_y_scrollbar().children(
+                this.rows.map((row) => this.diffRow(row, t, dt, commentMap))
+              ))
+              .when(!this.open && this.files.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child("Select a file to view its changes")))
+          )
+      )
       .when(Boolean(this.note), (e) => e.child(div().px(10).pb(4).text_size(11).text_color(del).child(this.note)))
 
       // Bottom switcher bar (Review | Commit)

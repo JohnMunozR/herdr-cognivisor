@@ -27,7 +27,7 @@ The `submodule-mod-changes-review` provides interactive source control inspectio
   - Shared state bus:
     - Consumes and publishes `mesh.services` (with `sig` change key, `candidates` cache, and per-service `branch`/`workingCount`/`aheadCount`, `BUS_MAX_AGE_MS = 90000`).
     - Reads and writes `mesh.activeService` for synchronized service filtering.
-    - Reads and updates `mesh.flows[activeTabId]` (`reviewedServices` checklist map and `sessionRepos` attribution, preserving all sibling fields such as `leadTerminal`, `ticket`, `derivedTitle`, `manualTitle`).
+    - Reads and updates `mesh.flows[activeTabId]` (`reviewedServices` checklist map, `reviewedFiles` per-file viewed map, and `sessionRepos` attribution, preserving all sibling fields such as `leadTerminal`, `ticket`, `derivedTitle`, `manualTitle`).
 - **Allowed deps:**
   - `gpui-kit`: `View`, `div`, `svg`.
   - `gpui-base`: `v_flex`, `h_flex`, `InputState`, `Input`, `TextareaState`, `Textarea`, `Scrollbar`, `ScrollHandle`.
@@ -98,10 +98,10 @@ The `submodule-mod-changes-review` provides interactive source control inspectio
    ];
    ```
    *Rationale:* This prevents Git from touching timestamps in the index or creating lock files, which would trip the `watchFolder` listener and trigger a perpetual re-render cascade.
-2. **Virtual Diff Rendering:**
-   Diff lines are pre-processed into lightweight metadata objects via `diffRows()`, ensuring that only visible rows within the scroll viewport are evaluated by GPUI during frame layout.
-3. **Theme Dynamic Adaptation:**
-   Diff additions and deletions calculate background tint using `hexWithAlpha` derived dynamically from `theme().diff_add` / `theme().diff_del` (or ANSI fallback tokens), ensuring high contrast across both light and dark themes.
+2. **Virtual Pre-Tokenized Diff Rendering:**
+   Diff lines are pre-processed once inside `diffRows(lines, filePath)` into numbered metadata objects with linear single-pass syntax tokens (`tokenizeDiffLine`, capped at 500 chars per line), keeping `diffRow()` allocation-light during scroll/re-renders.
+3. **Theme Dynamic Adaptation & Diff + Syntax Color Layering:**
+   Diff additions and deletions preserve unambiguous diff markers—background tint (`hexWithAlpha` from `theme().diff_add` / `theme().diff_del` or ANSI fallback tokens), left accent border, `+`/`-` gutter glyph, and colored line number—while rendering code content with semantic `theme()` syntax tokens (`ansi1`–`ansi6`, `dim`, `foreground`) across both light and dark themes.
 4. **Composite File Keys:**
    All internal state references (`this.open`, `this.expandedFiles`, `this.reviews`) MUST index files via composite `${serviceId}::${path}` keys to prevent cross-service collision.
 5. **Zero `localStorage` & Non-Reentrant Shared Updates:**
@@ -125,6 +125,7 @@ Consumes `mesh.services` published by `files-search` (`BUS_MAX_AGE_MS = 90000`, 
 - **Status Resolution:** Each service resolves to `"has_notes"` if `this.reviews.some(r => r.serviceId === serviceId)`, else `"approved"` if `flow.reviewedServices?.[serviceId]?.status === "approved"`, else `"pending"`.
 - **Service Filter Pills:** When multiple repositories exist, renders horizontally scrollable pills sorted dirty-first then alphabetically, displaying status glyph (`✓` in `t.ansi2`, `✎` in `t.blocked`, `○` in `t.dim`), service name, compact `service.branch` badge, and dirty count.
 - **Microservice Review Bar & `Approve Service ✓`:** Rendered when a single service is active or when the workspace has a sole repository (`services.length === 1`), showing service name, branch, status pill (`Pending` | `Has notes` | `Approved ✓`), and `Approve Service ✓` (or `Unapprove`). Approving persists `{ status: "approved", branch, updatedAt }` under `mesh.flows[activeTabId].reviewedServices[serviceId]` and automatically jumps `this.activeService` / `mesh.activeService` to the next unapproved dirty microservice (`workingCount > 0`), if any.
+- **Per-File Review Checklist (`reviewedFiles`, `#file-check-*`, `#diff-file-review-bar`):** Each changed file row renders an interactive checkbox (`✓`) keyed cleanly by scope (`working::<serviceId>::<path>` or `commit:<hash>::<serviceId>::<path>`) inside `mesh.flows[activeTabId].reviewedFiles` (with `localReviewedFiles` fallback when no tab is active). Checking a file dims its row so unreviewed files stand out, updates header/bar progress (`N/M ✓`), clears matching `working::` entries automatically when committed, and clicking `Mark reviewed` inside `#diff-file-review-bar` checks the active file and advances to the next unreviewed file.
 
 ### Repository Standards & Check Runner (`#changes-checks-btn` & Checks Drawer)
 Clicking `Checks` (`#changes-checks-btn`) in the header toggles a collapsible drawer above the changed files and diff area for the target service(s) (`activeService === "all"` targets dirty services or all services; otherwise the selected service). Discovery inspects root files via `readTextFile`:
