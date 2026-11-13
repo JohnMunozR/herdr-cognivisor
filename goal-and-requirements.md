@@ -9,7 +9,7 @@ tags: [root, requirements, herdr, microservices, agent-ide]
 
 ## Goal
 
-Herdr Mesh transforms the Herdr desktop application into a focused **Multi-Microservice Agent Workspace**. In modern cloud-native systems, a single Jira ticket or feature frequently requires simultaneous edits across multiple independent services, frontend apps, and worker daemons—or an agent started inside one microservice ends up editing sibling repositories. Herdr Mesh creates an organic, terminal-first environment where developers start directly with an AI coding agent in a tab and get representative automatic tab names, session-scoped microservice visibility in the file tree and change reviewer, per-service diff inspection and repo standard checks, and instant workspace search.
+Herdr Mesh transforms the Herdr desktop application into a focused **Multi-Microservice Agent Workspace**. In modern cloud-native systems, a single Jira ticket or feature frequently requires simultaneous edits across multiple independent services, frontend apps, and worker daemons—or an agent started inside one microservice ends up editing sibling repositories. Herdr Mesh creates an organic, terminal-first environment where developers start directly with an AI coding agent in a tab and get representative automatic tab names, session-scoped microservice visibility in the file tree and change reviewer, per-service diff inspection and approval tracking, and instant workspace search.
 
 This document serves as the root requirement specification for the Herdr Mesh ecosystem, establishing product goals, user personas, core architectural principles, and required functional capabilities that govern the entire Fractal Spec-Graph (`[[architecture]]`, `[[spec-lifecycle]]`).
 
@@ -19,7 +19,7 @@ Software engineering teams building distributed microservices face severe fricti
 
 - **Repository Fragmentation & Noise Across Multi-Repo Workspaces:** Opening Herdr in a parent directory containing dozens of projects creates visual clutter if unrelated clean repos are shown, while opening in a single microservice obscures sibling repositories touched by the agent during the same session.
 - **Agent Terminal Friction & Generic Tab Chaos:** Developers open terminal tabs and immediately launch CLI agents (`claude`, `gemini`, `codex`, `opencode`, `pi`, `antigravity`), leaving tabs named generically (`tb1`, `tb2`) instead of reflecting the ticket/prompt being worked on.
-- **Fragmented Code Review & Repo Standard Verification:** In multi-repo environments, git status, diffs, branch verification, and build/lint checks are scattered across distinct repositories. Reviewers need microservice-by-microservice inspection, per-service approval tracking, automated checks, and direct dispatch back to the tab's lead agent.
+- **Fragmented Code Review & Approval Tracking:** In multi-repo environments, git status, diffs, and branch verification are scattered across distinct repositories. Reviewers need microservice-by-microservice inspection, per-service approval tracking, and direct dispatch back to the tab's lead agent.
 - **Cross-Platform Performance Overhead:** Un-debounced `watchFolder` cascades, repeated repository scans across mods, uncached `git status --untracked-files=all`, or redundant `powershell` invocations degrade responsiveness on Windows, Linux, and macOS.
 
 ## Who it's for
@@ -27,14 +27,14 @@ Software engineering teams building distributed microservices face severe fricti
 Herdr Mesh is designed for software engineers, tech leads, and autonomous AI coding agents working within multi-service architectures:
 
 1. **Multi-Service Full-Stack Developers:** Engineers implementing end-to-end features spanning frontend web apps (e.g., Angular), API gateways, backend microservices (Java/Node.js/Go/Rust), and shared libraries.
-2. **AI Coding Agents (In-IDE Agents):** CLI agents operating inside Herdr terminal panes that benefit from direct feedback dispatch of code review notes and failing repo checks.
-3. **Engineering Leads & Reviewers:** Reviewers who inspect holistic diffs service by service, run repository standard checks, approve per-service modifications, and feed review notes directly to the tab's lead agent.
+2. **AI Coding Agents (In-IDE Agents):** CLI agents operating inside Herdr terminal panes that benefit from direct feedback dispatch of code review notes.
+3. **Engineering Leads & Reviewers:** Reviewers who inspect holistic diffs service by service, approve per-service modifications, and feed review notes directly to the tab's lead agent.
 
 ## Value
 
 - **Organic Terminal-First Auto-Naming:** Developers open a terminal tab, launch any agent, and describe their ticket—`mesh-tabs` (`[[submodule-mod-mesh-tabs]]`) automatically extracts Jira keys (`[A-Z][A-Z0-9]{1,9}-\d+`) and summarizes the first prompt or branch into representative tab names without overwriting manual renames.
 - **Session-Scoped Multi-Repo Discovery:** `files-search` (`[[submodule-mod-files-search]]`) and `changes-review` (`[[submodule-mod-changes-review]]`) show only the repositories touched/created during the current tab's session (including sibling repos outside the starting service), filtering out unrelated clean projects under `/Projects`.
-- **Microservice-by-Microservice Review & Checks:** `changes-review` shows per-service branches, tracks per-service review checklists (`pending | has_notes | approved`), advances through dirty microservices with `Approve Service ✓`, and runs repo standard `Checks`.
+- **Microservice-by-Microservice Review:** `changes-review` shows per-service branches, tracks per-service review checklists (`pending | has_notes | approved`), and advances through dirty microservices with `Approve Service ✓`.
 - **Instant Global Navigation & Cross-Platform Performance:** `files-search` delivers cross-service fuzzy search and ripgrep preview while enforcing debounced watches, cached repo discovery, `mesh.services` bus sharing, native `fs/promises` scans on local OS, and lock-free Git inspection with zero `localStorage`.
 
 ## Principles
@@ -51,10 +51,10 @@ Herdr Mesh is designed for software engineers, tech leads, and autonomous AI cod
   - Top tab bar (`mesh-tabs`) with automatic Jira/prompt naming, double-click inline rename, `Files`/`Review` toggles, and `mesh.spacePanels` persistence.
   - Expandable `#panel-body` stack hosting `files` (`files-search`) and `changes` (`changes-review`).
   - Bottom telemetry bar (`mesh-status`) summarizing host, session service/dirty counts, branch, agents, and palette hint.
-- **Microservice Code Review & Repo Checks (`[[submodule-mod-changes-review]]`):**
+- **Microservice Code Review (`[[submodule-mod-changes-review]]`):**
   - Per-service branch visibility, working-tree/commit diffs, expandable context (`git diff -U99999`), and inline notes.
   - Tab-scoped `reviewedServices` checklist (`pending | has_notes | approved`) and `Approve Service ✓` auto-advance across dirty services.
-  - Repository standards `Checks` inspector (`AGENTS.md`, `CLAUDE.md`, `SPEC.md`, `package.json`, `pom.xml`, `Cargo.toml`, `Makefile`) with cross-platform Windows `cmd /c` / POSIX `sh -c` execution and failure dispatch to `leadTerminal`.
+  - Direct review feedback dispatch to `leadTerminal` and multi-repo commit execution.
 - **Workspace Search Everywhere & Multi-Repo Tree (`[[submodule-mod-files-search]]`):**
   - Multi-tab floating overlay (`All`, `Files`, `Text`) with ripgrep streaming, fixed-string fallback on invalid regex, clamped multi-pane preview, and docked session-scoped multi-repo file tree.
 - **Shared State Orchestration (`[[architecture]]`):**
@@ -63,6 +63,6 @@ Herdr Mesh is designed for software engineers, tech leads, and autonomous AI cod
 ## Non-Goals
 
 - **Full Text Editor Replacement:** Herdr Mesh is a terminal-first Agent Workspace and orchestration platform; it does not attempt to embed an LSP text editor.
-- **In-IDE E2E Test Orchestration or PR Management UI:** Dedicated `mesh-test`, `mesh-ship`, and `#flow` chrome modules are intentionally omitted; agents and developers run tests and GitHub PR workflows directly in terminals or via `changes-review` Checks.
+- **In-IDE E2E Test Orchestration or PR Management UI:** Dedicated `mesh-test`, `mesh-ship`, and `#flow` chrome modules are intentionally omitted; agents and developers run tests and GitHub PR workflows directly in terminals.
 - **Direct Unregulated Subprocess Daemons:** Mods interact through standard Herdr interfaces (`hc`, `exec`, `run`, `shared()`) rather than spawning hidden unmanaged daemon processes.
 - **Bypassing Herdr Shipped Layout Protections:** Modifying or overwriting Herdr's built-in `main.json`, `terminals.json`, `win98.json`, or core shipped mods is explicitly out of scope; Herdr Mesh distributes its own owned `layouts/mesh.json` and active mods.

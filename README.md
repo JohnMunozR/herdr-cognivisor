@@ -2,7 +2,7 @@
 
 > A unified **Multi-Microservice Agent Workspace** layout and 4-mod suite for the [Herdr](https://github.com/herdr-app) desktop application.
 
-Herdr Mesh adapts Herdr for modern multi-repository and microservice workflows without visual noise or heavyweight IDE chrome. Instead of listing unrelated clean repositories under `/Projects` or hiding sibling microservices edited by an agent started in a single folder, Herdr Mesh tracks session-attributed repositories per tab, auto-names agent tabs from Jira keys and prompts, provides service-by-service code review with repo standard `Checks`, and delivers cross-platform Search Everywhere navigation.
+Herdr Mesh adapts Herdr for modern multi-repository and microservice workflows without visual noise or heavyweight IDE chrome. Instead of listing unrelated clean repositories under `/Projects` or hiding sibling microservices edited by an agent started in a single folder, Herdr Mesh tracks session-attributed repositories per tab, auto-names agent tabs from Jira keys and prompts, provides service-by-service code review with per-service checklist tracking, and delivers cross-platform Search Everywhere navigation.
 
 ---
 
@@ -16,10 +16,10 @@ Herdr Mesh adapts Herdr for modern multi-repository and microservice workflows w
   - Anchors the tree root to `space.folder`, discovers repositories (including parent siblings and extra pane `cwd`s), runs lock-free `git status --untracked-files=normal`, and exposes only session-attributed touched repositories via `mesh.services`.
   - Uses debounced `watchFolder` (ignoring `target/`, `node_modules/`, internal `.git/` lock churn), cached repo discovery (`REPO_CACHE_TTL_MS = 60000`), incremental dirty-folder reloads, hidden-panel polling throttling, and native `fs/promises` local scans on Windows/Linux/macOS.
   - Multi-tab floating Search Everywhere overlay (`All`, `Files`, `Text`) with normalized ripgrep paths (`--path-separator /`), fixed-string `-F` retry on regex characters, exit-code-aware fallback, and clamped live code preview.
-- **Microservice-by-Microservice Review & Repo Checks (`mods/changes-review`):**
+- **Microservice-by-Microservice Review (`mods/changes-review`):**
   - Consumes `mesh.services` (`sig`-gated, `BUS_MAX_AGE_MS = 90000`) to avoid duplicate scanning, displaying per-service Git branches, JetBrains Mono diffs, `git diff -U99999` hunk context expansion, and inline multi-line review notes.
   - Maintains a tab-scoped per-service checklist (`pending | has_notes | approved`) in `mesh.flows[tabId].reviewedServices`; `Approve Service ✓` marks the current service approved and advances to the next unreviewed dirty microservice.
-  - Includes a `Checks` drawer that inspects `AGENTS.md`, `CLAUDE.md`, `SPEC.md`, `package.json`, `pom.xml`, `Cargo.toml`, and `Makefile`, executes lint/test/check commands per microservice (`cmd /c` for `.cmd` shims/chains on Windows, `sh -c` on POSIX), and dispatches failures directly to `leadTerminal`.
+  - Dispatches structured code review feedback directly to the tab's prioritized `leadTerminal` agent and supports sequential multi-repository commits.
 - **Workspace Telemetry Status Bar (`mods/mesh-status`):**
   - Upgrades `#status` (`28px`) to display active host/machine, multi-service/dirty counts, active branch, live agent activity counters, and `app.palette` shortcut hint.
 - **Lock-Free & Native GPUI Guarantees:**
@@ -45,7 +45,7 @@ goal-and-requirements.md (Root requirements)
          ├── layouts/SPEC.md (Layout module & layouts/mesh.json)
          └── mods/SPEC.md (4-mod active suite catalog)
                ├── mods/files-search/SPEC.md (Search Everywhere & session file tree)
-               ├── mods/changes-review/SPEC.md (Per-service diff review, checklist & Checks)
+               ├── mods/changes-review/SPEC.md (Per-service diff review & checklist)
                ├── mods/mesh-tabs/SPEC.md (Organic auto-naming & mesh.spacePanels)
                └── mods/mesh-status/SPEC.md (Workspace status telemetry bar)
 ```

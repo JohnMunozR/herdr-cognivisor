@@ -49,7 +49,7 @@ The root UI topology is defined by `layouts/mesh.json` (`[[module-layouts]]`), p
 - **`#main`:** Primary terminal workspace hosting feature agents (`claude`, `gemini`, `codex`, `opencode`, `pi`, `antigravity`).
 - **`#panel` / `#panel-body`:** Collapsible mutually exclusive stack hosting:
   - `#files` (`[[submodule-mod-files-search]]`): Session-scoped multi-repo file tree with git status decorators and Search Everywhere overlay (`files-search-win`).
-  - `#changes` (`[[submodule-mod-changes-review]]`): Per-service branches, diffs, inline review notes, `reviewedServices` checklist (`Approve Service ✓`), and `Checks` runner.
+  - `#changes` (`[[submodule-mod-changes-review]]`): Per-service branches, diffs, inline review notes, and `reviewedServices` checklist (`Approve Service ✓`).
 - **`#status` (`28px`, `mesh-status`):** Bottom telemetry bar displaying active host, service/dirty counts, active branch, agent summary, and palette shortcut.
 
 ---
@@ -65,7 +65,7 @@ herdr-mesh/
 └── mods/                  <- [[module-mods]]: Independent GPUI-kit mod extensions
     ├── SPEC.md
     ├── files-search/      <- [[submodule-mod-files-search]]: Search Everywhere, indexer engine (`indexer.js`, `search-logic.js`)
-    ├── changes-review/    <- [[submodule-mod-changes-review]]: Per-service diff review, Checks (`review-logic.js`)
+    ├── changes-review/    <- [[submodule-mod-changes-review]]: Per-service diff review & checklist (`review-logic.js`)
     ├── mesh-tabs/         <- [[submodule-mod-mesh-tabs]]: Tab strip, auto-naming, `mesh.spacePanels` (`tab-logic.js`)
     └── mesh-status/       <- [[submodule-mod-mesh-status]]: Telemetry status bar
 ```
@@ -87,7 +87,7 @@ herdr-mesh/
    - Synchronizes `mesh.activeService` with monotonic timestamp checks (`ts > lastActiveServiceTs`).
 4. **Composite File Disambiguation (`${serviceId}::${path}`):**
    - Prevents path collisions across microservices for file selection, hunk expansion (`git diff -U99999`), and inline review comments.
-5. **Tab-Scoped Lead Agent & Review/Checks Dispatch (`findActiveAgent`):**
+5. **Tab-Scoped Lead Agent & Review Dispatch (`findActiveAgent`):**
    - Resolves target agent with `mesh.flows[tabId].leadTerminal` first, then focused agent, tab primary agent, and global `agents()[0]` fallback.
 6. **Microservice Checklist & Batch Commits:**
    - Tracks per-service review status (`pending | has_notes | approved`) in `mesh.flows[tabId].reviewedServices`; `Approve Service ✓` marks reviewed and advances to the next unreviewed dirty microservice.
@@ -128,4 +128,4 @@ All bus keys outside mod-private namespaces MUST carry the `mesh.*` prefix.
 5. **Spec Consistency:**
    Every structural change to directories, layouts, interfaces, or bus keys MUST be reflected in the owning `SPEC.md` and `openspec/specs/` before or alongside code changes.
 6. **Pure Logic Decoupling & Mandatory Unit Tests:**
-   Testable business logic (indexing, watch filtering, query scoring, Git/diff parsing, command validation, tab naming) MUST reside in zero-UI intra-mod helper modules (`indexer.js`, `*-logic.js`) covered by native `node --test` suites under `tests/*.test.mjs` (`npm test`) whenever developed or fixed.
+   Testable business logic (indexing, watch filtering, query scoring, Git/diff parsing, tab naming) MUST reside in zero-UI intra-mod helper modules (`indexer.js`, `*-logic.js`) covered by native `node --test` suites under `tests/*.test.mjs` (`npm test`) whenever developed or fixed.

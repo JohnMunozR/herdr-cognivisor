@@ -5,13 +5,13 @@ status: active
 title: Agent Workspace Lifecycle Specification
 parent: architecture
 references: [goal-and-requirements, module-layouts, module-mods, submodule-mod-changes-review, submodule-mod-files-search, submodule-mod-mesh-tabs, submodule-mod-mesh-status]
-covers: [tab-auto-naming, session-scoped-repo-attribution, microservice-review-checks, cross-platform-performance, shared-bus-persistence]
+covers: [tab-auto-naming, session-scoped-repo-attribution, microservice-review-checklist, cross-platform-performance, shared-bus-persistence]
 tags: [openspec, lifecycle, mesh-tabs, mesh-status, changes-review, files-search]
 ---
 
 ## Purpose
 
-This specification defines the active **Agent Workspace Lifecycle** for Herdr Mesh (`[[goal-and-requirements]]`, `[[architecture]]`). It covers organic, terminal-first tab naming, session-scoped multi-repository attribution, service-by-service code review with repo standard checks, cross-platform Search Everywhere and watch debouncing, and non-blocking bus coordination across `[[module-layouts]]`, `[[module-mods]]`, `[[submodule-mod-changes-review]]`, `[[submodule-mod-files-search]]`, `[[submodule-mod-mesh-tabs]]`, and `[[submodule-mod-mesh-status]]`.
+This specification defines the active **Agent Workspace Lifecycle** for Herdr Mesh (`[[goal-and-requirements]]`, `[[architecture]]`). It covers organic, terminal-first tab naming, session-scoped multi-repository attribution, service-by-service code review with per-service checklist tracking, cross-platform Search Everywhere and watch debouncing, and non-blocking bus coordination across `[[module-layouts]]`, `[[module-mods]]`, `[[submodule-mod-changes-review]]`, `[[submodule-mod-files-search]]`, `[[submodule-mod-mesh-tabs]]`, and `[[submodule-mod-mesh-status]]`.
 
 ## Requirements
 
@@ -57,14 +57,13 @@ This specification defines the active **Agent Workspace Lifecycle** for Herdr Me
 
 ---
 
-### Requirement: Microservice-by-Microservice Review, Repo Standards Checks, and Lead Agent Priority
+### Requirement: Microservice-by-Microservice Review and Lead Agent Priority
 
-`mods/changes-review` (`[[submodule-mod-changes-review]]`) SHALL support structured microservice-by-microservice review, automated cross-platform repository standard checks, and tab-scoped lead-agent targeting.
+`mods/changes-review` (`[[submodule-mod-changes-review]]`) SHALL support structured microservice-by-microservice review and tab-scoped lead-agent targeting.
 
 - `changes-review` MUST display the current Git branch per touched microservice using lock-free Git read flags (`--no-optional-locks -c core.fsmonitor=false -c diff.autoRefreshIndex=false`).
 - `changes-review` MUST maintain a per-service review checklist with state `"pending" | "has_notes" | "approved"` persisted per tab in `mesh.flows[tabId].reviewedServices`.
 - Adding inline notes on a service MUST mark its review status `"has_notes"`; clicking `Approve Service ✓` MUST set the current service's status to `"approved"` and jump directly to the next unreviewed dirty microservice (`workingCount > 0` and status !== `"approved"`), updating `mesh.activeService`.
-- Clicking the `Checks` button MUST inspect repository standards and build manifests (`AGENTS.md`, `CLAUDE.md`, `SPEC.md`, `package.json`, `pom.xml`, `Cargo.toml`, `Makefile`) to resolve lint/test/check commands, execute them asynchronously via platform-appropriate shell wrappers (`cmd /c` for shell chains and Windows `.cmd` shims, `sh -c` on POSIX), surface check statuses and output, and permit 1-click dispatch of check failures to the active feature agent.
 - `findActiveAgent()` MUST resolve the target agent with `mesh.flows[tabId].leadTerminal` as highest priority before falling back to focused pane agent, tab agent, or global `agents()`.
 
 ---
@@ -88,6 +87,6 @@ All `herdr-mesh` mods MUST comply with Herdr's native persistence and GPUI-kit i
 
 ### Requirement: Pure Mod Logic Separation & Mandatory Unit Test Gate
 
-All `herdr-mesh` mods MUST keep testable non-UI business logic (indexing, watch filtering, query scoring, diff/syntax parsing, check command validation, tab naming) separated into intra-mod logic modules (`indexer.js`, `*-logic.js`) verified by native `node --test` unit suites (`tests/*.test.mjs`).
+All `herdr-mesh` mods MUST keep testable non-UI business logic (indexing, watch filtering, query scoring, diff/syntax parsing, tab naming) separated into intra-mod logic modules (`indexer.js`, `*-logic.js`) verified by native `node --test` unit suites (`tests/*.test.mjs`).
 
 - Feature development, refactors, and bug fixes affecting mod logic MUST add or update unit/regression tests in `tests/*.test.mjs` and pass `npm test` (`node --test tests/*.test.mjs`) alongside `herdr-app check` before completion (`[[architecture]]`).

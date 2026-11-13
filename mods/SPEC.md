@@ -11,7 +11,7 @@ tags: [mods, gpui-kit, herdr, lifecycle]
 
 ## Responsibility
 
-The `module-mods` encapsulates the suite of interactive GPUI extensions operating within the Herdr desktop application runtime (`gpui-shell 0.7.x`). Together with `[[module-layouts]]` and `[[spec-lifecycle]]`, the mods suite transforms Herdr's terminal workspace into a multi-microservice Agent IDE: organic tab auto-naming (`mesh-tabs`), workspace-wide navigation (`files-search`), session-scoped microservice code review and repo checks (`changes-review`), and bottom telemetry (`mesh-status`).
+The `module-mods` encapsulates the suite of interactive GPUI extensions operating within the Herdr desktop application runtime (`gpui-shell 0.7.x`). Together with `[[module-layouts]]` and `[[spec-lifecycle]]`, the mods suite transforms Herdr's terminal workspace into a multi-microservice Agent IDE: organic tab auto-naming (`mesh-tabs`), workspace-wide navigation (`files-search`), session-scoped microservice code review (`changes-review`), and bottom telemetry (`mesh-status`).
 
 Mods run as QuickJS JavaScript modules utilizing `gpui-kit` and `gpui-base` declarative components and interface with Herdr's native Rust core via the `herdr` host module.
 
@@ -25,7 +25,7 @@ Mods run as QuickJS JavaScript modules utilizing `gpui-kit` and `gpui-base` decl
 - **Public surface:**
   - Active mod directories installed into `$HERDR_APP_HOME/mods/`:
     - `mods/files-search`: Docked session-scoped multi-repo file tree and floating Search Everywhere overlay.
-    - `mods/changes-review`: Per-service Git branch/diff inspector, tab-scoped review checklist (`Approve Service ✓`), `Checks` runner, and `leadTerminal`-prioritized agent dispatch.
+    - `mods/changes-review`: Per-service Git branch/diff inspector, tab-scoped review checklist (`Approve Service ✓`), and `leadTerminal`-prioritized agent dispatch.
     - `mods/mesh-tabs`: Workspace tab strip with organic Jira/prompt auto-naming, 1-click inline rename, 2-panel drawer toggles (`Files`, `Review`), and `mesh.spacePanels` persistence.
     - `mods/mesh-status`: Bottom status bar displaying host machine, multi-service/dirty counts, active branch, agent activity, and palette trigger.
   - Mod command endpoints:
@@ -51,7 +51,7 @@ Mods run as QuickJS JavaScript modules utilizing `gpui-kit` and `gpui-base` decl
 | Submodule | Owns | Status / Spec |
 | :--- | :--- | :--- |
 | `submodule-mod-files-search` | Dual-mode file tree panel and floating Search Everywhere overlay (`files-search-win`) with ripgrep live search and shared file selection | Active (`[[submodule-mod-files-search]]`) |
-| `submodule-mod-changes-review` | Multi-repo Git diff viewer, per-service branch/checklist (`Approve Service ✓`), repo standard `Checks`, inline notes, and `leadTerminal` dispatch | Active (`[[submodule-mod-changes-review]]`, extended by `[[spec-lifecycle]]`) |
+| `submodule-mod-changes-review` | Multi-repo Git diff viewer, per-service branch/checklist (`Approve Service ✓`), inline notes, and `leadTerminal` dispatch | Active (`[[submodule-mod-changes-review]]`, extended by `[[spec-lifecycle]]`) |
 | `submodule-mod-mesh-tabs` | Tab strip, generic-name detection, Jira/prompt/branch auto-naming, inline rename, `Files`/`Review` toggles, and `mesh.spacePanels` sync | Active (`[[submodule-mod-mesh-tabs]]`) |
 | `submodule-mod-mesh-status` | 28px `#status` telemetry bar rendering machine, service/dirty count, active branch, agents, and palette hint | Active (`[[submodule-mod-mesh-status]]`) |
 

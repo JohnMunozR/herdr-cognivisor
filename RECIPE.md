@@ -13,7 +13,7 @@ A unified **Multi-Microservice Agent Workspace** layout recipe and 4-mod distrib
   - Primary execution pane (`tab: "active"`, `pane` header `30px`, `lone: true`, `radius: 10`) hosting AI coding agents (`claude`, `gemini`, `codex`, `opencode`, `pi`, `antigravity`).
 - **Collapsible 2-Panel Stack (`#panel`, `420px` [300–960], `hidden: true` by default / `#panel-body` stack):**
   - **`#files` (`files-search`):** Docked session-scoped multi-repo file tree with folder modification badges, `repo` markers, synchronized service filter pills, and the floating **Search Everywhere** modal (`files-search-win`) with `All` / `Files` / `Text` tabs, normalized ripgrep streaming, live code preview, and corner resize grip.
-  - **`#changes` (`changes-review`):** Per-service Git branch pills, working-tree/commit diff viewer in JetBrains Mono (`11px`), `Expand context` (`git diff -U99999`), inline comment cards, per-tab `reviewedServices` checklist (`Approve Service ✓`), repository standards `Checks` drawer (`AGENTS.md`, `CLAUDE.md`, `SPEC.md`, `package.json`, `pom.xml`, `Cargo.toml`, `Makefile`), and `leadTerminal`-prioritized feedback / multi-repo commit footer.
+  - **`#changes` (`changes-review`):** Per-service Git branch pills, working-tree/commit diff viewer in JetBrains Mono (`11px`), `Expand context` (`git diff -U99999`), inline comment cards, per-tab `reviewedServices` checklist (`Approve Service ✓`), and `leadTerminal`-prioritized feedback / multi-repo commit footer.
 - **Telemetry Status Bar (`#status`, `28px`, `mod: "mesh-status"`):**
   - Displays active host (`This computer` / SSH machine), multi-service & dirty counts (`N services · M dirty`), active branch, live agent counter (`N agents · M needs you`), and `app.palette` shortcut hint.
 
@@ -27,9 +27,9 @@ A unified **Multi-Microservice Agent Workspace** layout recipe and 4-mod distrib
   - `changes-review` consumes fresh `mesh.services` entries (`BUS_MAX_AGE_MS = 90000`) and wakes only when `bus.sig` changes, eliminating duplicate polling and Windows PowerShell storms.
 - **Space Panel Memory & Pure Render Frames:**
   - `mesh-tabs` stores each space's open panel choice in `shared("mesh.spacePanels")` (zero `localStorage`) using deferred `cx.timer.after(0, ...)` syncs so `render()` stays pure across all mods.
-- **Microservice Review, Checks & Lead Agent Targeting:**
+- **Microservice Review & Lead Agent Targeting:**
   - Adding inline diff notes marks `reviewedServices[serviceId]` as `"has_notes"`; clicking `Approve Service ✓` marks it `"approved"` and advances `mesh.activeService` to the next unreviewed dirty microservice.
-  - `changes-review` resolves `findActiveAgent()` with `mesh.flows[tabId].leadTerminal` first, and executes Windows `.cmd` shims (`npm`/`pnpm`/`yarn`/`npx`/`bun`/`ng`/`mvnw`/`gradlew`) or chained checks via `cmd /c` on Windows and `sh -c` on POSIX.
+  - `changes-review` resolves `findActiveAgent()` with `mesh.flows[tabId].leadTerminal` first to deliver review notes directly to the tab's primary coding agent.
 - **Global Search Everywhere:**
   - `Ctrl+P`, `Alt+F`, or double-tapping `Shift` in `#files` opens `files-search-win`; `Tab` / `Shift+Tab` cycles `All`, `Files`, and `Text`, and `Enter` expands the target file path in the tree.
 
@@ -39,7 +39,7 @@ A unified **Multi-Microservice Agent Workspace** layout recipe and 4-mod distrib
   - `#sidebar` (`brand`, `spaces`, `agents`, `sidebar-footer`) + `#work` (`#tabs` `42px` → `#work-body` [`#main` + collapsible `#panel` → `#panel-body` stack with `#files`, `#changes`] → `#status` `28px`).
 - **4 Active Extension Mods (`mods/`):**
   - `mods/files-search/main.js` & `mod.json`: Docked session-scoped multi-repo file tree + `files-search-win` Search Everywhere overlay.
-  - `mods/changes-review/main.js` & `mod.json`: Per-service branch diffs, inline notes, `reviewedServices` checklist, `Checks` runner, and `leadTerminal` dispatch.
+  - `mods/changes-review/main.js` & `mod.json`: Per-service branch diffs, inline notes, `reviewedServices` checklist, and `leadTerminal` dispatch.
   - `mods/mesh-tabs/main.js` & `mod.json`: Tab strip, organic auto-naming, double-click inline rename, 2-panel toggles (`Files`, `Review`), and `mesh.spacePanels`.
   - `mods/mesh-status/main.js` & `mod.json`: `#status` bar telemetry for machine, service/dirty counts, active branch, agents, and command palette trigger.
 - **Keybindings (`keys.json`):**
@@ -90,4 +90,4 @@ All cross-mod communication flows strictly through Herdr's persisted reactive bu
 3. `rg -n "localStorage|\.key\(" mods/*/main.js` returns zero matches, and all read-only Git queries include lock-free flags.
 4. Launching Herdr with `layouts/mesh.json` mounts `#sidebar`, `#tabs` (`mesh-tabs`), `#main`, `#panel-body` (`files`, `changes`), and `#status` (`mesh-status`).
 5. Opening an agent tab auto-derives a concise Jira/prompt/branch title without overwriting manual renames, and space panels persist in `mesh.spacePanels`.
-6. In `files-search` and `changes-review`, only session-attributed touched repositories render, `Approve Service ✓` progresses across dirty services, and `Checks` / inline review notes dispatch directly to `leadTerminal`.
+6. In `files-search` and `changes-review`, only session-attributed touched repositories render, `Approve Service ✓` progresses across dirty services, and inline review notes dispatch directly to `leadTerminal`.

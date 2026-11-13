@@ -17,9 +17,6 @@ import {
   hasRelevantWatchChange,
   parsePorcelainHeader,
   getParentDir,
-  tailOutput,
-  extractDocChecks,
-  tokenizeCheckCommand,
 } from "./review-logic.js";
 
 function location() {
@@ -489,103 +486,6 @@ function updateTabFlow(tabId, mutator, workspaceRoot = "") {
   return nextFlow;
 }
 
-async function discoverServiceChecks(service, on, isWindows) {
-  const root = String(service?.root || "").replace(/\\/g, "/").replace(/\/+$/, "");
-  if (!root) return { standardsDocs: [], checks: [] };
-
-  const readRoot = (name) => readTextFile(`${root}/${name}`, { on }).catch(() => null);
-  const [agentsMd, claudeMd, specMd, pkgRaw, pomRaw, cargoRaw, makeRaw] = await Promise.all([
-    readRoot("AGENTS.md"),
-    readRoot("CLAUDE.md"),
-    readRoot("SPEC.md"),
-    readRoot("package.json"),
-    readRoot("pom.xml"),
-    readRoot("Cargo.toml"),
-    readRoot("Makefile"),
-  ]);
-
-  const standardsDocs = [];
-  const discovered = [];
-
-  if (agentsMd !== null) {
-    standardsDocs.push("AGENTS.md");
-    discovered.push(...extractDocChecks(agentsMd, "AGENTS.md"));
-  }
-  if (claudeMd !== null) {
-    standardsDocs.push("CLAUDE.md");
-    discovered.push(...extractDocChecks(claudeMd, "CLAUDE.md"));
-  }
-  if (specMd !== null) {
-    standardsDocs.push("SPEC.md");
-    discovered.push(...extractDocChecks(specMd, "SPEC.md"));
-  }
-
-  if (pkgRaw !== null) {
-    try {
-      const pkg = JSON.parse(pkgRaw);
-      const scripts = pkg?.scripts;
-      if (scripts && typeof scripts === "object") {
-        const pmRaw = typeof pkg.packageManager === "string" ? pkg.packageManager.toLowerCase() : "";
-        const pm = pmRaw.startsWith("pnpm") ? "pnpm" : pmRaw.startsWith("yarn") ? "yarn" : pmRaw.startsWith("bun") ? "bun" : "npm";
-        for (const scriptName of ["lint", "typecheck", "test", "build"]) {
-          if (typeof scripts[scriptName] === "string" && scripts[scriptName].trim()) {
-            const cmdStr = pm === "npm" && scriptName === "test" ? "npm test" : `${pm} run ${scriptName}`;
-            discovered.push({ command: cmdStr, source: "package.json" });
-          }
-        }
-      }
-    } catch {}
-  }
-
-  if (pomRaw !== null) {
-    const wrapperName = isWindows ? "mvnw.cmd" : "mvnw";
-    const hasWrapper = (await readRoot(wrapperName)) !== null;
-    discovered.push({
-      command: hasWrapper ? (isWindows ? "mvnw.cmd test" : "./mvnw test") : "mvn test",
-      source: "pom.xml",
-    });
-  }
-
-  if (cargoRaw !== null) {
-    discovered.push({ command: "cargo check", source: "Cargo.toml" });
-    discovered.push({ command: "cargo test", source: "Cargo.toml" });
-  }
-
-  if (makeRaw !== null) {
-    for (const target of ["lint", "test", "check"]) {
-      const re = new RegExp(`^${target}\\s*:(?!=)`, "m");
-      if (re.test(makeRaw)) {
-        discovered.push({ command: `make ${target}`, source: "Makefile" });
-      }
-    }
-  }
-
-  const deduped = [];
-  const byCmd = new Map();
-  for (const item of discovered) {
-    const key = item.command.trim();
-    if (!key) continue;
-    const existing = byCmd.get(key);
-    if (existing) {
-      if (!existing.sources.includes(item.source)) {
-        existing.sources.push(item.source);
-        existing.source = existing.sources.join(" · ");
-      }
-    } else {
-      const tokenized = tokenizeCheckCommand(key, isWindows);
-      const entry = {
-        ...tokenized,
-        source: item.source,
-        sources: [item.source],
-      };
-      byCmd.set(key, entry);
-      deduped.push(entry);
-    }
-  }
-
-  return { standardsDocs, checks: deduped };
-}
-
 export default class ChangesReview extends View {
   init(_props, cx) {
     this.files = [];
@@ -620,14 +520,7 @@ export default class ChangesReview extends View {
     this.hasLoadedOnce = false;
     this.needsRefreshOnShow = false;
 
-    // Repo standards & checks runner state
-    this.checksOpen = false;
-    this.checksByService = new Map();
-    this.checkResults = new Map();
-    this.runningAllTarget = null;
-    this.sendingCheckFailures = false;
     this.serviceFilterScroll = ScrollHandle.new();
-    this.checksScroll = ScrollHandle.new();
 
     this.viewMode = "working"; // "working" | "commit"
     this.commits = [];
@@ -678,7 +571,6 @@ export default class ChangesReview extends View {
     try { this.input?.release(); } catch {}
     try { this.commentInput?.release(); } catch {}
     try { this.serviceFilterScroll?.release(); } catch {}
-    try { this.checksScroll?.release(); } catch {}
   }
 
   scheduleRenderRefresh(cx) {
@@ -834,7 +726,6 @@ export default class ChangesReview extends View {
         });
       }
       this.applyServiceFilter();
-      if (this.checksOpen) this.ensureChecksDiscovered(cx);
     }
 
     const targetKey = latest.fileKey || latest.file;
@@ -1179,262 +1070,6 @@ export default class ChangesReview extends View {
     );
   }
 
-  checkKey(serviceId, command) {
-    return `${serviceId}::${command}`;
-  }
-
-  getCheckTargetServices() {
-    if (!this.services || this.services.length === 0) return [];
-    if (this.activeService !== "all") {
-      const svc = this.services.find((s) => s.id === this.activeService);
-      return svc ? [svc] : [];
-    }
-    const dirty = this.services.filter((s) => (s.workingCount || 0) > 0);
-    return dirty.length > 0 ? dirty : this.services;
-  }
-
-  toggleChecksDrawer(cx) {
-    this.isWindows = !this.on && window()?.platform === "windows";
-    this.checksOpen = !this.checksOpen;
-    if (this.checksOpen) {
-      this.ensureChecksDiscovered(cx, false);
-    }
-    cx.notify();
-  }
-
-  ensureChecksDiscovered(cx, force = false) {
-    const targets = this.getCheckTargetServices();
-    if (targets.length === 0) return;
-
-    const on = this.on;
-    const context = this.context;
-    const isWindows = Boolean(this.isWindows);
-    const toScan = [];
-
-    for (const svc of targets) {
-      const existing = this.checksByService.get(svc.id);
-      if (!force && existing && (existing.scanning || existing.root === svc.root)) {
-        continue;
-      }
-      this.checksByService.set(svc.id, {
-        root: svc.root,
-        discoveredAt: 0,
-        standardsDocs: existing?.standardsDocs || [],
-        checks: existing?.checks || [],
-        scanning: true,
-        error: null,
-      });
-      toScan.push(svc);
-    }
-
-    if (toScan.length === 0) return;
-    cx.notify();
-
-    cx.spawn(async (cx) => {
-      await Promise.all(
-        toScan.map(async (svc) => {
-          try {
-            const res = await discoverServiceChecks(svc, on, isWindows);
-            if (key() !== context) return;
-            this.checksByService.set(svc.id, {
-              root: svc.root,
-              discoveredAt: Date.now(),
-              standardsDocs: res.standardsDocs,
-              checks: res.checks,
-              scanning: false,
-              error: null,
-            });
-          } catch (e) {
-            if (key() !== context) return;
-            this.checksByService.set(svc.id, {
-              root: svc.root,
-              discoveredAt: Date.now(),
-              standardsDocs: [],
-              checks: [],
-              scanning: false,
-              error: String(e?.message || e),
-            });
-          }
-        }),
-      );
-      cx.notify();
-    });
-  }
-
-  async executeCheck(service, check, context, cx) {
-    const resKey = this.checkKey(service.id, check.command);
-    const current = this.checkResults.get(resKey);
-    if (current?.status === "running") return;
-
-    const on = this.on;
-    const started = Date.now();
-    this.checkResults.set(resKey, {
-      status: "running",
-      exitCode: null,
-      durationMs: null,
-      output: "",
-      updatedAt: started,
-      expanded: Boolean(current?.expanded),
-    });
-    cx.notify();
-
-    const r = await exec(check.cmd, check.args, {
-      cwd: service.root,
-      on,
-      timeout: 120000,
-    }).catch((e) => ({
-      code: 1,
-      stdout: "",
-      stderr: String(e?.message || e),
-    }));
-
-    if (key() !== context) return;
-    const durationMs = Date.now() - started;
-    const exitCode = typeof r?.code === "number" ? r.code : 1;
-    const output = tailOutput(r?.stdout, r?.stderr, 60, 4000);
-    const passed = exitCode === 0;
-
-    this.checkResults.set(resKey, {
-      status: passed ? "passed" : "failed",
-      exitCode,
-      durationMs,
-      output,
-      updatedAt: Date.now(),
-      expanded: !passed || Boolean(current?.expanded),
-    });
-    cx.notify();
-  }
-
-  runCheck(service, check, cx) {
-    if (!service || !check) return;
-    const context = this.context;
-    cx.spawn(async (cx) => {
-      await this.executeCheck(service, check, context, cx);
-    });
-  }
-
-  runAllChecks(servicesToRun, targetId, cx) {
-    if (this.runningAllTarget || !servicesToRun || servicesToRun.length === 0) return;
-    const context = this.context;
-    this.runningAllTarget = targetId;
-    cx.notify();
-
-    cx.spawn(async (cx) => {
-      try {
-        for (const svc of servicesToRun) {
-          if (key() !== context) return;
-          const entry = this.checksByService.get(svc.id);
-          if (!entry || !entry.checks || entry.checks.length === 0) continue;
-          for (const check of entry.checks) {
-            if (key() !== context) return;
-            await this.executeCheck(svc, check, context, cx);
-          }
-        }
-      } finally {
-        if (key() !== context) return;
-        if (this.runningAllTarget === targetId) {
-          this.runningAllTarget = null;
-        }
-        cx.notify();
-      }
-    });
-  }
-
-  toggleCheckOutput(serviceId, command, cx) {
-    const resKey = this.checkKey(serviceId, command);
-    const cur = this.checkResults.get(resKey);
-    if (!cur) return;
-    this.checkResults.set(resKey, { ...cur, expanded: !cur.expanded });
-    cx.notify();
-  }
-
-  getFailedChecksForTargets() {
-    const targets = this.getCheckTargetServices();
-    const failures = [];
-    for (const svc of targets) {
-      const entry = this.checksByService.get(svc.id);
-      if (!entry || !entry.checks) continue;
-      for (const chk of entry.checks) {
-        const res = this.checkResults.get(this.checkKey(svc.id, chk.command));
-        if (res && res.status === "failed") {
-          failures.push({ service: svc, check: chk, result: res });
-        }
-      }
-    }
-    return failures;
-  }
-
-  async sendCheckFailuresToAgent(cx) {
-    const failures = this.getFailedChecksForTargets();
-    if (this.sendingCheckFailures || failures.length === 0) return;
-
-    const agent = this.findActiveAgent();
-    if (!agent) {
-      this.note = "No active agent found to send check failures to.";
-      notify({
-        title: "No active agent found",
-        body: "Open or focus an agent terminal to send check failures.",
-        level: "warning",
-      });
-      cx.notify();
-      return;
-    }
-
-    this.sendingCheckFailures = true;
-    this.note = null;
-    cx.notify();
-
-    try {
-      const byService = new Map();
-      for (const item of failures) {
-        if (!byService.has(item.service.id)) byService.set(item.service.id, []);
-        byService.get(item.service.id).push(item);
-      }
-
-      const parts = [
-        `Repository check failures in workspace (${this.workspaceRoot || this.root || ""}):`,
-        "",
-      ];
-
-      for (const [, items] of byService) {
-        const svc = items[0].service;
-        const branchNote = svc.branch ? ` · branch: ${svc.branch}` : "";
-        parts.push(`### Service: ${svc.name} (${svc.root}${branchNote})`, "");
-        for (const { check, result } of items) {
-          parts.push(`- Failed check: \`${check.command}\` (source: ${check.source}, exit code: ${result.exitCode ?? 1})`);
-          if (result.output) {
-            parts.push("  ```text");
-            for (const line of tailOutput(result.output, "", 40, 2500).split("\n")) {
-              parts.push(`  ${line}`);
-            }
-            parts.push("  ```");
-          }
-          parts.push("");
-        }
-      }
-
-      const r = await hc(["send", agent.address, parts.join("\n")]);
-      if (r.code !== 0) {
-        throw new Error(r.stderr || r.stdout || "Failed to send check failures to agent");
-      }
-      notify({
-        title: "Check failures sent to agent",
-        body: `${failures.length} failed check${failures.length === 1 ? "" : "s"} sent to ${agent.address}.`,
-        level: "success",
-      });
-    } catch (e) {
-      this.note = `Failed to send check failures: ${e.message || e}`;
-      notify({
-        title: "Failed to send check failures",
-        body: String(e?.message || e),
-        level: "error",
-      });
-    } finally {
-      this.sendingCheckFailures = false;
-      cx.notify();
-    }
-  }
-
   selectService(serviceId, cx) {
     if (this.activeService === serviceId) return;
     this.activeService = serviceId;
@@ -1450,12 +1085,10 @@ export default class ChangesReview extends View {
     if (this.viewMode === "commit" && this.selectedCommit) {
       if (this.activeService !== "all" && this.selectedCommit.serviceId !== this.activeService) {
         this.switchMode("working", null, cx);
-        if (this.checksOpen) this.ensureChecksDiscovered(cx, false);
         return;
       }
     }
     this.applyServiceFilter(cx);
-    if (this.checksOpen) this.ensureChecksDiscovered(cx, false);
   }
 
   applyServiceFilter(cx) {
@@ -1755,10 +1388,6 @@ export default class ChangesReview extends View {
       this.selectedCommit = null;
       this.workingFiles = [];
       this.workingFilesCount = 0;
-      this.checksByService.clear();
-      this.checkResults.clear();
-      this.runningAllTarget = null;
-      this.sendingCheckFailures = false;
     }
 
     this.isWindows = !on && this.hostIsWindows;
@@ -2006,7 +1635,6 @@ export default class ChangesReview extends View {
         this.root = services[0]?.root || workspaceRoot;
 
         // Check external mesh.activeService
-        const prevActiveService = this.activeService;
         const sharedActive = shared("mesh.activeService");
         if (sharedActive && normPathStr(sharedActive.workspaceRoot) === normWs && typeof sharedActive.ts === "number") {
           if (!this.lastActiveServiceTs || sharedActive.ts > this.lastActiveServiceTs) {
@@ -2079,9 +1707,6 @@ export default class ChangesReview extends View {
 
         this.watch(services, cx);
         this.applyServiceFilter();
-        if (this.checksOpen && (prevActiveService !== this.activeService || !this.checksByService.size)) {
-          this.ensureChecksDiscovered(cx, false);
-        }
 
         if (this.viewMode === "working") {
           this.limited = this.files.length > 1000;
@@ -2326,377 +1951,6 @@ export default class ChangesReview extends View {
       ));
   }
 
-  renderChecksDrawer(t, mono, targetServices, failedChecks) {
-    const passColor = t.ansi2 || t.done || t.accent;
-    const failColor = t.ansi1 || t.blocked;
-    const warnColor = t.working || t.accent;
-    const totalChecks = targetServices.reduce((n, svc) => {
-      const entry = this.checksByService.get(svc.id);
-      return n + (entry?.checks?.length || 0);
-    }, 0);
-    const isRunningAny = Boolean(this.runningAllTarget) || targetServices.some((svc) => {
-      const entry = this.checksByService.get(svc.id);
-      return (entry?.checks || []).some((c) => this.checkResults.get(this.checkKey(svc.id, c.command))?.status === "running");
-    });
-
-    return v_flex()
-      .id("changes-checks-drawer")
-      .flex_none()
-      .max_h(220)
-      .border_b(1)
-      .border_color(t.border)
-      .bg(t.raised)
-      .child(
-        h_flex()
-          .flex_none()
-          .h(32)
-          .px(10)
-          .gap(6)
-          .items_center()
-          .justify_between()
-          .border_b(1)
-          .border_color(t.border)
-          .child(
-            h_flex()
-              .min_w(0)
-              .gap(6)
-              .items_center()
-              .child(div().text_size(11.5).font_semibold().text_color(t.foreground).child("Checks"))
-              .child(
-                div()
-                  .truncate()
-                  .text_size(10.5)
-                  .text_color(t.dim)
-                  .child(
-                    targetServices.length === 1
-                      ? targetServices[0].name
-                      : `${targetServices.length} services`,
-                  ),
-              ),
-          )
-          .child(
-            h_flex()
-              .flex_none()
-              .gap(5)
-              .items_center()
-              .child(
-                h_flex()
-                  .id("checks-rescan-btn")
-                  .h(22)
-                  .px(7)
-                  .items_center()
-                  .rounded(4)
-                  .border_1()
-                  .border_color(t.border)
-                  .bg(t.background)
-                  .text_size(10)
-                  .text_color(t.muted)
-                  .cursor_pointer()
-                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                  .on_click((_e, cx) => this.ensureChecksDiscovered(cx, true))
-                  .child("Rescan"),
-              )
-              .child(
-                h_flex()
-                  .id("checks-run-all-btn")
-                  .h(22)
-                  .px(8)
-                  .items_center()
-                  .rounded(4)
-                  .bg(totalChecks > 0 && !isRunningAny ? t.solid : t.background)
-                  .border_1()
-                  .border_color(totalChecks > 0 && !isRunningAny ? t.solid : t.border)
-                  .text_size(10)
-                  .font_medium()
-                  .text_color(totalChecks > 0 && !isRunningAny ? t.solid_foreground : t.dim)
-                  .when(totalChecks > 0 && !isRunningAny, (btn) =>
-                    btn.cursor_pointer().on_click((_e, cx) => this.runAllChecks(targetServices, "__all__", cx)),
-                  )
-                  .child(this.runningAllTarget === "__all__" ? "Running…" : "Run All Checks"),
-              )
-              .when(failedChecks.length > 0, (el) =>
-                el.child(
-                  h_flex()
-                    .id("checks-send-failures-btn")
-                    .h(22)
-                    .px(8)
-                    .gap(4)
-                    .items_center()
-                    .rounded(4)
-                    .bg(hexWithAlpha(failColor, "22"))
-                    .border_1()
-                    .border_color(hexWithAlpha(failColor, "77"))
-                    .text_size(10)
-                    .font_semibold()
-                    .text_color(failColor)
-                    .when(!this.sendingCheckFailures, (btn) =>
-                      btn.cursor_pointer().hover((s) => s.bg(hexWithAlpha(failColor, "33"))).on_click((_e, cx) => this.sendCheckFailuresToAgent(cx)),
-                    )
-                    .child(this.sendingCheckFailures ? "Sending…" : "Send Failures to Agent"),
-                ),
-              )
-              .child(
-                h_flex()
-                  .id("checks-close-btn")
-                  .h(22)
-                  .w(22)
-                  .items_center()
-                  .justify_center()
-                  .rounded(4)
-                  .text_size(11)
-                  .text_color(t.muted)
-                  .cursor_pointer()
-                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                  .on_click((_e, cx) => {
-                    this.checksOpen = false;
-                    cx.notify();
-                  })
-                  .child("×"),
-              ),
-          ),
-      )
-      .child(
-        v_flex()
-          .id("changes-checks-body")
-          .flex_1()
-          .min_h(0)
-          .max_h(186)
-          .overflow_y_scrollbar()
-          .track_scroll(this.checksScroll)
-          .p(8)
-          .gap(8)
-          .children(
-            targetServices.map((svc) => {
-              const entry = this.checksByService.get(svc.id);
-              const docs = entry?.standardsDocs || [];
-              const checks = entry?.checks || [];
-              const branchLabel = svc.branch || "";
-              const svcRunning = this.runningAllTarget === svc.id || this.runningAllTarget === "__all__";
-
-              return v_flex()
-                .id(`checks-svc-${svc.id}`)
-                .flex_none()
-                .p(6)
-                .gap(5)
-                .rounded(6)
-                .bg(t.background)
-                .border_1()
-                .border_color(t.border)
-                .child(
-                  h_flex()
-                    .gap(6)
-                    .items_center()
-                    .justify_between()
-                    .child(
-                      h_flex()
-                        .flex_1()
-                        .min_w(0)
-                        .gap(5)
-                        .items_center()
-                        .child(div().truncate().text_size(11).font_medium().text_color(t.foreground).child(svc.name))
-                        .when(Boolean(branchLabel), (b) =>
-                          b.child(
-                            div()
-                              .max_w(110)
-                              .truncate()
-                              .text_size(9.5)
-                              .text_color(t.dim)
-                              .child(branchLabel),
-                          ),
-                        )
-                        .children(
-                          docs.map((docName) =>
-                            div()
-                              .flex_none()
-                              .px(4)
-                              .py(0.5)
-                              .rounded(3)
-                              .bg(t.raised)
-                              .border_1()
-                              .border_color(t.border)
-                              .text_size(9)
-                              .text_color(t.muted)
-                              .child(docName),
-                          ),
-                        ),
-                    )
-                    .when(checks.length > 0 && targetServices.length > 1, (b) =>
-                      b.child(
-                        h_flex()
-                          .id(`checks-run-svc-${svc.id}`)
-                          .h(20)
-                          .px(6)
-                          .flex_none()
-                          .items_center()
-                          .rounded(4)
-                          .bg(t.raised)
-                          .border_1()
-                          .border_color(t.border)
-                          .text_size(9.5)
-                          .text_color(svcRunning ? t.dim : t.foreground)
-                          .when(!svcRunning, (btn) =>
-                            btn.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.runAllChecks([svc], svc.id, cx)),
-                          )
-                          .child(svcRunning ? "Running…" : "Run All"),
-                      ),
-                    ),
-                )
-                .when(Boolean(entry?.scanning), (el) =>
-                  el.child(div().text_size(10.5).text_color(t.dim).child("Inspecting repository checks…")),
-                )
-                .when(Boolean(entry?.error), (el) =>
-                  el.child(div().text_size(10.5).text_color(failColor).child(`Scan failed: ${entry.error}`)),
-                )
-                .when(!entry?.scanning && !entry?.error && checks.length === 0, (el) =>
-                  el.child(
-                    div()
-                      .text_size(10.5)
-                      .text_color(t.dim)
-                      .child("No check commands detected in AGENTS.md, CLAUDE.md, SPEC.md, package.json, pom.xml, Cargo.toml, or Makefile."),
-                  ),
-                )
-                .children(
-                  checks.map((chk, idx) => {
-                    const res = this.checkResults.get(this.checkKey(svc.id, chk.command));
-                    const status = res?.status || "idle";
-                    const isRunning = status === "running";
-                    const statusLabel = status === "passed"
-                      ? "✓ Pass"
-                      : status === "failed"
-                        ? `✗ Fail${res?.exitCode != null ? ` (${res.exitCode})` : ""}`
-                        : status === "running"
-                          ? "Running…"
-                          : "Idle";
-                    const statusColor = status === "passed"
-                      ? passColor
-                      : status === "failed"
-                        ? failColor
-                        : status === "running"
-                          ? warnColor
-                          : t.dim;
-                    const durText = res?.durationMs != null
-                      ? (res.durationMs < 1000 ? `${res.durationMs}ms` : `${(res.durationMs / 1000).toFixed(1)}s`)
-                      : "";
-
-                    return v_flex()
-                      .id(`check-item-${svc.id}-${idx}`)
-                      .flex_none()
-                      .gap(4)
-                      .p(5)
-                      .rounded(5)
-                      .bg(t.raised)
-                      .border_1()
-                      .border_color(status === "failed" ? hexWithAlpha(failColor, "55") : t.border)
-                      .child(
-                        h_flex()
-                          .gap(6)
-                          .items_center()
-                          .child(
-                            div()
-                              .flex_none()
-                              .px(5)
-                              .py(0.5)
-                              .rounded(3)
-                              .bg(status === "idle" ? t.background : hexWithAlpha(statusColor, "22"))
-                              .text_size(9.5)
-                              .font_medium()
-                              .text_color(statusColor)
-                              .child(statusLabel),
-                          )
-                          .child(
-                            div()
-                              .flex_1()
-                              .min_w(0)
-                              .truncate()
-                              .font_family(mono)
-                              .text_size(10.5)
-                              .text_color(t.foreground)
-                              .child(chk.command),
-                          )
-                          .child(
-                            div()
-                              .flex_none()
-                              .px(4)
-                              .py(0.5)
-                              .rounded(3)
-                              .bg(t.background)
-                              .text_size(9)
-                              .text_color(t.dim)
-                              .child(chk.source),
-                          )
-                          .when(Boolean(durText), (el) =>
-                            el.child(div().flex_none().text_size(9.5).text_color(t.dim).child(durText)),
-                          )
-                          .when(Boolean(res?.output), (el) =>
-                            el.child(
-                              h_flex()
-                                .id(`check-toggle-out-${svc.id}-${idx}`)
-                                .h(20)
-                                .px(5)
-                                .flex_none()
-                                .items_center()
-                                .rounded(4)
-                                .bg(t.background)
-                                .border_1()
-                                .border_color(t.border)
-                                .text_size(9.5)
-                                .text_color(t.muted)
-                                .cursor_pointer()
-                                .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                                .on_click((_e, cx) => this.toggleCheckOutput(svc.id, chk.command, cx))
-                                .child(res.expanded ? "Hide" : "Output"),
-                            ),
-                          )
-                          .child(
-                            h_flex()
-                              .id(`check-run-${svc.id}-${idx}`)
-                              .h(20)
-                              .px(7)
-                              .flex_none()
-                              .items_center()
-                              .rounded(4)
-                              .bg(isRunning ? t.background : t.solid)
-                              .text_size(9.5)
-                              .font_medium()
-                              .text_color(isRunning ? t.dim : t.solid_foreground)
-                              .when(!isRunning, (btn) =>
-                                btn.cursor_pointer().on_click((_e, cx) => this.runCheck(svc, chk, cx)),
-                              )
-                              .child(isRunning ? "…" : res ? "Re-run" : "Run"),
-                          ),
-                      )
-                      .when(Boolean(res?.output && res?.expanded), (el) =>
-                        el.child(
-                          v_flex()
-                            .id(`check-out-${svc.id}-${idx}`)
-                            .w_full()
-                            .max_h(110)
-                            .overflow_y_scrollbar()
-                            .p(6)
-                            .gap(1)
-                            .rounded(4)
-                            .bg(t.background)
-                            .border_1()
-                            .border_color(t.border)
-                            .font_family(mono)
-                            .text_size(10)
-                            .children(
-                              res.output.split("\n").map((line) =>
-                                div()
-                                  .w_full()
-                                  .text_color(status === "failed" ? t.foreground : t.muted)
-                                  .child(line || " "),
-                              ),
-                            ),
-                        ),
-                      );
-                  }),
-                );
-            }),
-          ),
-      );
-  }
-
   render(cx) {
     const visible = isChangesVisible();
     const bus = shared("mesh.services");
@@ -2718,7 +1972,6 @@ export default class ChangesReview extends View {
     const dt = getDiffTheme(t);
     const { add, del } = dt;
     const passColor = t.ansi2 || t.done || t.accent;
-    const failColor = t.ansi1 || t.blocked;
     const noteColor = t.blocked || t.working || t.accent;
 
     const { activeTabId } = getActiveSpaceAndTab();
@@ -2728,19 +1981,6 @@ export default class ChangesReview extends View {
     const focusedService = this.activeService !== "all"
       ? (this.services.find((s) => s.id === this.activeService) || null)
       : (this.services.length === 1 ? this.services[0] : null);
-
-    const checkTargetServices = this.getCheckTargetServices();
-    const failedChecks = this.getFailedChecksForTargets();
-    let runningChecksCount = 0;
-    let passedChecksCount = 0;
-    for (const svc of checkTargetServices) {
-      const entry = this.checksByService.get(svc.id);
-      for (const chk of entry?.checks || []) {
-        const res = this.checkResults.get(this.checkKey(svc.id, chk.command));
-        if (res?.status === "running") runningChecksCount++;
-        else if (res?.status === "passed") passedChecksCount++;
-      }
-    }
 
     const targetRepos = this.getTargetRepos();
     const commitEnabled = Boolean(this.message.trim() && targetRepos.length > 0 && !this.busy && !this.loading);
@@ -2855,64 +2095,7 @@ export default class ChangesReview extends View {
 
         .child(div().flex_1())
         .child(div().flex_none().text_size(11).text_color(add).child(`+${addCount}`))
-        .child(div().flex_none().text_size(11).text_color(del).child(`−${delCount}`))
-        .child(
-          h_flex()
-            .id("changes-checks-btn")
-            .h(24)
-            .px(8)
-            .gap(4)
-            .flex_none()
-            .items_center()
-            .rounded(5)
-            .border_1()
-            .border_color(
-              failedChecks.length > 0
-                ? hexWithAlpha(failColor, "77")
-                : this.checksOpen
-                  ? t.accent
-                  : t.border,
-            )
-            .bg(
-              failedChecks.length > 0
-                ? hexWithAlpha(failColor, "22")
-                : this.checksOpen
-                  ? t.selected
-                  : t.background,
-            )
-            .text_size(11)
-            .font_medium()
-            .text_color(
-              failedChecks.length > 0
-                ? failColor
-                : this.checksOpen
-                  ? t.foreground
-                  : t.muted,
-            )
-            .cursor_pointer()
-            .tooltip("Discover and run repository standard checks")
-            .hover((s) => s.bg(t.hover).text_color(t.foreground))
-            .on_click((_e, cx) => this.toggleChecksDrawer(cx))
-            .child("Checks")
-            .when(runningChecksCount > 0, (el) =>
-              el.child(div().text_size(10).text_color(t.working || t.accent).child("…")),
-            )
-            .when(runningChecksCount === 0 && failedChecks.length > 0, (el) =>
-              el.child(
-                div()
-                  .px(4)
-                  .py(0.5)
-                  .rounded(3)
-                  .bg(hexWithAlpha(failColor, "33"))
-                  .text_size(9.5)
-                  .text_color(failColor)
-                  .child(String(failedChecks.length)),
-              ),
-            )
-            .when(runningChecksCount === 0 && failedChecks.length === 0 && passedChecksCount > 0, (el) =>
-              el.child(div().text_size(10).text_color(passColor).child("✓")),
-            ),
-        ))
+        .child(div().flex_none().text_size(11).text_color(del).child(`−${delCount}`)))
 
       // Service filter bar (when workspace contains multiple repositories)
       .when(this.services.length > 1, (el) => {
@@ -3052,13 +2235,8 @@ export default class ChangesReview extends View {
         );
       })
 
-      // Collapsible Repo Checks Drawer
-      .when(this.checksOpen, (el) =>
-        el.child(this.renderChecksDrawer(t, mono, checkTargetServices, failedChecks)),
-      )
-
       // File list (changes-list)
-      .child(v_flex().id("changes-list").flex_none().h(Math.min(this.checksOpen ? 96 : 160, Math.max(44, this.files.length * 28 + 12))).overflow_y_scrollbar().p(6).border_b(1).border_color(t.border).children(this.files.map((f) => {
+      .child(v_flex().id("changes-list").flex_none().h(Math.min(160, Math.max(44, this.files.length * 28 + 12))).overflow_y_scrollbar().p(6).border_b(1).border_color(t.border).children(this.files.map((f) => {
         const parts = f.path.split("/"), name = parts.pop();
         const isReviewed = this.isFileReviewed(f, flow);
         const isOpen = this.open === f.key;
