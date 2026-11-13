@@ -694,6 +694,8 @@ export default class ChangesReview extends View {
     this.allWorkingFiles = [];
     this.rows = [];
     this.diffWidth = 300;
+    this.panelWidth = 420;
+    this.viewerWidth = 900;
     this.handle = cx.focus_handle();
     this.bottomTab = "review"; // "review" | "commit"
     this.reviews = []; // Cached mirror of shared("mesh.reviewNotes")[sessionKey]
@@ -2665,10 +2667,174 @@ export default class ChangesReview extends View {
     const svcHasNotes = svcStatus === "has_notes";
     const canStepFiles = files.length > 1;
     const openIcon = openFile ? resolveDiffFileIcon(openFile.path || openFile.displayPath, t) : null;
+    const compactViewer = (this.viewerWidth || 900) < 680;
+
+    const renderFileInfo = () =>
+      h_flex()
+        .when(!compactViewer, (b) => b.flex_1().min_w(180))
+        .when(compactViewer, (b) => b.w_full().min_w(0))
+        .gap(6)
+        .items_center()
+        .when(services.length > 1 && Boolean(openFile?.serviceName), (b) => b.child(
+          div().flex_none().px(5).py(1).rounded(4).bg(t.background).border_1().border_color(t.border)
+            .text_size(10).font_medium().text_color(t.muted)
+            .child(openFile.serviceName)
+        ))
+        .child(
+          div().flex_none().w(14).text_center().text_size(11).font_semibold()
+            .text_color(openFile?.status === "A" ? add : openFile?.status === "D" || openFile?.status === "U" ? del : t.blocked)
+            .child(openFile?.status || "M")
+        )
+        .when(Boolean(openIcon), (b) => b.child(svg(openIcon.path).size(14).flex_none().text_color(openIcon.color)))
+        .child(
+          div().flex_1().min_w(0).truncate().text_size(12).font_medium()
+            .text_color(openFileReviewed ? t.muted : t.foreground)
+            .child(openFile?.displayPath || openFile?.path || "")
+        )
+        .when((openFile?.add || 0) > 0, (b) => b.child(div().flex_none().text_size(11).text_color(add).child(`+${openFile.add}`)))
+        .when((openFile?.del || 0) > 0, (b) => b.child(div().flex_none().text_size(11).text_color(del).child(`−${openFile.del}`)))
+        .when(!compactViewer || viewMode === "commit", (b) => b.child(
+          div().flex_none().px(5).py(1).rounded(4).bg(t.background).border_1().border_color(t.border)
+            .text_size(10).text_color(viewMode === "commit" ? (t.accent || t.foreground) : t.muted)
+            .child(viewMode === "commit" && selectedCommit?.shortHash ? selectedCommit.shortHash : "Working")
+        ));
+
+    const renderReviewControls = () =>
+      h_flex()
+        .when(compactViewer, (b) => b.w_full().justify_between())
+        .when(!compactViewer, (b) => b.flex_none())
+        .flex_wrap()
+        .gap(5)
+        .items_center()
+        .when(files.length > 0, (b) => b.child(
+          h_flex().flex_none().gap(4).items_center()
+            .child(
+              h_flex().id("diff-prev-btn").h(24).w(24).items_center().justify_center().rounded(5)
+                .border_1().border_color(t.border).bg(t.background)
+                .text_size(11.5).text_color(canStepFiles ? t.foreground : t.dim)
+                .when(canStepFiles, (p) => p.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.stepViewerFile(-1, cx)))
+                .tooltip("Previous file")
+                .child("←")
+            )
+            .when(fileIdx >= 0, (p) => p.child(
+              div().flex_none().px(3).text_size(10.5).text_color(t.muted).child(`${fileIdx + 1}/${files.length}`)
+            ))
+            .child(
+              h_flex().id("diff-next-btn").h(24).w(24).items_center().justify_center().rounded(5)
+                .border_1().border_color(t.border).bg(t.background)
+                .text_size(11.5).text_color(canStepFiles ? t.foreground : t.dim)
+                .when(canStepFiles, (p) => p.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.stepViewerFile(1, cx)))
+                .tooltip("Next file")
+                .child("→")
+            )
+            .child(
+              div().flex_none().px(5).py(1).rounded(4)
+                .bg(allFilesReviewed ? hexWithAlpha(passColor, "22") : t.background)
+                .border_1()
+                .border_color(allFilesReviewed ? hexWithAlpha(passColor, "66") : t.border)
+                .text_size(10).font_medium().text_color(allFilesReviewed ? passColor : t.muted)
+                .tooltip(`${reviewedFilesCount} of ${files.length} files reviewed`)
+                .child(`${reviewedFilesCount}/${files.length} ✓`)
+            )
+        ))
+        .child(
+          h_flex().flex_none().flex_wrap().gap(5).items_center()
+            .child(
+              h_flex().id("diff-reload-btn").h(24).w(24).items_center().justify_center().rounded(5)
+                .border_1().border_color(t.border).bg(t.background)
+                .text_size(12).text_color(t.muted).cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .tooltip("Reload diff")
+                .on_click((_e, cx) => this.loadViewerDiffNow(diff, cx))
+                .child("↻")
+            )
+            .child(
+              h_flex()
+                .id("diff-viewed-btn")
+                .h(24)
+                .px(compactViewer ? 7 : 9)
+                .gap(5)
+                .flex_none()
+                .items_center()
+                .rounded(5)
+                .border_1()
+                .cursor_pointer()
+                .tooltip(openFileReviewed ? "Unmark reviewed" : "Mark reviewed & advance to next unreviewed file")
+                .when(openFileReviewed, (btn) =>
+                  btn
+                    .bg(hexWithAlpha(passColor, "22"))
+                    .border_color(hexWithAlpha(passColor, "77"))
+                    .text_color(passColor)
+                    .hover((s) => s.bg(hexWithAlpha(passColor, "33")))
+                )
+                .when(!openFileReviewed, (btn) =>
+                  btn
+                    .bg(t.background)
+                    .border_color(t.border)
+                    .text_color(t.foreground)
+                    .hover((s) => s.bg(t.hover))
+                )
+                .on_click((_e, cx) => this.toggleViewerFileReviewed(cx))
+                .child(
+                  h_flex().w(12).h(12).flex_none().items_center().justify_center().rounded(3).border_1()
+                    .when(openFileReviewed, (c) => c.bg(passColor).border_color(passColor).text_color(t.background))
+                    .when(!openFileReviewed, (c) => c.bg(t.background).border_color(t.border))
+                    .text_size(8.5).font_semibold()
+                    .child(openFileReviewed ? "✓" : "")
+                )
+                .child(div().text_size(11).font_medium().child(compactViewer ? (openFileReviewed ? "Reviewed" : "Mark") : (openFileReviewed ? "Reviewed ✓" : "Mark reviewed")))
+            )
+            .when(Boolean(focusedService) && viewMode !== "commit", (el) => el.child(
+              h_flex()
+                .id("diff-approve-service-btn")
+                .h(24)
+                .px(compactViewer ? 8 : 10)
+                .flex_none()
+                .items_center()
+                .rounded(5)
+                .text_size(11)
+                .font_medium()
+                .when(svcApproved, (btn) =>
+                  btn
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.border)
+                    .text_color(t.muted)
+                    .cursor_pointer()
+                    .tooltip(`Unapprove ${focusedService.name}`)
+                    .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                    .on_click((_e, cx) => this.toggleViewerServiceApproval(focusedService, svcStatus, cx))
+                )
+                .when(svcHasNotes, (btn) =>
+                  btn
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.border)
+                    .text_color(t.dim)
+                    .tooltip("Send or clear review notes before approving")
+                )
+                .when(!svcApproved && !svcHasNotes, (btn) =>
+                  btn
+                    .bg(t.solid)
+                    .text_color(t.solid_foreground)
+                    .cursor_pointer()
+                    .tooltip(`Approve ${focusedService.name} & advance to next dirty service`)
+                    .on_click((_e, cx) => this.toggleViewerServiceApproval(focusedService, svcStatus, cx))
+                )
+                .child(svcApproved ? "Unapprove" : compactViewer ? "Approve ✓" : "Approve Service ✓")
+            ))
+        );
 
     return v_flex().id("review-tab-viewer").size_full().min_h(0).rounded(10).overflow_hidden().relative()
       .bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
       .track_focus(this.handle)
+      .on_size_change((size, cx) => {
+        const w = Math.round(size?.width || 0);
+        if (w > 0 && Math.abs(w - (this.viewerWidth || 900)) > 12) {
+          this.viewerWidth = w;
+          cx.notify();
+        }
+      })
       .on_key_down((e, cx) => {
         if (e.key === "escape" && (this.typingComment || this.activeComment)) {
           this.cancelActiveComment(cx);
@@ -2678,161 +2844,19 @@ export default class ChangesReview extends View {
         }
       })
       .when(Boolean(openFile), (el) => el.child(
-        h_flex()
+        (compactViewer ? v_flex() : h_flex().flex_wrap())
           .id("diff-file-review-bar")
           .min_h(40)
           .flex_none()
-          .px(12)
+          .px(compactViewer ? 10 : 12)
           .py(6)
-          .gap(8)
-          .items_center()
-          .justify_between()
+          .gap(compactViewer ? 6 : 8)
+          .when(!compactViewer, (b) => b.items_center().justify_between())
           .border_b(1)
           .border_color(t.border)
           .bg(t.raised)
-          .child(
-            h_flex().flex_1().min_w(0).gap(7).items_center()
-              .when(services.length > 1 && Boolean(openFile.serviceName), (b) => b.child(
-                div().flex_none().px(5).py(1).rounded(4).bg(t.background).border_1().border_color(t.border)
-                  .text_size(10).font_medium().text_color(t.muted)
-                  .child(openFile.serviceName)
-              ))
-              .child(
-                div().flex_none().w(14).text_center().text_size(11).font_semibold()
-                  .text_color(openFile.status === "A" ? add : openFile.status === "D" || openFile.status === "U" ? del : t.blocked)
-                  .child(openFile.status || "M")
-              )
-              .when(Boolean(openIcon), (b) => b.child(svg(openIcon.path).size(14).flex_none().text_color(openIcon.color)))
-              .child(
-                div().min_w(0).truncate().text_size(12).font_medium()
-                  .text_color(openFileReviewed ? t.muted : t.foreground)
-                  .child(openFile.displayPath || openFile.path)
-              )
-              .when((openFile.add || 0) > 0, (b) => b.child(div().flex_none().text_size(11).text_color(add).child(`+${openFile.add}`)))
-              .when((openFile.del || 0) > 0, (b) => b.child(div().flex_none().text_size(11).text_color(del).child(`−${openFile.del}`)))
-              .child(
-                div().flex_none().px(6).py(1).rounded(4).bg(t.background).border_1().border_color(t.border)
-                  .text_size(10).text_color(viewMode === "commit" ? (t.accent || t.foreground) : t.muted)
-                  .child(viewMode === "commit" && selectedCommit?.shortHash ? selectedCommit.shortHash : "Working Tree")
-              )
-          )
-          .child(
-            h_flex().flex_none().gap(6).items_center()
-              .when(files.length > 0, (b) => b.child(
-                h_flex().gap(4).items_center()
-                  .child(
-                    h_flex().id("diff-prev-btn").h(24).w(24).items_center().justify_center().rounded(5)
-                      .border_1().border_color(t.border).bg(t.background)
-                      .text_size(11.5).text_color(canStepFiles ? t.foreground : t.dim)
-                      .when(canStepFiles, (p) => p.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.stepViewerFile(-1, cx)))
-                      .tooltip("Previous file")
-                      .child("←")
-                  )
-                  .when(fileIdx >= 0, (p) => p.child(
-                    div().flex_none().px(4).text_size(10.5).text_color(t.muted).child(`${fileIdx + 1}/${files.length}`)
-                  ))
-                  .child(
-                    h_flex().id("diff-next-btn").h(24).w(24).items_center().justify_center().rounded(5)
-                      .border_1().border_color(t.border).bg(t.background)
-                      .text_size(11.5).text_color(canStepFiles ? t.foreground : t.dim)
-                      .when(canStepFiles, (p) => p.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.stepViewerFile(1, cx)))
-                      .tooltip("Next file")
-                      .child("→")
-                  )
-                  .child(
-                    div().flex_none().px(6).py(1).rounded(4)
-                      .bg(allFilesReviewed ? hexWithAlpha(passColor, "22") : t.background)
-                      .border_1()
-                      .border_color(allFilesReviewed ? hexWithAlpha(passColor, "66") : t.border)
-                      .text_size(10).font_medium().text_color(allFilesReviewed ? passColor : t.muted)
-                      .child(`${reviewedFilesCount}/${files.length} reviewed`)
-                  )
-              ))
-              .child(
-                h_flex().id("diff-reload-btn").h(24).w(24).items_center().justify_center().rounded(5)
-                  .border_1().border_color(t.border).bg(t.background)
-                  .text_size(12).text_color(t.muted).cursor_pointer()
-                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                  .tooltip("Reload diff")
-                  .on_click((_e, cx) => this.loadViewerDiffNow(diff, cx))
-                  .child("↻")
-              )
-              .child(
-                h_flex()
-                  .id("diff-viewed-btn")
-                  .h(24)
-                  .px(9)
-                  .gap(5)
-                  .flex_none()
-                  .items_center()
-                  .rounded(5)
-                  .border_1()
-                  .cursor_pointer()
-                  .tooltip(openFileReviewed ? "Unmark reviewed" : "Mark reviewed & advance to next unreviewed file")
-                  .when(openFileReviewed, (btn) =>
-                    btn
-                      .bg(hexWithAlpha(passColor, "22"))
-                      .border_color(hexWithAlpha(passColor, "77"))
-                      .text_color(passColor)
-                      .hover((s) => s.bg(hexWithAlpha(passColor, "33")))
-                  )
-                  .when(!openFileReviewed, (btn) =>
-                    btn
-                      .bg(t.background)
-                      .border_color(t.border)
-                      .text_color(t.foreground)
-                      .hover((s) => s.bg(t.hover))
-                  )
-                  .on_click((_e, cx) => this.toggleViewerFileReviewed(cx))
-                  .child(
-                    h_flex().w(12).h(12).flex_none().items_center().justify_center().rounded(3).border_1()
-                      .when(openFileReviewed, (c) => c.bg(passColor).border_color(passColor).text_color(t.background))
-                      .when(!openFileReviewed, (c) => c.bg(t.background).border_color(t.border))
-                      .text_size(8.5).font_semibold()
-                      .child(openFileReviewed ? "✓" : "")
-                  )
-                  .child(div().text_size(11).font_medium().child(openFileReviewed ? "Reviewed ✓" : "Mark reviewed"))
-              )
-              .when(Boolean(focusedService) && viewMode !== "commit", (el) => el.child(
-                h_flex()
-                  .id("diff-approve-service-btn")
-                  .h(24)
-                  .px(10)
-                  .flex_none()
-                  .items_center()
-                  .rounded(5)
-                  .text_size(11)
-                  .font_medium()
-                  .when(svcApproved, (btn) =>
-                    btn
-                      .bg(t.background)
-                      .border_1()
-                      .border_color(t.border)
-                      .text_color(t.muted)
-                      .cursor_pointer()
-                      .tooltip(`Unapprove ${focusedService.name}`)
-                      .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                      .on_click((_e, cx) => this.toggleViewerServiceApproval(focusedService, svcStatus, cx))
-                  )
-                  .when(svcHasNotes, (btn) =>
-                    btn
-                      .bg(t.background)
-                      .border_1()
-                      .border_color(t.border)
-                      .text_color(t.dim)
-                      .tooltip("Send or clear review notes before approving")
-                  )
-                  .when(!svcApproved && !svcHasNotes, (btn) =>
-                    btn
-                      .bg(t.solid)
-                      .text_color(t.solid_foreground)
-                      .cursor_pointer()
-                      .tooltip(`Approve ${focusedService.name} & advance to next dirty service`)
-                      .on_click((_e, cx) => this.toggleViewerServiceApproval(focusedService, svcStatus, cx))
-                  )
-                  .child(svcApproved ? "Unapprove" : "Approve Service ✓")
-              ))
-          )
+          .child(renderFileInfo())
+          .child(renderReviewControls())
       ))
       .when(Boolean(this.viewerNote), (el) => el.child(
         div().flex_none().px(12).py(6).border_b(1).border_color(t.border).text_size(11).text_color(del).child(this.viewerNote)
@@ -2940,8 +2964,66 @@ export default class ChangesReview extends View {
       : this.open;
     const reviewedFilesCount = this.files.reduce((n, f) => n + (this.isFileReviewed(f, flow) ? 1 : 0), 0);
     const allFilesReviewed = this.files.length > 0 && reviewedFilesCount === this.files.length;
+    const compactPanel = (this.panelWidth || 420) < 380;
+
+    const renderCommitSelector = () =>
+      h_flex().id("commit-selector-btn").h(24).px(8).gap(6).items_center().rounded(5)
+        .when(compactPanel, (b) => b.w_full().min_w(0))
+        .when(!compactPanel, (b) => b.flex_1().min_w(80).max_w(210))
+        .bg(this.showCommitMenu ? t.selected : t.background).border_1().border_color(this.showCommitMenu ? t.accent : t.border)
+        .cursor_pointer().hover((s) => s.bg(t.hover))
+        .on_click((_e, cx) => {
+          this.showCommitMenu = !this.showCommitMenu;
+          cx.notify();
+        })
+        .child(
+          svg("mods/changes-review/icons/git-commit.svg")
+            .size(11).flex_none()
+            .text_color(this.viewMode === "working" ? t.muted : t.accent || t.foreground)
+        )
+        .child(
+          div().flex_1().min_w(0).truncate().text_size(11).font_medium()
+            .text_color(t.foreground)
+            .child(
+              this.viewMode === "working"
+                ? "Working Tree"
+                : this.selectedCommit
+                  ? `${this.services.length > 1 && this.selectedCommit.serviceName ? `[${this.selectedCommit.serviceName}] ` : ""}${this.selectedCommit.shortHash}: ${this.selectedCommit.subject}`
+                  : "Select commit"
+            )
+        )
+        .when(this.viewMode === "working" && this.workingFilesCount > 0, (el) => el.child(
+          div().flex_none().px(4).py(0.5).rounded(3).bg(t.raised).text_size(9.5).text_color(t.muted).child(String(this.workingFilesCount))
+        ))
+        .child(svg("mods/changes-review/icons/chevron-down.svg").size(9).flex_none().text_color(t.dim));
+
+    const renderPanelHeaderBadges = () =>
+      h_flex().flex_none().gap(6).items_center()
+        .child(div().flex_none().font_semibold().child("Changes"))
+        .child(div().flex_none().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(compactPanel ? `${this.files.length}` : `${this.files.length} files`))
+        .when(this.files.length > 0 && reviewedFilesCount > 0, (el) => el.child(
+          div()
+            .flex_none()
+            .px(5)
+            .py(1)
+            .rounded(4)
+            .border_1()
+            .border_color(allFilesReviewed ? hexWithAlpha(passColor, "77") : t.border)
+            .when(allFilesReviewed, (b) => b.bg(hexWithAlpha(passColor, "22")))
+            .text_size(10)
+            .font_medium()
+            .text_color(allFilesReviewed ? passColor : t.muted)
+            .child(`${reviewedFilesCount}/${this.files.length} ✓`)
+        ));
 
     return v_flex().id("changes").size_full().min_h(0).rounded(10).overflow_hidden().relative().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
+      .on_size_change((size, cx) => {
+        const w = Math.round(size?.width || 0);
+        if (w > 0 && Math.abs(w - (this.panelWidth || 420)) > 12) {
+          this.panelWidth = w;
+          cx.notify();
+        }
+      })
       .on_key_down((e, cx) => {
         if (e.key === "escape") {
           if (this.showCommitMenu) {
@@ -2961,74 +3043,26 @@ export default class ChangesReview extends View {
         }
       })
       // Header
-      .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
-        .child(div().flex_none().font_semibold().child("Changes"))
-        .child(div().flex_none().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(`${this.files.length} files`))
-        .when(this.files.length > 0 && reviewedFilesCount > 0, (el) => el.child(
-          div()
-            .flex_none()
-            .px(5)
-            .py(1)
-            .rounded(4)
-            .border_1()
-            .border_color(allFilesReviewed ? hexWithAlpha(passColor, "77") : t.border)
-            .when(allFilesReviewed, (b) => b.bg(hexWithAlpha(passColor, "22")))
-            .text_size(10)
-            .font_medium()
-            .text_color(allFilesReviewed ? passColor : t.muted)
-            .child(`${reviewedFilesCount}/${this.files.length} ✓`)
-        ))
-
-        // Commit selector dropdown button right beside "Changes" and file counter
-        .child(
-          h_flex().id("commit-selector-btn").h(24).px(8).gap(6).items_center().rounded(5)
-            .min_w(0).max_w(180)
-            .bg(this.showCommitMenu ? t.selected : t.background).border_1().border_color(this.showCommitMenu ? t.accent : t.border)
-            .cursor_pointer().hover((s) => s.bg(t.hover))
-            .on_click((_e, cx) => {
-              this.showCommitMenu = !this.showCommitMenu;
-              cx.notify();
-            })
-            .child(
-              svg("mods/changes-review/icons/git-commit.svg")
-                .size(11).flex_none()
-                .text_color(this.viewMode === "working" ? t.muted : t.accent || t.foreground)
-            )
-            .child(
-              div().flex_1().min_w(0).truncate().text_size(11).font_medium()
-                .text_color(t.foreground)
-                .child(
-                  this.viewMode === "working"
-                    ? "Working Tree"
-                    : this.selectedCommit
-                      ? `${this.services.length > 1 && this.selectedCommit.serviceName ? `[${this.selectedCommit.serviceName}] ` : ""}${this.selectedCommit.shortHash}: ${this.selectedCommit.subject}`
-                      : "Select commit"
-                )
-            )
-            .when(this.viewMode === "working" && this.workingFilesCount > 0, (el) => el.child(
-              div().flex_none().px(4).py(0.5).rounded(3).bg(t.raised).text_size(9.5).text_color(t.muted).child(String(this.workingFilesCount))
-            ))
-            .child(svg("mods/changes-review/icons/chevron-down.svg").size(9).flex_none().text_color(t.dim))
-        )
-
-        // Quick return to Working Tree if currently viewing a commit
-        .when(this.viewMode !== "working", (el) => el.child(
-          h_flex().id("quick-working-tree-btn").h(22).px(7).gap(4).flex_none().items_center().rounded(4)
-            .bg(t.background).border_1().border_color(t.border)
-            .cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
-            .text_color(t.muted).text_size(10.5)
-            .on_click((_e, cx) => {
-              this.switchMode("working", null, cx);
-            })
-            .child("⚡ Working Tree")
-            .when(this.workingFilesCount > 0, (b) => b.child(
-              div().px(3.5).py(0.5).rounded(3).bg(t.raised).text_size(9).child(String(this.workingFilesCount))
-            ))
-        ))
-
-        .child(div().flex_1())
-        .child(div().flex_none().text_size(11).text_color(add).child(`+${addCount}`))
-        .child(div().flex_none().text_size(11).text_color(del).child(`−${delCount}`)))
+      .child(
+        compactPanel
+          ? v_flex().flex_none().px(10).py(7).gap(6).border_b(1).border_color(t.border)
+              .child(
+                h_flex().w_full().min_w(0).gap(6).items_center().justify_between()
+                  .child(renderPanelHeaderBadges())
+                  .child(
+                    h_flex().flex_none().gap(6).items_center()
+                      .child(div().flex_none().text_size(11).text_color(add).child(`+${addCount}`))
+                      .child(div().flex_none().text_size(11).text_color(del).child(`−${delCount}`))
+                  )
+              )
+              .child(renderCommitSelector())
+          : h_flex().min_h(40).flex_none().px(12).py(6).gap(8).items_center().border_b(1).border_color(t.border)
+              .child(renderPanelHeaderBadges())
+              .child(renderCommitSelector())
+              .child(div().flex_1())
+              .child(div().flex_none().text_size(11).text_color(add).child(`+${addCount}`))
+              .child(div().flex_none().text_size(11).text_color(del).child(`−${delCount}`))
+      )
 
       // Service filter bar (when workspace contains multiple repositories)
       .when(this.services.length > 1, (el) => {
@@ -3083,9 +3117,10 @@ export default class ChangesReview extends View {
             .id("microservice-review-bar")
             .min_h(34)
             .flex_none()
+            .flex_wrap()
             .px(10)
             .py(5)
-            .gap(8)
+            .gap(6)
             .items_center()
             .justify_between()
             .border_b(1)
@@ -3094,7 +3129,7 @@ export default class ChangesReview extends View {
             .child(
               h_flex()
                 .flex_1()
-                .min_w(0)
+                .min_w(140)
                 .gap(6)
                 .items_center()
                 .child(svg("mods/changes-review/icons/git-branch.svg").size(11).flex_none().text_color(t.muted))
@@ -3257,21 +3292,9 @@ export default class ChangesReview extends View {
                   .on_click((_e, cx) => this.commit(cx))
                   .child(this.busy ? "Committing…" : targetRepos.length > 1 ? `Commit (${targetRepos.length} repos)` : "Commit")
               )
-          : h_flex().flex_none().p(10).gap(8).items_center().justify_between().border_t(1).border_color(t.border).bg(t.background)
-              .child(
-                h_flex().gap(6).items_center().text_size(12).text_color(t.dim)
-                  .child(svg("mods/changes-review/icons/git-commit.svg").size(12).text_color(t.muted))
-                  .child(div().child("Commits can only be made on uncommitted Working Tree changes."))
-              )
-              .child(
-                h_flex().h(28).px(10).items_center().rounded(6).bg(t.raised).border_1().border_color(t.border)
-                  .text_size(11.5).text_color(t.foreground).cursor_pointer()
-                  .hover((s) => s.bg(t.hover))
-                  .on_click((_e, cx) => {
-                    this.switchMode("working", null, cx);
-                  })
-                  .child("Switch to Working Tree")
-              )
+          : h_flex().flex_none().px(12).py(8).gap(6).items_center().border_t(1).border_color(t.border).bg(t.background)
+              .child(svg("mods/changes-review/icons/git-commit.svg").size(12).flex_none().text_color(t.muted))
+              .child(div().flex_1().min_w(0).text_size(11.5).text_color(t.dim).child("Select Working Tree above to commit."))
       ))
 
       // Review section (scrollable list of notes + send to agent without counter)
@@ -3346,7 +3369,7 @@ export default class ChangesReview extends View {
           })
           .child(
             v_flex().id("commit-dropdown-floating")
-              .absolute().top(43).left(10).right(10).max_w(360).max_h(320)
+              .absolute().top(compactPanel ? 68 : 43).left(10).right(10).max_w(360).max_h(320)
               .rounded(8).bg(t.raised).border_1().border_color(t.border).shadow_xl().p(4).gap(2)
               .overflow_y_scrollbar()
               .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
