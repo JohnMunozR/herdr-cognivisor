@@ -11,10 +11,12 @@ tags: [mod, files, search, overlay]
 
 ## Responsibility
 
-The `submodule-mod-files-search` delivers workspace file tree navigation and ripgrep-powered fuzzy search for Herdr. It operates polymorphically in two distinct UI modes depending on instantiation context:
+The `submodule-mod-files-search` delivers workspace file tree navigation, ripgrep-powered fuzzy search, and full-pane IDE file viewing for Herdr. It operates polymorphically in four modes depending on instantiation context (`props()`):
 
-1. **Docked File Tree Panel:** Renders within the `#files` slot of `#panel-body`, displaying a collapsible directory tree of the active workspace, file badges, and selection states.
-2. **Search Everywhere Overlay:** Renders as a floating, frameless modal window (`files-search-win`) triggered globally via `Ctrl+P` or `Alt+F`. It supports searching files by name, full-text searching across source code with ripgrep, live code preview, and keyboard-centric selection.
+1. **Docked File Tree Panel (`#files`):** Renders within the `#files` slot of `#panel-body`, displaying a collapsible directory tree of the active workspace, service filters, file badges, and selection highlights without replacing the explorer with an inline editor.
+2. **File Viewer Tab (`role: "viewer"`):** Opens in `#main` via `run("tab.new", ...)` whenever a file is opened from `#files` or Search Everywhere, rendering a readonly syntax-highlighted `Editor` workspace tab with a compact `40px` header and reload support.
+3. **Search Everywhere Overlay (`overlay: true`):** Renders as a floating, frameless modal window (`files-search-win`) triggered globally via `Ctrl+P` or `Alt+F`. It supports searching files by name, full-text searching across source code with ripgrep, live code preview, and keyboard-centric selection.
+4. **Headless Indexer (`role: "indexer"`):** Renders a `0px` background instance in `#files-indexer` that maintains workspace file indexes, watcher-triggered cache invalidations, and service inventory updates.
 
 ## Boundary
 
@@ -34,8 +36,10 @@ The `submodule-mod-files-search` delivers workspace file tree navigation and rip
     - `ctrl-p` -> `mod.open:files-search`
     - `alt-f` -> `mod.open:files-search`
   - Shared state event channels:
-    - `files-search.select`: `{ root: string, kind: "file"|"dir", path: string, line: number|null, ts: number }`.
+    - `files-search.select`: `{ root: string, kind: "dir"|"reveal", path: string, line: number|null, ts: number }`.
     - `files-search.customSize`: `{ w: number, h: number }`.
+    - `mesh.spaceAgentTabs`: `Record<spaceId, tabId>` storing the active terminal/agent tab ID per space so workspace root resolution stays anchored even when a non-terminal File Viewer tab is active.
+    - `mesh.openFileTabs`: `Record<tabId, { tabId, spaceId, viewerId, root, path, absPath, displayPath, iconPath, line, serviceId, serviceName, updatedAt }>` tracking live File Viewer tabs in `#main` for cross-pane deduplication, line updates, and stale-tab pruning.
     - `mesh.services`: `{ tabId: string|null, workspaceRoot: string, on: string|null, services: Array<...>, candidates: Array<...>, sig: string, ts: number }`.
     - `mesh.activeService`: `{ workspaceRoot: string, serviceId: string, ts: number }`.
 - **Allowed deps:**
@@ -47,10 +51,10 @@ The `submodule-mod-files-search` delivers workspace file tree navigation and rip
   - Running synchronous file operations or unbounded recursive disk scans on the main thread.
   - Pre-warming or automatically re-indexing workspaces when the active space contains only plain shell terminals (no open non-runner coding agent).
   - Spawning uncancelled `ripgrep` subprocesses on every keystroke or reloading expanded folders while the `#files` panel is hidden.
-  - Calling `cx.notify()` or mutating shared/panel state synchronously during `renderPanel()` (deferred via `schedulePanelSync` using `cx.timer.after(0, ...)`).
-  - Retaining overlay resources, watchers, focus timers, or background tasks after view destruction.
+  - Calling `setShared()`, `cx.notify()`, or mutating shared/panel/viewer state synchronously during `render()`, `renderPanel()`, or `renderViewer()` (deferred via `schedulePanelSync` / `scheduleViewerSync` using `cx.timer.after(0, ...)`).
+  - Retaining overlay, viewer, or panel resources, watchers, focus timers, or background tasks after view destruction.
 
-## Tri-Mode Architecture
+## Quad-Mode Architecture
 
 The mod detects its operational mode during initialization via `props()`:
 
@@ -63,18 +67,19 @@ The mod detects its operational mode during initialization via `props()`:
                                /                 \
                           YES /                   \ NO
                              v                     v
-           +--------------------+        props()?.role === "indexer" ?
-           |    initOverlay     |               /            \
-           | (files-search-win) |          YES /              \ NO
-           +--------------------+             v                v
-                                   +---------------+    +--------------------+
-                                   |  initIndexer  |    |     initPanel      |
-                                   | (0px headless)|    |  (Docked #files)   |
-                                   +---------------+    +--------------------+
+           +--------------------+            props()?.role ?
+           |    initOverlay     |         /         |        \
+           | (files-search-win) |  "indexer"    "viewer"    default
+           +--------------------+     /             |           \
+                                     v              v            v
+                         +--------------+   +--------------+   +------------------+
+                         | initIndexer  |   |  initViewer  |   |    initPanel     |
+                         |(0px headless)|   | (#main tab)  |   | (Docked #files)  |
+                         +--------------+   +--------------+   +------------------+
 ```
 
-### 1. Docked Panel Mode (`isOverlay: false`, `isIndexer: false`)
-- **Workspace Root Anchoring (`location().cwd`):** Tracks the workspace directory using `space.folder` as the primary anchor whenever the focused pane's `cwd` resides within `space.folder` (`pane.cwd === space.folder || pane.cwd.startsWith(space.folder + "/")` or Windows `\`). This guarantees that terminal `cd` into microservice subfolders does not shrink the file tree or search scope.
+### 1. Docked Panel Mode (`isOverlay: false`, `isIndexer: false`, `isViewer: false`)
+- **Workspace Root Anchoring (`location().cwd` & `mesh.spaceAgentTabs`):** Tracks the workspace directory using `space.folder` as the primary anchor whenever the active terminal pane's `cwd` resides within `space.folder` (`pane.cwd === space.folder || pane.cwd.startsWith(space.folder + "/")` or Windows `\`). When a non-terminal mod tab (such as a File Viewer tab with no `cwd`) is active, `location()` falls back cleanly to `space?.folder` or the anchored terminal tab stored in `mesh.spaceAgentTabs` (or another live terminal pane in the same space), guaranteeing that terminal `cd` or switching to a File Viewer tab never drops workspace root anchoring.
 - **Session-Scoped Multi-Repository Discovery (`discoverRepos`, `attributeSessionServices`):** Discovers Git repositories under `workspaceRoot` up to depth 2 (plus parent siblings when `workspaceRoot` is itself a repo and extra active-tab `pane.cwd` paths) using native async `fs/promises` scans locally (`fsScanRepos`, falling back to PowerShell on Windows or POSIX `sh` outside `$HOME` / on unsupported `Dirent` shapes) and POSIX/PowerShell over SSH (`on`), cached for `REPO_CACHE_TTL_MS = 60000`. Executes lock-free `git status --porcelain=v1 -b -z --no-renames --untracked-files=normal` in parallel, attributes touched repositories to the active tab session via `mesh.flows[tabId].sessionRepos`, and publishes `mesh.services` with a `sig` change key (`45s` heartbeat) so `changes-review` reuses results cleanly.
 - **Folder Modification Counters & Badges:**
   - Aggregates file modification marks (`marks`: `fullPath -> "A" | "M" | "D" | "U"`).
@@ -92,8 +97,12 @@ The mod detects its operational mode during initialization via `props()`:
   - On local workspaces (`!context.on`), expanded views schedule bounded background prewarming (`schedulePrewarm`, `FOLDER_PREWARM_LIMIT = 24`, `FOLDER_PREWARM_CONCURRENCY = 4`, skipping build/VCS dirs) for direct visible collapsed child directories and shallow single-folder cascades so first-time opens frequently hit warm cache.
   - When uncached folders require async loading, the clicked folder remains marked `pending` (`mods/files-search/spinner.svg` with `.spin(900)` flush at the right edge of its row) while `runStagedCascade` + `directoryCascade` resolve the full single-directory chain (`MAX_CASCADE_DEPTH = 32`, filtered by active `serviceFilter`) before `commitStagedCascade` commits atomically so nested single folders visually unfold together. Clicking an already-pending folder cancels its in-flight cascade via `pendingTokens`.
   - `#files` renders flattened row metadata (`collectTreeRows`) inside `v_virtual_list("files-tree", ..., 28)` + `Scrollbar.vertical("files-tree").absolute().inset_0()` + `VirtualListScrollHandle`, anchored inside `.w_full().min_w(0)` flex containers with `.overflow_hidden()` on flexible row labels so only viewport-visible rows are built per frame and trailing `.flex_none()` spinner/badge elements are never clipped off-screen; file rows (including sibling rows) render semantic file-type SVG icons and theme palette colors via `resolveFileIcon(row.path, t)`.
-- `#files` opens file views using `EditorState.new` with `resolveEditorLanguage` (`java`, `py`/`pyi`/`pyw`, `js`/`ts`/`tsx`/`jsx`/`mjs`/`cjs`, `groovy`/`gradle`, `properties`, `yaml`, `json`) and `getEditorSyntaxConfig(t)` supplying all 12 `gpui-kit` semantic syntax keys (`keyword`, `string`, `string.escape`, `comment`, `function`, `type`, `number`, `boolean`, `constant`, `variable`, `operator`, `punctuation`) with luminance-guarded dark/light contrast (`#d19a66` / `#b35900` warm amber numbers/booleans/constants and coral `variable` emphasis on Java/Spring annotations, Python decorators, `this`/`self`/`cls`).
-- Listens to `shared("files-search.select")`: When a file or folder is selected from the overlay search, unpacks the path, expands all ancestor directories, scrolls the revealed folder into view via `VirtualListScrollHandle.scroll_to_item` (`pendingScrollPath`), and opens file previews when applicable. If the target path resides outside the active `serviceFilter`, resets `serviceFilter` to `"all"`. Prepend any relative root prefix if the selection payload root differs from the panel root.
+- **File Tab Deduplication & Viewer Mode (`role: "viewer"`):**
+  - Clicking a `file` or `sibling` row in `#files` or selecting a file in Search Everywhere calls `openFileInTab(...)`, opening or focusing a File Viewer tab in `#main` while keeping `#files` open as an IDE project explorer.
+  - Before opening or focusing a tab, `openFileInTab` snapshots `spaces()`, `panes()`, and `mesh.spaceAgentTabs`, and prunes `mesh.openFileTabs` entries whose `tabId` is no longer present in any space's tab list or whose pane is no longer a `files-search` pane (`pruneOpenFileTabs`).
+  - Per-space deduplication (`findMatchingOpenFileTab` + `buildFileViewerKey`) checks whether an existing live `files-search` tab in the target space already displays the same normalized `(absPath)` / `(root, path)`. If matched, it updates `line` and `updatedAt` in `mesh.openFileTabs` and calls `run("tab.select", { id: existingTabId })`; otherwise it assigns a unique `viewerId`, computes a concise tab title via `formatFileTabTitle`, and calls `run("tab.new", { space: spaceId, name: tabTitle, mod: "files-search", props: { role: "viewer", viewerId, spaceId, root, path, absPath, displayPath, on, line, serviceId, serviceName } })`.
+  - Viewer instances (`initViewer`, `renderViewer`) stay crash-safe on partial/missing props, defer `mesh.openFileTabs` claiming/syncing to `cx.timer.after(0, ...)` (never mutating shared state synchronously inside `render()`), read files asynchronously via `readTextFile(targetPath, { on })` into `EditorState.new` (`readonly: true`, `soft_wrap: false`, `line_numbers: true`, `folding: true`, `font_size: 12.5`, `resolveEditorLanguage`, `getEditorSyntaxConfig(t)`), render a `40px` header (file icon, optional service badge, filename + muted parent folder, optional `Ln <line>` badge, and `↻` Reload button), render `Editor.new(this.viewerCode).flex_1().min_h(0).w_full().min_w(0)` with loading/error/binary fallbacks, sync `line` updates from `mesh.openFileTabs`, and auto-reload when becoming newly active.
+- Listens to `shared("files-search.select")`: When `kind === "dir"` or `kind === "reveal"` arrives from Search Everywhere, unpacks the path, expands all ancestor directories (plus the directory itself when `kind === "dir"`), and scrolls the revealed item into view via `VirtualListScrollHandle.scroll_to_item` (`pendingScrollPath`). File selection emits `kind: "reveal"` so `#files` highlights the selected file in the background without forcing `#panel` open and without replacing `#files` with an inline editor; directory selection (`kind === "dir"`) reveals the folder in `#files` and opens `#panel`. If the target path resides outside the active `serviceFilter`, resets `serviceFilter` to `"all"`, prepending any relative root prefix if the selection payload root differs from the panel root.
 
 ### 2. Search Everywhere Overlay Mode (`isOverlay: true`)
 - **Workspace-Wide Root Resolution:** Resolves search root via `props().root || shared("mesh.services")?.workspaceRoot || location().cwd`. Immediately hydrates memory from persistent disk cache (`restoreDiskIndex`) if available before verifying/refreshing in the background via `ensureWorkspaceIndex`.
@@ -103,8 +112,8 @@ The mod detects its operational mode during initialization via `props()`:
   - **Files:** Time-sliced chunked fuzzy matching (`triggerFileSearch` / `fileSearchTask` with `scoreSubseqFast`, monotonic prefix narrowing, trailing `/` folder-query tolerance and directory boost, and bounded top-50 scoring so `renderOverlay()` stays O(1) without QuickJS `interrupted` timeouts) against cached workspace file + directory entry lists (`OVERLAY_INDEX_CACHE` refreshed via `rg --files --path-separator /`, `git ls-files`, `mesh.services.candidates` in bounded batches, or native `fsListWorkspace` falling back to Windows PowerShell `Get-ChildItem -Recurse` or POSIX `find`, deriving ancestor directories via `deriveDirsFromFiles`).
   - **Text:** Debounced asynchronous search (`160ms`/`260ms`) with session query cache executing `rg --vimgrep --path-separator / --max-count=3 --max-filesize 512K --threads 4` (caching ripgrep availability via `RG_AVAILABLE_CACHE`, handling `code === 1` empty matches without fallback, retrying regex-syntax `code === 2` with `-F`, and falling back to bounded-concurrency `git grep -F -m 3` across active-first `candidates` only when `rg` is missing/broken), normalizing Windows backslashes cleanly.
 - **Microservice Prefix Badges:** When the workspace contains multiple microservices (`mesh.services.services.length > 1`), search result rows display a distinctive badge identifying the microservice to which each matched file or text line belongs.
-- Features an optional live preview pane with viewport-clamped column widths (never overflowing down to `winW = 860`) that reads file chunks via `readFileChunk` (centering on matching line numbers) using `tokenizeCodeLine` + `syntaxTokenStyle` (`annotation`, `keyword`, `type`, `function`, `string`, `string.escape`, `number`, `boolean`, `constant`, `variable`, `operator`, `comment` for Java/Spring Boot, Python, JavaScript, YAML, JSON, and `.properties` with inline query-match highlights) or lists directory children asynchronously when a folder item is highlighted; Search Everywhere result rows (`isFile` and `isText`), preview header, and directory-preview child file rows all display semantic file-type SVG icons resolved by `resolveFileIcon`.
-- Selecting a directory (`kind === "dir"`) navigates and expands the folder in `#files` (`openFromSearch`); Shift/click-style reveal stays responsive.
+- Features an optional live preview pane with viewport-clamped column widths (never overflowing down to `winW = 860`) that reads file chunks via `readFileChunk` (centering on matching line numbers) using `tokenizeCodeLine` + `syntaxTokenStyle` (`annotation`, `keyword`, `type`, `function`, `string`, `string.escape`, `number`, `boolean`, `constant`, `variable`, `operator`, `comment` for Java/Spring Boot, Python, JavaScript, YAML, JSON, and `.properties` with inline query-match highlights) inside a horizontally scrollable (`overflow_x_scrollbar` + `computeCodeContentWidth` + `whitespace_nowrap` without line truncation up to 4,000 chars) body while unshifted vertical wheel events scroll lines and load chunks lazily, or lists directory children asynchronously when a folder item is highlighted; Search Everywhere result rows (`isFile` and `isText`), preview header, and directory-preview child file rows all display semantic file-type SVG icons resolved by `resolveFileIcon`.
+- Selecting a directory (`kind === "dir"`) emits `files-search.select`, reveals and expands the folder in `#files` (`openFromSearch`), and shows `#panel` (`layout.select` + `layout.show`); selecting a file closes the overlay, opens/focuses its File Viewer tab in `#main` via `openFileInTab(...)`, and emits `kind: "reveal"` on `files-search.select` so `#files` expands and highlights the path in the background without forcing `#panel` open.
 - Allows resizing via grip controls, persisting geometry across sessions via `setShared("files-search.customSize", ...)`.
 
 ### 3. Headless Agent-Triggered Indexer Mode (`isIndexer: true`, `props()?.role === "indexer"`)
@@ -126,9 +135,9 @@ The mod detects its operational mode during initialization via `props()`:
 5. **Non-Reentrant Shared State Synchronization & Pure Render:**
    Shared state listeners (`mesh.activeService`, `files-search.select`) MUST gate incoming events against monotonically increasing timestamps (`ts > this.lastActiveServiceTs`), defer panel mutations outside `renderPanel()`, and never emit reciprocal shared state updates for incoming events.
 6. **Deep Path & Directory Auto-Expansion:**
-   When `openFromSearch(path, cx, kind)` receives a file or directory selected externally, it iteratively builds and adds all intermediate folder paths (plus the directory itself when `kind === "dir"`) to `this.folders` before rendering, ensuring the target node is immediately visible in the tree.
+   When `openFromSearch(path, cx, kind)` receives a file or directory selected externally, it iteratively builds and adds all intermediate folder paths (plus the directory itself when `kind === "dir"`) to `this.folders` before rendering, ensuring the target node is immediately visible in the tree. When `kind === "reveal"`, it expands ancestors and updates `selectedFile` highlight without replacing the `#files` tree with an inline editor.
 7. **Graceful Teardown:**
-   Upon overlay close or view/indexer release, `_overlayClosed` / `_indexerClosed` is set and all background tasks (`focusInputTask`, `watchDebounceTask`, `pendingPanelSyncTask`, `prewarmTask`, `fileSearchTask`, `textSearchTask`, `previewDebounceTask`, `indexerSyncTask`, `indexerReindexTask`, `indexerWatchDebounceTask`), pending folder tokens (`pending`, `pendingTokens`), and allocated resources (`this.treeScrollHandle?.release()`, `this.input?.release()`, `this.code?.release()`, `releaseRootWatcher(...)`) must be cleanly disposed of.
+   Upon overlay close or panel/viewer/indexer release, `_overlayClosed` / `_indexerClosed` / `_viewerClosed` is set and all background tasks (`focusInputTask`, `watchDebounceTask`, `pendingPanelSyncTask`, `prewarmTask`, `fileSearchTask`, `textSearchTask`, `previewDebounceTask`, `indexerSyncTask`, `indexerReindexTask`, `indexerWatchDebounceTask`, `viewerSyncTask`), pending folder tokens (`pending`, `pendingTokens`), and allocated resources (`this.treeScrollHandle?.release()`, `this.input?.release()`, `this.viewerCode?.release()`, `releaseRootWatcher(...)`) must be cleanly disposed of.
 
 ## Multi-Repo & Mesh Architecture
 

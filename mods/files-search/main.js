@@ -56,6 +56,13 @@ import {
   syntaxTokenStyle,
   tokenizeCodeLine,
   resolveFileIcon,
+  expandCodeTabs,
+  computeCodeContentWidth,
+  resolveViewerFilePath,
+  buildFileViewerKey,
+  formatFileTabTitle,
+  pruneOpenFileTabs,
+  findMatchingOpenFileTab,
 } from "./search-logic.js";
 import {
   resolveCachedCascade,
@@ -69,21 +76,324 @@ import {
   runStagedCascade,
 } from "./tree-logic.js";
 
+function asPlainObject(v) {
+  return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+}
+
+function shallowEqualStringMap(a, b) {
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  for (const k of keysA) {
+    if (a[k] !== b[k]) return false;
+  }
+  return true;
+}
+
+const ACTIVE_VIEWER_CLAIMS = new Map();
+const PENDING_VIEWER_OPENS = new Map();
+let VIEWER_ID_SEQ = 0;
+
+function syncSpaceAgentTabs() {
+  const allSpaces = spaces() || [];
+  if (!allSpaces.length) return;
+  const allPanes = panes() || [];
+  const prev = asPlainObject(shared("mesh.spaceAgentTabs"));
+  const next = {};
+
+  for (const space of allSpaces) {
+    if (!space?.id) continue;
+    const spaceTabs = space.tabs || [];
+    const spaceTabIds = new Set(spaceTabs.map(t => t?.id).filter(Boolean));
+    const tabHasTerminal = tabId => Boolean(tabId && allPanes.some(p => p.tab === tabId && Boolean(p.terminal)));
+    const activeTab = spaceTabs.find(t => t?.active) || null;
+
+    if (activeTab && tabHasTerminal(activeTab.id)) {
+      next[space.id] = activeTab.id;
+    } else if (prev[space.id] && spaceTabIds.has(prev[space.id]) && tabHasTerminal(prev[space.id])) {
+      next[space.id] = prev[space.id];
+    } else {
+      const agentPane = allPanes.find(p => spaceTabIds.has(p.tab) && Boolean(p.terminal) && p.program?.agent);
+      const termPane = agentPane || allPanes.find(p => spaceTabIds.has(p.tab) && Boolean(p.terminal));
+      if (termPane?.tab) {
+        next[space.id] = termPane.tab;
+      }
+    }
+  }
+
+  if (!shallowEqualStringMap(prev, next)) {
+    setShared("mesh.spaceAgentTabs", next);
+  }
+}
+
 function location() {
-  const space = spaces().find(s => s.active), f = focused();
-  const activeTab = (space?.tabs || []).find(t => t.active) || null;
-  const pane = f?.pane ? panes().find(p => p.pane === f.pane) : null;
-  const on = f?.pane === null ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null) : space?.machine ?? null;
+  const allSpaces = spaces() || [];
+  const space = allSpaces.find(s => s.active) || null;
+  const f = focused();
+  const allPanes = panes() || [];
+  const spaceTabs = space?.tabs || [];
+  const spaceTabIds = new Set(spaceTabs.map(t => t.id));
+  const activeTab = spaceTabs.find(t => t.active) || null;
+  const spacePanes = allPanes.filter(p => spaceTabIds.has(p.tab));
+  const focusedPane = f?.pane ? allPanes.find(p => p.pane === f.pane) : null;
+  const activeTabPanes = activeTab ? spacePanes.filter(p => p.tab === activeTab.id) : [];
+  const activePane = (focusedPane && (!activeTab || focusedPane.tab === activeTab.id) ? focusedPane : null)
+    || activeTabPanes.find(p => p.focused)
+    || activeTabPanes[0]
+    || focusedPane
+    || null;
+
+  const tabHasTerminal = tabId => Boolean(tabId && spacePanes.some(p => p.tab === tabId && Boolean(p.terminal)));
+  const openFileTabs = asPlainObject(shared("mesh.openFileTabs"));
+  const isFileViewerTab = tabId => Boolean(
+    tabId && (
+      openFileTabs[tabId] ||
+      (spacePanes.some(p => p.tab === tabId && p.mod === "files-search") && !tabHasTerminal(tabId))
+    )
+  );
+  const isNonTerminalActive = Boolean(
+    activeTab && (isFileViewerTab(activeTab.id) || (!activePane?.cwd && activeTabPanes.length > 0 && !tabHasTerminal(activeTab.id)))
+  );
+
+  let anchoredTabId = null;
+  if (activeTab && !isNonTerminalActive) {
+    anchoredTabId = activeTab.id;
+  } else {
+    const storedAgentTabId = space?.id ? asPlainObject(shared("mesh.spaceAgentTabs"))[space.id] : null;
+    if (storedAgentTabId && spaceTabIds.has(storedAgentTabId) && tabHasTerminal(storedAgentTabId)) {
+      anchoredTabId = storedAgentTabId;
+    } else {
+      const fallbackTermPane = spacePanes.find(p => Boolean(p.terminal) && Boolean(p.cwd))
+        || spacePanes.find(p => Boolean(p.terminal));
+      anchoredTabId = fallbackTermPane?.tab || null;
+    }
+  }
+
+  const anchoredPanes = anchoredTabId ? spacePanes.filter(p => p.tab === anchoredTabId) : [];
+  const fallbackPane = anchoredPanes.find(p => Boolean(p.cwd))
+    || spacePanes.find(p => Boolean(p.terminal) && Boolean(p.cwd))
+    || spacePanes.find(p => Boolean(p.cwd))
+    || null;
+
+  const on = f?.pane === null && f?.terminal
+    ? (f.terminal.includes("/") ? f.terminal.split("/")[0] : null)
+    : space?.machine ?? null;
   const isWin = !on && window()?.platform === "windows";
-  let cwd;
   const spaceFolder = space?.folder;
-  const paneCwd = pane?.cwd;
+  const paneCwd = activePane?.cwd || (!activePane?.cwd ? fallbackPane?.cwd : null) || null;
+
+  let cwd;
   if (spaceFolder && (!paneCwd || isSameOrChildPath(paneCwd, spaceFolder, isWin))) {
     cwd = spaceFolder;
   } else {
     cwd = paneCwd || f?.cwd || spaceFolder;
   }
-  return { cwd, on, space: space?.id, tabId: activeTab?.id ?? null };
+  if (!cwd && activeTab && openFileTabs[activeTab.id]?.root) {
+    cwd = openFileTabs[activeTab.id].root;
+  }
+
+  return {
+    cwd,
+    on,
+    space: space?.id,
+    tabId: anchoredTabId ?? (isNonTerminalActive ? null : activeTab?.id ?? null),
+  };
+}
+
+function resolveServiceForFile(root, relOrPath, absPath, isWin = false, localServices = null) {
+  const bus = asPlainObject(shared("mesh.services"));
+  const merged = [];
+  const seenKeys = new Set();
+  const addList = list => {
+    for (const s of list || []) {
+      if (!s) continue;
+      const k = normCmpStr(s.root || s.id || s.name, isWin);
+      if (!k || seenKeys.has(k)) continue;
+      seenKeys.add(k);
+      merged.push(s);
+    }
+  };
+  addList(localServices);
+  addList(bus.services);
+  addList(bus.candidates);
+  if (!merged.length) return { serviceId: null, serviceName: null };
+
+  const normRel = normPathStr(relOrPath).replace(/^\.\//, "");
+  let best = null;
+  let bestScore = -1;
+  for (const s of merged) {
+    const sRel = normPathStr(s.relPath || "");
+    if (sRel && normRel && (normRel === sRel || normRel.startsWith(sRel + "/"))) {
+      const score = 1000 + sRel.length;
+      if (score > bestScore) {
+        best = s;
+        bestScore = score;
+      }
+      continue;
+    }
+    if (s.root && absPath && isSameOrChildPath(absPath, s.root, isWin)) {
+      const score = normPathStr(s.root).length;
+      if (score > bestScore) {
+        best = s;
+        bestScore = score;
+      }
+    }
+  }
+  if (!best) return { serviceId: null, serviceName: null };
+  if (merged.length <= 1 && !best.relPath && !best.isSibling) {
+    return { serviceId: null, serviceName: null };
+  }
+  return { serviceId: best.id || null, serviceName: best.name || null };
+}
+
+function openFileInTab({
+  spaceId = null,
+  root = "",
+  path = "",
+  on = null,
+  line = null,
+  serviceId = null,
+  serviceName = null,
+  localServices = null,
+} = {}) {
+  const allSpaces = spaces() || [];
+  const targetSpace = (spaceId ? allSpaces.find(s => s.id === spaceId) : null) || allSpaces.find(s => s.active) || null;
+  if (!targetSpace?.id) return null;
+
+  const resolvedSpaceId = targetSpace.id;
+  const resolvedOn = on ?? targetSpace.machine ?? null;
+  const isWin = !resolvedOn && window()?.platform === "windows";
+  const normRoot = normPathStr(root || targetSpace.folder || "");
+  const absPath = resolveViewerFilePath(normRoot, path);
+  if (!absPath) return null;
+
+  let relPath = normPathStr(path).replace(/^\.\//, "");
+  if (normRoot && isSameOrChildPath(absPath, normRoot, isWin)) {
+    if (normRoot === "/") {
+      relPath = absPath.slice(1) || relPath;
+    } else if (absPath.length > normRoot.length) {
+      relPath = absPath.slice(normRoot.length + 1);
+    }
+  } else if (!relPath) {
+    relPath = absPath;
+  }
+  const displayPath = (normRoot && isSameOrChildPath(absPath, normRoot, isWin) && relPath) ? relPath : absPath;
+  const resolvedLine = line ? Number(line) : null;
+
+  let resolvedServiceId = serviceId || null;
+  let resolvedServiceName = serviceName || null;
+  if (!resolvedServiceId && !resolvedServiceName) {
+    const svc = resolveServiceForFile(normRoot, relPath, absPath, isWin, localServices);
+    resolvedServiceId = svc.serviceId;
+    resolvedServiceName = svc.serviceName;
+  }
+
+  // Anchor the current space's terminal/agent tab before switching to a file viewer tab.
+  syncSpaceAgentTabs();
+
+  const allPanes = panes() || [];
+  const allLiveTabIds = new Set();
+  for (const s of allSpaces) {
+    for (const t of s.tabs || []) {
+      if (t?.id) allLiveTabIds.add(t.id);
+    }
+  }
+  const filePaneTabIds = new Set(
+    allPanes.filter(p => p?.mod === "files-search" && p?.tab).map(p => p.tab)
+  );
+  const spaceTabIds = new Set((targetSpace.tabs || []).map(t => t?.id).filter(Boolean));
+
+  const rawOpenTabs = asPlainObject(shared("mesh.openFileTabs"));
+  const { tabs: prunedTabs, changed: prunedChanged } = pruneOpenFileTabs(rawOpenTabs, allLiveTabIds, filePaneTabIds);
+  const resolvedIcon = resolveFileIcon(absPath, theme());
+  const iconPath = resolvedIcon.path;
+  const iconColor = resolvedIcon.color;
+  const match = findMatchingOpenFileTab(prunedTabs, spaceTabIds, filePaneTabIds, normRoot, absPath, isWin);
+
+  if (match) {
+    const nextTabs = {
+      ...prunedTabs,
+      [match.tabId]: {
+        ...match.entry,
+        tabId: match.tabId,
+        spaceId: resolvedSpaceId,
+        root: normRoot || match.entry.root || "",
+        path: relPath || match.entry.path || "",
+        absPath,
+        displayPath: displayPath || match.entry.displayPath || relPath || absPath,
+        iconPath: iconPath || match.entry.iconPath || "",
+        iconColor: iconColor || match.entry.iconColor || "",
+        line: resolvedLine,
+        serviceId: resolvedServiceId ?? match.entry.serviceId ?? null,
+        serviceName: resolvedServiceName ?? match.entry.serviceName ?? null,
+        updatedAt: Date.now(),
+      },
+    };
+    setShared("mesh.openFileTabs", nextTabs);
+    run("tab.select", { id: match.tabId });
+    return { reused: true, tabId: match.tabId, absPath };
+  }
+
+  const viewerKey = buildFileViewerKey(normRoot, absPath, isWin);
+  const pendingKey = `${resolvedSpaceId}::${viewerKey}`;
+  const now = Date.now();
+  for (const [k, pending] of PENDING_VIEWER_OPENS) {
+    if (!pending || (now - pending.ts) > 1500) {
+      PENDING_VIEWER_OPENS.delete(k);
+    }
+  }
+  const pendingEntry = PENDING_VIEWER_OPENS.get(pendingKey);
+  if (pendingEntry) {
+    const unclaimedTab = (targetSpace.tabs || []).find(
+      t => t?.id && filePaneTabIds.has(t.id) && !prunedTabs[t.id] && (!ACTIVE_VIEWER_CLAIMS.has(t.id) || ACTIVE_VIEWER_CLAIMS.get(t.id) === pendingEntry.viewerId)
+    );
+    if (unclaimedTab) {
+      if (prunedChanged) {
+        setShared("mesh.openFileTabs", prunedTabs);
+      }
+      run("tab.select", { id: unclaimedTab.id });
+      return { reused: true, tabId: unclaimedTab.id, absPath };
+    }
+  }
+
+  if (prunedChanged) {
+    setShared("mesh.openFileTabs", prunedTabs);
+  }
+
+  const existingTitles = new Set();
+  for (const t of targetSpace.tabs || []) {
+    if (t?.name) existingTitles.add(t.name);
+  }
+  const tabTitle = formatFileTabTitle(absPath || relPath, resolvedServiceName, existingTitles);
+  const viewerId = `fv-${now.toString(36)}-${(++VIEWER_ID_SEQ).toString(36)}`;
+  PENDING_VIEWER_OPENS.set(pendingKey, {
+    viewerId,
+    spaceId: resolvedSpaceId,
+    key: viewerKey,
+    line: resolvedLine,
+    ts: now,
+  });
+
+  run("tab.new", {
+    space: resolvedSpaceId,
+    name: tabTitle,
+    mod: "files-search",
+    props: {
+      role: "viewer",
+      viewerId,
+      tabTitle,
+      spaceId: resolvedSpaceId,
+      root: normRoot,
+      path: relPath,
+      absPath,
+      displayPath,
+      on: resolvedOn ?? null,
+      line: resolvedLine,
+      serviceId: resolvedServiceId,
+      serviceName: resolvedServiceName,
+    },
+  });
+  return { reused: false, viewerId, absPath };
 }
 
 const BASE_BRANCHES = new Set(["main", "master", "development", "develop", "ci", "HEAD", ""]);
@@ -103,7 +413,14 @@ function findLayoutNode(node, id) {
 
 function findFilesBlock(node) {
   if (!node || typeof node !== "object") return null;
-  if (node.content?.mod === "files-search" && !node.content?.props?.overlay && node.content?.props?.role !== "indexer") return node;
+  if (
+    node.content?.mod === "files-search" &&
+    !node.content?.props?.overlay &&
+    node.content?.props?.role !== "indexer" &&
+    node.content?.props?.role !== "viewer"
+  ) {
+    return node;
+  }
   for (const child of node.children ?? []) {
     const found = findFilesBlock(child);
     if (found) return found;
@@ -603,10 +920,13 @@ export default class FilesSearch extends View {
     const roleProps = props() || {};
     this.isOverlay = Boolean(roleProps.overlay);
     this.isIndexer = !this.isOverlay && roleProps.role === "indexer";
+    this.isViewer = !this.isOverlay && !this.isIndexer && roleProps.role === "viewer";
     if (this.isOverlay) {
       this.initOverlay(cx);
     } else if (this.isIndexer) {
       this.initIndexer(cx);
+    } else if (this.isViewer) {
+      this.initViewer(cx);
     } else {
       this.initPanel(cx);
     }
@@ -731,6 +1051,7 @@ export default class FilesSearch extends View {
 
   syncIndexer(cx) {
     if (this._indexerClosed) return;
+    syncSpaceAgentTabs();
     const { cwd, on } = location();
     const isWindows = !on && window()?.platform === "windows";
     const agentOpen = Boolean(cwd && hasOpenAgentInSpace());
@@ -776,6 +1097,8 @@ export default class FilesSearch extends View {
     this.prewarmSeq = 0;
     this.treeScrollHandle = VirtualListScrollHandle.new();
     this.pendingScrollPath = null;
+    this.selectedFile = null;
+    this.lastSyncedViewerTabId = null;
     this.marks = {};
     this.dirCounts = {};
     this.dirMarks = {};
@@ -823,6 +1146,7 @@ export default class FilesSearch extends View {
 
   syncPanelFromRender(cx) {
     let dirty = false;
+    syncSpaceAgentTabs();
     if (
       key() !== this.context?.key ||
       (isFilesVisible() && (!this.entries.has("") || Boolean(this.error) || this.needsFolderReloadOnShow || this.dirtyFolders.size > 0))
@@ -877,9 +1201,24 @@ export default class FilesSearch extends View {
             }
           }
         }
-        this.openFromSearch(filePath, cx, selectReq.kind || "file");
+        this.openFromSearch(filePath, cx, selectReq.kind || "reveal");
         return;
       }
+    }
+
+    const activeSpace = (spaces() || []).find(s => s.active) || null;
+    const activeTab = (activeSpace?.tabs || []).find(t => t.active) || null;
+    const openFileTabs = asPlainObject(shared("mesh.openFileTabs"));
+    const activeViewerEntry = activeTab?.id ? openFileTabs[activeTab.id] : null;
+    if (activeViewerEntry && activeViewerEntry.tabId !== this.lastSyncedViewerTabId) {
+      this.lastSyncedViewerTabId = activeViewerEntry.tabId;
+      const nextSelected = resolveViewerFilePath(activeViewerEntry.root || this.root, activeViewerEntry.absPath || activeViewerEntry.path);
+      if (nextSelected && nextSelected !== this.selectedFile) {
+        this.selectedFile = nextSelected;
+        dirty = true;
+      }
+    } else if (!activeViewerEntry && this.lastSyncedViewerTabId) {
+      this.lastSyncedViewerTabId = null;
     }
 
     if (dirty) cx.notify();
@@ -1110,16 +1449,16 @@ export default class FilesSearch extends View {
 
   schedulePrewarm(cx, context = this.context) {
     if (!cx?.timer || !cx?.spawn || !context || !this.current(context)) return;
-    if (context.on || !isFilesVisible() || this.file) return;
+    if (context.on || !isFilesVisible()) return;
     this.prewarmTask?.cancel();
     const token = ++this.prewarmSeq;
     this.prewarmTask = cx.timer.after(40, cx => {
       this.prewarmTask = null;
-      if (token !== this.prewarmSeq || !this.current(context) || !isFilesVisible() || this.file) return;
+      if (token !== this.prewarmSeq || !this.current(context) || !isFilesVisible()) return;
       const filterRel = this.activeServiceRelPath();
       const targets = this.collectPrewarmTargets(filterRel);
       if (!targets.length) return;
-      const isCancelled = () => token !== this.prewarmSeq || !this.current(context) || !isFilesVisible() || Boolean(this.file);
+      const isCancelled = () => token !== this.prewarmSeq || !this.current(context) || !isFilesVisible();
       cx.spawn(async () => {
         await runInBatches(targets, FOLDER_PREWARM_CONCURRENCY, async targetPath => {
           if (isCancelled() || this.entries.has(targetPath)) return;
@@ -1153,10 +1492,12 @@ export default class FilesSearch extends View {
   }
 
   refresh(cx, opts = {}) {
-    const { cwd, on } = location(), next = key();
+    syncSpaceAgentTabs();
+    const loc = location();
+    const { cwd, on } = loc, next = JSON.stringify(loc);
     const isWindows = !on && window()?.platform === "windows";
     if (next !== this.context?.key) {
-      if (this.context) this.saved.set(this.context.key, { folders: this.folders, file: this.file, serviceFilter: this.serviceFilter });
+      if (this.context) this.saved.set(this.context.key, { folders: this.folders, selectedFile: this.selectedFile, serviceFilter: this.serviceFilter });
       const saved = this.saved.get(next);
       this.context = { key: next, cwd, on, isWindows };
       this.root = cwd;
@@ -1171,6 +1512,7 @@ export default class FilesSearch extends View {
       this.prewarmTask = null;
       this.prewarmSeq = (this.prewarmSeq || 0) + 1;
       this.pendingScrollPath = null;
+      this.selectedFile = saved?.selectedFile || null;
       this.marks = {};
       this.dirCounts = {};
       this.dirMarks = {};
@@ -1179,7 +1521,6 @@ export default class FilesSearch extends View {
       this.services = [];
       this.repoRoots = new Set();
       this.serviceFilter = saved?.serviceFilter || "all";
-      this.show(null);
       this.watched = null;
       this.error = null;
       this.limited = false;
@@ -1203,7 +1544,6 @@ export default class FilesSearch extends View {
         this.panelWatchKey = null;
         this.panelWatchToken = null;
       }
-      if (saved?.file) this.show(saved.file, cx);
     } else if (this.context) {
       this.context.isWindows = isWindows;
     }
@@ -1224,7 +1564,7 @@ export default class FilesSearch extends View {
     this.limited = false;
     const activeSpace = spaces().find(s => s.active);
     const activeTab = (activeSpace?.tabs || []).find(t => t.active) || null;
-    const activeTabId = activeTab?.id || null;
+    const activeTabId = loc.tabId || activeTab?.id || null;
     const activeTabIds = new Set((activeSpace?.tabs || []).map(t => t.id));
     const allPanesList = panes() || [];
     const extraCwds = Array.from(
@@ -1593,55 +1933,56 @@ export default class FilesSearch extends View {
     });
   }
 
-  show(path, cx) {
-    this.code?.release();
-    this.code = null;
-    this.file = path;
-    this.fileError = null;
-    if (!path || !cx) return;
-    const context = this.context, root = this.root, on = this.on;
-    const isAbs = path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path);
-    const targetPath = isAbs ? path : `${root}/${path}`;
-    cx.spawn(async cx => {
-      try {
-        const text = await readTextFile(targetPath, { on });
-        if (this.file !== path || !this.current(context)) return;
-        if (text === null) { this.fileError = "This file is no longer available"; return; }
-        if (text.includes("\0")) { this.fileError = "Binary file · no text preview"; return; }
-        const t = theme();
-        this.code = EditorState.new({
-          language: resolveEditorLanguage(path),
-          readonly: true,
-          value: text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text,
-          font_family: settings().font_family,
-          font_size: 12,
-          syntax: getEditorSyntaxConfig(t),
-        });
-      } catch {
-        if (this.file === path && this.current(context)) this.fileError = "Cannot preview this file (binary, too large, or unreadable)";
-      } finally {
-        cx.notify();
-      }
-    });
-  }
-
-  // Open a file or directory from external/search selection and expand its path in the tree
-  openFromSearch(path, cx, kind = "file") {
+  // Expand a file or directory from external/search selection inside the docked #files tree without opening an inline editor
+  openFromSearch(path, cx, kind = "reveal") {
     if (!path) return;
-    const segments = path.split("/").filter(Boolean);
-    const expandLimit = kind === "dir" ? segments.length : Math.max(0, segments.length - 1);
-    let accum = "";
-    for (let i = 0; i < expandLimit; i++) {
-      accum = accum ? `${accum}/${segments[i]}` : segments[i];
-      this.folders.add(accum);
-      this.loadSingleFolderPending(accum, cx);
-    }
+    const visibleNow = isFilesVisible();
+    const isWin = Boolean(this.context?.isWindows);
+
     if (kind === "dir") {
+      const segments = path.split("/").filter(Boolean);
+      let accum = "";
+      for (let i = 0; i < segments.length; i++) {
+        accum = accum ? `${accum}/${segments[i]}` : segments[i];
+        this.folders.add(accum);
+        if (visibleNow) {
+          this.loadSingleFolderPending(accum, cx);
+        } else {
+          this.needsFolderReloadOnShow = true;
+        }
+      }
       this.pendingScrollPath = path;
-      this.schedulePrewarm(cx, this.context);
-      this.show(null);
-    } else {
-      this.show(path, cx);
+      this.selectedFile = null;
+      if (visibleNow) this.schedulePrewarm(cx, this.context);
+      cx.notify();
+      return;
+    }
+
+    const resolvedAbs = resolveViewerFilePath(this.root, path);
+    this.selectedFile = resolvedAbs || path;
+
+    const normPanelRoot = normPathStr(this.root);
+    let relPath = normPathStr(path).replace(/^\.\//, "");
+    if (normPanelRoot && resolvedAbs && isSameOrChildPath(resolvedAbs, normPanelRoot, isWin)) {
+      relPath = normPanelRoot === "/" ? resolvedAbs.slice(1) : resolvedAbs.slice(normPanelRoot.length + 1);
+    } else if (resolvedAbs && (resolvedAbs.startsWith("/") || /^[A-Za-z]:\//.test(resolvedAbs))) {
+      relPath = "";
+    }
+
+    if (relPath) {
+      const segments = relPath.split("/").filter(Boolean);
+      const expandLimit = Math.max(0, segments.length - 1);
+      let accum = "";
+      for (let i = 0; i < expandLimit; i++) {
+        accum = accum ? `${accum}/${segments[i]}` : segments[i];
+        this.folders.add(accum);
+        if (visibleNow) {
+          this.loadSingleFolderPending(accum, cx);
+        } else {
+          this.needsFolderReloadOnShow = true;
+        }
+      }
+      this.pendingScrollPath = relPath;
     }
     cx.notify();
   }
@@ -1655,8 +1996,9 @@ export default class FilesSearch extends View {
       frame: "none",
       props: {
         role: "search",
+        spaceId: currentLoc.space || null,
         root: this.root || currentLoc.cwd,
-        on: this.on || currentLoc.on,
+        on: this.on ?? currentLoc.on ?? null,
       },
     });
   }
@@ -1782,15 +2124,40 @@ export default class FilesSearch extends View {
     const row = this.visibleRowByKey?.get(itemKey);
     if (!row) return;
     if (row.kind === "sibling" || row.kind === "file") {
-      this.show(row.kind === "sibling" ? row.fullPath : row.path, cx);
+      const clickedPath = row.kind === "sibling" ? row.fullPath : row.path;
+      const isWin = Boolean(this.context?.isWindows);
+      const resolvedAbs = resolveViewerFilePath(this.root, clickedPath);
+      this.selectedFile = resolvedAbs || clickedPath;
+      const activeSpaceId = this.context?.space || spaces().find(s => s.active)?.id || null;
+      const selectedService = (this.serviceFilter && this.serviceFilter !== "all")
+        ? this.services?.find(s => s.id === this.serviceFilter)
+        : null;
+      const svc = selectedService?.isSibling && row.kind === "sibling"
+        ? { serviceId: selectedService.id || null, serviceName: selectedService.name || null }
+        : resolveServiceForFile(this.root, clickedPath, resolvedAbs, isWin, this.services);
+
+      openFileInTab({
+        spaceId: activeSpaceId,
+        root: this.root,
+        path: clickedPath,
+        on: this.on ?? null,
+        line: null,
+        serviceId: svc.serviceId,
+        serviceName: svc.serviceName,
+        localServices: this.services,
+      });
+      cx.notify();
       return;
     }
     this.toggle(row.path, cx);
   }
 
-  renderTreeRow(row, t) {
+  renderTreeRow(row, t, selectedKey = "") {
+    const isWin = Boolean(this.context?.isWindows);
     if (row.kind === "sibling") {
       const siblingIcon = resolveFileIcon(row.path || row.name, t);
+      const rowKey = selectedKey ? buildFileViewerKey(this.root, row.fullPath, isWin) : "";
+      const isSelected = Boolean(selectedKey && rowKey && rowKey === selectedKey);
       return h_flex()
         .id(row.key)
         .h(28)
@@ -1802,7 +2169,8 @@ export default class FilesSearch extends View {
         .items_center()
         .rounded(7)
         .cursor_pointer()
-        .hover(s => s.bg(t.hover))
+        .when(isSelected, el => el.bg(t.selected))
+        .hover(s => s.bg(isSelected ? t.selected : t.hover))
         .child(div().w(12).flex_none())
         .child(svg(siblingIcon.path).size(14).flex_none().text_color(siblingIcon.color))
         .child(div().flex_1().min_w(0).truncate().child(row.name))
@@ -1811,6 +2179,8 @@ export default class FilesSearch extends View {
 
     const { path, depth, entry, open, isLoadingFolder, isRepo, dirCount, mark } = row;
     const entryIcon = entry.dir ? null : resolveFileIcon(path || entry.name, t);
+    const rowKey = (!entry.dir && selectedKey) ? buildFileViewerKey(this.root, path, isWin) : "";
+    const isSelected = Boolean(!entry.dir && selectedKey && rowKey && rowKey === selectedKey);
     return h_flex()
       .id(`file-${path}`)
       .h(28)
@@ -1822,7 +2192,8 @@ export default class FilesSearch extends View {
       .items_center()
       .rounded(7)
       .cursor_pointer()
-      .hover(s => s.bg(t.hover))
+      .when(isSelected, el => el.bg(t.selected))
+      .hover(s => s.bg(isSelected ? t.selected : t.hover))
       .child(entry.dir ? svg(`mods/files-search/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
       .child(svg(entry.dir ? "mods/files-search/folder.svg" : entryIcon.path).size(14).flex_none().text_color(entry.dir ? t.muted : entryIcon.color))
       .child(
@@ -1893,16 +2264,48 @@ export default class FilesSearch extends View {
     const selectReq = shared("files-search.select");
     const hasSelectReq = Boolean(selectReq && selectReq.ts && selectReq.ts > (this.lastSelectedTs || 0));
 
+    const activeSpace = (spaces() || []).find(s => s.active) || null;
+    const activeTab = (activeSpace?.tabs || []).find(t => t.active) || null;
+    const activeTabHasTerminal = Boolean(
+      activeTab?.id && (panes() || []).some(p => p.tab === activeTab.id && Boolean(p.terminal))
+    );
+    const needsAgentAnchorSync = Boolean(
+      activeSpace?.id && activeTab?.id && activeTabHasTerminal &&
+      asPlainObject(shared("mesh.spaceAgentTabs"))[activeSpace.id] !== activeTab.id
+    );
+    const openFileTabs = asPlainObject(shared("mesh.openFileTabs"));
+    const activeViewerEntry = activeTab?.id ? openFileTabs[activeTab.id] : null;
+    const needsViewerSelectionSync = Boolean(
+      (activeViewerEntry && activeViewerEntry.tabId !== this.lastSyncedViewerTabId) ||
+      (!activeViewerEntry && this.lastSyncedViewerTabId)
+    );
+
     if (
       key() !== this.context?.key ||
       (becameVisible && (!this.entries.has("") || Boolean(this.error) || this.needsFolderReloadOnShow || this.dirtyFolders.size > 0)) ||
       hasActiveReq ||
-      hasSelectReq
+      hasSelectReq ||
+      needsAgentAnchorSync ||
+      needsViewerSelectionSync
     ) {
       this.schedulePanelSync(cx);
     }
 
     const t = theme();
+    const isWin = Boolean(this.context?.isWindows);
+    const selectedKey = this.selectedFile ? buildFileViewerKey(this.root, this.selectedFile, isWin) : "";
+    const { rows: visibleRows, hitVisibleCap, byKey } = this.collectTreeRows();
+    this.visibleRowByKey = byKey;
+    const isLimited = hitVisibleCap || this.hasTruncatedOpenFolder();
+    this.limited = isLimited;
+    if (this.pendingScrollPath && this.treeScrollHandle) {
+      const targetIdx = visibleRows.findIndex(r => r.path === this.pendingScrollPath);
+      if (targetIdx >= 0) {
+        this.treeScrollHandle.scroll_to_item(targetIdx, "center");
+        this.pendingScrollPath = null;
+      }
+    }
+
     return v_flex()
       .id("files")
       .track_focus(this.panelHandle)
@@ -1944,15 +2347,12 @@ export default class FilesSearch extends View {
           .items_center()
           .border_b(1)
           .border_color(t.border)
-          .when(Boolean(this.file), el =>
-            el.child(this.button("files-back", div().child("←"), (_e, cx) => { this.show(null); cx.notify(); }))
-          )
           .child(div().font_semibold().child("Files"))
-          .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(this.file ?? (this.root?.split(/[\\/]/).filter(Boolean).pop() || this.root || "")))
+          .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(this.root?.split(/[\\/]/).filter(Boolean).pop() || this.root || ""))
           .child(this.button("files-search-btn", svg("mods/files-search/search.svg").size(14), () => this.openSearchOverlay()))
       )
       // Compact horizontal scrollable service quick-filter bar
-      .when(Boolean((this.services?.length > 1 || (this.serviceFilter && this.serviceFilter !== "all")) && !this.file), el =>
+      .when(Boolean(this.services?.length > 1 || (this.serviceFilter && this.serviceFilter !== "all")), el =>
         el.child(
           h_flex()
             .h(30)
@@ -2022,79 +2422,63 @@ export default class FilesSearch extends View {
             )
         )
       )
-      .when(!this.file, el => {
-        const { rows: visibleRows, hitVisibleCap, byKey } = this.collectTreeRows();
-        this.visibleRowByKey = byKey;
-        const isLimited = hitVisibleCap || this.hasTruncatedOpenFolder();
-        this.limited = isLimited;
-        if (this.pendingScrollPath && this.treeScrollHandle) {
-          const targetIdx = visibleRows.findIndex(r => r.path === this.pendingScrollPath);
-          if (targetIdx >= 0) {
-            this.treeScrollHandle.scroll_to_item(targetIdx, "center");
-            this.pendingScrollPath = null;
-          }
-        }
-        return el.child(
-          v_flex()
-            .flex_1()
-            .min_h(0)
-            .w_full()
-            .min_w(0)
-            .px(6)
-            .py(4)
-            .when(visibleRows.length > 0, treeWrap =>
-              treeWrap.child(
-                div()
-                  .flex_1()
-                  .min_h(0)
-                  .w_full()
-                  .min_w(0)
-                  .relative()
-                  .child(
-                    v_virtual_list(
-                      "files-tree",
-                      visibleRows.length,
-                      28,
-                      index => visibleRows[index].key,
-                      range => {
-                        const items = [];
-                        for (let i = range.start; i < range.end; i++) {
-                          items.push(this.renderTreeRow(visibleRows[i], t));
-                        }
-                        return items;
-                      },
-                    )
-                      .size_full()
-                      .track_scroll(this.treeScrollHandle)
-                      .on_item_click((itemKey, cx) => this.handleTreeItemClick(itemKey, cx))
+      .child(
+        v_flex()
+          .flex_1()
+          .min_h(0)
+          .w_full()
+          .min_w(0)
+          .px(6)
+          .py(4)
+          .when(visibleRows.length > 0, treeWrap =>
+            treeWrap.child(
+              div()
+                .flex_1()
+                .min_h(0)
+                .w_full()
+                .min_w(0)
+                .relative()
+                .child(
+                  v_virtual_list(
+                    "files-tree",
+                    visibleRows.length,
+                    28,
+                    index => visibleRows[index].key,
+                    range => {
+                      const items = [];
+                      for (let i = range.start; i < range.end; i++) {
+                        items.push(this.renderTreeRow(visibleRows[i], t, selectedKey));
+                      }
+                      return items;
+                    },
                   )
-                  .child(Scrollbar.vertical("files-tree").absolute().inset_0())
-              )
+                    .size_full()
+                    .track_scroll(this.treeScrollHandle)
+                    .on_item_click((itemKey, cx) => this.handleTreeItemClick(itemKey, cx))
+                )
+                .child(Scrollbar.vertical("files-tree").absolute().inset_0())
             )
-            .when(Boolean(this.error) || visibleRows.length === 0, emptyWrap =>
-              emptyWrap.child(
-                div()
-                  .p(8)
-                  .flex_none()
-                  .text_size(12)
-                  .text_color(t.dim)
-                  .child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))
-              )
+          )
+          .when(Boolean(this.error) || visibleRows.length === 0, emptyWrap =>
+            emptyWrap.child(
+              div()
+                .p(8)
+                .flex_none()
+                .text_size(12)
+                .text_color(t.dim)
+                .child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))
             )
-            .when(isLimited, limWrap =>
-              limWrap.child(
-                div()
-                  .p(8)
-                  .flex_none()
-                  .text_size(11)
-                  .text_color(t.dim)
-                  .child("File list limited to 500 entries per folder and 5,000 total")
-              )
+          )
+          .when(isLimited, limWrap =>
+            limWrap.child(
+              div()
+                .p(8)
+                .flex_none()
+                .text_size(11)
+                .text_color(t.dim)
+                .child("File list limited to 500 entries per folder and 5,000 total")
             )
-        );
-      })
-      .when(Boolean(this.file), el =>
-        el.child(this.code ? Editor.new(this.code).flex_1().min_h(0) : div().p(12).text_color(t.dim).child(this.fileError || "Loading file…"))
+          )
       );
   }
 
@@ -2103,8 +2487,11 @@ export default class FilesSearch extends View {
   // ==========================================
   initOverlay(cx) {
     const p = props();
-    this.searchRoot = p?.root || shared("mesh.services")?.workspaceRoot || location().cwd;
-    this.searchOn = p?.on || location().on;
+    syncSpaceAgentTabs();
+    const loc = location();
+    this.searchSpaceId = p?.spaceId || loc.space || spaces().find(s => s.active)?.id || null;
+    this.searchRoot = p?.root || loc.cwd || shared("mesh.services")?.workspaceRoot;
+    this.searchOn = p?.on ?? loc.on ?? null;
     this.searchIsWindows = !this.searchOn && window()?.platform === "windows";
     this._overlayClosed = false;
     this.tab = "all"; // "all" | "files" | "text"
@@ -2236,8 +2623,7 @@ export default class FilesSearch extends View {
     this.treeScrollHandle = null;
     try { this.input?.release(); } catch {}
     this.input = null;
-    this.code?.release();
-    this.code = null;
+    this.closeViewer();
   }
 
   closeOverlay() {
@@ -2298,17 +2684,42 @@ export default class FilesSearch extends View {
 
   selectResult(item, cx) {
     if (!item) return;
+    if (item.kind === "dir") {
+      setShared("files-search.select", {
+        root: this.searchRoot,
+        path: item.path,
+        kind: "dir",
+        line: null,
+        ts: Date.now(),
+      });
+      if (!isFilesVisible()) {
+        run("layout.select", { stack: "panel-body", child: "files" });
+        run("layout.show", { id: "panel" });
+      }
+      this.closeOverlay();
+      cx.notify();
+      return;
+    }
+
+    const line = item.line ? Number(item.line) : null;
+    const absPath = resolveViewerFilePath(this.searchRoot, item.path);
+    const svc = resolveServiceForFile(this.searchRoot, item.path, absPath, this.searchIsWindows);
+    openFileInTab({
+      spaceId: this.searchSpaceId || spaces().find(s => s.active)?.id || null,
+      root: this.searchRoot,
+      path: item.path,
+      on: this.searchOn ?? null,
+      line,
+      serviceId: svc.serviceId,
+      serviceName: svc.serviceName,
+    });
     setShared("files-search.select", {
       root: this.searchRoot,
       path: item.path,
-      kind: item.kind || "file",
-      line: item.line || null,
+      kind: "reveal",
+      line,
       ts: Date.now(),
     });
-    if (!isFilesVisible()) {
-      run("layout.select", { stack: "panel-body", child: "files" });
-      run("layout.show", { id: "panel" });
-    }
     this.closeOverlay();
     cx.notify();
   }
@@ -2988,14 +3399,23 @@ export default class FilesSearch extends View {
   }
 
   renderSyntaxLine(t, text, ext, query, isTarget) {
-    if (!text) return div().child("\u00a0");
-    if (text.length > 600) {
-      return this.renderHighlightedCodeLine(t, text.slice(0, 600) + "…", query);
+    const fontFamily = settings()?.font_family || "monospace";
+    if (!text) {
+      return div().flex_none().whitespace_nowrap().text_size(11.5).font_family(fontFamily).child("\u00a0");
     }
-    const clean = text.indexOf("\t") !== -1 ? text.replace(/\t/g, "    ") : text;
-    const tokens = tokenizeCodeLine(clean, ext);
+    const clean = expandCodeTabs(text);
+    const displayText = clean.length > 4000 ? clean.slice(0, 4000) + "… (line truncated)" : clean;
+    const tokens = tokenizeCodeLine(displayText, ext);
     if (!tokens) {
-      return query ? this.renderHighlightedCodeLine(t, clean, query) : div().child(clean ? clean.replace(/ /g, "\u00a0") : "\u00a0");
+      return query
+        ? this.renderHighlightedCodeLine(t, displayText, query)
+        : div()
+            .flex_none()
+            .whitespace_nowrap()
+            .text_size(11.5)
+            .font_family(fontFamily)
+            .text_color(t.foreground)
+            .child(displayText ? displayText.replace(/ /g, "\u00a0") : "\u00a0");
     }
 
     const spans = [];
@@ -3028,13 +3448,19 @@ export default class FilesSearch extends View {
     }
 
     if (spans.length === 0) {
-      return div().child(clean ? clean.replace(/ /g, "\u00a0") : "\u00a0");
+      return div()
+        .flex_none()
+        .whitespace_nowrap()
+        .text_size(11.5)
+        .font_family(fontFamily)
+        .child(displayText ? displayText.replace(/ /g, "\u00a0") : "\u00a0");
     }
 
-    const fontFamily = settings()?.font_family || "monospace";
-    const row = h_flex().items_center();
+    const row = h_flex().flex_none().whitespace_nowrap().items_center();
     spans.forEach((s) => {
       const el = div()
+        .flex_none()
+        .whitespace_nowrap()
         .text_size(11.5)
         .font_family(fontFamily)
         .text_color(s.color)
@@ -3047,22 +3473,53 @@ export default class FilesSearch extends View {
   }
 
   renderHighlightedCodeLine(t, text, query) {
-    if (!text || !query) return div().child(text ? text.replace(/\t/g, "    ").replace(/ /g, "\u00a0") : "\u00a0");
-    const clean = text.replace(/\t/g, "    ");
-    const lowerText = clean.toLowerCase();
+    const fontFamily = settings()?.font_family || "monospace";
+    const clean = expandCodeTabs(text);
+    const displayText = clean.length > 4000 ? clean.slice(0, 4000) + "… (line truncated)" : clean;
+    if (!displayText || !query) {
+      return div()
+        .flex_none()
+        .whitespace_nowrap()
+        .text_size(11.5)
+        .font_family(fontFamily)
+        .text_color(t.foreground)
+        .child(displayText ? displayText.replace(/ /g, "\u00a0") : "\u00a0");
+    }
+    const lowerText = displayText.toLowerCase();
     const lowerQ = query.toLowerCase();
     const idx = lowerText.indexOf(lowerQ);
     if (idx < 0) {
-      return div().child(clean ? clean.replace(/ /g, "\u00a0") : "\u00a0");
+      return div()
+        .flex_none()
+        .whitespace_nowrap()
+        .text_size(11.5)
+        .font_family(fontFamily)
+        .text_color(t.foreground)
+        .child(displayText ? displayText.replace(/ /g, "\u00a0") : "\u00a0");
     }
-    const before = clean.slice(0, idx);
-    const match = clean.slice(idx, idx + query.length);
-    const after = clean.slice(idx + query.length);
+    const before = displayText.slice(0, idx);
+    const match = displayText.slice(idx, idx + query.length);
+    const after = displayText.slice(idx + query.length);
 
     return h_flex()
-      .child(div().child(before.replace(/ /g, "\u00a0")))
+      .flex_none()
+      .whitespace_nowrap()
+      .items_center()
       .child(
         div()
+          .flex_none()
+          .whitespace_nowrap()
+          .text_size(11.5)
+          .font_family(fontFamily)
+          .text_color(t.foreground)
+          .child(before.replace(/ /g, "\u00a0"))
+      )
+      .child(
+        div()
+          .flex_none()
+          .whitespace_nowrap()
+          .text_size(11.5)
+          .font_family(fontFamily)
           .bg(t.accent)
           .text_color(t.background)
           .font_semibold()
@@ -3070,7 +3527,15 @@ export default class FilesSearch extends View {
           .px(2)
           .child(match.replace(/ /g, "\u00a0"))
       )
-      .child(div().child(after.replace(/ /g, "\u00a0")));
+      .child(
+        div()
+          .flex_none()
+          .whitespace_nowrap()
+          .text_size(11.5)
+          .font_family(fontFamily)
+          .text_color(t.foreground)
+          .child(after.replace(/ /g, "\u00a0"))
+      );
   }
 
   renderPreviewPane(t, item, cx, listH = LIST_H, previewW = 520) {
@@ -3095,7 +3560,7 @@ export default class FilesSearch extends View {
     const ext = getSyntaxExt(item.path);
 
     const LINE_H = 21;
-    const VISIBLE_ROWS = Math.max(5, Math.floor((listH + 12) / LINE_H));
+    const VISIBLE_ROWS = Math.max(5, Math.floor((listH - 6) / LINE_H));
 
     if (isDirItem) {
       const dirTotal = this.previewDirEntries.length;
@@ -3196,6 +3661,11 @@ export default class FilesSearch extends View {
         );
     }
 
+    const previewContentW = computeCodeContentWidth(this.previewLines, {
+      minWidth: Math.max(200, previewW - 2),
+      charPx: 7.6,
+      gutterPx: 88,
+    });
     const maxScroll = Math.max(0, this.previewLines.length - VISIBLE_ROWS);
     this.previewScroll = Math.max(0, Math.min(this.previewScroll, maxScroll));
 
@@ -3210,10 +3680,12 @@ export default class FilesSearch extends View {
 
       visibleLines.push(
         h_flex()
+          .w_full()
           .h(LINE_H)
           .flex_none()
           .items_center()
-          .px(4)
+          .pl(4)
+          .pr(20)
           .gap(8)
           .cursor_pointer()
           .hover(s => s.bg(t.hover))
@@ -3232,12 +3704,11 @@ export default class FilesSearch extends View {
               .when(isTarget, el => el.font_semibold())
               .child(String(lineNum))
           )
-          // Line Content with Syntax Highlighting
+          // Line Content with Syntax Highlighting (untruncated for horizontal scrolling)
           .child(
             div()
-              .flex_1()
-              .min_w(0)
-              .truncate()
+              .flex_none()
+              .whitespace_nowrap()
               .child(this.renderSyntaxLine(t, lineContent, ext, isTarget ? item.matchedQuery : null, isTarget))
           )
       );
@@ -3340,20 +3811,36 @@ export default class FilesSearch extends View {
           )
           .when(this.previewLines.length > 0, el =>
             el
-              .py(4)
               .on_scroll_wheel((e, cx) => {
-                const delta = e.delta.y > 0 ? -3 : 3;
-                this.previewScroll = Math.max(0, this.previewScroll + delta);
-                if (this.previewHasMore && !this.previewLoadingMore) {
-                  if (this.previewScroll + VISIBLE_ROWS >= this.previewLines.length - 15) {
-                    this.loadNextPreviewChunk(cx);
+                const dx = Math.abs(e.delta?.x || 0);
+                const dy = Math.abs(e.delta?.y || 0);
+                if (dy > 0 && dy >= dx && !e.modifiers?.shift) {
+                  const delta = e.delta.y > 0 ? -3 : 3;
+                  this.previewScroll = Math.max(0, this.previewScroll + delta);
+                  if (this.previewHasMore && !this.previewLoadingMore) {
+                    if (this.previewScroll + VISIBLE_ROWS >= this.previewLines.length - 15) {
+                      this.loadNextPreviewChunk(cx);
+                    }
                   }
+                  const max = Math.max(0, this.previewLines.length - VISIBLE_ROWS);
+                  this.previewScroll = Math.min(this.previewScroll, max);
+                  cx.notify();
                 }
-                const max = Math.max(0, this.previewLines.length - VISIBLE_ROWS);
-                this.previewScroll = Math.min(this.previewScroll, max);
-                cx.notify();
               })
-              .children(visibleLines)
+              .child(
+                div()
+                  .id("files-preview-x")
+                  .size_full()
+                  .overflow_x_scrollbar()
+                  .child(
+                    v_flex()
+                      .w_full()
+                      .min_w(previewContentW)
+                      .pt(4)
+                      .pb(12)
+                      .children(visibleLines)
+                  )
+              )
           )
           .when(!this.previewLoading && !this.previewError && this.previewLines.length === 0, el =>
             el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child("Empty file"))
@@ -3905,12 +4392,508 @@ export default class FilesSearch extends View {
     );
   }
 
+  // ==========================================
+  // FILE VIEWER TAB MODE (IDE Non-Terminal Tab)
+  // ==========================================
+  initViewer(cx) {
+    const p = asPlainObject(props());
+    this._viewerClosed = false;
+    this.viewerId = typeof p.viewerId === "string" && p.viewerId
+      ? p.viewerId
+      : `fv-inst-${Date.now().toString(36)}-${(++VIEWER_ID_SEQ).toString(36)}`;
+    this.viewerSpaceId = typeof p.spaceId === "string" && p.spaceId ? p.spaceId : null;
+    this.viewerRoot = normPathStr(p.root || "");
+    this.viewerPath = normPathStr(p.path || "");
+    this.viewerAbsPath = normPathStr(p.absPath || "");
+    this.viewerTargetPath = resolveViewerFilePath(this.viewerRoot, this.viewerAbsPath || this.viewerPath);
+    this.viewerDisplayPath = normPathStr(p.displayPath || "") || this.viewerPath || this.viewerTargetPath;
+    this.viewerOn = p.on ?? null;
+    this.viewerLine = p.line ? Number(p.line) : null;
+    this.viewerServiceId = p.serviceId || null;
+    this.viewerServiceName = p.serviceName || null;
+    this.viewerTabTitle = typeof p.tabTitle === "string" && p.tabTitle
+      ? p.tabTitle
+      : formatFileTabTitle(this.viewerTargetPath || this.viewerPath || "", this.viewerServiceName);
+
+    this.viewerCode = null;
+    this.viewerSyntaxSig = null;
+    this.viewerLoading = Boolean(this.viewerTargetPath);
+    this.viewerError = this.viewerTargetPath ? null : "No file path specified";
+    this.viewerTabId = null;
+    this.viewerSyncTask = null;
+    this.viewerClaimRetries = 0;
+    this.viewerLoadSeq = 0;
+    this.viewerSeenActiveState = false;
+    this.viewerWasActive = false;
+    this.viewerHasLoadedOnce = false;
+    this.viewerLastSyncedUpdatedAt = 0;
+
+    this.scheduleViewerSync(cx, 0);
+    if (this.viewerTargetPath) {
+      this.loadViewerFile(cx);
+    }
+  }
+
+  scheduleViewerSync(cx, delayMs = 0) {
+    if (this._viewerClosed || this.viewerSyncTask || !cx?.timer) return;
+    this.viewerSyncTask = cx.timer.after(delayMs, cx => {
+      this.viewerSyncTask = null;
+      this.syncViewerFromRender(cx);
+    });
+  }
+
+  syncViewerFromRender(cx) {
+    if (this._viewerClosed) return;
+    syncSpaceAgentTabs();
+
+    const allSpaces = spaces() || [];
+    const allPanes = panes() || [];
+    const allLiveTabIds = new Set();
+    for (const s of allSpaces) {
+      for (const t of s.tabs || []) {
+        if (t?.id) allLiveTabIds.add(t.id);
+      }
+    }
+    const filePaneTabIds = new Set(
+      allPanes.filter(p => p?.mod === "files-search" && p?.tab).map(p => p.tab)
+    );
+
+    const rawOpenTabs = asPlainObject(shared("mesh.openFileTabs"));
+    const { tabs: nextTabs, changed: prunedChanged } = pruneOpenFileTabs(rawOpenTabs, allLiveTabIds, filePaneTabIds);
+    let sharedChanged = prunedChanged;
+    let dirty = false;
+
+    if (this.viewerTabId && (!allLiveTabIds.has(this.viewerTabId) || !filePaneTabIds.has(this.viewerTabId))) {
+      if (ACTIVE_VIEWER_CLAIMS.get(this.viewerTabId) === this.viewerId) {
+        ACTIVE_VIEWER_CLAIMS.delete(this.viewerTabId);
+      }
+      this.viewerTabId = null;
+    }
+
+    if (!this.viewerTabId) {
+      const byViewerId = Object.values(nextTabs).find(
+        e => e?.viewerId === this.viewerId && allLiveTabIds.has(e.tabId) && filePaneTabIds.has(e.tabId)
+      );
+      if (byViewerId?.tabId) {
+        this.viewerTabId = byViewerId.tabId;
+      } else {
+        const preferredSpace = this.viewerSpaceId ? allSpaces.find(s => s.id === this.viewerSpaceId) : null;
+        const activeSpace = allSpaces.find(s => s.active) || null;
+        const searchOrder = [];
+        if (preferredSpace) searchOrder.push(preferredSpace);
+        if (activeSpace && activeSpace !== preferredSpace) searchOrder.push(activeSpace);
+        for (const s of allSpaces) {
+          if (s !== preferredSpace && s !== activeSpace) searchOrder.push(s);
+        }
+
+        const fTabId = focused()?.tab || null;
+        for (const s of searchOrder) {
+          const candidates = (s?.tabs || []).filter(t => {
+            if (!t?.id || !filePaneTabIds.has(t.id)) return false;
+            const claimedEntry = nextTabs[t.id];
+            if (claimedEntry?.viewerId && claimedEntry.viewerId !== this.viewerId) return false;
+            const memClaim = ACTIVE_VIEWER_CLAIMS.get(t.id);
+            if (memClaim && memClaim !== this.viewerId) return false;
+            return true;
+          });
+          if (!candidates.length) continue;
+          const expectedTitle = this.viewerTabTitle || "";
+          const picked = (expectedTitle ? candidates.find(t => t.name === expectedTitle && t.active) : null)
+            || (expectedTitle ? candidates.find(t => t.name === expectedTitle) : null)
+            || candidates.find(t => t.active && candidates.length === 1)
+            || candidates[0];
+          if (picked?.id) {
+            this.viewerTabId = picked.id;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!this.viewerTabId) {
+      if (sharedChanged) setShared("mesh.openFileTabs", nextTabs);
+      if (this.viewerClaimRetries < 12) {
+        this.viewerClaimRetries++;
+        this.scheduleViewerSync(cx, 35);
+      }
+      return;
+    }
+
+    this.viewerClaimRetries = 0;
+    ACTIVE_VIEWER_CLAIMS.set(this.viewerTabId, this.viewerId);
+    for (const [k, pending] of PENDING_VIEWER_OPENS) {
+      if (pending?.viewerId === this.viewerId) {
+        PENDING_VIEWER_OPENS.delete(k);
+      }
+    }
+
+    const ownerSpace = allSpaces.find(s => (s.tabs || []).some(t => t.id === this.viewerTabId)) || null;
+    const ownerSpaceId = ownerSpace?.id || this.viewerSpaceId || null;
+    if (ownerSpaceId && !this.viewerSpaceId) {
+      this.viewerSpaceId = ownerSpaceId;
+    }
+
+    const existingEntry = nextTabs[this.viewerTabId];
+    if (existingEntry && existingEntry.viewerId === this.viewerId) {
+      if (existingEntry.updatedAt && existingEntry.updatedAt > this.viewerLastSyncedUpdatedAt) {
+        this.viewerLastSyncedUpdatedAt = existingEntry.updatedAt;
+        const nextLine = existingEntry.line ? Number(existingEntry.line) : null;
+        if (nextLine !== (this.viewerLine || null)) {
+          this.viewerLine = nextLine;
+          dirty = true;
+        }
+      } else if (!this.viewerLastSyncedUpdatedAt) {
+        this.viewerLastSyncedUpdatedAt = existingEntry.updatedAt || Date.now();
+      }
+    }
+
+    const t = theme();
+    const resolvedIcon = resolveFileIcon(this.viewerTargetPath || this.viewerPath, t);
+    const iconPath = resolvedIcon.path;
+    const iconColor = resolvedIcon.color;
+    const updatedAt = this.viewerLastSyncedUpdatedAt || existingEntry?.updatedAt || Date.now();
+    if (!this.viewerLastSyncedUpdatedAt) this.viewerLastSyncedUpdatedAt = updatedAt;
+
+    const desiredEntry = {
+      tabId: this.viewerTabId,
+      spaceId: ownerSpaceId,
+      viewerId: this.viewerId,
+      root: this.viewerRoot,
+      path: this.viewerPath,
+      absPath: this.viewerTargetPath,
+      displayPath: this.viewerDisplayPath,
+      iconPath,
+      iconColor,
+      line: this.viewerLine || null,
+      serviceId: this.viewerServiceId || null,
+      serviceName: this.viewerServiceName || null,
+      updatedAt,
+    };
+
+    const needsRegister = !existingEntry ||
+      existingEntry.tabId !== desiredEntry.tabId ||
+      existingEntry.spaceId !== desiredEntry.spaceId ||
+      existingEntry.viewerId !== desiredEntry.viewerId ||
+      existingEntry.absPath !== desiredEntry.absPath ||
+      existingEntry.iconPath !== desiredEntry.iconPath ||
+      existingEntry.iconColor !== desiredEntry.iconColor ||
+      (existingEntry.line || null) !== desiredEntry.line ||
+      (existingEntry.serviceId || null) !== desiredEntry.serviceId ||
+      (existingEntry.serviceName || null) !== desiredEntry.serviceName;
+
+    if (needsRegister) {
+      nextTabs[this.viewerTabId] = desiredEntry;
+      sharedChanged = true;
+    }
+    if (sharedChanged) {
+      setShared("mesh.openFileTabs", nextTabs);
+    }
+
+    const syntaxCfg = getEditorSyntaxConfig(t);
+    const fontFamily = settings()?.font_family || "";
+    const nextSyntaxSig = `${JSON.stringify(syntaxCfg)}|${fontFamily}`;
+    if (this.viewerCode && this.viewerSyntaxSig && this.viewerSyntaxSig !== nextSyntaxSig && !this.viewerLoading && this.viewerTargetPath) {
+      const currentValue = this.viewerCode.value();
+      this.viewerCode.release();
+      this.viewerCode = EditorState.new({
+        language: resolveEditorLanguage(this.viewerTargetPath),
+        readonly: true,
+        soft_wrap: false,
+        line_numbers: true,
+        folding: true,
+        value: currentValue,
+        font_family: settings()?.font_family,
+        font_size: 12.5,
+        syntax: syntaxCfg,
+      });
+      this.viewerSyntaxSig = nextSyntaxSig;
+      dirty = true;
+    }
+
+    const isActiveNow = Boolean(ownerSpace?.active && (ownerSpace.tabs || []).some(tab => tab.id === this.viewerTabId && tab.active));
+    if (!this.viewerSeenActiveState) {
+      this.viewerSeenActiveState = true;
+      this.viewerWasActive = isActiveNow;
+    } else if (isActiveNow !== this.viewerWasActive) {
+      this.viewerWasActive = isActiveNow;
+      dirty = true;
+      if (isActiveNow && this.viewerHasLoadedOnce && this.viewerTargetPath) {
+        this.loadViewerFile(cx, { silent: true });
+      }
+    }
+
+    if (dirty) cx.notify();
+  }
+
+  loadViewerFile(cx, { silent = false, forceRecreate = false } = {}) {
+    if (this._viewerClosed || !this.viewerTargetPath) return;
+    const reqSeq = ++this.viewerLoadSeq;
+    const targetPath = this.viewerTargetPath;
+    const on = this.viewerOn ?? null;
+
+    if (!silent) {
+      this.viewerLoading = true;
+      this.viewerError = null;
+      cx.notify();
+    }
+
+    cx.spawn(async cx => {
+      try {
+        const text = await readTextFile(targetPath, { on });
+        if (this._viewerClosed || reqSeq !== this.viewerLoadSeq) return;
+        if (text === null) {
+          this.viewerCode?.release();
+          this.viewerCode = null;
+          this.viewerError = "This file is no longer available";
+          return;
+        }
+        if (text.includes("\0")) {
+          this.viewerCode?.release();
+          this.viewerCode = null;
+          this.viewerError = "Binary file · no text preview";
+          return;
+        }
+        const value = text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text;
+        const t = theme();
+        const syntaxCfg = getEditorSyntaxConfig(t);
+        const fontFamily = settings()?.font_family;
+        const syntaxSig = `${JSON.stringify(syntaxCfg)}|${fontFamily || ""}`;
+        this.viewerError = null;
+
+        if (!forceRecreate && this.viewerCode && this.viewerSyntaxSig === syntaxSig) {
+          if (this.viewerCode.value() !== value) {
+            this.viewerCode.set_value(value);
+          }
+        } else {
+          this.viewerCode?.release();
+          this.viewerCode = EditorState.new({
+            language: resolveEditorLanguage(targetPath),
+            readonly: true,
+            soft_wrap: false,
+            line_numbers: true,
+            folding: true,
+            value,
+            font_family: fontFamily,
+            font_size: 12.5,
+            syntax: syntaxCfg,
+          });
+          this.viewerSyntaxSig = syntaxSig;
+        }
+      } catch {
+        if (!this._viewerClosed && reqSeq === this.viewerLoadSeq) {
+          this.viewerCode?.release();
+          this.viewerCode = null;
+          this.viewerError = "Cannot open this file (binary, too large, or unreadable)";
+        }
+      } finally {
+        if (!this._viewerClosed && reqSeq === this.viewerLoadSeq) {
+          this.viewerLoading = false;
+          this.viewerHasLoadedOnce = true;
+          cx.notify();
+        }
+      }
+    });
+  }
+
+  closeViewer() {
+    this._viewerClosed = true;
+    this.viewerLoadSeq = (this.viewerLoadSeq || 0) + 1;
+    try { this.viewerSyncTask?.cancel(); } catch {}
+    this.viewerSyncTask = null;
+    try { this.viewerCode?.release(); } catch {}
+    this.viewerCode = null;
+    if (this.viewerTabId && ACTIVE_VIEWER_CLAIMS.get(this.viewerTabId) === this.viewerId) {
+      ACTIVE_VIEWER_CLAIMS.delete(this.viewerTabId);
+    }
+  }
+
+  renderViewer(cx) {
+    const t = theme();
+    const allSpaces = spaces() || [];
+    const activeSpace = allSpaces.find(s => s.active) || null;
+    const openTabs = asPlainObject(shared("mesh.openFileTabs"));
+    const sharedEntry = this.viewerTabId ? openTabs[this.viewerTabId] : null;
+    const isActiveNow = Boolean(
+      this.viewerTabId && activeSpace && (activeSpace.tabs || []).some(tab => tab.id === this.viewerTabId && tab.active)
+    );
+    const hasNewSharedUpdate = Boolean(
+      sharedEntry && sharedEntry.updatedAt && sharedEntry.updatedAt > this.viewerLastSyncedUpdatedAt
+    );
+    const currentSyntaxSig = `${JSON.stringify(getEditorSyntaxConfig(t))}|${settings()?.font_family || ""}`;
+    const needsSyntaxUpdate = Boolean(this.viewerCode && this.viewerSyntaxSig && this.viewerSyntaxSig !== currentSyntaxSig);
+
+    if (
+      !this.viewerTabId ||
+      !sharedEntry ||
+      hasNewSharedUpdate ||
+      needsSyntaxUpdate ||
+      (this.viewerSeenActiveState && isActiveNow !== this.viewerWasActive)
+    ) {
+      this.scheduleViewerSync(cx, 0);
+    }
+
+    const activeLine = (sharedEntry && hasNewSharedUpdate ? sharedEntry.line : null) ?? this.viewerLine;
+    const fileIcon = resolveFileIcon(this.viewerTargetPath || this.viewerPath || "file", t);
+    const normDisplay = normPathStr(this.viewerDisplayPath || this.viewerPath || this.viewerTargetPath || "");
+    const slashIdx = normDisplay.lastIndexOf("/");
+    const fileName = slashIdx >= 0 ? normDisplay.slice(slashIdx + 1) : (normDisplay || "Untitled");
+    const parentDir = slashIdx >= 0 ? normDisplay.slice(0, slashIdx) : "";
+
+    return v_flex()
+      .id("file-viewer")
+      .size_full()
+      .min_h(0)
+      .min_w(0)
+      .bg(t.background)
+      .text_color(t.foreground)
+      .text_size(13)
+      .child(
+        h_flex()
+          .h(40)
+          .flex_none()
+          .px(14)
+          .gap(8)
+          .items_center()
+          .border_b(1)
+          .border_color(t.border)
+          .child(svg(fileIcon.path).size(14).flex_none().text_color(fileIcon.color))
+          .when(Boolean(this.viewerServiceName), el =>
+            el.child(
+              div()
+                .flex_none()
+                .px(5)
+                .py(1)
+                .rounded(4)
+                .bg(t.raised)
+                .border_1()
+                .border_color(t.border)
+                .text_size(10)
+                .font_medium()
+                .text_color(t.accent)
+                .child(this.viewerServiceName)
+            )
+          )
+          .child(
+            h_flex()
+              .flex_1()
+              .min_w(0)
+              .overflow_hidden()
+              .gap(6)
+              .items_center()
+              .child(
+                div()
+                  .min_w(0)
+                  .when(!parentDir, el => el.flex_1())
+                  .truncate()
+                  .font_semibold()
+                  .text_size(12.5)
+                  .text_color(t.foreground)
+                  .child(fileName)
+              )
+              .when(Boolean(parentDir), el =>
+                el.child(
+                  div()
+                    .flex_1()
+                    .min_w(0)
+                    .truncate()
+                    .text_size(11.5)
+                    .text_color(t.dim)
+                    .child(parentDir)
+                )
+              )
+          )
+          .when(Boolean(activeLine), el =>
+            el.child(
+              div()
+                .flex_none()
+                .px(6)
+                .py(1)
+                .rounded(4)
+                .bg(t.selected)
+                .border_1()
+                .border_color(t.border)
+                .text_size(10.5)
+                .font_medium()
+                .text_color(t.ansi3 || t.accent || t.foreground)
+                .child(`Ln ${activeLine}`)
+            )
+          )
+          .child(
+            h_flex()
+              .id("viewer-reload")
+              .h(26)
+              .px(8)
+              .gap(4)
+              .flex_none()
+              .items_center()
+              .justify_center()
+              .rounded(6)
+              .cursor_pointer()
+              .border_1()
+              .border_color(t.border)
+              .bg(t.raised)
+              .text_size(11.5)
+              .text_color(t.muted)
+              .hover(s => s.bg(t.hover).text_color(t.foreground))
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .on_click((_e, cx) => this.loadViewerFile(cx, { silent: false, forceRecreate: true }))
+              .child(this.viewerLoading ? svg("mods/files-search/spinner.svg").size(11).spin(900) : div().child("↻"))
+              .child(div().child("Reload"))
+          )
+      )
+      .child(
+        this.viewerCode
+          ? Editor.new(this.viewerCode).flex_1().min_h(0).w_full().min_w(0)
+          : this.viewerError
+            ? v_flex()
+                .flex_1()
+                .min_h(0)
+                .w_full()
+                .p(20)
+                .gap(10)
+                .items_start()
+                .child(div().text_size(12.5).text_color(t.dim).child(this.viewerError))
+                .when(Boolean(this.viewerTargetPath), el =>
+                  el.child(
+                    div()
+                      .id("viewer-retry")
+                      .px(10)
+                      .py(5)
+                      .rounded(6)
+                      .border_1()
+                      .border_color(t.border)
+                      .bg(t.raised)
+                      .text_size(12)
+                      .text_color(t.foreground)
+                      .cursor_pointer()
+                      .hover(s => s.bg(t.hover))
+                      .on_click((_e, cx) => this.loadViewerFile(cx, { silent: false, forceRecreate: true }))
+                      .child("Retry")
+                  )
+                )
+            : h_flex()
+                .flex_1()
+                .min_h(0)
+                .w_full()
+                .p(20)
+                .gap(8)
+                .items_start()
+                .text_size(12.5)
+                .text_color(t.dim)
+                .child(svg("mods/files-search/spinner.svg").size(13).flex_none().spin(900))
+                .child("Loading file…")
+      );
+  }
+
   render(cx) {
     if (this.isOverlay) {
       return this.renderOverlay(cx);
     }
     if (this.isIndexer) {
       return this.renderIndexer(cx);
+    }
+    if (this.isViewer) {
+      return this.renderViewer(cx);
     }
     return this.renderPanel(cx);
   }

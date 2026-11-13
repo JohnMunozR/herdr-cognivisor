@@ -33,8 +33,8 @@ Mods run as QuickJS JavaScript modules utilizing `gpui-kit` and `gpui-base` decl
     - `layout.select --stack panel-body --child files|changes`.
   - Reactive shared state channels:
     - `files-search.select`, `files-search.customSize`
-    - `changes-review.focus`
-    - `mesh.services`, `mesh.activeService`, `mesh.flows`, `mesh.spacePanels`
+    - `changes-review.activeDiff`
+    - `mesh.services`, `mesh.activeService`, `mesh.flows`, `mesh.spacePanels`, `mesh.spaceAgentTabs`, `mesh.openFileTabs`, `mesh.reviewNotes`
 - **Allowed deps:**
   - `gpui-kit` primitives: `View`, `div`, `svg`, `image`, `list`.
   - `gpui-base` widgets: `v_flex`, `h_flex`, `Input`, `InputState`, `Textarea`, `TextareaState`, `Scrollbar`, `ScrollHandle`.
@@ -77,8 +77,9 @@ All mods communicate solely through Herdr's persisted reactive bus (`shared()` /
 
 ### Bus Channels Summary
 
-- **`files-search.select` & `files-search.customSize`**: File jump coordination `{ root, path, line, ts }` and overlay geometry persistence `{ w, h }`.
-- **`changes-review.focus`**: Diff viewer line navigation `{ path, line? }`.
+- **`files-search.select` & `files-search.customSize`**: Tree directory/file reveal coordination `{ root, kind: "dir" | "reveal", path, line, ts }` and overlay geometry persistence `{ w, h }`.
+- **`mesh.openFileTabs` & `mesh.spaceAgentTabs`**: Per-tab non-terminal File Viewer metadata `{ tabId, spaceId, viewerId, root, path, absPath, displayPath, iconPath, iconColor, line, ... }` (for deduplication and tab-bar file icons) plus per-space active terminal/agent tab anchors `Record<spaceId, tabId>`.
+- **`changes-review.activeDiff` & `mesh.reviewNotes`**: Per-space reusable Review tab state `{ spaceId, sourceTabId, openFileKey, openFile, files, services, viewMode, selectedCommit, requestSeq, focusLine, openCommentLine, ... }` and synchronized inline review notes keyed by `${spaceId}::${sourceTabId}`.
 - **`mesh.services` & `mesh.activeService`**: Discovered session-scoped microservice repository list (`{ tabId, workspaceRoot, on, services, candidates, sig, ts }`) published when `sig` changes or heartbeat refreshes, plus synchronized active filter (`"all"` or `serviceId` with monotonic `ts`).
 - **`mesh.flows`**: Tab-scoped metadata keyed by `tabId` holding `ticket`, `derivedTitle`, `autoNamed`, `manualTitle`, `leadTerminal`, `reviewedServices` (`pending | has_notes | approved`), `sessionRepos`, and `updatedAt`.
 - **`mesh.spacePanels`**: Persisted `Record<spaceId, "files" | "changes" | null>` replacing `localStorage` in `mesh-tabs`.

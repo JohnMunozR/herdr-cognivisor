@@ -316,11 +316,20 @@ function tokenizeDiffPropertiesLine(text, tokens) {
   return tokens;
 }
 
+export const MAX_DIFF_SYNTAX_LINE_CHARS = 1600;
+export const MAX_DIFF_RENDER_LINE_CHARS = 4000;
+
+export function expandCodeTabs(rawText) {
+  if (!rawText) return "";
+  const s = String(rawText);
+  return s.indexOf("\t") !== -1 ? s.replace(/\t/g, "    ") : s;
+}
+
 // Linear single-pass lexer that preserves exact characters and avoids regex backtracking.
 export function tokenizeDiffLine(rawText, ext) {
   if (!rawText) return null;
-  const text = rawText.indexOf("\t") !== -1 ? rawText.replace(/\t/g, "    ") : rawText;
-  if (text.length > 500 || ext === "txt" || ext === "log") return null;
+  const text = expandCodeTabs(rawText);
+  if (text.length > MAX_DIFF_SYNTAX_LINE_CHARS || ext === "txt" || ext === "log") return null;
 
   if (PROP_EXTS.has(ext)) {
     return tokenizeDiffPropertiesLine(text, []);
@@ -629,20 +638,33 @@ export function diffRows(lines, filePath = "") {
     if (match) { old = +match[1]; next = +match[2]; return { kind: "@", text: line }; }
     const kind = line[0];
     if (kind === "-") {
-      const code = line.slice(1) || " ";
+      const code = expandCodeTabs(line.slice(1) || " ");
       return { kind, number: old++, text: code, tokens: tokenizeDiffLine(code, ext) };
     }
     if (kind === "+") {
-      const code = line.slice(1) || " ";
+      const code = expandCodeTabs(line.slice(1) || " ");
       return { kind, number: next++, text: code, tokens: tokenizeDiffLine(code, ext) };
     }
     if (kind === " ") {
       old++;
-      const code = line.slice(1) || " ";
+      const code = expandCodeTabs(line.slice(1) || " ");
       return { kind, number: next++, text: code, tokens: tokenizeDiffLine(code, ext) };
     }
-    return { kind: "", text: line };
+    return { kind: "", text: expandCodeTabs(line) };
   });
+}
+
+// Stack-safe pixel width estimation for horizontal diff scrolling.
+export function computeDiffContentWidth(rows, { minWidth = 300, charPx = 7.8, gutterPx = 96 } = {}) {
+  let maxCols = 0;
+  for (const row of rows || []) {
+    const raw = typeof row === "string" ? row : row?.text;
+    if (!raw) continue;
+    const expanded = expandCodeTabs(raw);
+    const cols = Math.min(expanded.length, MAX_DIFF_RENDER_LINE_CHARS + 32);
+    if (cols > maxCols) maxCols = cols;
+  }
+  return Math.max(minWidth, Math.ceil(maxCols * charPx) + gutterPx);
 }
 
 export const DISCOVER_SKIP_DIRS = new Set([
@@ -944,4 +966,89 @@ export function resolveDiffFileIcon(filePath, t) {
     path: `mods/changes-review/icons/file-types/${spec.kind}.svg`,
     color: palette[spec.tone] || palette.muted,
   };
+}
+
+export function formatReviewTabTitle(file) {
+  const raw = typeof file === "string"
+    ? file
+    : (file?.path || file?.displayPath || file?.name || "");
+  const clean = String(raw || "").replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!clean) return "Review";
+  const slash = clean.lastIndexOf("/");
+  const base = slash >= 0 ? clean.slice(slash + 1) : clean;
+  return base ? `Review · ${base}` : "Review";
+}
+
+export function getSessionNotesKey(spaceId, sourceTabId) {
+  return `${spaceId || "default"}::${sourceTabId || "global"}`;
+}
+
+export function resolveSessionAgentTabId(space, allPanes, storedAgentTabs) {
+  const tabs = Array.isArray(space?.tabs) ? space.tabs : [];
+  if (tabs.length === 0) return null;
+  const panesList = Array.isArray(allPanes) ? allPanes : [];
+  const hasTerminal = (tabId) =>
+    Boolean(tabId) && panesList.some((p) => p && p.tab === tabId && Boolean(p.terminal));
+
+  const activeTab = tabs.find((t) => t && t.active) || null;
+  if (activeTab && hasTerminal(activeTab.id)) return activeTab.id;
+
+  const storedId = storedAgentTabs && space?.id ? storedAgentTabs[space.id] : null;
+  if (storedId && tabs.some((t) => t && t.id === storedId) && hasTerminal(storedId)) {
+    return storedId;
+  }
+
+  const firstTerminalTab = tabs.find((t) => t && hasTerminal(t.id));
+  if (firstTerminalTab) return firstTerminalTab.id;
+
+  return activeTab?.id || null;
+}
+
+export function pickNextUnreviewedFile(files, currentKey, isReviewedFn) {
+  if (!Array.isArray(files) || files.length === 0) return null;
+  const isReviewed = typeof isReviewedFn === "function" ? isReviewedFn : () => false;
+  const curIdx = currentKey ? files.findIndex((f) => f?.key === currentKey) : -1;
+  if (curIdx < 0) {
+    for (const cand of files) {
+      if (cand && !isReviewed(cand)) return cand;
+    }
+    return null;
+  }
+  for (let offset = 1; offset < files.length; offset++) {
+    const cand = files[(curIdx + offset) % files.length];
+    if (cand && cand.key !== currentKey && !isReviewed(cand)) {
+      return cand;
+    }
+  }
+  return null;
+}
+
+export function sortServicesDirtyFirst(services) {
+  return [...(Array.isArray(services) ? services : [])].sort((a, b) => {
+    const aCount = a?.workingCount || 0;
+    const bCount = b?.workingCount || 0;
+    if ((aCount > 0) !== (bCount > 0)) return bCount - aCount;
+    return String(a?.name || "").localeCompare(String(b?.name || ""));
+  });
+}
+
+export function pickNextDirtyService(sortedServices, currentServiceId, getServiceStatusFn) {
+  if (!Array.isArray(sortedServices) || sortedServices.length === 0) return null;
+  const getStatus = typeof getServiceStatusFn === "function" ? getServiceStatusFn : () => "pending";
+  const curIdx = currentServiceId ? sortedServices.findIndex((s) => s?.id === currentServiceId) : -1;
+  if (curIdx < 0) {
+    for (const cand of sortedServices) {
+      if (cand && (cand.workingCount || 0) > 0 && getStatus(cand.id, cand) !== "approved") {
+        return cand;
+      }
+    }
+    return null;
+  }
+  for (let offset = 1; offset < sortedServices.length; offset++) {
+    const cand = sortedServices[(curIdx + offset) % sortedServices.length];
+    if (cand && cand.id !== currentServiceId && (cand.workingCount || 0) > 0 && getStatus(cand.id, cand) !== "approved") {
+      return cand;
+    }
+  }
+  return null;
 }

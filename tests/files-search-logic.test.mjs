@@ -17,6 +17,13 @@ import {
   tokenizeCodeLine,
   resolveFileIconSpec,
   resolveFileIcon,
+  expandCodeTabs,
+  computeCodeContentWidth,
+  resolveViewerFilePath,
+  buildFileViewerKey,
+  formatFileTabTitle,
+  pruneOpenFileTabs,
+  findMatchingOpenFileTab,
 } from "../mods/files-search/search-logic.js";
 
 describe("files-search search-logic", () => {
@@ -338,5 +345,203 @@ describe("files-search search-logic", () => {
     for (const kind of expectedKinds) {
       assert.ok(fs.existsSync(path.join(iconDir, `${kind}.svg`)), `missing icon file: ${kind}.svg`);
     }
+  });
+
+  test("expandCodeTabs, tokenizeCodeLine, and computeCodeContentWidth support long lines for horizontal scrolling", () => {
+    assert.equal(expandCodeTabs("\treturn x;\t// tab"), "    return x;    // tab");
+
+    const longJava = `@GetMapping("${"/segment".repeat(100)}") public ResponseEntity<String> handleLongRoute() { return ResponseEntity.ok("ok"); }`;
+    assert.ok(longJava.length > 800 && longJava.length < 1600);
+    const tokens = tokenizeCodeLine(longJava, "java");
+    assert.ok(Array.isArray(tokens) && tokens.length > 0);
+    assert.equal(tokens[0][0], "annotation");
+    assert.equal(tokens.map(([, txt]) => txt).join(""), longJava);
+
+    const w = computeCodeContentWidth(["short", `\t${longJava}`], { minWidth: 320, charPx: 7.6, gutterPx: 88 });
+    assert.ok(w > 6000, `expected horizontal scroll width > 6000 for long line, got ${w}`);
+    assert.equal(computeCodeContentWidth(["short"], { minWidth: 500, charPx: 7.6, gutterPx: 88 }), 500);
+
+    // Ensure stack-safe iteration across 12k lines (exceeding JS call-stack arg limit)
+    const manyLines = Array.from({ length: 12000 }, () => "const x = 1;");
+    assert.equal(computeCodeContentWidth(manyLines, { minWidth: 240, charPx: 7.6, gutterPx: 92 }), 240);
+  });
+
+  test("resolveViewerFilePath resolves relative, Unix absolute, Windows drive, and UNC paths", () => {
+    assert.equal(resolveViewerFilePath("/workspace/repo", "src/./app/../AuthController.java"), "/workspace/repo/src/AuthController.java");
+    assert.equal(resolveViewerFilePath("/workspace/repo/", "nested/sub/"), "/workspace/repo/nested/sub");
+    assert.equal(resolveViewerFilePath("/", "etc/hosts"), "/etc/hosts");
+    assert.equal(resolveViewerFilePath("/workspace/repo", "/other/abs/file.ts"), "/other/abs/file.ts");
+    assert.equal(resolveViewerFilePath("", "relative/./file.js"), "relative/file.js");
+    assert.equal(resolveViewerFilePath("/workspace/repo", ""), "");
+
+    // Windows drive and UNC paths normalize to forward slashes and resolve dot segments cleanly
+    assert.equal(
+      resolveViewerFilePath("C:\\work\\mesh\\", "auth-service\\src\\..\\Main.java"),
+      "C:/work/mesh/auth-service/Main.java"
+    );
+    assert.equal(
+      resolveViewerFilePath("C:/work/mesh", "D:\\elsewhere\\config.yml"),
+      "D:/elsewhere/config.yml"
+    );
+    assert.equal(
+      resolveViewerFilePath("\\\\fileserver\\share\\repo", "dir\\sub\\..\\mod.rs"),
+      "//fileserver/share/repo/dir/mod.rs"
+    );
+  });
+
+  test("buildFileViewerKey normalizes equivalent targets and respects case sensitivity", () => {
+    const k1 = buildFileViewerKey("/work/mesh", "auth-service/src/AuthController.java", false);
+    const k2 = buildFileViewerKey("/work/mesh/auth-service", "src/./AuthController.java", false);
+    const k3 = buildFileViewerKey("", "/work/mesh/auth-service/src/AuthController.java", false);
+    assert.equal(k1, "/work/mesh/auth-service/src/AuthController.java");
+    assert.equal(k2, k1);
+    assert.equal(k3, k1);
+
+    // POSIX preserves case while Windows folds case for deduplication
+    assert.notEqual(
+      buildFileViewerKey("/work/mesh", "src/Main.java", false),
+      buildFileViewerKey("/work/mesh", "src/main.java", false)
+    );
+    assert.equal(
+      buildFileViewerKey("C:\\Work\\Mesh", "Src\\Main.Java", true),
+      buildFileViewerKey("C:/work/mesh", "src/main.java", true)
+    );
+    assert.equal(buildFileViewerKey("/work/mesh", "   ", false), "");
+  });
+
+  test("formatFileTabTitle keeps concise basenames and disambiguates duplicate tab titles", () => {
+    assert.equal(formatFileTabTitle("src/main/java/AuthController.java", "auth-service", []), "AuthController.java");
+    assert.equal(formatFileTabTitle("C:\\repo\\order\\OrderService.java", null, new Set()), "OrderService.java");
+    assert.equal(formatFileTabTitle("", null, []), "File");
+
+    // Duplicate basename disambiguates with service name first
+    assert.equal(
+      formatFileTabTitle("auth-service/src/Application.java", "auth-service", ["Application.java"]),
+      "Application.java · auth-service"
+    );
+    // Same-service collision escalates cleanly to service/parent, parent, deeper segments, and numeric fallback
+    const taken = new Set([
+      "application.yml",
+      "application.yml · auth-service",
+    ]);
+    assert.equal(
+      formatFileTabTitle("auth-service/src/test/resources/application.yml", "auth-service", taken),
+      "application.yml · auth-service/resources"
+    );
+    taken.add("application.yml · auth-service/resources");
+    assert.equal(
+      formatFileTabTitle("auth-service/src/test/resources/application.yml", "auth-service", taken),
+      "application.yml · resources"
+    );
+    taken.add("application.yml · resources");
+    assert.equal(
+      formatFileTabTitle("auth-service/src/test/resources/application.yml", "auth-service", taken),
+      "application.yml · test/resources"
+    );
+    taken.add("application.yml · test/resources");
+    taken.add("application.yml · src/test/resources");
+    assert.equal(
+      formatFileTabTitle("auth-service/src/test/resources/application.yml", "auth-service", taken),
+      "application.yml (2)"
+    );
+
+    // Boolean hint disambiguates when no service or duplicate list is supplied
+    assert.equal(formatFileTabTitle("packages/api/index.ts", null, true), "index.ts · api");
+  });
+
+  test("pruneOpenFileTabs drops closed or non-viewer tabs and repairs inconsistent entries", () => {
+    const initial = {
+      "tab-1": { tabId: "tab-1", root: "/repo", path: "a.ts", absPath: "/repo/a.ts" },
+      "tab-dead": { tabId: "tab-dead", root: "/repo", path: "b.ts", absPath: "/repo/b.ts" },
+      "tab-terminal": { tabId: "tab-terminal", root: "/repo", path: "c.ts", absPath: "/repo/c.ts" },
+      "wrong-key": { tabId: "tab-2", root: "/repo", path: "d.ts", absPath: "/repo/d.ts" },
+      broken: null,
+    };
+
+    const pruned = pruneOpenFileTabs(
+      initial,
+      ["tab-1", "tab-2", "tab-terminal"],
+      ["tab-1", "tab-2"]
+    );
+    assert.equal(pruned.changed, true);
+    assert.deepEqual(Object.keys(pruned.tabs).sort(), ["tab-1", "tab-2"]);
+    assert.equal(pruned.tabs["tab-2"].tabId, "tab-2");
+
+    // Re-running on already clean tabs reports unchanged
+    const second = pruneOpenFileTabs(pruned.tabs, new Set(["tab-1", "tab-2"]), new Set(["tab-1", "tab-2"]));
+    assert.equal(second.changed, false);
+    assert.deepEqual(second.tabs, pruned.tabs);
+    assert.deepEqual(pruneOpenFileTabs(null, []), { tabs: {}, changed: false });
+  });
+
+  test("findMatchingOpenFileTab deduplicates per space and respects stale/cross-space boundaries", () => {
+    const openTabs = {
+      "tab-space1-auth": {
+        tabId: "tab-space1-auth",
+        spaceId: "space-1",
+        root: "/workspace/mesh",
+        path: "auth-service/src/AuthController.java",
+        absPath: "/workspace/mesh/auth-service/src/AuthController.java",
+      },
+      "tab-space2-auth": {
+        tabId: "tab-space2-auth",
+        spaceId: "space-2",
+        root: "/workspace/mesh",
+        path: "auth-service/src/AuthController.java",
+        absPath: "/workspace/mesh/auth-service/src/AuthController.java",
+      },
+      "tab-win": {
+        tabId: "tab-win",
+        spaceId: "space-1",
+        root: "C:\\Work\\Mesh",
+        path: "gateway\\App.ts",
+        absPath: "C:/Work/Mesh/gateway/App.ts",
+      },
+    };
+
+    // Opening from sub-service root or absolute path matches the existing space-1 tab
+    const hitFromSubroot = findMatchingOpenFileTab(
+      openTabs,
+      ["tab-space1-auth", "tab-win"],
+      ["tab-space1-auth", "tab-space2-auth", "tab-win"],
+      "/workspace/mesh/auth-service",
+      "src/AuthController.java",
+      false
+    );
+    assert.equal(hitFromSubroot?.tabId, "tab-space1-auth");
+
+    // Space without that file tab must NOT reuse a viewer tab belonging to another space
+    const missInSpace3 = findMatchingOpenFileTab(
+      openTabs,
+      ["tab-space3-term"],
+      ["tab-space1-auth", "tab-space2-auth"],
+      "/workspace/mesh",
+      "auth-service/src/AuthController.java",
+      false
+    );
+    assert.equal(missInSpace3, null);
+
+    // Pane that is no longer a files-search pane cannot be reused
+    const stalePane = findMatchingOpenFileTab(
+      openTabs,
+      ["tab-space1-auth"],
+      ["tab-win"],
+      "/workspace/mesh",
+      "auth-service/src/AuthController.java",
+      false
+    );
+    assert.equal(stalePane, null);
+
+    // Windows case-insensitive dedupe match
+    const winHit = findMatchingOpenFileTab(
+      openTabs,
+      ["tab-space1-auth", "tab-win"],
+      ["tab-space1-auth", "tab-win"],
+      "c:/work/mesh",
+      "GATEWAY/app.ts",
+      true
+    );
+    assert.equal(winHit?.tabId, "tab-win");
+    assert.equal(findMatchingOpenFileTab(null, ["tab-1"], ["tab-1"], "/repo", "a.ts"), null);
   });
 });

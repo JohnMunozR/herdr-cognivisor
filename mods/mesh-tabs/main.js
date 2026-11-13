@@ -337,6 +337,7 @@ export default class MeshTabs extends View {
     }
 
     const allPanes = panes();
+    const openFileTabs = asPlainObject(shared("mesh.openFileTabs"));
     const stop = (_e, cx) => cx.stop_propagation();
     const button = (id, label, action) =>
       div()
@@ -355,11 +356,24 @@ export default class MeshTabs extends View {
         .child(label);
 
     const item = (c, i) => {
+      const tabPanes = allPanes.filter((p) => p.tab === c.id);
       const program =
-        allPanes.find((p) => p.tab === c.id && p.program?.agent)?.program ??
-        allPanes.find((p) => p.tab === c.id)?.program;
+        tabPanes.find((p) => p.program?.agent)?.program ??
+        tabPanes[0]?.program;
+      const openFileEntry = openFileTabs[c.id] || null;
+      const isFilesTab = tabPanes.some((p) => p.mod === "files-search") || Boolean(openFileEntry);
+      const isReviewTab = tabPanes.some((p) => p.mod === "changes-review");
+      const isViewerTab = isFilesTab || isReviewTab;
       const displayName = /^tb\d+$/.test(c.name) ? (program?.name ?? "Terminal") : c.name;
       const isEditing = this.editingTabId === c.id;
+      const modIconPath = isReviewTab
+        ? "mods/mesh-tabs/icons/changes.svg"
+        : isFilesTab
+          ? (openFileEntry?.iconPath || "mods/mesh-tabs/icons/files.svg")
+          : null;
+      const modIconColor = isReviewTab
+        ? (c.active ? (t.accent || t.foreground) : t.muted)
+        : (openFileEntry?.iconColor || (c.active ? t.foreground : t.muted));
 
       return h_flex()
         .id(`tab-${c.id}`)
@@ -370,6 +384,7 @@ export default class MeshTabs extends View {
         .items_center()
         .flex_none()
         .text_size(12.8)
+        .when(Boolean(openFileEntry?.displayPath), (el) => el.tooltip(openFileEntry.displayPath))
         // A rename or status dot on this or an earlier tab can push the active one out.
         .when(i <= active, (el) =>
           el.on_size_change((_size, cx) => {
@@ -424,6 +439,9 @@ export default class MeshTabs extends View {
               : image(program.icon).size(14),
           ),
         )
+        .when(!program?.icon && Boolean(modIconPath), (el) =>
+          el.child(svg(modIconPath).size(13).flex_none().text_color(modIconColor)),
+        )
         .when(isEditing, (el) =>
           el.child(
             div()
@@ -463,11 +481,11 @@ export default class MeshTabs extends View {
         .when(c.status === "blocked" || c.status === "done", (el) =>
           el.child(div().size(6).rounded(3).bg(t[c.status])),
         )
-        .when(c.active && !isEditing, (el) =>
+        .when((c.active || isViewerTab) && !isEditing, (el) =>
           el.child(
             div()
               .id(`close-${c.id}`)
-              .text_color(t.dim)
+              .text_color(c.active ? t.dim : t.muted)
               .cursor_pointer()
               .hover((s) => s.text_color(t.foreground))
               .on_mouse_down("left", stop)

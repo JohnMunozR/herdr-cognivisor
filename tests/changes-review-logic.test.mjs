@@ -9,11 +9,20 @@ import {
   normCmpStr,
   resolveDiffFileIconSpec,
   resolveDiffFileIcon,
+  expandCodeTabs,
+  computeDiffContentWidth,
+  MAX_DIFF_SYNTAX_LINE_CHARS,
   isSameOrChildPath,
   isIgnoredWatchPath,
   hasRelevantWatchChange,
   parsePorcelainHeader,
   getParentDir,
+  formatReviewTabTitle,
+  getSessionNotesKey,
+  resolveSessionAgentTabId,
+  pickNextUnreviewedFile,
+  sortServicesDirtyFirst,
+  pickNextDirtyService,
 } from "../mods/changes-review/review-logic.js";
 
 describe("changes-review review-logic", () => {
@@ -42,7 +51,12 @@ describe("changes-review review-logic", () => {
     assert.ok(!rustTokens.some(([k, v]) => k === "string" && v.includes("input")), "Rust lifetimes must not parse as strings");
 
     assert.equal(rustTokens.map(([, v]) => v).join(""), "fn parse<'a>(input: &'a str) -> char { 'x' }");
-    assert.equal(tokenizeDiffLine("x".repeat(501), "js"), null, "long lines should bypass tokenization cleanly");
+    assert.ok(Array.isArray(tokenizeDiffLine(`const longIdent = "${"a".repeat(1000)}";`, "js")), "1000-char source lines should still tokenize");
+    assert.equal(
+      tokenizeDiffLine("x".repeat(MAX_DIFF_SYNTAX_LINE_CHARS + 1), "js"),
+      null,
+      "lines above MAX_DIFF_SYNTAX_LINE_CHARS should bypass tokenization cleanly",
+    );
   });
 
   test("tokenizeDiffLine separates Spring annotations, operators, self/this, Python f-strings, and properties", () => {
@@ -176,5 +190,168 @@ describe("changes-review review-logic", () => {
     for (const kind of expectedKinds) {
       assert.ok(fs.existsSync(path.join(iconDir, `${kind}.svg`)), `missing icon file: ${kind}.svg`);
     }
+  });
+
+  test("diffRows, expandCodeTabs, and computeDiffContentWidth preserve long lines and tab spacing for horizontal scrolling", () => {
+    const longExpr = `${"service.execute(" + "\"arg\",".repeat(150)}"end")`;
+    assert.ok(longExpr.length > 900 && longExpr.length < 1600);
+    const rows = diffRows([
+      "@@ -10,2 +10,2 @@ public void processLongChain()",
+      `-\t${longExpr}`,
+      `+\t${longExpr} // updated`,
+    ], "src/Service.java");
+
+    assert.equal(rows[1].text, `    ${longExpr}`);
+    assert.ok(Array.isArray(rows[1].tokens) && rows[1].tokens.length > 0);
+    assert.equal(rows[2].tokens.map(([, txt]) => txt).join(""), `    ${longExpr} // updated`);
+
+    const width = computeDiffContentWidth(rows, { minWidth: 300, charPx: 7.8, gutterPx: 96 });
+    assert.ok(width > 7000, `expected wide diff width for horizontal scroll, got ${width}`);
+    assert.equal(computeDiffContentWidth([{ text: "x" }], { minWidth: 300, charPx: 7.8, gutterPx: 96 }), 300);
+
+    // Ensure stack-safe iteration on large diffs
+    const manyRows = Array.from({ length: 12000 }, () => ({ text: "ok" }));
+    assert.equal(computeDiffContentWidth(manyRows, { minWidth: 300 }), 300);
+  });
+
+  test("formatReviewTabTitle and getSessionNotesKey format deterministic labels and keys", () => {
+    assert.equal(formatReviewTabTitle(null), "Review");
+    assert.equal(formatReviewTabTitle({}), "Review");
+    assert.equal(formatReviewTabTitle({ path: "src/components/LoginModal.tsx" }), "Review · LoginModal.tsx");
+    assert.equal(
+      formatReviewTabTitle({ displayPath: "auth-api/src/jwt.ts", path: "src/jwt.ts" }),
+      "Review · jwt.ts",
+    );
+    assert.equal(formatReviewTabTitle("README.md"), "Review · README.md");
+
+    assert.equal(getSessionNotesKey("space-1", "tab-9"), "space-1::tab-9");
+    assert.equal(getSessionNotesKey("space-1", null), "space-1::global");
+    assert.equal(getSessionNotesKey("", ""), "default::global");
+  });
+
+  test("resolveSessionAgentTabId preserves agent tab while viewing non-terminal Review tab", () => {
+    const space = {
+      id: "sp-1",
+      tabs: [
+        { id: "tab-agent-1", active: false },
+        { id: "tab-agent-2", active: false },
+        { id: "tab-review", active: true },
+      ],
+    };
+    const allPanes = [
+      { id: "p-1", tab: "tab-agent-1", terminal: "term-1" },
+      { id: "p-2", tab: "tab-agent-2", terminal: "term-2" },
+      { id: "p-3", tab: "tab-review", terminal: null, mod: "changes-review" },
+    ];
+
+    // Stored agent tab still has a terminal -> resolve it over non-terminal Review tab
+    assert.equal(
+      resolveSessionAgentTabId(space, allPanes, { "sp-1": "tab-agent-2" }),
+      "tab-agent-2",
+    );
+
+    // Stale or missing stored tab -> fall back to first tab with a terminal in the space
+    assert.equal(
+      resolveSessionAgentTabId(space, allPanes, { "sp-1": "tab-deleted" }),
+      "tab-agent-1",
+    );
+
+    // If the active tab itself has a terminal, it wins immediately over stored tab
+    const terminalActiveSpace = {
+      id: "sp-1",
+      tabs: [
+        { id: "tab-agent-1", active: true },
+        { id: "tab-agent-2", active: false },
+      ],
+    };
+    assert.equal(
+      resolveSessionAgentTabId(terminalActiveSpace, allPanes, { "sp-1": "tab-agent-2" }),
+      "tab-agent-1",
+    );
+
+    // Space without any terminal panes falls back to active tab id, or null when empty
+    assert.equal(
+      resolveSessionAgentTabId({ id: "sp-2", tabs: [{ id: "tab-review", active: true }] }, [], {}),
+      "tab-review",
+    );
+    assert.equal(resolveSessionAgentTabId(null, allPanes, {}), null);
+  });
+
+  test("pickNextUnreviewedFile wraps around files skipping current and reviewed items", () => {
+    const files = [
+      { key: "svc::a.js" },
+      { key: "svc::b.js" },
+      { key: "svc::c.js" },
+    ];
+    const reviewed = new Set(["svc::b.js"]);
+
+    // Starting at a.js skips already-reviewed b.js and lands on c.js
+    assert.equal(
+      pickNextUnreviewedFile(files, "svc::a.js", (f) => reviewed.has(f.key))?.key,
+      "svc::c.js",
+    );
+
+    // Starting at c.js wraps back to unreviewed a.js
+    assert.equal(
+      pickNextUnreviewedFile(files, "svc::c.js", (f) => reviewed.has(f.key))?.key,
+      "svc::a.js",
+    );
+
+    // Null/absent currentKey selects the first unreviewed entry from index 0
+    assert.equal(
+      pickNextUnreviewedFile(files, null, (f) => f.key === "svc::a.js")?.key,
+      "svc::b.js",
+    );
+
+    // Returns null when every remaining file is already reviewed (or single file only)
+    assert.equal(
+      pickNextUnreviewedFile(files, "svc::c.js", (f) => f.key !== "svc::c.js"),
+      null,
+    );
+    assert.equal(pickNextUnreviewedFile([{ key: "svc::only.js" }], "svc::only.js", () => false), null);
+    assert.equal(pickNextUnreviewedFile([], null, () => false), null);
+  });
+
+  test("sortServicesDirtyFirst and pickNextDirtyService advance across dirty unapproved services", () => {
+    const sorted = sortServicesDirtyFirst([
+      { id: "web", name: "web-client", workingCount: 0 },
+      { id: "billing", name: "billing-api", workingCount: 2 },
+      { id: "auth", name: "auth-api", workingCount: 5 },
+      { id: "docs", name: "docs", workingCount: 0 },
+    ]);
+    assert.deepEqual(sorted.map((s) => s.id), ["auth", "billing", "docs", "web"]);
+
+    const statuses = {
+      auth: "approved",
+      billing: "pending",
+      web: "pending",
+    };
+    assert.equal(
+      pickNextDirtyService(sorted, "auth", (id) => statuses[id])?.id,
+      "billing",
+    );
+
+    // Wraps to earlier dirty service when current is at the end
+    const statusesWrap = {
+      auth: "pending",
+      billing: "approved",
+      web: "pending",
+    };
+    assert.equal(
+      pickNextDirtyService(sorted, "billing", (id) => statusesWrap[id])?.id,
+      "auth",
+    );
+
+    // Skips clean services even if pending, returns null when none left dirty & unapproved
+    const allCleanOrApproved = {
+      auth: "approved",
+      billing: "approved",
+      docs: "pending",
+      web: "pending",
+    };
+    assert.equal(
+      pickNextDirtyService(sorted, "auth", (id) => allCleanOrApproved[id]),
+      null,
+    );
   });
 });

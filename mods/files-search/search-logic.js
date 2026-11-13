@@ -551,11 +551,20 @@ function tokenizePropertiesLine(text, tokens) {
   return tokens;
 }
 
+export const MAX_PREVIEW_SYNTAX_LINE_CHARS = 1600;
+export const MAX_PREVIEW_RENDER_LINE_CHARS = 4000;
+
+export function expandCodeTabs(rawText) {
+  if (!rawText) return "";
+  const s = String(rawText);
+  return s.indexOf("\t") !== -1 ? s.replace(/\t/g, "    ") : s;
+}
+
 // Single-pass linear tokenizer shared by preview rendering (lossless on all chars).
 export function tokenizeCodeLine(rawText, ext = "") {
   if (!rawText) return null;
-  const text = rawText.indexOf("\t") !== -1 ? rawText.replace(/\t/g, "    ") : rawText;
-  if (text.length > 600 || ext === "txt" || ext === "log") return null;
+  const text = expandCodeTabs(rawText);
+  if (text.length > MAX_PREVIEW_SYNTAX_LINE_CHARS || ext === "txt" || ext === "log") return null;
 
   if (CODE_PROP_EXTS.has(ext)) {
     return tokenizePropertiesLine(text, []);
@@ -1018,4 +1027,207 @@ export function resolveFileIcon(filePath, t) {
     path: `mods/files-search/icons/file-types/${spec.kind}.svg`,
     color: palette[spec.tone] || palette.muted,
   };
+}
+
+// Stack-safe pixel width estimation for horizontal code preview scrolling.
+export function computeCodeContentWidth(lines, { minWidth = 240, charPx = 7.6, gutterPx = 92 } = {}) {
+  let maxCols = 0;
+  for (const line of lines || []) {
+    if (!line) continue;
+    const expanded = expandCodeTabs(line);
+    const cols = Math.min(expanded.length, MAX_PREVIEW_RENDER_LINE_CHARS + 32);
+    if (cols > maxCols) maxCols = cols;
+  }
+  return Math.max(minWidth, Math.ceil(maxCols * charPx) + gutterPx);
+}
+
+function normalizeViewerSlashes(rawPath) {
+  const raw = String(rawPath || "");
+  if (!raw) return "";
+  const replaced = raw.replace(/\\/g, "/");
+  const isUnc = replaced.startsWith("//") && !replaced.startsWith("///");
+  const collapsed = replaced.replace(/\/+/g, "/");
+  return isUnc ? `/${collapsed}` : collapsed;
+}
+
+function isAbsoluteViewerPath(normPath) {
+  return normPath.startsWith("/") || /^[A-Za-z]:(?:\/|$)/.test(normPath);
+}
+
+function toTabIdSet(ids) {
+  if (ids instanceof Set) return ids;
+  if (Array.isArray(ids) || (ids && typeof ids[Symbol.iterator] === "function")) {
+    return new Set(ids);
+  }
+  return new Set();
+}
+
+export function resolveViewerFilePath(root, filePath) {
+  const rawFile = String(filePath || "");
+  if (!rawFile.trim()) return "";
+
+  const normFile = normalizeViewerSlashes(rawFile);
+  const normRoot = normalizeViewerSlashes(root);
+  let combined;
+
+  if (isAbsoluteViewerPath(normFile) || !normRoot.trim()) {
+    combined = normFile;
+  } else if (normRoot === "/" || /^[A-Za-z]:\/$/.test(normRoot)) {
+    combined = `${normRoot}${normFile}`;
+  } else {
+    combined = `${normRoot.replace(/\/+$/, "")}/${normFile}`;
+  }
+
+  let prefix = "";
+  let rest = combined;
+  const uncMatch = combined.match(/^(\/\/[^/]+\/[^/]+)(?:\/(.*))?$/);
+  const uncRootMatch = !uncMatch ? combined.match(/^(\/\/[^/]*)(?:\/(.*))?$/) : null;
+  const driveMatch = combined.match(/^([A-Za-z]:)(?:\/(.*))?$/);
+
+  if (uncMatch) {
+    prefix = uncMatch[1];
+    rest = uncMatch[2] || "";
+  } else if (uncRootMatch) {
+    prefix = uncRootMatch[1];
+    rest = uncRootMatch[2] || "";
+  } else if (driveMatch) {
+    prefix = `${driveMatch[1]}/`;
+    rest = driveMatch[2] || "";
+  } else if (combined.startsWith("/")) {
+    prefix = "/";
+    rest = combined.slice(1);
+  }
+
+  const stack = [];
+  for (const seg of rest.split("/")) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") {
+      if (stack.length > 0 && stack[stack.length - 1] !== "..") {
+        stack.pop();
+      } else if (!prefix) {
+        stack.push("..");
+      }
+    } else {
+      stack.push(seg);
+    }
+  }
+
+  if (prefix === "/" || /^[A-Za-z]:\/$/.test(prefix)) {
+    return `${prefix}${stack.join("/")}`;
+  }
+  if (prefix.startsWith("//")) {
+    return stack.length > 0 ? `${prefix}/${stack.join("/")}` : prefix;
+  }
+  return stack.length > 0 ? stack.join("/") : ".";
+}
+
+export function buildFileViewerKey(root, filePath, isWin = false) {
+  const resolved = resolveViewerFilePath(root, filePath);
+  if (!resolved) return "";
+  return isWin ? resolved.toLowerCase() : resolved;
+}
+
+export function formatFileTabTitle(filePath, serviceName = null, existingTitlesOrDuplicateHint = null) {
+  const norm = normalizeViewerSlashes(filePath).replace(/\/+$/, "");
+  const segs = norm.split("/").filter(Boolean);
+  const base = segs.length > 0 ? segs[segs.length - 1] : "";
+  if (!base) return "File";
+
+  let existingSet = null;
+  if (existingTitlesOrDuplicateHint instanceof Set) {
+    existingSet = existingTitlesOrDuplicateHint;
+  } else if (Array.isArray(existingTitlesOrDuplicateHint)) {
+    existingSet = new Set(existingTitlesOrDuplicateHint.filter(Boolean).map(String));
+  }
+
+  const isDup = existingSet ? existingSet.has(base) : Boolean(existingTitlesOrDuplicateHint);
+  if (!isDup) return base;
+
+  const cleanSvc = typeof serviceName === "string" ? serviceName.trim() : "";
+  const dirSegs = segs.slice(0, -1);
+  const parent = dirSegs.length > 0 ? dirSegs[dirSegs.length - 1] : "";
+
+  const candidates = [];
+  if (cleanSvc && cleanSvc !== base) {
+    candidates.push(`${base} · ${cleanSvc}`);
+  }
+  if (parent) {
+    if (cleanSvc && parent !== cleanSvc) {
+      candidates.push(`${base} · ${cleanSvc}/${parent}`);
+    }
+    candidates.push(`${base} · ${parent}`);
+  }
+  for (let depth = 2; depth <= Math.min(3, dirSegs.length); depth++) {
+    candidates.push(`${base} · ${dirSegs.slice(-depth).join("/")}`);
+  }
+
+  for (const candidate of candidates) {
+    if (!existingSet || !existingSet.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  if (existingSet) {
+    let idx = 2;
+    while (existingSet.has(`${base} (${idx})`)) {
+      idx++;
+    }
+    return `${base} (${idx})`;
+  }
+  return `${base} (2)`;
+}
+
+export function pruneOpenFileTabs(openTabsMap, allLiveTabIds, filePaneTabIds = null) {
+  if (!openTabsMap || typeof openTabsMap !== "object" || Array.isArray(openTabsMap)) {
+    return { tabs: {}, changed: Boolean(openTabsMap) };
+  }
+  const liveSet = toTabIdSet(allLiveTabIds);
+  const paneSet = filePaneTabIds == null ? null : toTabIdSet(filePaneTabIds);
+  const next = {};
+  let changed = false;
+
+  for (const [key, entry] of Object.entries(openTabsMap)) {
+    if (!entry || typeof entry !== "object") {
+      changed = true;
+      continue;
+    }
+    const tabId = entry.tabId || key;
+    if (!tabId || !liveSet.has(tabId) || (paneSet && !paneSet.has(tabId))) {
+      changed = true;
+      continue;
+    }
+    if (key !== tabId || entry.tabId !== tabId) {
+      changed = true;
+      next[tabId] = { ...entry, tabId };
+    } else {
+      next[tabId] = entry;
+    }
+  }
+  return { tabs: next, changed };
+}
+
+export function findMatchingOpenFileTab(openTabsMap, spaceTabIds, filePaneTabIds, targetRoot, targetPath, isWin = false) {
+  if (!openTabsMap || typeof openTabsMap !== "object" || Array.isArray(openTabsMap)) {
+    return null;
+  }
+  const targetKey = buildFileViewerKey(targetRoot, targetPath, isWin);
+  if (!targetKey) return null;
+
+  const spaceSet = toTabIdSet(spaceTabIds);
+  if (spaceSet.size === 0) return null;
+  const paneSet = filePaneTabIds == null ? null : toTabIdSet(filePaneTabIds);
+
+  for (const [key, entry] of Object.entries(openTabsMap)) {
+    if (!entry || typeof entry !== "object") continue;
+    const tabId = entry.tabId || key;
+    if (!tabId || !spaceSet.has(tabId)) continue;
+    if (paneSet && !paneSet.has(tabId)) continue;
+
+    const absKey = entry.absPath ? buildFileViewerKey(entry.root || "", entry.absPath, isWin) : "";
+    const relKey = entry.path ? buildFileViewerKey(entry.root || "", entry.path, isWin) : "";
+    if ((absKey && absKey === targetKey) || (relKey && relKey === targetKey)) {
+      return { tabId, entry };
+    }
+  }
+  return null;
 }

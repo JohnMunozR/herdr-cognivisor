@@ -30,6 +30,7 @@ The `submodule-mod-mesh-tabs` implements the top 42px workspace tab strip (`#tab
   - Shared state channels:
     - Reads/writes `mesh.spacePanels`: `Record<spaceId, "files" | "changes" | null>`.
     - Reads/writes `mesh.flows`: `Record<tabId, MeshFlowTabState>` (`ticket`, `derivedTitle`, `autoNamed`, `manualTitle`, `leadTerminal`, `reviewedServices`, `sessionRepos`, `updatedAt`).
+    - Reads `mesh.openFileTabs`: `Record<tabId, OpenFileTabMeta>` to display semantic file-type icons and path tooltips on non-terminal `files-search` tabs alongside `changes-review` review tab icons and quick one-click close buttons.
     - Enables `#panel-body` module toggles (`["files", "changes"]`).
   - Herdr command invocations: `tab.select`, `tab.move`, `tab.close`, `tab.rename`, `tab.next`, `tab.prev`, `layout.select`, `layout.show`, `layout.hide`, `window.minimize`, `window.maximize`, `window.close`.
 - **Allowed deps:**
@@ -42,7 +43,7 @@ The `submodule-mod-mesh-tabs` implements the top 42px workspace tab strip (`#tab
   - Overwriting user-named tabs (`tab.named === true` or `mesh.flows[tabId].manualTitle === true`).
   - Targeting auxiliary runner split panes (`labels.meshRunner === "true"`) during auto-naming probes.
   - Calling `run()`, `setShared()`, or `cx.notify()` synchronously inside `render()` (space-panel sync and newly-seen tab scans defer via `cx.timer.after(0, ...)`).
-  - Referencing external core mod icon paths instead of self-contained `mods/mesh-tabs/icons/*.svg` assets (except dynamic `program.icon` entries managed by Herdr core).
+  - Referencing external core mod icon paths instead of self-contained `mods/mesh-tabs/icons/*.svg` assets (except dynamic `program.icon` entries managed by Herdr core and `mesh.openFileTabs` `iconPath` entries provided by `files-search`).
 
 ## Architecture & Interaction Flow
 
