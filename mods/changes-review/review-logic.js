@@ -1052,3 +1052,43 @@ export function pickNextDirtyService(sortedServices, currentServiceId, getServic
   }
   return null;
 }
+
+export function filterSessionCommits(commits, sessionStartedAt) {
+  if (!Array.isArray(commits)) return [];
+  const startedAtMs = Number(sessionStartedAt || 0);
+  if (!startedAtMs || startedAtMs <= 0) return commits;
+  const cutoffSec = Math.floor(startedAtMs / 1000);
+  return commits.filter((c) => c && Number(c.timestamp || 0) >= cutoffSec);
+}
+
+export function filterSessionWorkingEntries(entries, baselineRepo, sessionStartedAt) {
+  if (!Array.isArray(entries)) return [];
+  const startedAtMs = Number(sessionStartedAt || 0);
+  const dirtyFiles =
+    baselineRepo && typeof baselineRepo === "object" && baselineRepo.dirtyFiles && typeof baselineRepo.dirtyFiles === "object"
+      ? baselineRepo.dirtyFiles
+      : null;
+
+  return entries.filter((entry) => {
+    if (!entry) return false;
+    const relFile = entry.relFile ?? entry.path ?? "";
+    const status = entry.status ?? "";
+    const sig = entry.sig ?? "";
+    const mtimeMs = Number(entry.mtimeMs || 0);
+
+    if (dirtyFiles) {
+      const base = dirtyFiles[relFile];
+      if (base && typeof base === "object") {
+        if ((base.status ?? "") === status && (base.sig ?? "") === sig) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    if (startedAtMs > 0) {
+      return !mtimeMs || mtimeMs >= startedAtMs;
+    }
+    return true;
+  });
+}

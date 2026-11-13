@@ -4,7 +4,7 @@ import { v_flex, h_flex, Editor, EditorState, Input, InputState, Scrollbar, Virt
 import { readdir, exists } from "fs/promises";
 import { join } from "path";
 import {
-  spaces, panes, focused, agents, terminals, hc, exec, readTextFile, watchFolder,
+  spaces, panes, focused, agents, terminals, hc, exec, appHome, readTextFile, watchFolder,
   theme, settings, window, layout, props, openOverlay, closeOverlay,
   shared, setShared, run,
 } from "herdr";
@@ -26,7 +26,7 @@ import {
   makeIndexKey,
   getCachedIndex,
   isIndexInFlight,
-  hasOpenAgentInSpace,
+  hasOpenTerminalInSpace,
   restoreDiskIndex,
   shouldRefreshIndex,
   handleWatchForIndex,
@@ -42,7 +42,6 @@ import {
   MAX_TEXT_RESULTS,
   FILE_SEARCH_CHUNK,
   FILE_SEARCH_BUDGET_MS,
-  repoMatchesTranscript,
   parsePorcelainHeader,
   parseSearchOutputLines,
   fuzzy,
@@ -75,6 +74,14 @@ import {
   parseCascadeStdout,
   runStagedCascade,
 } from "./tree-logic.js";
+import {
+  normalizeSessionBaseline,
+  readDiskSessionBaseline,
+  writeDiskSessionBaseline,
+  terminalHasResumeCommand,
+  statFileEntry,
+  filterSessionDirtyEntries,
+} from "./session-baseline.js";
 
 function asPlainObject(v) {
   return v && typeof v === "object" && !Array.isArray(v) ? v : {};
@@ -178,16 +185,9 @@ function location() {
   const on = f?.pane === null && f?.terminal
     ? (f.terminal.includes("/") ? f.terminal.split("/")[0] : null)
     : space?.machine ?? null;
-  const isWin = !on && window()?.platform === "windows";
   const spaceFolder = space?.folder;
   const paneCwd = activePane?.cwd || (!activePane?.cwd ? fallbackPane?.cwd : null) || null;
-
-  let cwd;
-  if (spaceFolder && (!paneCwd || isSameOrChildPath(paneCwd, spaceFolder, isWin))) {
-    cwd = spaceFolder;
-  } else {
-    cwd = paneCwd || f?.cwd || spaceFolder;
-  }
+  let cwd = paneCwd || f?.cwd || spaceFolder;
   if (!cwd && activeTab && openFileTabs[activeTab.id]?.root) {
     cwd = openFileTabs[activeTab.id].root;
   }
@@ -440,70 +440,39 @@ function isFilesVisible() {
   return block ? !block.hidden : true;
 }
 
-async function attributeSessionServices(tabId, touchedServices, serviceFiles, tabPaneCwds, tabTermAddrs, transcriptCache = null) {
-  if (!tabId || !Array.isArray(touchedServices) || touchedServices.length === 0) return [];
-  const flows = shared("mesh.flows");
-  const flowObj = flows && typeof flows === "object" ? flows[tabId] : null;
-  const prevSessionRepos = new Set(
-    Array.isArray(flowObj?.sessionRepos)
-      ? flowObj.sessionRepos.map(r => normPathStr(r))
-      : []
-  );
-
-  const normCwds = (tabPaneCwds || []).map(c => normPathStr(c)).filter(Boolean);
-  const needTranscript = [];
-  for (const s of touchedServices) {
-    const normRoot = normPathStr(s.root);
-    if (!normRoot) continue;
-    const inPrev = prevSessionRepos.has(normRoot);
-    const inPaneCwd = normCwds.some(c => c === normRoot || c.startsWith(normRoot + "/"));
-    if (!inPrev && !inPaneCwd) needTranscript.push(s);
+function getSafeAppHome() {
+  try {
+    return typeof appHome === "function" ? appHome() : "";
+  } catch {
+    return "";
   }
+}
 
-  let transcript = "";
-  if (needTranscript.length > 0 && (tabTermAddrs || []).length > 0) {
-    const now = Date.now();
-    const unattrSig = needTranscript.map(s => s.root).sort().join("|") + "::" + (tabTermAddrs || []).join(",");
-    const canReuse = transcriptCache && transcriptCache.sig === unattrSig && (now - transcriptCache.ts) < TRANSCRIPT_THROTTLE_MS;
-    if (canReuse) {
-      transcript = transcriptCache.text;
-    } else {
-      const reads = await Promise.all(
-        (tabTermAddrs || []).map(addr => hc(["read", "--lines", "250", addr]).catch(() => ""))
-      );
-      transcript = reads.filter(Boolean).join("\n").replace(/\\/g, "/");
-      if (transcriptCache) {
-        transcriptCache.sig = unattrSig;
-        transcriptCache.ts = now;
-        transcriptCache.text = transcript;
+function recordDirtyMarksAndCounts(cwd, isWindows, normCwd, service, entries, marks, dirCounts, serviceCounts, serviceFiles) {
+  const touchedList = [];
+  const cmpCwd = normCmpStr(cwd, isWindows);
+  for (const item of entries) {
+    const { relFile, fullPath, mark } = item;
+    const cmpFile = normCmpStr(fullPath, isWindows);
+    marks[fullPath] = mark;
+    marks[cmpFile] = mark;
+    touchedList.push({ name: relFile, fullPath, mark });
+
+    if (cmpFile.startsWith(cmpCwd + "/")) {
+      const relToWorkspace = fullPath.replace(/\\/g, "/").slice(normCwd.length + 1);
+      const segs = relToWorkspace.split("/");
+      let accum = "";
+      for (let i = 0; i < segs.length - 1; i++) {
+        accum = accum ? `${accum}/${segs[i]}` : segs[i];
+        const dirFullPath = `${cwd}/${accum}`;
+        const cmpDir = normCmpStr(dirFullPath, isWindows);
+        dirCounts[dirFullPath] = (dirCounts[dirFullPath] || 0) + 1;
+        if (cmpDir !== dirFullPath) dirCounts[cmpDir] = (dirCounts[cmpDir] || 0) + 1;
       }
     }
   }
-
-  const attributed = [];
-  const nextSessionRepos = new Set(prevSessionRepos);
-
-  for (const s of touchedServices) {
-    const normRoot = normPathStr(s.root);
-    if (!normRoot) continue;
-    const inPrev = prevSessionRepos.has(normRoot);
-    const inPaneCwd = normCwds.some(c => c === normRoot || c.startsWith(normRoot + "/"));
-    const inTranscript = !inPrev && !inPaneCwd && repoMatchesTranscript(s, serviceFiles[s.id], transcript);
-
-    if (inPrev || inPaneCwd || inTranscript) {
-      attributed.push(s);
-      nextSessionRepos.add(normRoot);
-    }
-  }
-
-  if (nextSessionRepos.size !== prevSessionRepos.size) {
-    const allFlows = flows && typeof flows === "object" ? { ...flows } : {};
-    const cur = allFlows[tabId] && typeof allFlows[tabId] === "object" ? allFlows[tabId] : {};
-    allFlows[tabId] = { ...cur, sessionRepos: [...nextSessionRepos], updatedAt: Date.now() };
-    setShared("mesh.flows", allFlows);
-  }
-
-  return attributed;
+  serviceCounts[service.id] = entries.length;
+  serviceFiles[service.id] = touchedList;
 }
 
 function getParentDir(normPath) {
@@ -983,11 +952,11 @@ export default class FilesSearch extends View {
           try {
             const changed = await watchFolder(root);
             if (this._indexerClosed || !ownsRootWatcher(indexKey, token)) break;
-            if (!hasOpenAgentInSpace()) break;
+            if (!hasOpenTerminalInSpace()) break;
             const info = analyzeWatchBatch(changed, root, null);
             if (!info.hasNonIgnored) continue;
             const dirty = await handleWatchForIndex(root, on, isWindows, info, changed);
-            if (dirty && !this._indexerClosed && ownsRootWatcher(indexKey, token) && hasOpenAgentInSpace()) {
+            if (dirty && !this._indexerClosed && ownsRootWatcher(indexKey, token) && hasOpenTerminalInSpace()) {
               this.scheduleIndexerReindex(root, on, isWindows, indexKey, cx);
             }
           } catch {
@@ -1014,7 +983,7 @@ export default class FilesSearch extends View {
     }
     this.indexerReindexTask = cx.timer.after(INDEX_REBUILD_DEBOUNCE_MS, cx => {
       this.indexerReindexTask = null;
-      if (this._indexerClosed || !hasOpenAgentInSpace()) return;
+      if (this._indexerClosed || !hasOpenTerminalInSpace()) return;
       const curLoc = location();
       const curIsWin = !curLoc.on && window()?.platform === "windows";
       if (!curLoc.cwd || makeIndexKey(curLoc.cwd, curLoc.on, curIsWin) !== indexKey) return;
@@ -1030,7 +999,7 @@ export default class FilesSearch extends View {
         if (!getCachedIndex(indexKey)) {
           await restoreDiskIndex(root, on, isWindows, cx);
         }
-        if (this._indexerClosed || !hasOpenAgentInSpace()) return;
+        if (this._indexerClosed || !hasOpenTerminalInSpace()) return;
         const curLoc = location();
         const curIsWin = !curLoc.on && window()?.platform === "windows";
         if (!curLoc.cwd || makeIndexKey(curLoc.cwd, curLoc.on, curIsWin) !== indexKey) return;
@@ -1054,7 +1023,7 @@ export default class FilesSearch extends View {
     syncSpaceAgentTabs();
     const { cwd, on } = location();
     const isWindows = !on && window()?.platform === "windows";
-    const agentOpen = Boolean(cwd && hasOpenAgentInSpace());
+    const agentOpen = Boolean(cwd && hasOpenTerminalInSpace());
 
     if (!agentOpen) {
       try { this.indexerPrewarmTask?.cancel(); } catch {}
@@ -1279,7 +1248,7 @@ export default class FilesSearch extends View {
     const context = this.context;
     this.watchReindexTask = cx.timer.after(delayMs, cx => {
       this.watchReindexTask = null;
-      if (!this.current(context) || !hasOpenAgentInSpace()) return;
+      if (!this.current(context) || !hasOpenTerminalInSpace()) return;
       const { cwd, on, isWindows } = context;
       if (!cwd) return;
       cx.spawn(async cx => {
@@ -1287,7 +1256,7 @@ export default class FilesSearch extends View {
           if (!getCachedIndex(makeIndexKey(cwd, on, isWindows))) {
             await restoreDiskIndex(cwd, on, isWindows, cx);
           }
-          if (!this.current(context) || !hasOpenAgentInSpace()) return;
+          if (!this.current(context) || !hasOpenTerminalInSpace()) return;
           const cached = getCachedIndex(makeIndexKey(cwd, on, isWindows));
           if (shouldRefreshIndex(cached, on)) {
             await ensureWorkspaceIndex({ root: cwd, on, isWindows, discoverRepos, cx });
@@ -1330,7 +1299,7 @@ export default class FilesSearch extends View {
             }
             this.scheduleWatchRefresh(cx);
             const indexDirty = await handleWatchForIndex(root, null, isWindows, info, changed);
-            if (indexDirty && this.current(context) && hasOpenAgentInSpace()) {
+            if (indexDirty && this.current(context) && hasOpenTerminalInSpace()) {
               this.scheduleWatchReindex(cx);
             }
           } catch {
@@ -1663,44 +1632,6 @@ export default class FilesSearch extends View {
         if (!this.current(context)) return;
 
         const normCwd = normPathStr(cwd);
-
-        for (const { service, branch, fileEntries, ahead } of statusResults) {
-          serviceAhead[service.id] = ahead || 0;
-          serviceBranches[service.id] = branch || "";
-          if (!fileEntries.length) continue;
-          let count = 0;
-          const touchedList = [];
-          for (const entry of fileEntries.slice(0, TOTAL)) {
-            const xy = entry.slice(0, 2);
-            const rawRel = entry.slice(3);
-            const relFile = rawRel.replace(/\/+$/, "");
-            if (!relFile) continue;
-            const fullPath = `${service.root}/${relFile}`;
-            const cmpFile = normCmpStr(fullPath, isWindows);
-            const mark = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
-            marks[fullPath] = mark;
-            marks[cmpFile] = mark;
-            count++;
-            touchedList.push({ name: relFile, fullPath, mark });
-
-            const cmpCwd = normCmpStr(cwd, isWindows);
-            if (cmpFile.startsWith(cmpCwd + "/")) {
-              const relToWorkspace = fullPath.replace(/\\/g, "/").slice(normCwd.length + 1);
-              const segs = relToWorkspace.split("/");
-              let accum = "";
-              for (let i = 0; i < segs.length - 1; i++) {
-                accum = accum ? `${accum}/${segs[i]}` : segs[i];
-                const dirFullPath = `${cwd}/${accum}`;
-                const cmpDir = normCmpStr(dirFullPath, isWindows);
-                dirCounts[dirFullPath] = (dirCounts[dirFullPath] || 0) + 1;
-                if (cmpDir !== dirFullPath) dirCounts[cmpDir] = (dirCounts[cmpDir] || 0) + 1;
-              }
-            }
-          }
-          serviceCounts[service.id] = count;
-          serviceFiles[service.id] = touchedList;
-        }
-
         const prevBus = shared("mesh.services");
         const normBusRoot = prevBus?.workspaceRoot ? normPathStr(prevBus.workspaceRoot) : "";
         const prevByRoot = new Map();
@@ -1712,24 +1643,208 @@ export default class FilesSearch extends View {
           }
         }
 
-        // Only expose touched/modified repositories in this session & tab
-        const rawTouched = candidateServices
-          .map(s => {
-            const normRoot = normPathStr(s.root);
-            const existing = prevByRoot.get(normRoot);
-            return {
-              ...s,
-              branch: serviceBranches[s.id] || existing?.branch || s.branch || "",
-              workingCount: serviceCounts[s.id] ?? 0,
-              aheadCount: serviceAhead[s.id] ?? existing?.aheadCount ?? 0,
-            };
-          })
-          .filter(s => (s.workingCount || 0) > 0 || (s.aheadCount || 0) > 0);
+        let enrichedServices = [];
 
-        const enrichedServices = activeTabId
-          ? await attributeSessionServices(activeTabId, rawTouched, serviceFiles, tabPaneCwds, tabTermAddrs, this.lastTranscriptScan)
-          : rawTouched;
-        if (!this.current(context)) return;
+        if (activeTabId) {
+          const appHomeDir = getSafeAppHome();
+          const primaryStatus = statusResults.find(r => normPathStr(r.service.root) === normCwd)
+            || statusResults.find(r => r.branch)
+            || null;
+          const primaryBranch = primaryStatus?.branch || "";
+
+          let sessionBaseline = normalizeSessionBaseline(tabFlowObj?.sessionBaseline);
+          let isFreshBaseline = false;
+          let baselineDirtyChanged = false;
+
+          if (!sessionBaseline && appHomeDir) {
+            sessionBaseline = await readDiskSessionBaseline(appHomeDir, activeTabId, cwd, primaryBranch, false);
+            if (!this.current(context)) return;
+            if (sessionBaseline) baselineDirtyChanged = true;
+          }
+          if (!sessionBaseline && appHomeDir && (tabTermAddrs || []).length > 0) {
+            const reads = await Promise.all(
+              (tabTermAddrs || []).map(addr => hc(["read", "--lines", "250", addr]).catch(() => ""))
+            );
+            if (!this.current(context)) return;
+            const transcript = reads.filter(Boolean).join("\n");
+            if (terminalHasResumeCommand(transcript)) {
+              sessionBaseline = await readDiskSessionBaseline(appHomeDir, activeTabId, cwd, primaryBranch, true);
+              if (!this.current(context)) return;
+              if (sessionBaseline) baselineDirtyChanged = true;
+            }
+          }
+          if (!sessionBaseline) {
+            sessionBaseline = {
+              version: 1,
+              startedAt: Date.now(),
+              workspaceRoot: normCwd,
+              repos: {},
+            };
+            isFreshBaseline = true;
+            baselineDirtyChanged = true;
+          }
+
+          const sinceSec = Math.floor(sessionBaseline.startedAt / 1000);
+          const repoEvaluations = await Promise.all(
+            statusResults.map(async ({ service, branch, fileEntries, ahead }) => {
+              serviceAhead[service.id] = ahead || 0;
+              serviceBranches[service.id] = branch || "";
+
+              const parsedRaw = [];
+              for (const entry of fileEntries.slice(0, TOTAL)) {
+                const xy = entry.slice(0, 2);
+                const rawRel = entry.slice(3);
+                const relFile = rawRel.replace(/\/+$/, "");
+                if (!relFile) continue;
+                const fullPath = `${service.root}/${relFile}`;
+                const mark = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
+                parsedRaw.push({ relFile, fullPath, status: mark, mark });
+              }
+
+              const [parsedEntries, logRes] = await Promise.all([
+                Promise.all(
+                  parsedRaw.map(async item => {
+                    const { sig, mtimeMs } = await statFileEntry(item.fullPath, item.status, on);
+                    return { ...item, sig, mtimeMs };
+                  })
+                ),
+                isFreshBaseline
+                  ? Promise.resolve(null)
+                  : exec(
+                      "git",
+                      ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "log", "-n", "1", `--since=${sinceSec}`, "--format=%ct"],
+                      { cwd: service.root, on }
+                    ).catch(() => null),
+              ]);
+
+              const sessionCommitCount = !isFreshBaseline && logRes?.code === 0 && Boolean((logRes.stdout || "").trim()) ? 1 : 0;
+              return { service, branch, ahead, parsedEntries, sessionCommitCount };
+            })
+          );
+          if (!this.current(context)) return;
+
+          for (const { service, branch, ahead, parsedEntries, sessionCommitCount } of repoEvaluations) {
+            const normRoot = normPathStr(service.root);
+            const sigMap = new Map();
+            for (const item of parsedEntries) sigMap.set(item.relFile, item.sig);
+
+            const existingBaselineRepo = sessionBaseline.repos[normRoot] || null;
+            let sessionWorkingFiles = [];
+
+            if (isFreshBaseline) {
+              const dirtyFiles = {};
+              for (const item of parsedEntries) {
+                dirtyFiles[item.relFile] = { status: item.status, sig: item.sig };
+              }
+              sessionBaseline.repos[normRoot] = { dirtyFiles };
+              baselineDirtyChanged = true;
+              sessionWorkingFiles = [];
+            } else if (!existingBaselineRepo) {
+              sessionWorkingFiles = filterSessionDirtyEntries(parsedEntries, null, sessionBaseline.startedAt, sigMap);
+              const dirtyFiles = {};
+              for (const item of parsedEntries) {
+                if (!item.mtimeMs || item.mtimeMs < sessionBaseline.startedAt) {
+                  dirtyFiles[item.relFile] = { status: item.status, sig: item.sig };
+                }
+              }
+              sessionBaseline.repos[normRoot] = { dirtyFiles };
+              baselineDirtyChanged = true;
+            } else {
+              sessionWorkingFiles = filterSessionDirtyEntries(parsedEntries, existingBaselineRepo, sessionBaseline.startedAt, sigMap);
+            }
+
+            if (sessionWorkingFiles.length > 0 || sessionCommitCount > 0) {
+              if (sessionWorkingFiles.length > 0) {
+                recordDirtyMarksAndCounts(
+                  cwd,
+                  isWindows,
+                  normCwd,
+                  service,
+                  sessionWorkingFiles,
+                  marks,
+                  dirCounts,
+                  serviceCounts,
+                  serviceFiles
+                );
+              } else {
+                serviceCounts[service.id] = 0;
+                serviceFiles[service.id] = [];
+              }
+              const existing = prevByRoot.get(normRoot);
+              enrichedServices.push({
+                ...service,
+                branch: branch || existing?.branch || service.branch || "",
+                workingCount: sessionWorkingFiles.length,
+                aheadCount: ahead ?? existing?.aheadCount ?? 0,
+                sessionCommitCount,
+              });
+            }
+          }
+
+          const sessionRepos = enrichedServices.map(s => normPathStr(s.root)).filter(Boolean);
+          const latestFlows = asPlainObject(shared("mesh.flows"));
+          const curFlow = asPlainObject(latestFlows[activeTabId]);
+          const prevRepos = Array.isArray(curFlow.sessionRepos) ? curFlow.sessionRepos.map(r => normPathStr(r)) : [];
+          const reposChanged = prevRepos.length !== sessionRepos.length || prevRepos.some((r, idx) => r !== sessionRepos[idx]);
+
+          if (baselineDirtyChanged || reposChanged || !curFlow.sessionBaseline || curFlow.sessionStartedAt !== sessionBaseline.startedAt) {
+            setShared("mesh.flows", {
+              ...latestFlows,
+              [activeTabId]: {
+                ...curFlow,
+                sessionBaseline,
+                sessionStartedAt: sessionBaseline.startedAt,
+                sessionRepos,
+                updatedAt: Date.now(),
+              },
+            });
+          }
+          if (appHomeDir && (baselineDirtyChanged || reposChanged)) {
+            await writeDiskSessionBaseline(appHomeDir, activeTabId, cwd, primaryBranch, sessionBaseline);
+            if (!this.current(context)) return;
+          }
+        } else {
+          for (const { service, branch, fileEntries, ahead } of statusResults) {
+            serviceAhead[service.id] = ahead || 0;
+            serviceBranches[service.id] = branch || "";
+            if (!fileEntries.length) continue;
+            const parsedEntries = [];
+            for (const entry of fileEntries.slice(0, TOTAL)) {
+              const xy = entry.slice(0, 2);
+              const rawRel = entry.slice(3);
+              const relFile = rawRel.replace(/\/+$/, "");
+              if (!relFile) continue;
+              const fullPath = `${service.root}/${relFile}`;
+              const mark = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
+              parsedEntries.push({ relFile, fullPath, status: xy, mark });
+            }
+            if (parsedEntries.length > 0) {
+              recordDirtyMarksAndCounts(
+                cwd,
+                isWindows,
+                normCwd,
+                service,
+                parsedEntries,
+                marks,
+                dirCounts,
+                serviceCounts,
+                serviceFiles
+              );
+            }
+          }
+          enrichedServices = candidateServices
+            .map(s => {
+              const normRoot = normPathStr(s.root);
+              const existing = prevByRoot.get(normRoot);
+              return {
+                ...s,
+                branch: serviceBranches[s.id] || existing?.branch || s.branch || "",
+                workingCount: serviceCounts[s.id] ?? 0,
+                aheadCount: serviceAhead[s.id] ?? existing?.aheadCount ?? 0,
+              };
+            })
+            .filter(s => (s.workingCount || 0) > 0 || (s.aheadCount || 0) > 0);
+        }
 
         this.services = enrichedServices;
         this.repoRoots = new Set(enrichedServices.map(s => normCmpStr(s.root, isWindows)));
@@ -1778,7 +1893,7 @@ export default class FilesSearch extends View {
         this.serviceFiles = serviceFiles;
         this.error = null;
         this.watch(cwd, cx);
-        if (hasOpenAgentInSpace()) {
+        if (hasOpenTerminalInSpace()) {
           const indexKey = makeIndexKey(cwd, on, isWindows);
           const cached = getCachedIndex(indexKey);
           if (shouldRefreshIndex(cached, on) && !isIndexInFlight(indexKey) && !this.watchReindexTask) {

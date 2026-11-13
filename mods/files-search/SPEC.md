@@ -26,6 +26,7 @@ The `submodule-mod-files-search` delivers workspace file tree navigation, ripgre
   - Shared indexing & cache engine: `mods/files-search/indexer.js`.
   - Pure search scoring, syntax highlighting, and file-type icon helpers: `mods/files-search/search-logic.js` (`resolveFileIconSpec`, `resolveFileIcon`).
   - Pure tree cascade & subtree filtering helpers: `mods/files-search/tree-logic.js`.
+  - Pure session baseline & disk persistence helpers: `mods/files-search/session-baseline.js` (`normalizeSessionBaseline`, `readDiskSessionBaseline`, `writeDiskSessionBaseline`, `terminalHasResumeCommand`, `computeFileSig`, `statFileEntry`, `filterSessionDirtyEntries`).
   - Icon assets: `mods/files-search/*.svg` (`file.svg`, `folder.svg`, `spinner.svg`, `search.svg`, `preview.svg`, `grip.svg`, etc.) and `mods/files-search/icons/file-types/*.svg` (22 vector file-type icons for Java, Spring Boot, Python, JS/TS/React, Kotlin, JSON, YAML, settings/env, SQL, HTML/XML, CSS, Docker, Git, build manifests, lockfiles, Markdown, shell, images, generic code, and fallback file).
   - Type definitions and config: `gpui-kit.d.ts`, `jsconfig.json`.
 - **Public surface:**
@@ -46,7 +47,7 @@ The `submodule-mod-files-search` delivers workspace file tree navigation, ripgre
   - `gpui-kit`: `View`, `div`, `svg`.
   - `gpui-base`: `v_flex`, `h_flex`, `InputState`, `Input`, `Editor`, `EditorState`, `TextareaState`, `Textarea`, `Scrollbar`, `VirtualListScrollHandle`, `v_virtual_list`.
   - `herdr`: `spaces`, `panes`, `terminals`, `focused`, `agents`, `hc`, `exec`, `run`, `appHome`, `readTextFile`, `watchFolder`, `theme`, `settings`, `window`, `layout`, `props`, `openOverlay`, `closeOverlay`, `shared`, `setShared`.
-  - `fs/promises`, `path`: Local asynchronous filesystem scans and cross-platform persistent index cache I/O under `${appHome()}/mesh/workspaces/<slug>-<fnv1a8>/files-index.json`.
+  - `fs/promises`, `path`: Local asynchronous filesystem scans, persistent index cache I/O under `${appHome()}/mesh/workspaces/<slug>-<fnv1a8>/files-index.json`, and persistent session baseline I/O under `${appHome()}/mesh/sessions/{tabs,resume}/*.json`.
 - **Forbidden:**
   - Running synchronous file operations or unbounded recursive disk scans on the main thread.
   - Pre-warming or automatically re-indexing workspaces when the active space contains only plain shell terminals (no open non-runner coding agent).
@@ -80,7 +81,7 @@ The mod detects its operational mode during initialization via `props()`:
 
 ### 1. Docked Panel Mode (`isOverlay: false`, `isIndexer: false`, `isViewer: false`)
 - **Workspace Root Anchoring (`location().cwd` & `mesh.spaceAgentTabs`):** Tracks the workspace directory using `space.folder` as the primary anchor whenever the active terminal pane's `cwd` resides within `space.folder` (`pane.cwd === space.folder || pane.cwd.startsWith(space.folder + "/")` or Windows `\`). When a non-terminal mod tab (such as a File Viewer tab with no `cwd`) is active, `location()` falls back cleanly to `space?.folder` or the anchored terminal tab stored in `mesh.spaceAgentTabs` (or another live terminal pane in the same space), guaranteeing that terminal `cd` or switching to a File Viewer tab never drops workspace root anchoring.
-- **Session-Scoped Multi-Repository Discovery (`discoverRepos`, `attributeSessionServices`):** Discovers Git repositories under `workspaceRoot` up to depth 2 (plus parent siblings when `workspaceRoot` is itself a repo and extra active-tab `pane.cwd` paths) using native async `fs/promises` scans locally (`fsScanRepos`, falling back to PowerShell on Windows or POSIX `sh` outside `$HOME` / on unsupported `Dirent` shapes) and POSIX/PowerShell over SSH (`on`), cached for `REPO_CACHE_TTL_MS = 60000`. Executes lock-free `git status --porcelain=v1 -b -z --no-renames --untracked-files=normal` in parallel, attributes touched repositories to the active tab session via `mesh.flows[tabId].sessionRepos`, and publishes `mesh.services` with a `sig` change key (`45s` heartbeat) so `changes-review` reuses results cleanly.
+- **Session-Scoped Multi-Repository Discovery & Baseline Delta Tracking (`discoverRepos`, `session-baseline.js`):** Discovers Git repositories under `workspaceRoot` up to depth 2 (plus parent siblings when `workspaceRoot` is itself a repo and extra active-tab `pane.cwd` paths) using native async `fs/promises` scans locally (`fsScanRepos`, falling back to PowerShell on Windows or POSIX `sh` outside `$HOME` / on unsupported `Dirent` shapes) and POSIX/PowerShell over SSH (`on`), cached for `REPO_CACHE_TTL_MS = 60000`. Executes lock-free `git status --porcelain=v1 -b -z --no-renames --untracked-files=normal` and `git log -n 1 --since=<floor(startedAt/1000)> --format=%ct` in parallel, tracks per-tab session baselines (`sessionBaseline`, `sessionStartedAt`, `sessionRepos`) in `mesh.flows[tabId]` and on disk under `${appHome()}/mesh/sessions/tabs/<safeTabId>.json` and `${appHome()}/mesh/sessions/resume/<hash(normRoot::branch)>.json` (restored on `/resume`), filters out pre-existing dirty files and untouched sibling repositories via `filterSessionDirtyEntries` + `computeFileSig`/`statFileEntry`, and publishes `mesh.services` with a `sig` change key (`45s` heartbeat) so `changes-review` reuses results cleanly.
 - **Folder Modification Counters & Badges:**
   - Aggregates file modification marks (`marks`: `fullPath -> "A" | "M" | "D" | "U"`).
   - Computes ancestor directory modification counters (`dirCounts` / `dirMarks`: `dirFullPath -> count`).
@@ -116,22 +117,22 @@ The mod detects its operational mode during initialization via `props()`:
 - Selecting a directory (`kind === "dir"`) emits `files-search.select`, reveals and expands the folder in `#files` (`openFromSearch`), and shows `#panel` (`layout.select` + `layout.show`); selecting a file closes the overlay, opens/focuses its File Viewer tab in `#main` via `openFileInTab(...)`, and emits `kind: "reveal"` on `files-search.select` so `#files` expands and highlights the path in the background without forcing `#panel` open.
 - Allows resizing via grip controls, persisting geometry across sessions via `setShared("files-search.customSize", ...)`.
 
-### 3. Headless Agent-Triggered Indexer Mode (`isIndexer: true`, `props()?.role === "indexer"`)
+### 3. Headless Terminal-Triggered Indexer Mode (`isIndexer: true`, `props()?.role === "indexer"`)
 - Mounted in a `0px` `#files-indexer` block inside `#work` so workspace indexing stays active even while `#panel` starts collapsed (`hidden: true`).
 - Renders an inert `div().h(0).w(0)` container (`renderIndexer`).
-- Observes workspace/tab/agent lifecycle (`hasOpenAgentInSpace`, ignoring `meshRunner === "true"` splits): remains completely idle when only plain shell terminals are open, and pre-warms (`AGENT_PREWARM_DEBOUNCE_MS = 250`) only once a live coding agent opens in the space.
-- Deduplicates concurrent `ensureWorkspaceIndex` scans, persists file + directory snapshots to `${appHome()}/mesh/workspaces/<slug>-<fnv1a8>/files-index.json`, shares root `watchFolder` ownership (`claimRootWatcher` / `releaseRootWatcher`) with docked panel mode, extends cache TTL to `INDEX_WATCHED_TTL_MS = 300000` while watched, ignores pure edits to existing indexed files, and triggers debounced incremental re-indexing (`INDEX_REBUILD_DEBOUNCE_MS = 1200`) on additions, deletions, `.gitignore` changes, branch/HEAD switches, or watch overflow while an agent remains open.
+- Observes workspace/tab/terminal lifecycle (`hasOpenTerminalInSpace`, ignoring `meshRunner === "true"` splits): remains idle when the active space has no open terminals, and pre-warms (`AGENT_PREWARM_DEBOUNCE_MS = 250`) as soon as a terminal (plain shell or coding agent) opens in the space for work.
+- Deduplicates concurrent `ensureWorkspaceIndex` scans, persists file + directory snapshots to `${appHome()}/mesh/workspaces/<slug>-<fnv1a8>/files-index.json`, shares root `watchFolder` ownership (`claimRootWatcher` / `releaseRootWatcher`) with docked panel mode, extends cache TTL to `INDEX_WATCHED_TTL_MS = 300000` while watched, ignores pure edits to existing indexed files, and triggers debounced incremental re-indexing (`INDEX_REBUILD_DEBOUNCE_MS = 1200`) on additions, deletions, `.gitignore` changes, branch/HEAD switches, or watch overflow while a terminal remains open.
 
 ## Invariants
 
-1. **Agent-Gated Background Pre-Warming & Shared Watch Ownership:**
-   Automatic workspace indexing and headless `watchFolder` monitoring MUST ONLY start when `hasOpenAgentInSpace()` detects a live non-runner coding agent in the active space (never for plain shell terminals alone), and `indexer.js` MUST enforce single-owner `watchFolder` registration (`claimRootWatcher`) and `INDEX_INFLIGHT` deduplication per workspace root.
+1. **Terminal-Gated Background Pre-Warming & Shared Watch Ownership:**
+   Automatic workspace indexing and headless `watchFolder` monitoring MUST start once `hasOpenTerminalInSpace()` detects a live non-runner terminal (plain shell or agent) in the active space (never for spaces with zero terminals or `meshRunner === "true"` splits alone), and `indexer.js` MUST enforce single-owner `watchFolder` registration (`claimRootWatcher`) and `INDEX_INFLIGHT` deduplication per workspace root.
 2. **Subprocess Throttling, Chunked File Matching, and Cancellation:**
    Entering characters into the search field triggers time-sliced file+directory matching (`triggerFileSearch` / `fileSearchTask`) and a debounced text search task. `renderOverlay()` only reads precomputed `searchResults()`. Any previously running `fileSearchTask` or `textSearchTask` MUST be cancelled via `.cancel()` before launching a subsequent query, guaranteeing that slow work never blocks `render()` or overwrites newer results.
 3. **Lock-Free Multi-Repository Git Operations:**
    Every read-only Git status, diff, ls-files, or grep command executed across discovered services MUST supply `--no-optional-locks -c core.fsmonitor=false -c diff.autoRefreshIndex=false` to prevent touching `.git/index.lock` or tripping filesystem watchers.
-4. **Workspace Root Stability:**
-   Terminal navigation into subdirectories or microservices must never mutate or truncate the panel's root file tree or search scope. Root resolution strictly anchors to `space.folder` when available.
+4. **Live Terminal Directory Tracking:**
+   Terminal navigation (`cd` in the CLI) updates the panel's active `cwd` and file tree dynamically (`paneCwd || focused.cwd || space.folder`), switching watchers and background indexing to the current directory automatically.
 5. **Non-Reentrant Shared State Synchronization & Pure Render:**
    Shared state listeners (`mesh.activeService`, `files-search.select`) MUST gate incoming events against monotonically increasing timestamps (`ts > this.lastActiveServiceTs`), defer panel mutations outside `renderPanel()`, and never emit reciprocal shared state updates for incoming events.
 6. **Deep Path & Directory Auto-Expansion:**

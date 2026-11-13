@@ -88,6 +88,45 @@ describe("files-search indexer — agent gate", () => {
   });
 });
 
+describe("files-search indexer — terminal gate", () => {
+  test("returns true when active space has a plain shell terminal", () => {
+    resetHerdrMock({
+      spaces: [{ id: "sp-1", active: true, tabs: [{ id: "tab-1" }] }],
+      panes: [{ id: "p-shell", tab: "tab-1", terminal: "term-shell", program: { name: "bash", agent: false } }],
+      terminals: [{ address: "term-shell", program: { name: "bash", agent: false }, labels: {} }],
+      agents: [],
+      focused: { space: "sp-1", tab: "tab-1", terminal: "term-shell", agent: null },
+    });
+    assert.equal(idx.hasOpenTerminalInSpace(), true);
+  });
+
+  test("ignores auxiliary runner splits marked with meshRunner=true when no other terminal exists", () => {
+    resetHerdrMock({
+      spaces: [{ id: "sp-1", active: true, tabs: [{ id: "tab-1" }] }],
+      panes: [{ id: "p-run", tab: "tab-1", terminal: "term-run", labels: { meshRunner: "true" }, program: { agent: false } }],
+      terminals: [{ address: "term-run", labels: { meshRunner: "true" }, program: { agent: false } }],
+      agents: [],
+      focused: { space: "sp-1", tab: "tab-1", terminal: "term-run", agent: null },
+    });
+    assert.equal(idx.hasOpenTerminalInSpace(), false);
+  });
+
+  test("returns false when active space has no terminals even if another space has one", () => {
+    resetHerdrMock({
+      spaces: [
+        { id: "sp-1", active: true, tabs: [] },
+        { id: "sp-2", active: false, tabs: [{ id: "tab-2" }] },
+      ],
+      panes: [{ id: "p-other", tab: "tab-2", terminal: "term-other", program: { name: "zsh", agent: false } }],
+      terminals: [{ address: "term-other", program: { name: "zsh", agent: false }, labels: {} }],
+      agents: [],
+      focused: { space: "sp-1", tab: null, terminal: null, agent: null },
+    });
+    assert.equal(idx.hasOpenTerminalInSpace(), false);
+    assert.equal(idx.hasOpenTerminalInSpace({ id: "sp-2", tabs: [{ id: "tab-2" }] }), true);
+  });
+});
+
 describe("files-search indexer — cache, disk persistence & watch invalidation", () => {
   let tmpRoot;
 

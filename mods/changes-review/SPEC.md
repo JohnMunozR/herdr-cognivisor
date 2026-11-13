@@ -31,11 +31,12 @@ The `submodule-mod-changes-review` provides interactive source control inspectio
     - Reads and defers updates to `mesh.spaceAgentTabs` (`Record<spaceId, tabId>`) recording the most recent terminal-bearing tab per space so session identity, flows, and agent resolution stay intact while the non-terminal Review tab is active.
     - Coordinates the active space's single Review tab via `changes-review.activeDiff` (`Record<spaceId, ActiveDiffState>` containing `spaceId`, `sourceTabId`, `workspaceRoot`, `on`, `viewMode`, `selectedCommit`, `activeService`, `openFileKey`, `openFile`, `files`, `allFiles`, `services`, `requestSeq`, `focusLine`, `openCommentLine`, `ts`).
     - Synchronizes inline review notes bidirectionally between the Review tab and docked `#changes` via `mesh.reviewNotes` (`Record<sessionKey, Array<ReviewNote>>` where `sessionKey = "${spaceId}::${sourceTabId || 'global'}"`).
-    - Reads and updates `mesh.flows[sessionTabId]` (`reviewedServices` checklist map, `reviewedFiles` per-file viewed map, and `sessionRepos` attribution, preserving all sibling fields such as `leadTerminal`, `ticket`, `derivedTitle`, `manualTitle`).
+    - Reads and updates `mesh.flows[sessionTabId]` (`reviewedServices` checklist map, `reviewedFiles` per-file viewed map, `sessionRepos` attribution, and `sessionBaseline` session snapshot, preserving all sibling fields such as `leadTerminal`, `ticket`, `derivedTitle`, `manualTitle`).
 - **Allowed deps:**
   - `gpui-kit`: `View`, `div`, `svg`.
   - `gpui-base`: `v_flex`, `h_flex`, `InputState`, `Input`, `TextareaState`, `Textarea`, `Scrollbar`, `ScrollHandle`.
-  - `herdr`: `props`, `run`, `spaces`, `panes`, `focused`, `agents`, `terminals`, `exec`, `readTextFile`, `watchFolder`, `theme`, `settings`, `notify`, `hc`, `layout`, `shared`, `setShared`, `window`.
+  - `herdr`: `props`, `run`, `spaces`, `panes`, `focused`, `agents`, `terminals`, `exec`, `readTextFile`, `watchFolder`, `theme`, `settings`, `notify`, `hc`, `layout`, `shared`, `setShared`, `window`, `appHome`.
+  - `fs/promises`, `path`: Local directory discovery, file statting (`size:mtimeMs`), and session baseline persistence under `${appHome()}/mesh/sessions/`.
 - **Forbidden:**
   - Any usage of `localStorage` or browser DOM APIs.
   - Calling `cx.notify()`, `setShared()`, or mutating inputs synchronously inside `render()` (all refreshes, `viewerLoadedKey` diff fetches, `mesh.spaceAgentTabs` recordings, and cross-mode syncs run asynchronously via `cx.timer.after(0, ...)` or explicit interaction handlers).
@@ -113,6 +114,12 @@ The workspace root is anchored to `space.folder`. When the active tab is a non-t
 
 ### Multi-Repository Discovery & Session Attribution (`discoverRepos`, `attributeSessionRepos`)
 Scans `workspaceRoot` up to depth 2 (`$root/*` and `$root/*/*`) using `fs/promises` on local workspaces (and POSIX/PowerShell over SSH when `on` is set), plus parent/sibling discovery for single-repo workspaces, caching candidates for `REPO_CACHE_TTL_MS = 60000`. Shared `loadServiceWorkingSnapshot` queries `git status --porcelain=v1 -b -z --no-renames --untracked-files=normal` and `numstat` in lock-free passes per repo, attributing touched repositories to `sessionTabId` (`sessionRepos` in `mesh.flows[sessionTabId]`).
+
+### Strict Session-Scoped Filtering (`sessionBaseline`, `filterSessionWorkingEntries`, `filterSessionCommits`)
+Both `#changes` and `#review-tab-viewer` are strictly session-scoped with no global repository toggle, rendering `"No changes in this session yet"` when no session-scoped modifications exist:
+- **Baseline Resolution & Restart Persistence:** `resolveOrInitSessionBaseline` reads `mesh.flows[sessionTabId].sessionBaseline`, falling back to `${appHome()}/mesh/sessions/tabs/<safeTabId>.json` and `/resume` terminal detection via `${appHome()}/mesh/sessions/resume/<hash>.json`. If no baseline exists yet, it initializes `startedAt = Date.now()` and `repos[normRoot].dirtyFiles` from the initial working snapshot and persists to both `mesh.flows[sessionTabId]` and disk.
+- **Working Tree Filtering:** Local dirty files are statted (`size:mtimeMs` `sig`, `mtimeMs`). `filterSessionWorkingEntries` excludes entries matching `baselineRepo.dirtyFiles[relFile]` (`status` and `sig`), surfaces re-edited or newly modified files, and when `baselineRepo` is absent includes entries only if `mtimeMs >= startedAt` (or `!mtimeMs` when stat is unavailable).
+- **Commit Filtering:** `filterSessionCommits` restricts `#commit-selector-btn` commits to `Number(c.timestamp || 0) >= Math.floor(startedAt / 1000)`, excluding pre-session commits.
 
 ### Shared Bus Synchronization (`mesh.services`, `mesh.activeService`, `changes-review.activeDiff`, `mesh.reviewNotes`, `mesh.spaceAgentTabs`)
 Consumes `mesh.services` published by `files-search` (`BUS_MAX_AGE_MS = 90000`, `sig`-matched to ignore heartbeat-only `ts` ticks when unchanged) and publishes updates only when topology/branch/dirty signature changes. Active service filter state (`"all"` or a specific `serviceId`) synchronizes bidirectionally over `mesh.activeService`. `changes-review.activeDiff` and `mesh.reviewNotes` coordinate the single reusable Review tab and inline comment state without duplicating git scans inside `#main`.

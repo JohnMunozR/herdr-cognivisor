@@ -330,6 +330,64 @@ export function hasOpenAgentInSpace(targetSpace = null) {
   return false;
 }
 
+// Detect whether the active workspace space has at least one open non-runner terminal (plain shell or agent).
+export function hasOpenTerminalInSpace(targetSpace = null) {
+  const allSpaces = spaces() || [];
+  const space = targetSpace || allSpaces.find(s => s.active) || null;
+  const f = focused();
+  const allTerms = terminals() || [];
+  const termByAddr = new Map();
+  for (const term of allTerms) {
+    if (term?.address) termByAddr.set(term.address, term);
+  }
+  const isRunner = (pane, term) =>
+    pane?.labels?.meshRunner === "true" || term?.labels?.meshRunner === "true";
+
+  const spaceId = space?.id || f?.space || null;
+  const spaceTabIds = new Set((space?.tabs || []).map(t => t?.id).filter(Boolean));
+  if (!spaceTabIds.size && f?.tab && (!spaceId || !f?.space || f.space === spaceId)) {
+    spaceTabIds.add(f.tab);
+  }
+  const otherSpaceTabIds = new Set();
+  for (const sp of allSpaces) {
+    if (spaceId && sp?.id === spaceId) continue;
+    for (const t of sp?.tabs || []) {
+      if (t?.id) otherSpaceTabIds.add(t.id);
+    }
+  }
+
+  for (const p of panes() || []) {
+    if (!p?.terminal) continue;
+    if (spaceTabIds.size > 0) {
+      if (!spaceTabIds.has(p.tab)) continue;
+    } else if (otherSpaceTabIds.has(p.tab) || (space && !f?.tab)) {
+      continue;
+    }
+    const term = termByAddr.get(p.terminal) || null;
+    if (isRunner(p, term)) continue;
+    return true;
+  }
+
+  for (const a of agents() || []) {
+    if (!a?.address) continue;
+    const term = termByAddr.get(a.address) || null;
+    if (isRunner(null, term)) continue;
+    if ((spaceId && a.space === spaceId) || (a.tab && spaceTabIds.has(a.tab))) {
+      return true;
+    }
+  }
+
+  if (f?.terminal || f?.agent) {
+    const focusedAddr = f.terminal || f.agent;
+    const focusedTerm = termByAddr.get(focusedAddr) || null;
+    if (!isRunner(null, focusedTerm) && (!spaceId || !f.space || f.space === spaceId)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function fnv1aHex(str) {
   let hash = 0x811c9dc5;
   for (let i = 0; i < str.length; i++) {

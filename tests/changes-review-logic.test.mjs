@@ -23,6 +23,8 @@ import {
   pickNextUnreviewedFile,
   sortServicesDirtyFirst,
   pickNextDirtyService,
+  filterSessionCommits,
+  filterSessionWorkingEntries,
 } from "../mods/changes-review/review-logic.js";
 
 describe("changes-review review-logic", () => {
@@ -352,6 +354,60 @@ describe("changes-review review-logic", () => {
     assert.equal(
       pickNextDirtyService(sorted, "auth", (id) => allCleanOrApproved[id]),
       null,
+    );
+  });
+
+  test("filterSessionCommits excludes pre-session commits and keeps session commits", () => {
+    const startedAtMs = 1700000100500; // floor(/1000) === 1700000100
+    const commits = [
+      { hash: "c3", timestamp: 1700000200, subject: "after" },
+      { hash: "c2", timestamp: 1700000100, subject: "exact boundary" },
+      { hash: "c1", timestamp: 1700000099, subject: "before" },
+      { hash: "c0", timestamp: 0, subject: "missing ts" },
+    ];
+
+    assert.deepEqual(
+      filterSessionCommits(commits, startedAtMs).map((c) => c.hash),
+      ["c3", "c2"],
+    );
+
+    // When sessionStartedAt is falsy, returns commits unchanged
+    assert.equal(filterSessionCommits(commits, 0).length, 4);
+    assert.equal(filterSessionCommits(commits, null).length, 4);
+    assert.deepEqual(filterSessionCommits(null, startedAtMs), []);
+  });
+
+  test("filterSessionWorkingEntries excludes unchanged baseline files, includes re-edited files, and handles missing baselineRepo", () => {
+    const startedAt = 1700000100000;
+    const baselineRepo = {
+      dirtyFiles: {
+        "src/unchanged.js": { status: "M", sig: "120:1700000050000" },
+        "src/re-edited.js": { status: "M", sig: "200:1700000050000" },
+        "src/status-changed.js": { status: "A", sig: "50:1700000050000" },
+      },
+    };
+
+    const entries = [
+      { relFile: "src/unchanged.js", status: "M", sig: "120:1700000050000", mtimeMs: 1700000050000 },
+      { relFile: "src/re-edited.js", status: "M", sig: "245:1700000200000", mtimeMs: 1700000200000 },
+      { relFile: "src/status-changed.js", status: "M", sig: "50:1700000050000", mtimeMs: 1700000050000 },
+      { relFile: "src/new-session.js", status: "A", sig: "99:1700000150000", mtimeMs: 1700000150000 },
+    ];
+
+    assert.deepEqual(
+      filterSessionWorkingEntries(entries, baselineRepo, startedAt).map((e) => e.relFile),
+      ["src/re-edited.js", "src/status-changed.js", "src/new-session.js"],
+    );
+
+    // When baselineRepo is missing and sessionStartedAt > 0, filter by mtimeMs >= sessionStartedAt (or !mtimeMs fallback)
+    const fallbackEntries = [
+      { relFile: "old.js", status: "M", sig: "10:1700000000000", mtimeMs: 1700000000000 },
+      { relFile: "fresh.js", status: "M", sig: "10:1700000100000", mtimeMs: 1700000100000 },
+      { relFile: "remote-no-stat.js", status: "M", sig: "", mtimeMs: 0 },
+    ];
+    assert.deepEqual(
+      filterSessionWorkingEntries(fallbackEntries, null, startedAt).map((e) => e.relFile),
+      ["fresh.js", "remote-no-stat.js"],
     );
   });
 });

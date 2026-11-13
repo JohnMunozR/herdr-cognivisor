@@ -1,10 +1,10 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, Scrollbar, ScrollHandle } from "gpui-base";
-import { readdir, exists } from "fs/promises";
-import { join } from "path";
+import { readdir, exists, readFile, writeFile, mkdir } from "fs/promises";
+import { join, dirname } from "path";
 import {
   spaces, panes, focused, agents, terminals, exec, readTextFile, watchFolder,
-  theme, settings, notify, hc, run, layout, props, shared, setShared, window,
+  theme, settings, notify, hc, run, layout, props, shared, setShared, window, appHome,
 } from "herdr";
 import {
   DISCOVER_SKIP_DIRS,
@@ -27,10 +27,154 @@ import {
   pickNextUnreviewedFile,
   pickNextDirtyService,
   sortServicesDirtyFirst,
+  filterSessionCommits,
+  filterSessionWorkingEntries,
 } from "./review-logic.js";
 
 function readPlainObject(val) {
   return val && typeof val === "object" && !Array.isArray(val) ? val : {};
+}
+
+function safeTabId(tabId) {
+  return String(tabId || "").replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function fnv1aHex(str) {
+  let hash = 0x811c9dc5;
+  const s = String(str || "");
+  for (let i = 0; i < s.length; i++) {
+    hash ^= s.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function getMeshSessionsBase() {
+  try {
+    const base = typeof appHome === "function" ? appHome() : "";
+    return base ? join(base, "mesh", "sessions") : "";
+  } catch {
+    return "";
+  }
+}
+
+async function readJsonFileSafe(filePath) {
+  if (!filePath) return null;
+  try {
+    const raw = await readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeJsonFileSafe(filePath, data) {
+  if (!filePath) return;
+  try {
+    await mkdir(dirname(filePath), { recursive: true });
+    await writeFile(filePath, JSON.stringify(data), "utf8");
+  } catch {}
+}
+
+function extractResumeKeyFromTranscript(text, workspaceRoot) {
+  const s = String(text || "");
+  if (!s) return "";
+  const lines = s.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const cmdMatch = line.match(/(?:^|\s)(?:\/resume|(?:claude|codex)\s+(?:--)?resume)(?:\s+([a-zA-Z0-9._:/-]+))?/);
+    if (cmdMatch) {
+      const id = cmdMatch[1] ? cmdMatch[1].trim() : "";
+      return id ? `resume:${id}` : `resume:${normPathStr(workspaceRoot || "")}`;
+    }
+  }
+  return "";
+}
+
+function isValidBaseline(baseline) {
+  return Boolean(baseline && typeof baseline === "object" && typeof baseline.startedAt === "number" && baseline.startedAt > 0);
+}
+
+function mergeSessionBaselineIntoFlow(tabId, baseline) {
+  if (!tabId || !isValidBaseline(baseline)) return;
+  const flows = readPlainObject(shared("mesh.flows"));
+  const cur = flows[tabId] && typeof flows[tabId] === "object" ? flows[tabId] : {};
+  if (cur.sessionBaseline && cur.sessionBaseline.startedAt === baseline.startedAt) return;
+  setShared("mesh.flows", {
+    ...flows,
+    [tabId]: { ...cur, sessionBaseline: baseline, updatedAt: Date.now() },
+  });
+}
+
+async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTermAddrs, workspaceRoot) {
+  if (!sessionTabId) return null;
+  const flows = readPlainObject(shared("mesh.flows"));
+  const existing = flows[sessionTabId]?.sessionBaseline;
+  if (isValidBaseline(existing)) return existing;
+
+  const sessionsBase = getMeshSessionsBase();
+  const tabFilePath = sessionsBase ? join(sessionsBase, "tabs", `${safeTabId(sessionTabId)}.json`) : "";
+  if (tabFilePath) {
+    const diskTab = await readJsonFileSafe(tabFilePath);
+    const diskBaseline = isValidBaseline(diskTab?.sessionBaseline) ? diskTab.sessionBaseline : (isValidBaseline(diskTab) ? diskTab : null);
+    if (diskBaseline) {
+      mergeSessionBaselineIntoFlow(sessionTabId, diskBaseline);
+      return diskBaseline;
+    }
+  }
+
+  let resumeKey = "";
+  if (sessionsBase && Array.isArray(tabTermAddrs) && tabTermAddrs.length > 0) {
+    const reads = await Promise.all(
+      tabTermAddrs.slice(0, 2).map((addr) => hc(["read", "--lines", "120", addr]).catch(() => ""))
+    );
+    const transcript = reads.filter(Boolean).join("\n");
+    resumeKey = extractResumeKeyFromTranscript(transcript, workspaceRoot);
+    if (resumeKey) {
+      const candidateBranches = Array.from(new Set((serviceResults || []).map((r) => String(r.branch || r.service?.branch || "").trim()).filter(Boolean)));
+      const resumeHashes = [fnv1aHex(resumeKey), ...candidateBranches.map((br) => fnv1aHex(`${normPathStr(workspaceRoot || "")}::${br}`)), fnv1aHex(`${normPathStr(workspaceRoot || "")}::`)];
+      for (const h of resumeHashes) {
+        const resumePath = join(sessionsBase, "resume", `${h}.json`);
+        const diskResume = await readJsonFileSafe(resumePath);
+        const resumeBaseline = isValidBaseline(diskResume?.sessionBaseline) ? diskResume.sessionBaseline : (isValidBaseline(diskResume) ? diskResume : null);
+        if (resumeBaseline) {
+          mergeSessionBaselineIntoFlow(sessionTabId, resumeBaseline);
+          await writeJsonFileSafe(tabFilePath, { tabId: sessionTabId, sessionBaseline: resumeBaseline });
+          return resumeBaseline;
+        }
+      }
+    }
+  }
+
+  const startedAt = Date.now();
+  const repos = {};
+  for (const res of serviceResults || []) {
+    const normRoot = normPathStr(res.service?.root);
+    if (!normRoot) continue;
+    const dirtyFiles = {};
+    for (const f of res.files || []) {
+      const rel = f.relFile ?? f.path ?? "";
+      if (!rel) continue;
+      dirtyFiles[rel] = {
+        status: f.status || "M",
+        sig: f.sig || "",
+        mtimeMs: Number(f.mtimeMs || 0),
+      };
+    }
+    repos[normRoot] = { dirtyFiles };
+  }
+  const baseline = { startedAt, repos };
+  mergeSessionBaselineIntoFlow(sessionTabId, baseline);
+  if (tabFilePath) {
+    await writeJsonFileSafe(tabFilePath, { tabId: sessionTabId, sessionBaseline: baseline });
+  }
+  if (sessionsBase && resumeKey) {
+    const resumePath = join(sessionsBase, "resume", `${fnv1aHex(resumeKey)}.json`);
+    await writeJsonFileSafe(resumePath, { resumeKey, sessionBaseline: baseline });
+  }
+  return baseline;
 }
 
 function location() {
@@ -531,26 +675,40 @@ async function loadServiceWorkingSnapshot(service, on, includeCommits = true) {
       }
     }
 
-    const files = [];
-    for (const { xy, path } of fileEntries) {
-      const fresh = xy === "??";
-      const conflict = xy.includes("U") || xy === "AA" || xy === "DD";
-      const s = conflict ? "U" : xy.includes("D") ? "D" : fresh || xy.includes("A") ? "A" : "M";
-      const stat = stats[path] ?? { add: 0, del: 0 };
-      files.push({
-        key: `${service.id}::${path}`,
-        serviceId: service.id,
-        serviceName: service.name,
-        relPrefix: service.relPath,
-        repoRoot: service.root,
-        hasHead: serviceHasHead,
-        path,
-        displayPath: service.relPath ? `${service.relPath}/${path}` : (service.isSibling ? `${service.name}/${path}` : path),
-        status: s,
-        fresh,
-        ...stat,
-      });
-    }
+    const files = await Promise.all(
+      fileEntries.map(async ({ xy, path }) => {
+        const fresh = xy === "??";
+        const conflict = xy.includes("U") || xy === "AA" || xy === "DD";
+        const s = conflict ? "U" : xy.includes("D") ? "D" : fresh || xy.includes("A") ? "A" : "M";
+        const lineStat = stats[path] ?? { add: 0, del: 0 };
+        let sig = s === "D" ? "deleted" : "";
+        let mtimeMs = 0;
+        if (!on && s !== "D") {
+          try {
+            const content = await readFile(join(service.root, path), "utf8");
+            sig = `${content.length}:${fnv1aHex(String(content))}`;
+          } catch {
+            sig = "deleted";
+          }
+        }
+        return {
+          key: `${service.id}::${path}`,
+          serviceId: service.id,
+          serviceName: service.name,
+          relPrefix: service.relPath,
+          repoRoot: service.root,
+          hasHead: serviceHasHead,
+          path,
+          relFile: path,
+          displayPath: service.relPath ? `${service.relPath}/${path}` : (service.isSibling ? `${service.name}/${path}` : path),
+          status: s,
+          fresh,
+          sig,
+          mtimeMs,
+          ...lineStat,
+        };
+      })
+    );
 
     service.workingCount = rawEntries.length;
     service.aheadCount = aheadCount;
@@ -2003,8 +2161,29 @@ export default class ChangesReview extends View {
 
         if (key() !== context) return;
 
+        const sessionBaseline = sessionTabId
+          ? await resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTermAddrs, workspaceRoot)
+          : null;
+        if (key() !== context) return;
+
+        if (sessionBaseline) {
+          const startedAt = sessionBaseline.startedAt || 0;
+          for (const res of serviceResults) {
+            const normRoot = normPathStr(res.service?.root);
+            const baselineRepo = normRoot ? (sessionBaseline.repos?.[normRoot] || null) : null;
+            const sessionFiles = filterSessionWorkingEntries(res.files, baselineRepo, startedAt);
+            const sessionCommits = filterSessionCommits(res.commits, startedAt);
+            res.files = sessionFiles;
+            res.commits = sessionCommits;
+            if (res.service) {
+              res.service.workingCount = sessionFiles.length;
+            }
+            res.touched = sessionFiles.length > 0 || sessionCommits.length > 0;
+          }
+        }
+
         const rawTouched = serviceResults.filter((r) => r.touched);
-        const touchedResults = (sessionTabId && !usingBusServices)
+        const touchedResults = (sessionTabId && !usingBusServices && !sessionBaseline)
           ? await attributeSessionRepos(sessionTabId, rawTouched, tabPaneCwds, tabTermAddrs, this.lastTranscriptScan)
           : rawTouched;
         if (key() !== context) return;
@@ -2420,7 +2599,12 @@ export default class ChangesReview extends View {
         if (nextFiles.length === 0 && nextDirty.root) {
           try {
             const snap = await loadServiceWorkingSnapshot(nextDirty, diff?.on ?? null, false);
-            nextFiles = (snap?.files || []).map(buildFileDescriptor);
+            const baseline = updatedFlow?.sessionBaseline || null;
+            const normRoot = normPathStr(nextDirty.root);
+            const rawSnapFiles = baseline
+              ? filterSessionWorkingEntries(snap?.files || [], baseline.repos?.[normRoot] || null, baseline.startedAt || 0)
+              : (snap?.files || []);
+            nextFiles = rawSnapFiles.map(buildFileDescriptor);
           } catch {}
         }
         const firstUnreviewed =
@@ -2877,7 +3061,11 @@ export default class ChangesReview extends View {
           .child(Scrollbar.vertical("changes-diff-lines").viewport_from_layout().absolute().inset_0())
           .when(!openFile, (e) => e.child(
             h_flex().absolute().inset_0().items_center().justify_center()
-              .child(div().text_size(12).text_color(t.dim).child("Select a file from the Changes panel to review its diff"))
+              .child(div().text_size(12).text_color(t.dim).child(
+                files.length === 0 && viewMode === "working"
+                  ? "No changes in this session yet"
+                  : "Select a file from the Changes panel to review its diff"
+              ))
           ))
           .when(Boolean(openFile) && this.viewerLoading && this.rows.length === 0, (e) => e.child(
             div().absolute().top(12).left(14).text_size(11.5).text_color(t.dim).child("Loading diff…")
@@ -3247,7 +3435,7 @@ export default class ChangesReview extends View {
           .when(f.add > 0, (e) => e.child(div().text_size(11).text_color(isReviewed ? t.dim : add).child(`+${f.add}`)))
           .when(f.del > 0, (e) => e.child(div().text_size(11).text_color(isReviewed ? t.dim : del).child(`−${f.del}`)));
       })).when(!this.files.length, (e) => e.child(div().p(8).text_color(t.dim).child(
-        this.error || (this.loading ? "Loading changes…" : this.services.length ? (this.viewMode === "commit" ? "No files changed in this commit" : "No uncommitted changes") : "No folder")
+        this.error || (this.loading ? "Loading changes…" : !this.workspaceRoot ? "No folder" : this.viewMode === "commit" ? "No files changed in this commit" : "No changes in this session yet")
       ))))
 
       .when(this.limited, (el) => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files")))
@@ -3369,9 +3557,9 @@ export default class ChangesReview extends View {
           })
           .child(
             v_flex().id("commit-dropdown-floating")
-              .absolute().top(compactPanel ? 68 : 43).left(10).right(10).max_w(360).max_h(320)
+              .absolute().top(compactPanel ? 68 : 43).left(10).right(10).max_w(360)
+              .when(this.commits.length > 6, (b) => b.h(320).overflow_y_scrollbar())
               .rounded(8).bg(t.raised).border_1().border_color(t.border).shadow_xl().p(4).gap(2)
-              .overflow_y_scrollbar()
               .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
               .child(
                 h_flex().id("select-working-tree").min_h(28).py(3).flex_none().px(8).gap(7).items_center().rounded(5).cursor_pointer()
@@ -3386,7 +3574,7 @@ export default class ChangesReview extends View {
                     div().flex_none().px(4).py(0.5).rounded(3).bg(t.background).text_size(9).text_color(t.muted).child(String(this.workingFilesCount))
                   ))
               )
-              .child(div().h(1).w_full().bg(t.border).my(1).flex_none())
+              .when(this.commits.length > 0, (b) => b.child(div().h(1).w_full().bg(t.border).my(1).flex_none()))
               .children(
                 this.commits.map((c) => {
                   const isSelected = this.viewMode === "commit" && this.selectedCommit?.hash === c.hash;
