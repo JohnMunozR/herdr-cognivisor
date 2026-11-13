@@ -9,6 +9,8 @@ import {
 import {
   DISCOVER_SKIP_DIRS,
   diffRows,
+  diffSyntaxTokenColor,
+  resolveDiffFileIcon,
   normPathStr,
   normCmpStr,
   isSameOrChildPath,
@@ -94,16 +96,7 @@ function getDiffTheme(t) {
 }
 
 function syntaxTokenColor(kind, t) {
-  switch (kind) {
-    case "keyword": return t.ansi5 || t.accent || t.foreground;
-    case "string": return t.ansi2 || t.accent || t.foreground;
-    case "comment": return t.dim || t.muted;
-    case "function": return t.ansi4 || t.accent || t.foreground;
-    case "type": return t.ansi3 || t.accent || t.foreground;
-    case "number": return t.ansi1 || t.accent || t.foreground;
-    case "constant": return t.ansi6 || t.accent || t.foreground;
-    default: return t.foreground;
-  }
+  return diffSyntaxTokenColor(kind, t);
 }
 
 const BASE_BRANCHES = new Set(["main", "master", "development", "develop", "ci", "HEAD", ""]);
@@ -2240,6 +2233,7 @@ export default class ChangesReview extends View {
         const parts = f.path.split("/"), name = parts.pop();
         const isReviewed = this.isFileReviewed(f, flow);
         const isOpen = this.open === f.key;
+        const fileIcon = resolveDiffFileIcon(f.path, t);
         return h_flex().id(`change-${f.key}`).h(28).flex_none().px(8).gap(7).items_center().rounded(7).cursor_pointer()
           .when(isOpen, (e) => e.bg(t.selected))
           .hover((s) => s.bg(t.hover))
@@ -2269,6 +2263,7 @@ export default class ChangesReview extends View {
           .when(this.services.length > 1 && this.activeService === "all", (e) => e.child(
             div().flex_none().px(4).py(0.5).rounded(3).bg(t.raised).border_1().border_color(t.border).text_size(9.5).text_color(t.muted).child(f.serviceName)
           ))
+          .child(svg(fileIcon.path).size(13).flex_none().text_color(fileIcon.color))
           .child(
             h_flex().flex_1().min_w(0)
               .child(div().text_color(t.dim).truncate().child(parts.length ? parts.join("/") + "/" : ""))
@@ -2299,6 +2294,10 @@ export default class ChangesReview extends View {
               .bg(t.raised)
               .child(
                 h_flex().flex_1().min_w(0).gap(6).items_center()
+                  .child((() => {
+                    const openIcon = resolveDiffFileIcon(openFile.path || openFile.displayPath, t);
+                    return svg(openIcon.path).size(13).flex_none().text_color(openIcon.color);
+                  })())
                   .child(
                     div().min_w(0).truncate().text_size(11).font_medium()
                       .text_color(openFileReviewed ? t.muted : t.foreground)

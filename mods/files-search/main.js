@@ -49,6 +49,13 @@ import {
   prepareSearchQuery,
   scoreIndexEntry,
   buildTopFileItems,
+  getSyntaxExt,
+  resolveEditorLanguage,
+  getSyntaxPalette,
+  getEditorSyntaxConfig,
+  syntaxTokenStyle,
+  tokenizeCodeLine,
+  resolveFileIcon,
 } from "./search-logic.js";
 import {
   resolveCachedCascade,
@@ -401,7 +408,6 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
   return services;
 }
 const key = () => JSON.stringify(location());
-const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
 const PER_FOLDER = 500, TOTAL = 5000;
 const MAX_CACHED_FOLDERS = 400, MAX_CACHED_ENTRIES = 25000;
 const FOLDER_PREWARM_LIMIT = 24, FOLDER_PREWARM_CONCURRENCY = 4, FOLDER_RELOAD_CONCURRENCY = 8;
@@ -1602,22 +1608,14 @@ export default class FilesSearch extends View {
         if (this.file !== path || !this.current(context)) return;
         if (text === null) { this.fileError = "This file is no longer available"; return; }
         if (text.includes("\0")) { this.fileError = "Binary file · no text preview"; return; }
-        const t = theme(), ext = path.includes(".") ? path.split(".").pop() : "txt";
+        const t = theme();
         this.code = EditorState.new({
-          language: LANG[ext] ?? ext,
+          language: resolveEditorLanguage(path),
           readonly: true,
           value: text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text,
           font_family: settings().font_family,
           font_size: 12,
-          syntax: {
-            keyword: t.ansi5,
-            string: t.ansi2,
-            comment: t.dim,
-            function: t.ansi4,
-            type: t.ansi3,
-            number: t.ansi1,
-            constant: t.ansi6,
-          },
+          syntax: getEditorSyntaxConfig(t),
         });
       } catch {
         if (this.file === path && this.current(context)) this.fileError = "Cannot preview this file (binary, too large, or unreadable)";
@@ -1792,6 +1790,7 @@ export default class FilesSearch extends View {
 
   renderTreeRow(row, t) {
     if (row.kind === "sibling") {
+      const siblingIcon = resolveFileIcon(row.path || row.name, t);
       return h_flex()
         .id(row.key)
         .h(28)
@@ -1805,12 +1804,13 @@ export default class FilesSearch extends View {
         .cursor_pointer()
         .hover(s => s.bg(t.hover))
         .child(div().w(12).flex_none())
-        .child(svg("mods/files-search/file.svg").size(14).flex_none().text_color(t.muted))
+        .child(svg(siblingIcon.path).size(14).flex_none().text_color(siblingIcon.color))
         .child(div().flex_1().min_w(0).truncate().child(row.name))
         .child(div().flex_none().text_size(11).font_medium().text_color(t.blocked).child(row.mark));
     }
 
     const { path, depth, entry, open, isLoadingFolder, isRepo, dirCount, mark } = row;
+    const entryIcon = entry.dir ? null : resolveFileIcon(path || entry.name, t);
     return h_flex()
       .id(`file-${path}`)
       .h(28)
@@ -1824,7 +1824,7 @@ export default class FilesSearch extends View {
       .cursor_pointer()
       .hover(s => s.bg(t.hover))
       .child(entry.dir ? svg(`mods/files-search/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
-      .child(svg(`mods/files-search/${entry.dir ? "folder" : "file"}.svg`).size(14).flex_none().text_color(t.muted))
+      .child(svg(entry.dir ? "mods/files-search/folder.svg" : entryIcon.path).size(14).flex_none().text_color(entry.dir ? t.muted : entryIcon.color))
       .child(
         h_flex()
           .flex_1()
@@ -2992,15 +2992,14 @@ export default class FilesSearch extends View {
     if (text.length > 600) {
       return this.renderHighlightedCodeLine(t, text.slice(0, 600) + "…", query);
     }
-    const clean = text.replace(/\t/g, "    ");
-
-    const tokenRegex = /(\/\/.*$|#.*$|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|\b(?:class|public|private|protected|static|final|abstract|interface|extends|implements|import|package|return|new|this|super|if|else|for|while|do|switch|case|default|break|continue|try|catch|finally|throw|throws|void|int|long|short|byte|float|double|boolean|char|const|let|var|function|def|fn|async|await|export|from|as|type|struct|impl|trait|pub|mut|match|enum|select|defer|go)\b|\b[a-zA-Z_$][a-zA-Z0-9_$]*(?=\s*\()|\b[A-Z][a-zA-Z0-9_]*\b|\b(?:true|false|null|nil|None|undefined|[A-Z0-9_]{2,})\b|\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)?)\b)/g;
+    const clean = text.indexOf("\t") !== -1 ? text.replace(/\t/g, "    ") : text;
+    const tokens = tokenizeCodeLine(clean, ext);
+    if (!tokens) {
+      return query ? this.renderHighlightedCodeLine(t, clean, query) : div().child(clean ? clean.replace(/ /g, "\u00a0") : "\u00a0");
+    }
 
     const spans = [];
-    let lastIndex = 0;
-    let match;
     const lowerQ = query ? query.toLowerCase() : "";
-
     const addTextChunk = (str, color, isBold = false) => {
       if (!str) return;
       if (lowerQ && str.toLowerCase().includes(lowerQ)) {
@@ -3023,48 +3022,21 @@ export default class FilesSearch extends View {
       }
     };
 
-    while ((match = tokenRegex.exec(clean)) !== null) {
-      if (match.index > lastIndex) {
-        addTextChunk(clean.slice(lastIndex, match.index), isTarget ? t.foreground : t.muted);
-      }
-      const tok = match[0];
-      let color = isTarget ? t.foreground : t.muted;
-      let bold = false;
-
-      if (tok.startsWith("//") || tok.startsWith("#")) {
-        color = t.dim;
-      } else if (tok.startsWith('"') || tok.startsWith("'") || tok.startsWith("`")) {
-        color = t.ansi2;
-      } else if (/^\d/.test(tok) || tok.startsWith("0x")) {
-        color = t.ansi1;
-      } else if (/^(true|false|null|nil|None|undefined)$/.test(tok) || (tok.length > 1 && tok === tok.toUpperCase() && /^[A-Z0-9_]+$/.test(tok))) {
-        color = t.ansi6;
-      } else if (/^(class|public|private|protected|static|final|abstract|interface|extends|implements|import|package|return|new|this|super|if|else|for|while|do|switch|case|default|break|continue|try|catch|finally|throw|throws|void|int|long|short|byte|float|double|boolean|char|const|let|var|function|def|fn|async|await|export|from|as|type|struct|impl|trait|pub|mut|match|enum|select|defer|go)$/.test(tok)) {
-        color = t.ansi5;
-        bold = true;
-      } else if (/^[A-Z]/.test(tok)) {
-        color = t.ansi3;
-      } else {
-        color = t.ansi4;
-      }
-
-      addTextChunk(tok, color, bold);
-      lastIndex = tokenRegex.lastIndex;
-    }
-
-    if (lastIndex < clean.length) {
-      addTextChunk(clean.slice(lastIndex), isTarget ? t.foreground : t.muted);
+    for (const [tokKind, tokText] of tokens) {
+      const style = syntaxTokenStyle(tokKind, t, isTarget);
+      addTextChunk(tokText, style.color, style.bold);
     }
 
     if (spans.length === 0) {
       return div().child(clean ? clean.replace(/ /g, "\u00a0") : "\u00a0");
     }
 
+    const fontFamily = settings()?.font_family || "monospace";
     const row = h_flex().items_center();
     spans.forEach((s) => {
       const el = div()
         .text_size(11.5)
-        .font_family(settings()?.font_family || "monospace")
+        .font_family(fontFamily)
         .text_color(s.color)
         .when(Boolean(s.bold), d => d.font_semibold())
         .when(Boolean(s.bg), d => d.bg(s.bg).rounded(2).px(2))
@@ -3120,7 +3092,7 @@ export default class FilesSearch extends View {
     const targetLine = isTextMatch ? item.line : null;
     const fileName = item.path.split("/").pop() || item.path;
     const dirPath = item.path.includes("/") ? item.path.slice(0, item.path.lastIndexOf("/")) : "";
-    const ext = item.path.includes(".") ? item.path.split(".").pop().toLowerCase() : "";
+    const ext = getSyntaxExt(item.path);
 
     const LINE_H = 21;
     const VISIBLE_ROWS = Math.max(5, Math.floor((listH + 12) / LINE_H));
@@ -3135,6 +3107,7 @@ export default class FilesSearch extends View {
       for (let i = startIdx; i < endIdx; i++) {
         const child = this.previewDirEntries[i];
         const childPath = `${item.path}/${child.name}`.replace(/^\/+/, "");
+        const childIcon = child.dir ? null : resolveFileIcon(childPath, t);
         visibleDirRows.push(
           h_flex()
             .id(`dir-prev-${i}`)
@@ -3146,7 +3119,7 @@ export default class FilesSearch extends View {
             .cursor_pointer()
             .hover(s => s.bg(t.hover))
             .on_click(() => this.selectResult({ kind: child.dir ? "dir" : "file", path: childPath, name: child.name }, cx))
-            .child(svg(`mods/files-search/${child.dir ? "folder" : "file"}.svg`).size(13).flex_none().text_color(child.dir ? t.ansi4 : t.muted))
+            .child(svg(child.dir ? "mods/files-search/folder.svg" : childIcon.path).size(13).flex_none().text_color(child.dir ? t.ansi4 : childIcon.color))
             .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).child(child.dir ? `${child.name}/` : child.name))
         );
       }
@@ -3255,7 +3228,7 @@ export default class FilesSearch extends View {
               .text_right()
               .text_size(11)
               .font_family(settings()?.font_family || "monospace")
-              .text_color(isTarget ? t.ansi3 : t.dim)
+              .text_color(isTarget ? getSyntaxPalette(t).type : getSyntaxPalette(t).comment)
               .when(isTarget, el => el.font_semibold())
               .child(String(lineNum))
           )
@@ -3291,7 +3264,10 @@ export default class FilesSearch extends View {
           .border_b(1)
           .border_color(t.border)
           .bg(t.raised)
-          .child(svg("mods/files-search/file.svg").size(13).flex_none().text_color(t.dim))
+          .child((() => {
+            const previewIcon = resolveFileIcon(item.path, t);
+            return svg(previewIcon.path).size(13).flex_none().text_color(previewIcon.color);
+          })())
           .child(div().text_size(12).font_semibold().text_color(t.foreground).child(fileName))
           .when(Boolean(dirPath), el =>
             el.child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(dirPath))
@@ -3466,6 +3442,7 @@ export default class FilesSearch extends View {
       const isDir = item.kind === "dir";
       const isFile = !isText && !isDir;
       const matchedService = findServiceForPath(item.path);
+      const rowIcon = isDir ? null : resolveFileIcon(item.path, t);
 
       list.push(
         place(h_flex(), rowStart, rowEnd)
@@ -3489,10 +3466,10 @@ export default class FilesSearch extends View {
             }
           })
           .child(
-            svg(`mods/files-search/${isDir ? "folder" : isFile ? "file" : "search"}.svg`)
+            svg(isDir ? "mods/files-search/folder.svg" : rowIcon.path)
               .size(13)
               .flex_none()
-              .text_color(isDir || isText ? t.ansi4 : t.muted)
+              .text_color(isDir ? t.ansi4 : rowIcon.color)
           )
           .when(isFile || isDir, el =>
             el

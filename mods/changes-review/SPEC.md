@@ -18,8 +18,8 @@ The `submodule-mod-changes-review` provides interactive source control inspectio
 - **Owns:**
   - Manifest file: `mods/changes-review/mod.json` (`{ "place": "none", "title": "Changes Review" }`).
   - Main component: `mods/changes-review/main.js`.
-  - Pure diff, syntax lexer & watch filter helpers: `mods/changes-review/review-logic.js`.
-  - Icon assets: `mods/changes-review/changes.svg` and `mods/changes-review/icons/*.svg`.
+  - Pure diff, syntax lexer, file-type icon, & watch filter helpers: `mods/changes-review/review-logic.js` (`resolveDiffFileIconSpec`, `resolveDiffFileIcon`).
+  - Icon assets: `mods/changes-review/changes.svg`, `mods/changes-review/icons/*.svg`, and `mods/changes-review/icons/file-types/*.svg` (22 vector file-type icons).
   - Type definitions and compiler configuration: `gpui-kit.d.ts`, `jsconfig.json`.
 - **Public surface:**
   - Registered mod identifier: `changes-review`.
@@ -95,9 +95,9 @@ The `submodule-mod-changes-review` provides interactive source control inspectio
    ```
    *Rationale:* This prevents Git from touching timestamps in the index or creating lock files, which would trip the `watchFolder` listener and trigger a perpetual re-render cascade.
 2. **Virtual Pre-Tokenized Diff Rendering:**
-   Diff lines are pre-processed once inside `diffRows(lines, filePath)` into numbered metadata objects with linear single-pass syntax tokens (`tokenizeDiffLine`, capped at 500 chars per line), keeping `diffRow()` allocation-light during scroll/re-renders.
+   Diff lines are pre-processed once inside `diffRows(lines, filePath)` into numbered metadata objects with linear single-pass syntax tokens (`tokenizeDiffLine`, capped at 500 chars per line, separating `annotation`, `keyword`, `type`, `function`, `string`, `string.escape`, `number`, `boolean`, `constant`, `variable`, `operator`, and `comment` across Java/Spring Boot, Python, JavaScript, YAML, JSON, and `.properties`), keeping `diffRow()` allocation-light during scroll/re-renders.
 3. **Theme Dynamic Adaptation & Diff + Syntax Color Layering:**
-   Diff additions and deletions preserve unambiguous diff markers—background tint (`hexWithAlpha` from `theme().diff_add` / `theme().diff_del` or ANSI fallback tokens), left accent border, `+`/`-` gutter glyph, and colored line number—while rendering code content with semantic `theme()` syntax tokens (`ansi1`–`ansi6`, `dim`, `foreground`) across both light and dark themes.
+   Diff additions and deletions preserve unambiguous diff markers—background tint (`hexWithAlpha` from `theme().diff_add` / `theme().diff_del` or ANSI fallback tokens), left accent border, `+`/`-` gutter glyph, and colored line number—while rendering code content through `getDiffSyntaxPalette` / `diffSyntaxTokenColor` with luminance-guarded `theme()` syntax tokens across both light and dark themes.
 4. **Composite File Keys:**
    All internal state references (`this.open`, `this.expandedFiles`, `this.reviews`) MUST index files via composite `${serviceId}::${path}` keys to prevent cross-service collision.
 5. **Zero `localStorage` & Non-Reentrant Shared Updates:**
@@ -121,7 +121,7 @@ Consumes `mesh.services` published by `files-search` (`BUS_MAX_AGE_MS = 90000`, 
 - **Status Resolution:** Each service resolves to `"has_notes"` if `this.reviews.some(r => r.serviceId === serviceId)`, else `"approved"` if `flow.reviewedServices?.[serviceId]?.status === "approved"`, else `"pending"`.
 - **Service Filter Pills:** When multiple repositories exist, renders horizontally scrollable pills sorted dirty-first then alphabetically, displaying status glyph (`✓` in `t.ansi2`, `✎` in `t.blocked`, `○` in `t.dim`), service name, compact `service.branch` badge, and dirty count.
 - **Microservice Review Bar & `Approve Service ✓`:** Rendered when a single service is active or when the workspace has a sole repository (`services.length === 1`), showing service name, branch, status pill (`Pending` | `Has notes` | `Approved ✓`), and `Approve Service ✓` (or `Unapprove`). Approving persists `{ status: "approved", branch, updatedAt }` under `mesh.flows[activeTabId].reviewedServices[serviceId]` and automatically jumps `this.activeService` / `mesh.activeService` to the next unapproved dirty microservice (`workingCount > 0`), if any.
-- **Per-File Review Checklist (`reviewedFiles`, `#file-check-*`, `#diff-file-review-bar`):** Each changed file row renders an interactive checkbox (`✓`) keyed cleanly by scope (`working::<serviceId>::<path>` or `commit:<hash>::<serviceId>::<path>`) inside `mesh.flows[activeTabId].reviewedFiles` (with `localReviewedFiles` fallback when no tab is active). Checking a file dims its row so unreviewed files stand out, updates header/bar progress (`N/M ✓`), clears matching `working::` entries automatically when committed, and clicking `Mark reviewed` inside `#diff-file-review-bar` checks the active file and advances to the next unreviewed file.
+- **Per-File Review Checklist & File-Type Icons (`reviewedFiles`, `#file-check-*`, `#diff-file-review-bar`):** Each changed file row renders an interactive checkbox (`✓`) keyed cleanly by scope (`working::<serviceId>::<path>` or `commit:<hash>::<serviceId>::<path>`) inside `mesh.flows[activeTabId].reviewedFiles` (with `localReviewedFiles` fallback when no tab is active), paired with a semantic file-type SVG icon and theme-aware color from `resolveDiffFileIcon(file.path, t)`. Checking a file dims its row so unreviewed files stand out, updates header/bar progress (`N/M ✓`), clears matching `working::` entries automatically when committed, and `#diff-file-review-bar` renders the matching file-type icon alongside the active file path while `Mark reviewed` checks the file and advances to the next unreviewed file.
 
 ### Lead-Terminal-Prioritized Agent Resolution (`findActiveAgent`)
 Resolves the target agent strictly in this priority order:
