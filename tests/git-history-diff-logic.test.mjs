@@ -27,8 +27,12 @@ import {
   paginateDiffRows,
   capRenderTokens,
   buildWaveDiffLayout,
+  buildWaveDiffBlocks,
+  computeUnifiedRowHeights,
+  countCellVisualRows,
   toNbspString,
   prepareRenderLineData,
+  prepareWrappedRenderLines,
   tokenizeDeferredRow,
   tokenizeSideBySidePage,
 } from "../mods/git-history/diff-logic.js";
@@ -835,5 +839,101 @@ describe("git-history diff-logic", () => {
     );
     assert.equal(wide.leftWidth, Math.ceil(40 * 7.6) + 92);
     assert.equal(wide.rightWidth, Math.ceil(42 * 7.6) + 92);
+  });
+
+  test("prepareWrappedRenderLines and buildWaveDiffLayout maintain exact column/gutter height parity across wrapped diffs and width resizes", () => {
+    const longBefore = "const oldValue = veryLongHelperCall(firstArgumentName, secondArgumentName, thirdArgumentName);";
+    const longAfter = "const newValue = updatedVeryLongHelperCall(firstArgumentName, secondArgumentName, thirdArgumentName, fourthArgument);";
+    const longCtx = "// shared comment explaining why both columns wrap identically across resizes without adding extra line numbers";
+    const patch = [
+      "diff --git a/src/app.js b/src/app.js",
+      "index 1111111..2222222 100644",
+      "@@ -10,4 +10,5 @@ export function superLongFunctionSignatureWithManyArgsForHunkWrapTest(paramOne, paramTwo)",
+      ` ${longCtx}`,
+      `-${longBefore}`,
+      `+${longAfter}`,
+      `+const extraAddedLine = "wrapped tail addition for asymmetric block check";`,
+      " return true;",
+    ].join("\n");
+
+    const sbs = buildSideBySideRows(patch, "src/app.js");
+    const themeStub = { foreground: "#cdd6f4", ansi1: "#f38ba8", ansi2: "#a6e3a1", ansi3: "#f9e2af", ansi4: "#89b4fa", ansi5: "#cba6f7", ansi6: "#94e2d5" };
+
+    // Verify prepareWrappedRenderLines sub-row count matches countCellVisualRows across widths
+    for (const row of sbs.rows) {
+      if (row.kind !== "pair") continue;
+      for (const cell of [row.left, row.right]) {
+        if (!cell || cell.kind === "empty") continue;
+        for (const cols of [22, 36, 80]) {
+          const wrapped = prepareWrappedRenderLines(cell.tokens, cell.text, themeStub, "#cdd6f4", cols);
+          assert.equal(wrapped.length, countCellVisualRows(cell.text, cols));
+        }
+      }
+    }
+
+    const narrowWave = buildWaveDiffLayout(sbs.rows, { leftCols: 28, rightCols: 28, hunkCols: 30 });
+    const wideWave = buildWaveDiffLayout(sbs.rows, { leftCols: 160, rightCols: 160, hunkCols: 160 });
+
+    const sumH = (items) => items.reduce((acc, item) => acc + item.height, 0);
+    assert.equal(sumH(narrowWave.leftItems), narrowWave.totalHeight);
+    assert.equal(sumH(narrowWave.rightItems), narrowWave.totalHeight);
+    assert.equal(sumH(narrowWave.gutterItems), narrowWave.totalHeight);
+    assert.equal(sumH(wideWave.leftItems), wideWave.totalHeight);
+    assert.equal(sumH(wideWave.rightItems), wideWave.totalHeight);
+    assert.equal(sumH(wideWave.gutterItems), wideWave.totalHeight);
+
+    // Narrow layout must expand vertically due to wrapping while preserving only one line item per logical cell
+    assert.ok(narrowWave.totalHeight > wideWave.totalHeight);
+    assert.equal(narrowWave.waves.length, 1);
+    const nw = narrowWave.waves[0];
+    assert.ok(nw.rightBot - nw.rightTop > nw.leftBot - nw.leftTop);
+    const narrowCtxItem = narrowWave.leftItems.find((it) => it.type === "line" && it.cell?.kind === "ctx");
+    assert.ok(narrowCtxItem.height >= 3 * DIFF_ROW_HEIGHT);
+
+    // Unified heights also expand on narrow width and shrink back when widened
+    const uni = buildUnifiedRows(patch, "src/app.js");
+    const narrowUniH = computeUnifiedRowHeights(uni.rows, 28, { hunkWrapCols: 30 });
+    const wideUniH = computeUnifiedRowHeights(uni.rows, 160, { hunkWrapCols: 160 });
+    assert.equal(narrowUniH.length, uni.rows.length);
+    assert.ok(narrowUniH[0] > DIFF_HUNK_HEIGHT);
+    assert.equal(wideUniH[0], DIFF_HUNK_HEIGHT);
+    assert.ok(narrowUniH.reduce((a, b) => a + b, 0) > wideUniH.reduce((a, b) => a + b, 0));
+  });
+
+  test("buildWaveDiffBlocks decomposes buildWaveDiffLayout into exact height-synced virtualizable blocks", () => {
+    const patch = [
+      "diff --git a/src/service.js b/src/service.js",
+      "index 1111111..2222222 100644",
+      "@@ -1,5 +1,6 @@ function example(alpha, beta, gamma)",
+      " context line one with moderate length to trigger wrapping on narrow panes",
+      "-deleted old line A",
+      "-deleted old line B with extra wrapped content exceeding narrow width",
+      "+added new line X",
+      "+added new line Y",
+      "+added new line Z",
+      " trailing context line",
+    ].join("\n");
+    const sbs = buildSideBySideRows(patch, "src/service.js");
+    const wave = buildWaveDiffLayout(sbs.rows, { leftCols: 28, rightCols: 28, hunkCols: 30 });
+    const { blocks, blockHeights, totalHeight } = buildWaveDiffBlocks(wave);
+
+    assert.equal(blocks.length, wave.gutterItems.length);
+    assert.equal(blockHeights.length, blocks.length);
+    assert.equal(totalHeight, wave.totalHeight);
+    assert.equal(blockHeights.reduce((a, b) => a + b, 0), wave.totalHeight);
+
+    const flatLeft = [];
+    const flatRight = [];
+    for (let i = 0; i < blocks.length; i += 1) {
+      const b = blocks[i];
+      assert.equal(b.height, blockHeights[i]);
+      assert.equal(b.gutter, wave.gutterItems[i]);
+      assert.equal(b.leftItems.reduce((a, it) => a + it.height, 0), b.height);
+      assert.equal(b.rightItems.reduce((a, it) => a + it.height, 0), b.height);
+      flatLeft.push(...b.leftItems);
+      flatRight.push(...b.rightItems);
+    }
+    assert.deepEqual(flatLeft, wave.leftItems);
+    assert.deepEqual(flatRight, wave.rightItems);
   });
 });

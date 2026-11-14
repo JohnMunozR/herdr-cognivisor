@@ -191,6 +191,9 @@ done
 for mod in "${MODS[@]}"; do
   say "Installing $mod mod..."
   copy_mod_clean "$pkg_root/mods/$mod" "$target_mods/$mod"
+  if [ -f "$pkg_root/shared/code-wrap.js" ] && { [ "$mod" = "files-search" ] || [ "$mod" = "changes-review" ] || [ "$mod" = "git-history" ]; }; then
+    cp "$pkg_root/shared/code-wrap.js" "$target_mods/$mod/code-wrap.js"
+  fi
 done
 
 if [ -n "$HERDR_BIN" ]; then

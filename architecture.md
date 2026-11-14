@@ -62,12 +62,13 @@ herdr-mesh/
 ├── package.json           <- Zero-dependency test runner entrypoint (`npm test`)
 ├── tests/                 <- Native `node --test` unit/regression suites (`*.test.mjs` + `helpers/herdr-mock.mjs`)
 ├── layouts/               <- [[module-layouts]]: Layout recipe (layouts/mesh.json) & SPEC.md
+├── shared/                <- [[module-shared]]: Canonical pure helpers (`code-wrap.js`) & `scripts/sync-shared.mjs`
 ├── openspec/specs/        <- [[spec-lifecycle]]: Agent Workspace domain specification
 └── mods/                  <- [[module-mods]]: Independent GPUI-kit mod extensions
     ├── SPEC.md
-    ├── files-search/      <- [[submodule-mod-files-search]]: Search Everywhere, indexer engine (`indexer.js`, `search-logic.js`)
-    ├── changes-review/    <- [[submodule-mod-changes-review]]: Per-service diff review & checklist (`review-logic.js`)
-    ├── git-history/       <- [[submodule-mod-git-history]]: Topological commit graph & Before/After diff viewer (`graph-logic.js`, `diff-logic.js`, `repo-logic.js`)
+    ├── files-search/      <- [[submodule-mod-files-search]]: Search Everywhere, indexer engine (`indexer.js`, `search-logic.js`, `code-wrap.js`)
+    ├── changes-review/    <- [[submodule-mod-changes-review]]: Per-service diff review & checklist (`review-logic.js`, `code-wrap.js`)
+    ├── git-history/       <- [[submodule-mod-git-history]]: Topological commit graph & Before/After diff viewer (`graph-logic.js`, `diff-logic.js`, `repo-logic.js`, `code-wrap.js`)
     ├── mesh-tabs/         <- [[submodule-mod-mesh-tabs]]: Tab strip, auto-naming, `mesh.spacePanels` (`tab-logic.js`)
     └── mesh-status/       <- [[submodule-mod-mesh-status]]: Telemetry status bar
 ```

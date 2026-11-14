@@ -1,4 +1,5 @@
 // Pure zero-UI diff parsing, side-by-side alignment, syntax lexing, and theme palette helpers for git-history.
+import { countWrappedLines, wrapPlainText, wrapStyledSpans } from "./code-wrap.js";
 
 export const MAX_DIFF_SYNTAX_LINE_CHARS = 500;
 export const MAX_VIEWER_DIFF_LINES = 1500;
@@ -240,6 +241,74 @@ export function prepareRenderLineData(tokens, plainText, paletteOrTheme, fallbac
     return { kind: "single", color: spans[0][0], text: spans[0][1] };
   }
   return { kind: "multi", spans };
+}
+
+export function countCellVisualRows(text, wrapCols) {
+  const cols = Number(wrapCols);
+  if (!Number.isFinite(cols) || cols <= 0) return 1;
+  return countWrappedLines(text, cols);
+}
+
+/**
+ * Resolves syntax/plain tokens once and splits them into visual sub-rows fitting `wrapCols`
+ * without losing colors or dropping whitespace.
+ */
+export function prepareWrappedRenderLines(tokens, plainText, paletteOrTheme, fallbackColor, wrapCols, maxTokens = MAX_RENDER_TOKENS_PER_LINE) {
+  const base = prepareRenderLineData(tokens, plainText, paletteOrTheme, fallbackColor, maxTokens);
+  const cols = Number(wrapCols);
+  if (!Number.isFinite(cols) || cols <= 0) {
+    return [base];
+  }
+  if (base.kind === "single") {
+    const txt = base.text;
+    if (txt.length <= cols && txt.indexOf("\t") === -1 && txt.indexOf("\r") === -1) {
+      return [base];
+    }
+    const segs = wrapPlainText(txt, cols, { toNbsp: false });
+    if (segs.length <= 1) {
+      return [base];
+    }
+    const out = new Array(segs.length);
+    for (let i = 0; i < segs.length; i += 1) {
+      out[i] = {
+        kind: "single",
+        color: base.color,
+        text: segs[i] || "\u00a0",
+      };
+    }
+    return out;
+  }
+
+  let totalLen = 0;
+  let hasTabOrCr = false;
+  for (let i = 0; i < base.spans.length; i += 1) {
+    const s = base.spans[i][1];
+    totalLen += s.length;
+    if (!hasTabOrCr && (s.indexOf("\t") !== -1 || s.indexOf("\r") !== -1)) {
+      hasTabOrCr = true;
+    }
+    if (totalLen > cols && hasTabOrCr) break;
+  }
+  if (!hasTabOrCr && totalLen <= cols) {
+    return [base];
+  }
+
+  const wrappedRows = wrapStyledSpans(base.spans, cols, { toNbsp: false });
+  if (wrappedRows.length <= 1) {
+    return [base];
+  }
+  const out = new Array(wrappedRows.length);
+  for (let i = 0; i < wrappedRows.length; i += 1) {
+    const rowSpans = wrappedRows[i];
+    if (!rowSpans || rowSpans.length === 0) {
+      out[i] = { kind: "single", color: fallbackColor, text: "\u00a0" };
+    } else if (rowSpans.length === 1) {
+      out[i] = { kind: "single", color: rowSpans[0][0], text: rowSpans[0][1] || "\u00a0" };
+    } else {
+      out[i] = { kind: "multi", spans: rowSpans };
+    }
+  }
+  return out;
 }
 
 export function getFileExt(filePath) {
@@ -1664,8 +1733,8 @@ export function capRenderTokens(tokens, maxTokens = MAX_RENDER_TOKENS_PER_LINE) 
   return head;
 }
 
-function layoutWaveSide(items, lines, blockH, cursorY, rowHeight, maxOffsetPx, markerKindOnZero) {
-  if (lines.length === 0) {
+function layoutWaveSide(items, entries, blockH, cursorY, maxOffsetPx, markerKindOnZero) {
+  if (entries.length === 0) {
     const markerY = Math.min(Math.floor(blockH / 2), maxOffsetPx);
     items.push({ type: "spacer", height: blockH, markerOffsetY: markerY, markerKind: markerKindOnZero });
     return {
@@ -1675,14 +1744,18 @@ function layoutWaveSide(items, lines, blockH, cursorY, rowHeight, maxOffsetPx, m
       localBot: markerY,
     };
   }
-  const sideH = lines.length * rowHeight;
+  let sideH = 0;
+  for (let i = 0; i < entries.length; i++) {
+    sideH += entries[i].height;
+  }
   const topPad = sideH < blockH ? Math.min(Math.floor((blockH - sideH) / 2), maxOffsetPx) : 0;
   const botPad = blockH - sideH - topPad;
   if (topPad > 0) {
     items.push({ type: "spacer", height: topPad, markerOffsetY: null, markerKind: null });
   }
-  for (const cell of lines) {
-    items.push({ type: "line", height: rowHeight, cell });
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    items.push({ type: "line", height: entry.height, rowCount: entry.rowCount, cell: entry.cell });
   }
   if (botPad > 0) {
     items.push({ type: "spacer", height: botPad, markerOffsetY: null, markerKind: null });
@@ -1697,8 +1770,8 @@ function layoutWaveSide(items, lines, blockH, cursorY, rowHeight, maxOffsetPx, m
 
 /**
  * Computes compact, aligned Left/Right column items, per-block center gutter items,
- * and bezier wave ribbon geometry for a bounded page of side-by-side diff rows.
- * Using matching v_flex gutterItems keeps vertical alignment exact across HiDPI scales.
+ * and bezier wave ribbon geometry for a bounded page of side-by-side diff rows,
+ * accounting for wrapped sub-row heights on both sides so wave bands stay height-synced.
  */
 export function buildWaveDiffLayout(pageRows, options = {}) {
   const rows = Array.isArray(pageRows) ? pageRows : [];
@@ -1712,6 +1785,15 @@ export function buildWaveDiffLayout(pageRows, options = {}) {
     Number.isFinite(Number(options?.maxCenterOffsetRows)) && Number(options.maxCenterOffsetRows) >= 0
       ? Math.floor(Number(options.maxCenterOffsetRows))
       : DIFF_WAVE_MAX_CENTER_OFFSET_ROWS;
+  const leftCols = Number.isFinite(Number(options?.leftCols)) && Number(options.leftCols) > 0
+    ? Math.floor(Number(options.leftCols))
+    : 0;
+  const rightCols = Number.isFinite(Number(options?.rightCols)) && Number(options.rightCols) > 0
+    ? Math.floor(Number(options.rightCols))
+    : 0;
+  const hunkCols = Number.isFinite(Number(options?.hunkCols)) && Number(options.hunkCols) > 0
+    ? Math.floor(Number(options.hunkCols))
+    : (leftCols > 0 ? Math.max(12, leftCols) : 0);
   const maxOffsetPx = maxCenterOffsetRows * rowHeight;
 
   const leftItems = [];
@@ -1723,13 +1805,24 @@ export function buildWaveDiffLayout(pageRows, options = {}) {
   let pendingDels = [];
   let pendingAdds = [];
 
+  const measureEntry = (cell, cols) => {
+    const rowCount = cols > 0 ? countCellVisualRows(cell?.text || "", cols) : 1;
+    return { cell, rowCount, height: rowCount * rowHeight };
+  };
+
   const flushChange = () => {
     const dCount = pendingDels.length;
     const aCount = pendingAdds.length;
     if (dCount === 0 && aCount === 0) return;
-    const blockH = Math.max(dCount, aCount) * rowHeight;
-    const leftSpan = layoutWaveSide(leftItems, pendingDels, blockH, cursorY, rowHeight, maxOffsetPx, "add");
-    const rightSpan = layoutWaveSide(rightItems, pendingAdds, blockH, cursorY, rowHeight, maxOffsetPx, "del");
+
+    let leftSideH = 0;
+    for (let i = 0; i < dCount; i++) leftSideH += pendingDels[i].height;
+    let rightSideH = 0;
+    for (let i = 0; i < aCount; i++) rightSideH += pendingAdds[i].height;
+    const blockH = Math.max(leftSideH, rightSideH);
+
+    const leftSpan = layoutWaveSide(leftItems, pendingDels, blockH, cursorY, maxOffsetPx, "add");
+    const rightSpan = layoutWaveSide(rightItems, pendingAdds, blockH, cursorY, maxOffsetPx, "del");
     const kind = dCount > 0 && aCount > 0 ? "mod" : dCount === 0 ? "add" : "del";
     waves.push({
       kind,
@@ -1756,22 +1849,25 @@ export function buildWaveDiffLayout(pageRows, options = {}) {
     if (!row) continue;
     if (row.kind === "hunk") {
       flushChange();
+      const hSubRows = hunkCols > 0 ? countCellVisualRows(row.header || "", hunkCols) : 1;
+      const bandH = Math.max(hunkHeight, hSubRows * rowHeight);
       leftItems.push({
         type: "hunk",
-        height: hunkHeight,
+        height: bandH,
         header: row.header || "",
         hunkIndex: row.hunkIndex,
+        wrapCols: hunkCols,
       });
       rightItems.push({
         type: "hunk",
-        height: hunkHeight,
+        height: bandH,
       });
       gutterItems.push({
         type: "hunk",
-        height: hunkHeight,
+        height: bandH,
       });
-      hunkBands.push({ y: cursorY, height: hunkHeight });
-      cursorY += hunkHeight;
+      hunkBands.push({ y: cursorY, height: bandH });
+      cursorY += bandH;
       continue;
     }
 
@@ -1781,15 +1877,19 @@ export function buildWaveDiffLayout(pageRows, options = {}) {
 
     if (left.kind === "ctx" && right.kind === "ctx") {
       flushChange();
-      leftItems.push({ type: "line", height: rowHeight, cell: left });
-      rightItems.push({ type: "line", height: rowHeight, cell: right });
-      gutterItems.push({ type: "ctx", height: rowHeight });
-      cursorY += rowHeight;
+      const leftRows = leftCols > 0 ? countCellVisualRows(left.text || "", leftCols) : 1;
+      const rightRows = rightCols > 0 ? countCellVisualRows(right.text || "", rightCols) : 1;
+      const pairRows = Math.max(1, leftRows, rightRows);
+      const pairH = pairRows * rowHeight;
+      leftItems.push({ type: "line", height: pairH, rowCount: leftRows, cell: left });
+      rightItems.push({ type: "line", height: pairH, rowCount: rightRows, cell: right });
+      gutterItems.push({ type: "ctx", height: pairH });
+      cursorY += pairH;
       continue;
     }
 
-    if (left.kind !== "empty") pendingDels.push(left);
-    if (right.kind !== "empty") pendingAdds.push(right);
+    if (left.kind !== "empty") pendingDels.push(measureEntry(left, leftCols));
+    if (right.kind !== "empty") pendingAdds.push(measureEntry(right, rightCols));
   }
   flushChange();
 
@@ -1800,5 +1900,90 @@ export function buildWaveDiffLayout(pageRows, options = {}) {
     hunkBands,
     waves,
     totalHeight: cursorY,
+  };
+}
+
+export function computeUnifiedRowHeights(rows, wrapCols, options = {}) {
+  const list = Array.isArray(rows) ? rows : [];
+  const rowHeight = Number.isFinite(Number(options?.rowHeight)) && Number(options.rowHeight) > 0
+    ? Math.floor(Number(options.rowHeight))
+    : DIFF_ROW_HEIGHT;
+  const hunkHeight = Number.isFinite(Number(options?.hunkHeight)) && Number(options.hunkHeight) > 0
+    ? Math.floor(Number(options.hunkHeight))
+    : DIFF_HUNK_HEIGHT;
+  const cols = Number.isFinite(Number(wrapCols)) && Number(wrapCols) > 0
+    ? Math.floor(Number(wrapCols))
+    : 0;
+  const hunkCols = Number.isFinite(Number(options?.hunkWrapCols)) && Number(options.hunkWrapCols) > 0
+    ? Math.floor(Number(options.hunkWrapCols))
+    : (cols > 0 ? Math.max(12, cols - 2) : 0);
+
+  return list.map((row) => {
+    if (!row) return rowHeight;
+    if (row.kind === "hunk") {
+      const subRows = hunkCols > 0 ? countCellVisualRows(row.header || "", hunkCols) : 1;
+      return Math.max(hunkHeight, subRows * rowHeight);
+    }
+    const subRows = cols > 0 ? countCellVisualRows(row.text || "", cols) : 1;
+    return Math.max(1, subRows) * rowHeight;
+  });
+}
+
+/**
+ * Groups an aligned `buildWaveDiffLayout` output into vertically disjoint aligned blocks
+ * (one per `gutterItems` entry) so Side-by-Side panes and the center wave gutter can be
+ * virtually scrolled in lockstep via `v_virtual_list`.
+ */
+export function buildWaveDiffBlocks(waveLayout) {
+  const leftItems = Array.isArray(waveLayout?.leftItems) ? waveLayout.leftItems : [];
+  const rightItems = Array.isArray(waveLayout?.rightItems) ? waveLayout.rightItems : [];
+  const gutterItems = Array.isArray(waveLayout?.gutterItems) ? waveLayout.gutterItems : [];
+
+  const blocks = [];
+  const blockHeights = [];
+  let lIdx = 0;
+  let rIdx = 0;
+
+  for (let g = 0; g < gutterItems.length; g += 1) {
+    const gutter = gutterItems[g];
+    if (!gutter) continue;
+    const targetH = Math.max(0, Number(gutter.height) || 0);
+
+    const lStart = lIdx;
+    let lSum = 0;
+    while (lIdx < leftItems.length) {
+      lSum += Number(leftItems[lIdx]?.height) || 0;
+      lIdx += 1;
+      if (lSum >= targetH) break;
+    }
+
+    const rStart = rIdx;
+    let rSum = 0;
+    while (rIdx < rightItems.length) {
+      rSum += Number(rightItems[rIdx]?.height) || 0;
+      rIdx += 1;
+      if (rSum >= targetH) break;
+    }
+
+    blocks.push({
+      type: gutter.type,
+      height: targetH,
+      gutter,
+      leftItems: leftItems.slice(lStart, lIdx),
+      rightItems: rightItems.slice(rStart, rIdx),
+    });
+    blockHeights.push(targetH);
+  }
+
+  let totalHeight = Number(waveLayout?.totalHeight);
+  if (!Number.isFinite(totalHeight)) {
+    totalHeight = 0;
+    for (let i = 0; i < blockHeights.length; i += 1) totalHeight += blockHeights[i];
+  }
+
+  return {
+    blocks,
+    blockHeights,
+    totalHeight,
   };
 }

@@ -1,5 +1,5 @@
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, Scrollbar, ScrollHandle } from "gpui-base";
+import { v_flex, h_flex, v_virtual_list, VirtualListScrollHandle, InputState, Input, TextareaState, Textarea, Scrollbar, ScrollHandle } from "gpui-base";
 import * as fsPromises from "fs/promises";
 import { readdir, exists } from "fs/promises";
 import { join } from "path";
@@ -42,6 +42,11 @@ import {
   mergeBusCandidateServices,
   collectServiceWorkingSnapshot,
 } from "./review-logic.js";
+import { computeWrapColumns, countWrappedLines, wrapPlainText, wrapStyledSpans } from "./code-wrap.js";
+
+const reviewWrapCache = new WeakMap();
+const REVIEW_ROW_HEIGHT = 20;
+const REVIEW_ACTIVE_COMMENT_H = 134;
 
 function readPlainObject(val) {
   return val && typeof val === "object" && !Array.isArray(val) ? val : {};
@@ -597,6 +602,7 @@ export default class ChangesReview extends View {
     this.diffWidth = 300;
     this.panelWidth = 420;
     this.viewerWidth = 900;
+    this.diffViewportWidth = 0;
     this.handle = cx.focus_handle();
     this.bottomTab = "review"; // "review" | "commit"
     this.reviews = []; // Cached mirror of shared("mesh.reviewNotes")[sessionKey]
@@ -637,7 +643,8 @@ export default class ChangesReview extends View {
     this.needsRefreshOnShow = false;
 
     this.serviceFilterScroll = ScrollHandle.new();
-    this.diffScroll = ScrollHandle.new();
+    this.diffScroll = VirtualListScrollHandle.new();
+    this.diffResizeTask = null;
 
     this.viewMode = "working"; // "working" | "commit"
     this.commits = [];
@@ -660,10 +667,9 @@ export default class ChangesReview extends View {
     this.input.on("focus", (_e, cx) => { this.typingCommit = true; cx.notify(); });
     this.input.on("blur", (_e, cx) => { this.typingCommit = false; cx.notify(); });
 
-    // Inline review comment textarea (wraps lines and auto-grows)
-    this.commentInput = TextareaState.new({ placeholder: "Add a review note…", rows: 2 });
+    // Inline review comment textarea (fixed box height for virtual list stability)
+    this.commentInput = TextareaState.new({ placeholder: "Add a review note…", rows: 3 });
     this.commentInput.set_soft_wrap(true);
-    this.commentInput.set_auto_grow(2, 6);
     this.commentInput.on("change", (_e, cx) => {
       const hadText = Boolean(this.commentText.trim());
       this.commentText = this.commentInput.value();
@@ -692,6 +698,8 @@ export default class ChangesReview extends View {
     this.sharedSyncTask = null;
     try { this.viewerLoadTask?.cancel?.(); } catch {}
     this.viewerLoadTask = null;
+    try { this.diffResizeTask?.cancel?.(); } catch {}
+    this.diffResizeTask = null;
     try { this.pollTask?.cancel?.(); } catch {}
     this.pollTask = null;
     this.stopAllWatchers();
@@ -2457,28 +2465,132 @@ export default class ChangesReview extends View {
     }
   }
 
-  diffRow({ kind, number, text, tokens }, t, dt, commentMap, activeOpenKey = null) {
+  getReviewWrapCols() {
+    return computeWrapColumns({
+      viewportWidth: this.diffViewportWidth > 0
+        ? this.diffViewportWidth
+        : Math.max(240, (this.viewerWidth || 900) - 8),
+      gutterWidth: 56,
+      rightPadding: 20,
+      fontSize: 11.5,
+      minCols: 12,
+    });
+  }
+
+  getWrappedCommentLines(text, wrapCols) {
+    const commentCols = Math.max(24, Math.min(56, (wrapCols || 80) - 8));
+    const rawLines = String(text || "").split(/\r?\n/);
+    const out = [];
+    for (let i = 0; i < rawLines.length; i++) {
+      const wrapped = wrapPlainText(rawLines[i], commentCols, { toNbsp: false });
+      for (let j = 0; j < wrapped.length; j++) {
+        out.push(wrapped[j]);
+      }
+    }
+    return out.length > 0 ? out : [" "];
+  }
+
+  computeDiffRowHeights(commentMap, wrapCols) {
+    const rows = this.rows;
+    const len = rows.length;
+    const hunkCols = Math.max(12, wrapCols - 16);
+
+    let commentSig = "";
+    if (commentMap && commentMap.size > 0) {
+      commentMap.forEach((rec, lineNo) => {
+        commentSig += `${lineNo}:${rec?.text?.length || 0};`;
+      });
+    }
+    const cacheSig = `${len}|${wrapCols}|${commentSig}`;
+    if (
+      this._rowHeightsCache &&
+      this._rowHeightsCache.rows === rows &&
+      this._rowHeightsCache.sig === cacheSig
+    ) {
+      return this._rowHeightsCache.heights;
+    }
+
+    const heights = new Array(len);
+    for (let i = 0; i < len; i++) {
+      const r = rows[i];
+      if (!r) {
+        heights[i] = REVIEW_ROW_HEIGHT;
+        continue;
+      }
+      if (r.kind === "@") {
+        const hunkLines = countWrappedLines(r.text || "", hunkCols);
+        heights[i] = Math.max(22, 6 + hunkLines * 16);
+        continue;
+      }
+      const lineCount = countWrappedLines(r.text || " ", wrapCols);
+      let h = Math.max(1, lineCount) * REVIEW_ROW_HEIGHT;
+      if (r.number !== undefined) {
+        const existing = commentMap ? commentMap.get(r.number) : null;
+        if (existing) {
+          const cLines = this.getWrappedCommentLines(existing.text, wrapCols);
+          h += 13 + cLines.length * 16;
+        }
+      }
+      heights[i] = h;
+    }
+    this._rowHeightsCache = { rows, sig: cacheSig, heights };
+    return heights;
+  }
+
+  scheduleDiffResizeReflow(nextW, cx) {
+    const prevCols = this.getReviewWrapCols();
+    this.diffViewportWidth = nextW;
+    const nextCols = this.getReviewWrapCols();
+    if (nextCols === prevCols) return;
+
+    if (this.diffResizeTask) {
+      try { this.diffResizeTask.cancel(); } catch {}
+      this.diffResizeTask = null;
+    }
+    const timer = cx?.timer || this.hostCx?.timer;
+    if (timer) {
+      this.diffResizeTask = timer.after(16, (timerCx) => {
+        this.diffResizeTask = null;
+        try { (timerCx || cx || this.hostCx)?.notify(); } catch {}
+      });
+    } else {
+      cx?.notify();
+    }
+  }
+
+  diffRow(rowObj, t, dt, commentMap, activeOpenKey = null, wrapCols = 96) {
+    const { kind, number, text, tokens } = rowObj;
     const openKey = activeOpenKey || this.open;
     if (kind === "@") {
       const isExpanded = Boolean(this.expandedFiles && this.expandedFiles.has(openKey));
-      return h_flex().w_full().px(12).h(20).flex_none().items_center().gap(10)
+      const hunkCols = Math.max(12, wrapCols - 16);
+      const hCacheKey = `h|${hunkCols}`;
+      let cachedHunk = reviewWrapCache.get(rowObj);
+      if (!cachedHunk || cachedHunk.key !== hCacheKey) {
+        cachedHunk = { key: hCacheKey, segments: wrapPlainText(text || "", hunkCols, { toNbsp: true }) };
+        reviewWrapCache.set(rowObj, cachedHunk);
+      }
+      const hunkSegments = cachedHunk.segments;
+      const hunkH = Math.max(22, 6 + hunkSegments.length * 16);
+      return h_flex().w_full().h(hunkH).px(12).py(2).flex_none().items_center().gap(10)
         .bg(t.raised).border_b(1).border_color(t.border)
         .cursor_pointer()
         .hover((s) => s.bg(t.hover))
-        .on_click((_e, cx) => this.toggleExpand(openKey, cx))
         .child(
           div().flex_none().px(5).py(0.5).rounded(3).bg(t.background).text_size(9.5).text_color(t.muted)
             .child(isExpanded ? "Collapse context" : "Expand context")
         )
         .child(
-          div().flex_none().whitespace_nowrap().pr(20).text_size(11).text_color(t.dim)
-            .child(expandCodeTabs(text).replace(/ /g, "\u00a0"))
+          v_flex().flex_1().min_w(0).overflow_hidden().children(
+            hunkSegments.map((seg) =>
+              div().w_full().h(16).flex_none().whitespace_nowrap().text_size(11).text_color(t.dim).child(seg || "\u00a0")
+            )
+          )
         );
     }
     const isCommentable = number !== undefined;
     const existing = (isCommentable && commentMap) ? commentMap.get(number) : null;
     const isActive = this.activeComment && this.activeComment.fileKey === openKey && this.activeComment.line === number;
-    const canSave = Boolean(this.commentText.trim());
 
     const isAdd = kind === "+";
     const isDel = kind === "-";
@@ -2487,107 +2599,157 @@ export default class ChangesReview extends View {
     const hoverBg = isAdd ? dt.addHover : isDel ? dt.delHover : t.hover;
     const gutterSign = isAdd ? "+" : isDel ? "-" : " ";
 
-    const plainText = expandCodeTabs(text || " ");
-    const codeCell = tokens && tokens.length
-      ? h_flex().flex_none().whitespace_nowrap().items_center().pr(20).children(
-          tokens.map(([tokKind, tokText]) =>
-            div()
-              .flex_none()
-              .whitespace_nowrap()
-              .text_color(syntaxTokenColor(tokKind, t))
-              .child(tokText.replace(/ /g, "\u00a0"))
-          )
-        )
-      : div().flex_none().whitespace_nowrap().pr(20)
+    const hasTokens = Array.isArray(tokens) && tokens.length > 0;
+    const wCacheKey = `${wrapCols}|${hasTokens ? 1 : 0}`;
+    let cachedWrap = reviewWrapCache.get(rowObj);
+    if (!cachedWrap || cachedWrap.key !== wCacheKey) {
+      const segments = hasTokens
+        ? wrapStyledSpans(tokens, wrapCols, { toNbsp: true })
+        : wrapPlainText(text || " ", wrapCols, { toNbsp: true });
+      cachedWrap = { key: wCacheKey, segments };
+      reviewWrapCache.set(rowObj, cachedWrap);
+    }
+    const segments = cachedWrap.segments;
+
+    const renderSegContent = (seg) => {
+      if (!hasTokens) {
+        return div().flex_1().min_w(0).overflow_hidden().whitespace_nowrap()
           .text_color(diffColor || t.foreground)
-          .child(plainText.replace(/ /g, "\u00a0"));
+          .child(seg || "\u00a0");
+      }
+      if (!seg || seg.length === 0) {
+        return div().flex_1().min_w(0).overflow_hidden().whitespace_nowrap()
+          .text_color(diffColor || t.foreground)
+          .child("\u00a0");
+      }
+      const spanEls = new Array(seg.length);
+      for (let i = 0; i < seg.length; i++) {
+        const sp = seg[i];
+        spanEls[i] = div()
+          .flex_none()
+          .whitespace_nowrap()
+          .text_color(syntaxTokenColor(sp[0], t))
+          .child(sp[1] || "\u00a0");
+      }
+      return h_flex().flex_1().min_w(0).overflow_hidden().items_center().children(spanEls);
+    };
 
-    const row = h_flex().w_full().h(20).flex_none().items_center().gap(6).cursor_pointer()
-      .border_l(2)
-      .border_color(diffColor || t.background)
-      .when(Boolean(rowBg), (e) => e.bg(rowBg))
-      .when(Boolean(existing) || Boolean(isActive), (e) => e.bg(t.selected))
-      .hover((s) => s.bg(hoverBg))
-      .on_click((_e, cx) => {
-        if (isCommentable) this.startComment(openKey, number, text, cx);
-      })
-      .child(
-        div().w(32).flex_none().text_right()
-          .text_color(existing || isActive ? t.foreground : diffColor || t.dim)
-          .child(number === undefined ? "" : String(number))
-      )
-      .child(
-        div().w(10).flex_none().text_center().font_semibold()
-          .text_color(diffColor || t.dim)
-          .child(gutterSign)
-      )
-      .child(codeCell);
+    const buildVisualSubRow = (seg, isFirstSeg) =>
+      h_flex().w_full().h(REVIEW_ROW_HEIGHT).flex_none().items_center().gap(6).pr(14)
+        .border_l(2)
+        .border_color(diffColor || t.background)
+        .when(isCommentable, (e) => e.cursor_pointer())
+        .when(Boolean(rowBg), (e) => e.bg(rowBg))
+        .when(Boolean(existing) || Boolean(isActive), (e) => e.bg(t.selected))
+        .hover((s) => s.bg(hoverBg))
+        .child(
+          div().w(32).flex_none().text_right()
+            .text_color(existing || isActive ? t.foreground : diffColor || t.dim)
+            .child(!isFirstSeg || number === undefined ? "\u00a0" : String(number))
+        )
+        .child(
+          div().w(10).flex_none().text_center().font_semibold()
+            .text_color(diffColor || t.dim)
+            .child(isFirstSeg ? gutterSign : "\u00a0")
+        )
+        .child(renderSegContent(seg));
 
-    if (!isActive && !existing) {
+    const row = segments.length <= 1
+      ? buildVisualSubRow(segments[0], true)
+      : v_flex().w_full().flex_none().children(
+          segments.map((seg, idx) => buildVisualSubRow(seg, idx === 0))
+        );
+
+    if (!existing) {
       return row;
     }
 
+    const commentLines = this.getWrappedCommentLines(existing.text, wrapCols);
+
     return v_flex().w_full().flex_none()
       .child(row)
-      .when(Boolean(isActive), (c) => c.child(
-        v_flex().w_full().pl(8).pr(14).py(8).bg(t.raised).border_b(1).border_t(1).border_color(t.border)
-          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-          .child(
-            v_flex().w_full().max_w(460).gap(6)
-              .child(
-                div().w_full().p(8).rounded(7).border_1().border_color(this.typingComment ? t.accent : t.border).bg(t.background).cursor_text()
-                  .child(Textarea.new(this.commentInput).w_full().text_size(12).text_color(t.foreground))
-              )
-              .child(
-                h_flex().w_full().items_center().justify_between()
-                  .child(div().text_size(11).text_color(t.dim).child(`Line ${number}`))
-                  .child(
-                    h_flex().gap(6).items_center()
-                      .child(
-                        h_flex().id("inline-cancel-btn").h(26).px(10).items_center().rounded(6)
-                          .border_1().border_color(t.border).bg(t.background)
-                          .text_color(t.muted).text_size(11.5).cursor_pointer()
-                          .hover((s) => s.text_color(t.foreground))
-                          .on_click((_e, cx) => this.cancelActiveComment(cx))
-                          .child("Cancel")
-                      )
-                      .child(
-                        h_flex().id("inline-save-btn").h(26).px(12).items_center().rounded(6)
-                          .bg(canSave ? t.solid : t.background)
-                          .text_color(canSave ? t.solid_foreground : t.dim)
-                          .text_size(11.5).font_medium()
-                          .when(canSave, (e) => e.cursor_pointer())
-                          .on_click((_e, cx) => this.saveActiveComment(cx))
-                          .child(existing ? "Update" : "Save")
-                      )
-                  )
-              )
-          )
-      ))
-      .when(!isActive && Boolean(existing), (c) => c.child(
-        h_flex().w_full().pl(12).pr(16).py(6).bg(t.raised).border_b(1).border_color(t.border).cursor_pointer()
-          .hover((s) => s.bg(t.hover))
-          .on_click((_e, cx) => this.startComment(openKey, number, text, cx))
+      .child(
+        h_flex().w_full().h(13 + commentLines.length * 16).pl(12).pr(16).py(6).bg(t.raised).border_b(1).border_color(t.border)
+          .cursor_pointer().hover((s) => s.bg(t.hover))
           .child(
             h_flex().w_full().max_w(460).gap(8).items_start()
               .child(div().pt(2).flex_none().child(svg("mods/changes-review/icons/comment.svg").size(11).text_color(t.muted)))
               .child(
-                v_flex().flex_1().min_w(0).gap(2).children(
-                  String(existing.text || "").split(/\r?\n/).map((line) =>
-                    div().w_full().text_size(11.5).text_color(t.foreground).child(line || " ")
+                v_flex().flex_1().min_w(0).children(
+                  commentLines.map((line) =>
+                    div().w_full().h(16).flex_none().whitespace_nowrap().text_size(11.5).text_color(t.foreground).child(line || " ")
                   )
                 )
               )
+              .child(div().flex_none().text_size(10).text_color(t.dim).child(isActive ? "Editing" : "Edit"))
+          )
+      );
+  }
+
+  /**
+   * Renders the docked review-comment composer outside `v_virtual_list` so GPUI
+   * retained Textarea and button handlers never run inside a virtual-list layout callback.
+   */
+  renderCommentComposer(t, commentMap, openKey) {
+    const active = this.activeComment;
+    if (!active || active.fileKey !== openKey) return div();
+    const existing = commentMap ? commentMap.get(active.line) : null;
+    const canSave = Boolean(this.commentText.trim());
+    return v_flex().id("review-comment-composer").w_full().flex_none()
+      .px(12).py(8).bg(t.raised).border_t(1).border_color(t.border)
+      .child(
+        v_flex().w_full().max_w(520).gap(6)
+          .child(
+            h_flex().w_full().items_center().justify_between().gap(8)
               .child(
-                div().p(3).rounded(4).flex_none().cursor_pointer().hover((s) => s.bg(t.background))
-                  .on_click((_e, cx) => {
-                    cx.stop_propagation();
-                    this.removeComment(openKey, number, cx);
-                  })
-                  .child(svg("mods/changes-review/icons/trash.svg").size(10).text_color(t.dim))
+                h_flex().items_center().gap(6).min_w(0).flex_1()
+                  .child(svg("mods/changes-review/icons/comment.svg").size(11).text_color(t.accent))
+                  .child(div().text_size(11.5).font_semibold().text_color(t.foreground).child(`Line ${active.line}`))
+                  .when(Boolean(active.snippet), (e) =>
+                    e.child(div().flex_1().min_w(0).overflow_hidden().whitespace_nowrap().text_size(11).text_color(t.dim).child(active.snippet))
+                  )
+              )
+              .when(Boolean(existing), (e) =>
+                e.child(
+                  h_flex().id("inline-delete-btn").h(22).px(8).items_center().gap(4).rounded(5)
+                    .border_1().border_color(t.border).bg(t.background)
+                    .text_color(t.muted).text_size(11).cursor_pointer()
+                    .hover((s) => s.text_color(t.foreground).bg(t.hover))
+                    .on_click((_e, cx) => this.removeComment(openKey, active.line, cx))
+                    .child(svg("mods/changes-review/icons/trash.svg").size(10).text_color(t.muted))
+                    .child("Delete")
+                )
               )
           )
-      ));
+          .child(
+            div().w_full().h(78).p(7).rounded(7).border_1().border_color(this.typingComment ? t.accent : t.border).bg(t.background).cursor_text()
+              .child(Textarea.new(this.commentInput).w_full().h(62).text_size(12).text_color(t.foreground))
+          )
+          .child(
+            h_flex().w_full().h(26).items_center().justify_between()
+              .child(div().text_size(10.5).text_color(t.dim).child("Esc to cancel · Cmd/Ctrl+Enter to save"))
+              .child(
+                h_flex().gap(6).items_center()
+                  .child(
+                    h_flex().id("inline-cancel-btn").h(26).px(10).items_center().rounded(6)
+                      .border_1().border_color(t.border).bg(t.background)
+                      .text_color(t.muted).text_size(11.5).cursor_pointer()
+                      .hover((s) => s.text_color(t.foreground))
+                      .on_click((_e, cx) => this.cancelActiveComment(cx))
+                      .child("Cancel")
+                  )
+                  .child(
+                    h_flex().id("inline-save-btn").h(26).px(12).items_center().rounded(6)
+                      .bg(canSave ? t.solid : t.background)
+                      .text_color(canSave ? t.solid_foreground : t.dim)
+                      .text_size(11.5).font_medium()
+                      .when(canSave, (e) => e.cursor_pointer())
+                      .on_click((_e, cx) => this.saveActiveComment(cx))
+                      .child(existing ? "Update" : "Save")
+                  )
+              )
+          )
+      );
   }
 
   render(cx) {
@@ -2810,9 +2972,13 @@ export default class ChangesReview extends View {
       .track_focus(this.handle)
       .on_size_change((size, cx) => {
         const w = Math.round(size?.width || 0);
-        if (w > 0 && Math.abs(w - (this.viewerWidth || 900)) > 12) {
+        const prevW = this.viewerWidth || 900;
+        if (w > 0 && Math.abs(w - prevW) > 12) {
+          const compactChanged = (prevW < 680) !== (w < 680);
           this.viewerWidth = w;
-          cx.notify();
+          if (compactChanged || !this.diffViewportWidth) {
+            cx.notify();
+          }
         }
       })
       .on_key_down((e, cx) => {
@@ -2842,30 +3008,68 @@ export default class ChangesReview extends View {
         div().flex_none().px(12).py(6).border_b(1).border_color(t.border).text_size(11).text_color(del).child(this.viewerNote)
       ))
       .child(
-        div().flex_1().min_h(0).relative().font_family(mono).text_size(11.5)
-          .child(
-            div().id("changes-diff-x").size_full().overflow_x_scrollbar()
-              .child(
-                div().w_full().min_w(this.diffWidth).h_full()
+        (() => {
+          const wrapCols = this.getReviewWrapCols();
+          const rowHeights = this.computeDiffRowHeights(commentMap, wrapCols);
+          return v_flex().flex_1().min_h(0).w_full()
+            .on_size_change((size, cx) => {
+              const w = Math.round(size?.width || 0);
+              if (w > 0 && Math.abs(w - (this.diffViewportWidth || 0)) > 4) {
+                this.scheduleDiffResizeReflow(w, cx);
+              }
+            })
+            .child(
+              div().size_full().relative().font_family(mono).text_size(11.5)
+                .when(this.rows.length > 0, (el) => el
                   .child(
-                    v_flex().id("changes-diff-lines").size_full().overflow_y_scroll().track_scroll(this.diffScroll).pb(16).children(
-                      this.rows.map((row) => this.diffRow(row, t, dt, commentMap, openKey))
+                    v_virtual_list(
+                      "changes-diff-lines",
+                      this.rows.length,
+                      rowHeights,
+                      (index) => `${openKey || ""}::${index}`,
+                      (range) => {
+                        const out = [];
+                        for (let i = range.start; i < range.end; i++) {
+                          out.push(this.diffRow(this.rows[i], t, dt, commentMap, openKey, wrapCols));
+                        }
+                        return out;
+                      }
                     )
+                      .size_full()
+                      .track_scroll(this.diffScroll)
+                      .on_item_click((itemKey, cx) => {
+                        const keyStr = String(itemKey || "");
+                        const sep = keyStr.lastIndexOf("::");
+                        const idx = Number(sep >= 0 ? keyStr.slice(sep + 2) : keyStr);
+                        if (!Number.isInteger(idx) || idx < 0 || idx >= this.rows.length) return;
+                        const rowObj = this.rows[idx];
+                        if (!rowObj) return;
+                        const activeKey = readActiveDiff(this.getSessionContext().spaceId)?.openFileKey || openKey;
+                        if (rowObj.kind === "@") {
+                          this.toggleExpand(activeKey, cx);
+                        } else if (rowObj.number !== undefined) {
+                          this.startComment(activeKey, rowObj.number, rowObj.text, cx);
+                        }
+                      })
                   )
-              )
-          )
-          .child(Scrollbar.vertical("changes-diff-lines").viewport_from_layout().absolute().inset_0())
-          .when(!openFile, (e) => e.child(
-            h_flex().absolute().inset_0().items_center().justify_center()
-              .child(div().text_size(12).text_color(t.dim).child(
-                files.length === 0 && viewMode === "working"
-                  ? "No changes in this session yet"
-                  : "Select a file from the Changes panel to review its diff"
-              ))
-          ))
-          .when(Boolean(openFile) && this.viewerLoading && this.rows.length === 0, (e) => e.child(
-            div().absolute().top(12).left(14).text_size(11.5).text_color(t.dim).child("Loading diff…")
-          ))
+                  .child(Scrollbar.vertical("changes-diff-lines").viewport_from_layout().absolute().inset_0())
+                )
+                .when(!openFile, (e) => e.child(
+                  h_flex().absolute().inset_0().items_center().justify_center()
+                    .child(div().text_size(12).text_color(t.dim).child(
+                      files.length === 0 && viewMode === "working"
+                        ? "No changes in this session yet"
+                        : "Select a file from the Changes panel to review its diff"
+                    ))
+                ))
+                .when(Boolean(openFile) && this.viewerLoading && this.rows.length === 0, (e) => e.child(
+                  div().absolute().top(12).left(14).text_size(11.5).text_color(t.dim).child("Loading diff…")
+                ))
+            );
+        })()
+      )
+      .when(Boolean(this.activeComment && this.activeComment.fileKey === openKey), (el) =>
+        el.child(this.renderCommentComposer(t, commentMap, openKey))
       );
   }
 
@@ -3003,9 +3207,13 @@ export default class ChangesReview extends View {
     return v_flex().id("changes").size_full().min_h(0).rounded(10).overflow_hidden().relative().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
       .on_size_change((size, cx) => {
         const w = Math.round(size?.width || 0);
-        if (w > 0 && Math.abs(w - (this.panelWidth || 420)) > 12) {
+        const prevW = this.panelWidth || 420;
+        if (w > 0 && Math.abs(w - prevW) > 12) {
+          const compactChanged = (prevW < 380) !== (w < 380);
           this.panelWidth = w;
-          cx.notify();
+          if (compactChanged) {
+            cx.notify();
+          }
         }
       })
       .on_key_down((e, cx) => {

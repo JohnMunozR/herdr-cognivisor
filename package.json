@@ -5,6 +5,8 @@
   "type": "module",
   "description": "Multi-microservice Agent IDE layout and mod suite for Herdr",
   "scripts": {
-    "test": "node --test tests/*.test.mjs"
+    "sync:shared": "node scripts/sync-shared.mjs",
+    "check:shared": "node scripts/sync-shared.mjs --check",
+    "test": "node scripts/sync-shared.mjs --check && node --test tests/*.test.mjs"
   }
 }

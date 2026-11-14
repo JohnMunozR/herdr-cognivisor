@@ -56,13 +56,13 @@ import {
   tokenizeCodeLine,
   resolveFileIcon,
   expandCodeTabs,
-  computeCodeContentWidth,
   resolveViewerFilePath,
   buildFileViewerKey,
   formatFileTabTitle,
   pruneOpenFileTabs,
   findMatchingOpenFileTab,
 } from "./search-logic.js";
+import { computeWrapColumns, wrapStyledSpans } from "./code-wrap.js";
 import {
   resolveCachedCascade,
   MAX_CASCADE_DEPTH,
@@ -102,6 +102,51 @@ function shallowEqualStringMap(a, b) {
 const ACTIVE_VIEWER_CLAIMS = new Map();
 const PENDING_VIEWER_OPENS = new Map();
 let VIEWER_ID_SEQ = 0;
+
+const MAX_PREVIEW_WRAP_CACHE = 400;
+const previewWrapCache = new Map();
+
+function getCachedPreviewRows(text, ext, query, isTarget, maxCols) {
+  const key = `${text || ""}\0${ext || ""}\0${isTarget && query ? query : ""}\0${isTarget ? 1 : 0}\0${maxCols}`;
+  let hit = previewWrapCache.get(key);
+  if (hit) {
+    previewWrapCache.delete(key);
+    previewWrapCache.set(key, hit);
+    return hit;
+  }
+
+  const expanded = expandCodeTabs(text || "");
+  if (!expanded) {
+    hit = { mode: "empty", rows: null };
+  } else if (query && isTarget) {
+    const lowerText = expanded.toLowerCase();
+    const lowerQ = String(query).toLowerCase();
+    const idx = lowerQ ? lowerText.indexOf(lowerQ) : -1;
+    const spans =
+      idx >= 0
+        ? [
+            { text: expanded.slice(0, idx), match: false },
+            { text: expanded.slice(idx, idx + query.length), match: true },
+            { text: expanded.slice(idx + query.length), match: false },
+          ]
+        : [{ text: expanded, match: false }];
+    hit = { mode: "match", rows: wrapStyledSpans(spans, maxCols, { toNbsp: true }) };
+  } else {
+    const tokens = tokenizeCodeLine(expanded, ext);
+    if (!tokens || tokens.length === 0) {
+      hit = { mode: "plain", rows: wrapStyledSpans([["plain", expanded]], maxCols, { toNbsp: true }) };
+    } else {
+      hit = { mode: "tokens", rows: wrapStyledSpans(tokens, maxCols, { toNbsp: true }) };
+    }
+  }
+
+  if (previewWrapCache.size >= MAX_PREVIEW_WRAP_CACHE) {
+    const firstKey = previewWrapCache.keys().next().value;
+    if (firstKey !== undefined) previewWrapCache.delete(firstKey);
+  }
+  previewWrapCache.set(key, hit);
+  return hit;
+}
 
 function syncSpaceAgentTabs() {
   const allSpaces = spaces() || [];
@@ -3655,6 +3700,88 @@ export default class FilesSearch extends View {
       );
   }
 
+  renderWrappedSyntaxSegments(t, text, ext, query, isTarget, maxCols, resolvedFont = null, fillWidth = false) {
+    const fontFamily = resolvedFont || settings()?.font_family || "monospace";
+    const applyWrapBox = (el) => (fillWidth ? el.flex_1().min_w(0).overflow_hidden() : el.flex_none());
+    const cached = getCachedPreviewRows(text, ext, query, isTarget, maxCols);
+
+    if (cached.mode === "empty") {
+      return [
+        applyWrapBox(div())
+          .whitespace_nowrap()
+          .text_size(11.5)
+          .font_family(fontFamily)
+          .text_color(t.foreground)
+          .child("\u00a0"),
+      ];
+    }
+
+    if (cached.mode === "match") {
+      return cached.rows.map((rowSpans) => {
+        if (!rowSpans.length) {
+          return applyWrapBox(div()).text_size(11.5).font_family(fontFamily).text_color(t.foreground).child("\u00a0");
+        }
+        return applyWrapBox(h_flex())
+          .items_center()
+          .children(
+            rowSpans.map((seg) =>
+              seg.match
+                ? div()
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .text_size(11.5)
+                    .font_family(fontFamily)
+                    .bg(t.accent)
+                    .text_color(t.background)
+                    .font_semibold()
+                    .rounded(2)
+                    .px(2)
+                    .child(seg.text)
+                : div()
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .text_size(11.5)
+                    .font_family(fontFamily)
+                    .text_color(t.foreground)
+                    .child(seg.text)
+            )
+          );
+      });
+    }
+
+    if (cached.mode === "plain") {
+      return cached.rows.map((rowToks) =>
+        applyWrapBox(div())
+          .whitespace_nowrap()
+          .text_size(11.5)
+          .font_family(fontFamily)
+          .text_color(isTarget ? t.foreground : t.muted)
+          .child(rowToks[0]?.[1] || "\u00a0")
+      );
+    }
+
+    return cached.rows.map((rowToks) => {
+      if (!rowToks.length) {
+        return applyWrapBox(div()).text_size(11.5).font_family(fontFamily).text_color(t.muted).child("\u00a0");
+      }
+      return applyWrapBox(h_flex())
+        .items_center()
+        .children(
+          rowToks.map(([tokKind, tokText]) => {
+            const st = syntaxTokenStyle(tokKind, t, isTarget);
+            let el = div()
+              .flex_none()
+              .whitespace_nowrap()
+              .text_size(11.5)
+              .font_family(fontFamily)
+              .text_color(st.color);
+            if (st.bold) el = el.font_semibold();
+            return el.child(tokText);
+          })
+        );
+    });
+  }
+
   renderPreviewPane(t, item, cx, listH = LIST_H, previewW = 520) {
     if (!item) {
       return v_flex()
@@ -3778,57 +3905,74 @@ export default class FilesSearch extends View {
         );
     }
 
-    const previewContentW = computeCodeContentWidth(this.previewLines, {
-      minWidth: Math.max(200, previewW - 2),
-      charPx: 7.6,
-      gutterPx: 88,
+    const previewCols = computeWrapColumns({
+      viewportWidth: previewW,
+      gutterWidth: 53,
+      rightPadding: 20,
+      fontSize: 11.5,
+      minCols: 12,
     });
     const maxScroll = Math.max(0, this.previewLines.length - VISIBLE_ROWS);
     this.previewScroll = Math.max(0, Math.min(this.previewScroll, maxScroll));
 
+    const monoFont = settings()?.font_family || "monospace";
+    const syntaxPal = getSyntaxPalette(t);
+    const targetGutterColor = syntaxPal.type;
+    const dimGutterColor = syntaxPal.comment;
     const visibleLines = [];
     const startIdx = this.previewScroll;
     const endIdx = Math.min(this.previewLines.length, startIdx + VISIBLE_ROWS);
+    let renderedVisualRows = 0;
 
-    for (let i = startIdx; i < endIdx; i++) {
+    for (let i = startIdx; i < endIdx && renderedVisualRows < VISIBLE_ROWS; i++) {
       const lineNum = (this.previewStartLine || 1) + i;
       const isTarget = lineNum === targetLine;
+      const gutterLineColor = isTarget ? targetGutterColor : dimGutterColor;
       const lineContent = this.previewLines[i] ?? "";
-
-      visibleLines.push(
-        h_flex()
-          .w_full()
-          .h(LINE_H)
-          .flex_none()
-          .items_center()
-          .pl(4)
-          .pr(20)
-          .gap(8)
-          .cursor_pointer()
-          .hover(s => s.bg(t.hover))
-          .on_click(() => this.selectResult({ ...item, line: lineNum }, cx))
-          .when(isTarget, el => el.bg(t.selected).border_l(3).border_color(t.accent))
-          .when(!isTarget, el => el.border_l(3).border_color(t.background))
-          // Line Number Gutter
-          .child(
-            div()
-              .w(38)
-              .flex_none()
-              .text_right()
-              .text_size(11)
-              .font_family(settings()?.font_family || "monospace")
-              .text_color(isTarget ? getSyntaxPalette(t).type : getSyntaxPalette(t).comment)
-              .when(isTarget, el => el.font_semibold())
-              .child(String(lineNum))
-          )
-          // Line Content with Syntax Highlighting (untruncated for horizontal scrolling)
-          .child(
-            div()
-              .flex_none()
-              .whitespace_nowrap()
-              .child(this.renderSyntaxLine(t, lineContent, ext, isTarget ? item.matchedQuery : null, isTarget))
-          )
+      const wrappedSegments = this.renderWrappedSyntaxSegments(
+        t,
+        lineContent,
+        ext,
+        isTarget ? item.matchedQuery : null,
+        isTarget,
+        previewCols,
+        monoFont,
+        true
       );
+
+      for (let s = 0; s < wrappedSegments.length && renderedVisualRows < VISIBLE_ROWS; s++) {
+        const isFirstSeg = s === 0;
+        renderedVisualRows += 1;
+        visibleLines.push(
+          h_flex()
+            .w_full()
+            .h(LINE_H)
+            .flex_none()
+            .items_center()
+            .pl(4)
+            .pr(16)
+            .gap(8)
+            .cursor_pointer()
+            .hover(st => st.bg(t.hover))
+            .on_click(() => this.selectResult({ ...item, line: lineNum }, cx))
+            .when(isTarget, el => el.bg(t.selected).border_l(3).border_color(t.accent))
+            .when(!isTarget, el => el.border_l(3).border_color(t.background))
+            // Line Number Gutter (blank on wrapped continuation rows)
+            .child(
+              div()
+                .w(38)
+                .flex_none()
+                .text_right()
+                .text_size(11)
+                .font_family(monoFont)
+                .text_color(gutterLineColor)
+                .when(isTarget, el => el.font_semibold())
+                .child(isFirstSeg ? String(lineNum) : "\u00a0")
+            )
+            // Soft-wrapped Line Content
+            .child(wrappedSegments[s])
+        );
+      }
     }
 
     return v_flex()
@@ -3945,18 +4089,14 @@ export default class FilesSearch extends View {
                 }
               })
               .child(
-                div()
+                v_flex()
                   .id("files-preview-x")
                   .size_full()
-                  .overflow_x_scrollbar()
-                  .child(
-                    v_flex()
-                      .w_full()
-                      .min_w(previewContentW)
-                      .pt(4)
-                      .pb(12)
-                      .children(visibleLines)
-                  )
+                  .min_w(0)
+                  .overflow_hidden()
+                  .pt(4)
+                  .pb(12)
+                  .children(visibleLines)
               )
           )
           .when(!this.previewLoading && !this.previewError && this.previewLines.length === 0, el =>
@@ -4715,7 +4855,7 @@ export default class FilesSearch extends View {
       this.viewerCode = EditorState.new({
         language: resolveEditorLanguage(this.viewerTargetPath),
         readonly: true,
-        soft_wrap: false,
+        soft_wrap: true,
         line_numbers: true,
         folding: true,
         value: currentValue,
@@ -4786,7 +4926,7 @@ export default class FilesSearch extends View {
           this.viewerCode = EditorState.new({
             language: resolveEditorLanguage(targetPath),
             readonly: true,
-            soft_wrap: false,
+            soft_wrap: true,
             line_numbers: true,
             folding: true,
             value,

@@ -48,22 +48,21 @@ import {
   buildSideBySideRows,
   buildUnifiedRows,
   buildWaveDiffLayout,
+  buildWaveDiffBlocks,
+  computeUnifiedRowHeights,
+  prepareWrappedRenderLines,
   getFileExt,
   getDiffSyntaxPalette,
-  prepareRenderLineData,
   toNbspString,
   tokenizeDeferredRow,
   tokenizeSideBySidePage,
   resolveGitFileIcon,
-  computeDiffColumnWidths,
-  computeHorizontalWheelDelta,
-  computeHorizontalScrollbarMetrics,
-  computeScrollXFromTrackClick,
   computeViewerLoadedKey,
   formatGitTabTitle,
   expandCodeTabs,
   paginateDiffRows,
 } from "./diff-logic.js";
+import { computeWrapColumns, wrapPlainText } from "./code-wrap.js";
 import {
   READ_GIT,
   DISCOVER_SKIP_DIRS,
@@ -79,11 +78,6 @@ import {
 const ROW_HEIGHT = 30;
 const FILE_ROW_HEIGHT = 26;
 const Y_MID = ROW_HEIGHT / 2;
-const HSCROLL_AXIS_CONFIG = {
-  left: { contentKey: "leftWidth", viewportKey: "leftViewportW", scrollKey: "leftScrollX" },
-  right: { contentKey: "rightWidth", viewportKey: "rightViewportW", scrollKey: "rightScrollX" },
-  unified: { contentKey: "unifiedWidth", viewportKey: "unifiedViewportW", scrollKey: "unifiedScrollX" },
-};
 const LANE_WIDTH = 16;
 const LANE_PAD_LEFT = 10;
 const COMMIT_PAGE_SIZE = 200;
@@ -613,54 +607,6 @@ function buildRefBadgeColors(ref, t) {
   };
 }
 
-class GitDiffSideView extends View {
-  init(initProps) {
-    const p = initProps ?? {};
-    this.hostId = p.hostId || "";
-    this.side = p.side === "right" ? "right" : "left";
-  }
-
-  update(nextProps) {
-    if (nextProps?.hostId) this.hostId = nextProps.hostId;
-    if (nextProps?.side) this.side = nextProps.side === "right" ? "right" : "left";
-  }
-
-  render() {
-    const host = viewerHostsById.get(this.hostId);
-    return host ? host.renderSidePaneContent(this.side) : div();
-  }
-}
-
-class GitDiffWaveGutterView extends View {
-  init(initProps) {
-    this.hostId = initProps?.hostId || "";
-  }
-
-  update(nextProps) {
-    if (nextProps?.hostId) this.hostId = nextProps.hostId;
-  }
-
-  render() {
-    const host = viewerHostsById.get(this.hostId);
-    return host ? host.renderWaveGutterContent() : div();
-  }
-}
-
-class GitDiffHScrollView extends View {
-  init(initProps) {
-    this.hostId = initProps?.hostId || "";
-  }
-
-  update(nextProps) {
-    if (nextProps?.hostId) this.hostId = nextProps.hostId;
-  }
-
-  render() {
-    const host = viewerHostsById.get(this.hostId);
-    return host ? host.renderHScrollBarsContent() : div().h(0);
-  }
-}
-
 class GitDiffUnifiedView extends View {
   init(initProps) {
     this.hostId = initProps?.hostId || "";
@@ -750,16 +696,11 @@ export default class GitHistory extends View {
     this.sbsWaveLayout = null;
     this.uniRows = [];
     this.uniRowHeights = [];
-    this.leftWidth = 260;
-    this.rightWidth = 260;
-    this.unifiedWidth = 600;
     this.leftViewportW = 0;
     this.rightViewportW = 0;
     this.unifiedViewportW = 0;
-    this.leftScrollX = 0;
-    this.rightScrollX = 0;
-    this.unifiedScrollX = 0;
-    this.hScrollDrag = null;
+    this._lastSbsWrapSig = "";
+    this._lastUniWrapSig = "";
     this.open = null;
 
     // Watchers & timers
@@ -770,6 +711,7 @@ export default class GitHistory extends View {
     this.agentTabSyncTask = null;
     this.sharedSyncTask = null;
     this.viewerLoadTask = null;
+    this.diffResizeTask = null;
     this.pollTask = null;
     this.wasVisible = !this.isViewer && isGitPanelVisible();
     this.hasLoadedOnce = false;
@@ -780,11 +722,7 @@ export default class GitHistory extends View {
       this.viewerHostId = `vh-${nextViewerHostId++}`;
       viewerHostsById.set(this.viewerHostId, this);
       this.uniScroll = VirtualListScrollHandle.new();
-      this.diffScroll = ScrollHandle.new();
-      this.leftDiffPane = cx.new(GitDiffSideView, { hostId: this.viewerHostId, side: "left" });
-      this.rightDiffPane = cx.new(GitDiffSideView, { hostId: this.viewerHostId, side: "right" });
-      this.waveGutterPane = cx.new(GitDiffWaveGutterView, { hostId: this.viewerHostId });
-      this.hScrollBarPane = cx.new(GitDiffHScrollView, { hostId: this.viewerHostId });
+      this.diffScroll = VirtualListScrollHandle.new();
       this.unifiedDiffPane = cx.new(GitDiffUnifiedView, { hostId: this.viewerHostId });
     } else {
       this.commitsScroll = VirtualListScrollHandle.new();
@@ -857,15 +795,13 @@ export default class GitHistory extends View {
     this.sharedSyncTask = null;
     try { this.viewerLoadTask?.cancel?.(); } catch {}
     this.viewerLoadTask = null;
+    try { this.diffResizeTask?.cancel?.(); } catch {}
+    this.diffResizeTask = null;
     try { this.pollTask?.cancel?.(); } catch {}
     this.pollTask = null;
 
     this.stopAllWatchers();
 
-    try { this.leftDiffPane?.release?.(); } catch {}
-    try { this.rightDiffPane?.release?.(); } catch {}
-    try { this.waveGutterPane?.release?.(); } catch {}
-    try { this.hScrollBarPane?.release?.(); } catch {}
     try { this.unifiedDiffPane?.release?.(); } catch {}
     try { this.searchInput?.release?.(); } catch {}
     try { this.commitsScroll?.release?.(); } catch {}
@@ -1706,10 +1642,6 @@ export default class GitHistory extends View {
         }
       }
     };
-    if (want("left")) ping(this.leftDiffPane);
-    if (want("right")) ping(this.rightDiffPane);
-    if (want("gutter")) ping(this.waveGutterPane);
-    if (want("hscroll")) ping(this.hScrollBarPane);
     if (want("unified")) ping(this.unifiedDiffPane);
   }
 
@@ -1757,6 +1689,65 @@ export default class GitHistory extends View {
     return result;
   }
 
+  getSbsWrapMetrics() {
+    const estColW = Math.max(180, Math.floor(((this.viewerWidth || 960) - DIFF_WAVE_GUTTER_WIDTH - 4) / 2));
+    const leftVpW = this.leftViewportW > 0 ? this.leftViewportW : estColW;
+    const rightVpW = this.rightViewportW > 0 ? this.rightViewportW : estColW;
+    const leftCols = computeWrapColumns({
+      viewportWidth: leftVpW,
+      gutterWidth: 60,
+      rightPadding: 14,
+      fontSize: 11.5,
+      minCols: 10,
+    });
+    const rightCols = computeWrapColumns({
+      viewportWidth: rightVpW,
+      gutterWidth: 62,
+      rightPadding: 22,
+      fontSize: 11.5,
+      minCols: 10,
+    });
+    const hunkCols = computeWrapColumns({
+      viewportWidth: Math.min(leftVpW, rightVpW),
+      gutterWidth: 20,
+      rightPadding: 14,
+      fontSize: 11,
+      minCols: 12,
+    });
+    return { leftCols, rightCols, hunkCols, sig: `${leftCols}|${rightCols}|${hunkCols}` };
+  }
+
+  getUnifiedWrapMetrics() {
+    const uniVpW = this.unifiedViewportW > 0
+      ? this.unifiedViewportW
+      : Math.max(260, (this.viewerWidth || 960) - 4);
+    const uniCols = computeWrapColumns({
+      viewportWidth: uniVpW,
+      gutterWidth: 98,
+      rightPadding: 22,
+      fontSize: 11.5,
+      minCols: 10,
+    });
+    const uniHunkCols = computeWrapColumns({
+      viewportWidth: uniVpW,
+      gutterWidth: 24,
+      rightPadding: 22,
+      fontSize: 11,
+      minCols: 12,
+    });
+    return { uniCols, uniHunkCols, sig: `${uniCols}|${uniHunkCols}` };
+  }
+
+  recomputeUnifiedRowHeights() {
+    const metrics = this.getUnifiedWrapMetrics();
+    this._lastUniWrapSig = metrics.sig;
+    this.uniRowHeights = computeUnifiedRowHeights(this.uniRows, metrics.uniCols, {
+      rowHeight: DIFF_ROW_HEIGHT,
+      hunkHeight: DIFF_HUNK_HEIGHT,
+      hunkWrapCols: metrics.uniHunkCols,
+    });
+  }
+
   buildActiveDiffModeData() {
     const src = this.loadedPatchSource;
     if (!src) return;
@@ -1766,10 +1757,9 @@ export default class GitHistory extends View {
       const uni = buildUnifiedRows(patchText, filePath, { maxLines, deferTokens: true });
       this.isBinaryDiff = Boolean(this.isBinaryDiff || uni.isBinary);
       this.uniRows = uni.rows || [];
-      this.uniRowHeights = this.uniRows.map((r) => (r.kind === "hunk" || r.kind === "@" ? DIFF_HUNK_HEIGHT : DIFF_ROW_HEIGHT));
+      this.recomputeUnifiedRowHeights();
       this.diffTruncated = Boolean(this.diffTruncated || uni.truncated);
       this.diffTotalLines = Number(uni.totalLines || this.diffTotalLines || 0);
-      this.unifiedWidth = Math.max(520, computeDiffColumnWidths(this.uniRows, 7.6).unifiedWidth);
       this.uniBuilt = true;
     } else {
       if (this.sbsBuilt) return;
@@ -1820,6 +1810,7 @@ export default class GitHistory extends View {
       this.sbsPage = 0;
       this.sbsPageInfo = paginateDiffRows([], 0, DEFAULT_SBS_PAGE_ROWS);
       this.sbsWaveLayout = null;
+      this.sbsBlocks = null;
       this.uniRows = [];
       this.uniRowHeights = [];
       this.isBinaryDiff = false;
@@ -1859,6 +1850,7 @@ export default class GitHistory extends View {
           this.sbsPage = 0;
           this.sbsPageInfo = paginateDiffRows([], 0, DEFAULT_SBS_PAGE_ROWS);
           this.sbsWaveLayout = null;
+          this.sbsBlocks = null;
           this.uniRows = [];
           this.uniRowHeights = [];
           this.diffTruncated = false;
@@ -1868,6 +1860,7 @@ export default class GitHistory extends View {
           this.uniBuilt = false;
           this.sbsRows = [];
           this.sbsWaveLayout = null;
+          this.sbsBlocks = null;
           this.uniRows = [];
           this.uniRowHeights = [];
           this.isBinaryDiff = false;
@@ -1878,7 +1871,6 @@ export default class GitHistory extends View {
           this.buildActiveDiffModeData();
         }
         if (prevOpenKey !== openFile.key || opts.forceScrollTop) {
-          this.resetHorizontalScroll();
           try { this.diffScroll?.scroll_to_item(0); } catch {}
           try { this.uniScroll?.scroll_to_item(0); } catch {}
         }
@@ -1891,6 +1883,7 @@ export default class GitHistory extends View {
         this.sbsPage = 0;
         this.sbsPageInfo = paginateDiffRows([], 0, DEFAULT_SBS_PAGE_ROWS);
         this.sbsWaveLayout = null;
+        this.sbsBlocks = null;
         this.uniRows = [];
         this.uniRowHeights = [];
         this.viewerError = `Cannot load diff: ${e?.message || e}`;
@@ -1919,6 +1912,7 @@ export default class GitHistory extends View {
         this.sbsPage = 0;
         this.sbsPageInfo = paginateDiffRows([], 0, DEFAULT_SBS_PAGE_ROWS);
         this.sbsWaveLayout = null;
+        this.sbsBlocks = null;
         this.uniRows = [];
         this.uniRowHeights = [];
         this.diffTruncated = false;
@@ -1939,7 +1933,6 @@ export default class GitHistory extends View {
       }
 
       if (prevOpenKey !== openFile.key || opts.forceScrollTop) {
-        this.resetHorizontalScroll();
         try { this.diffScroll?.scroll_to_item(0); } catch {}
         try { this.uniScroll?.scroll_to_item(0); } catch {}
       }
@@ -1953,6 +1946,7 @@ export default class GitHistory extends View {
       this.sbsPage = 0;
       this.sbsPageInfo = paginateDiffRows([], 0, DEFAULT_SBS_PAGE_ROWS);
       this.sbsWaveLayout = null;
+      this.sbsBlocks = null;
       this.uniRows = [];
       this.uniRowHeights = [];
       this.viewerError = `Cannot load diff: ${e?.message || e}`;
@@ -1970,22 +1964,23 @@ export default class GitHistory extends View {
     this.sbsPage = pageInfo.pageIndex;
     this.sbsPageInfo = pageInfo;
     tokenizeSideBySidePage(pageInfo.rows, this.loadedFileExt);
+    const wrapMetrics = this.getSbsWrapMetrics();
+    this._lastSbsWrapSig = wrapMetrics.sig;
     this.sbsWaveLayout = buildWaveDiffLayout(pageInfo.rows, {
       rowHeight: DIFF_ROW_HEIGHT,
       hunkHeight: DIFF_HUNK_HEIGHT,
+      leftCols: wrapMetrics.leftCols,
+      rightCols: wrapMetrics.rightCols,
+      hunkCols: wrapMetrics.hunkCols,
     });
-    const pageWidths = computeDiffColumnWidths(pageInfo.rows, 7.6);
-    this.leftWidth = Math.max(260, Number(pageWidths?.leftWidth) || 260);
-    this.rightWidth = Math.max(260, Number(pageWidths?.rightWidth) || 260);
+    this.sbsBlocks = buildWaveDiffBlocks(this.sbsWaveLayout);
   }
 
   setSbsPage(nextPage, cx) {
     this.sbsPage = nextPage;
     this.rebuildSbsPageCache();
-    this.resetHorizontalScroll();
     try { this.diffScroll?.scroll_to_item(0); } catch {}
     cx?.notify();
-    this.notifyViewerChildren(cx, ["left", "right", "gutter", "hscroll"]);
   }
 
   openViewerFileInPlace(nextFile, diff, ctx, cx, overrides = {}) {
@@ -2068,170 +2063,94 @@ export default class GitHistory extends View {
         ts: Date.now(),
       });
     }
-    this.resetHorizontalScroll();
     try { this.diffScroll?.scroll_to_item(0); } catch {}
     try { this.uniScroll?.scroll_to_item(0); } catch {}
     cx.notify();
     this.notifyViewerChildren(cx, "all");
   }
 
-  resetHorizontalScroll() {
-    this.leftScrollX = 0;
-    this.rightScrollX = 0;
-    this.unifiedScrollX = 0;
-    this.hScrollDrag = null;
-  }
-
-  getHorizontalMetrics(side) {
-    const cfg = HSCROLL_AXIS_CONFIG[side];
-    if (!cfg) return computeHorizontalScrollbarMetrics(0, 0, 0, 0);
-    const viewportW = Number(this[cfg.viewportKey]) || 0;
-    const contentW = Number(this[cfg.contentKey]) || 0;
-    const trackW = Math.max(0, viewportW - 8);
-    return computeHorizontalScrollbarMetrics(contentW, viewportW, Number(this[cfg.scrollKey]) || 0, trackW);
-  }
-
-  updateHorizontalViewport(side, size, cx) {
-    const cfg = HSCROLL_AXIS_CONFIG[side];
-    if (!cfg) return;
-    const nextW = Math.round(Number(size?.width) || 0);
-    if (nextW > 0 && Math.abs(nextW - (Number(this[cfg.viewportKey]) || 0)) > 1) {
-      this[cfg.viewportKey] = nextW;
-      const metrics = this.getHorizontalMetrics(side);
-      const scrollChanged = (Number(this[cfg.scrollKey]) || 0) !== metrics.scrollX;
-      if (scrollChanged) {
-        this[cfg.scrollKey] = metrics.scrollX;
+  scheduleDiffResizeReflow(cx) {
+    const runReflow = (cxRef) => {
+      this.diffResizeTask = null;
+      if (this.diffMode === "unified") {
+        if (this.uniBuilt && this.getUnifiedWrapMetrics().sig !== this._lastUniWrapSig) {
+          this.recomputeUnifiedRowHeights();
+          try { cxRef?.notify(); } catch {}
+          this.notifyViewerChildren(cxRef, ["unified"]);
+        }
+        return;
       }
-      this.notifyViewerChildren(cx, scrollChanged ? [side, "hscroll"] : ["hscroll"]);
-    }
-  }
-
-  handleHorizontalWheel(side, e, cx) {
-    const cfg = HSCROLL_AXIS_CONFIG[side];
-    if (!cfg) return;
-    const res = computeHorizontalWheelDelta(e);
-    if (!res.handled) return;
-    cx?.stop_propagation();
-    if (res.deltaX === 0) return;
-    const metrics = this.getHorizontalMetrics(side);
-    if (!metrics.visible || metrics.maxScroll <= 0) return;
-    const prev = metrics.scrollX;
-    const next = Math.max(0, Math.min(metrics.maxScroll, Math.round(prev + res.deltaX)));
-    if (next !== prev) {
-      this[cfg.scrollKey] = next;
-      this.notifyViewerChildren(cx, [side, "hscroll"]);
-    }
-  }
-
-  startHScrollDrag(side, e, metrics, contentW, viewportW, cx) {
-    const cfg = HSCROLL_AXIS_CONFIG[side];
-    if (!cfg || !metrics.visible) return;
-    const trackLeft = Number(e?.bounds?.x) || 0;
-    const trackW = Number(e?.bounds?.width) > 0 ? Number(e.bounds.width) : metrics.trackW;
-    const localX = e?.local_position?.x != null
-      ? Number(e.local_position.x)
-      : (Number(e?.position?.x) || 0) - trackLeft;
-    const onThumb = localX >= metrics.thumbX && localX <= metrics.thumbX + metrics.thumbW;
-    const startScrollX = onThumb
-      ? metrics.scrollX
-      : computeScrollXFromTrackClick(localX, contentW, viewportW, trackW);
-    const scrollChanged = !onThumb && startScrollX !== (Number(this[cfg.scrollKey]) || 0);
-    if (scrollChanged) {
-      this[cfg.scrollKey] = startScrollX;
-    }
-    this.hScrollDrag = {
-      side,
-      startMouseX: Number(e?.position?.x) || 0,
-      startScrollX,
-      maxScroll: metrics.maxScroll,
-      travelW: metrics.travelW,
+      if (this.sbsBuilt && this.getSbsWrapMetrics().sig !== this._lastSbsWrapSig) {
+        this.rebuildSbsPageCache();
+        try { cxRef?.notify(); } catch {}
+      }
     };
-    cx?.stop_propagation();
-    try { this.hostCx?.notify(); } catch { cx?.notify(); }
-    this.notifyViewerChildren(cx, scrollChanged ? [side, "hscroll"] : ["hscroll"]);
-  }
 
-  handleHScrollDragMove(e, cx) {
-    const drag = this.hScrollDrag;
-    if (!drag) return;
-    const cfg = HSCROLL_AXIS_CONFIG[drag.side];
-    if (!cfg || drag.travelW <= 0 || drag.maxScroll <= 0) return;
-    const dx = (Number(e?.position?.x) || 0) - drag.startMouseX;
-    const deltaScroll = (dx / drag.travelW) * drag.maxScroll;
-    const next = Math.max(0, Math.min(drag.maxScroll, Math.round(drag.startScrollX + deltaScroll)));
-    if (next !== (Number(this[cfg.scrollKey]) || 0)) {
-      this[cfg.scrollKey] = next;
-      this.notifyViewerChildren(cx, [drag.side, "hscroll"]);
+    if (this.diffResizeTask) {
+      try { this.diffResizeTask.cancel(); } catch {}
+      this.diffResizeTask = null;
+    }
+    const timer = cx?.timer || this.hostCx?.timer;
+    if (timer) {
+      this.diffResizeTask = timer.after(16, (timerCx) => runReflow(timerCx || cx || this.hostCx));
+    } else {
+      runReflow(cx || this.hostCx);
     }
   }
 
-  endHScrollDrag(cx) {
-    if (!this.hScrollDrag) return;
-    this.hScrollDrag = null;
-    cx?.notify();
-    this.notifyViewerChildren(cx, ["hscroll"]);
-  }
+  updateDiffViewportWidth(side, size, cx) {
+    const nextW = Math.round(Number(size?.width) || 0);
+    if (nextW <= 0) return;
 
-  renderHorizontalScrollbar(side, metrics, contentW, viewportW, t) {
-    if (!metrics.visible) {
-      return div().flex_1().min_w(0).h_full();
+    if (side === "unified") {
+      if (Math.abs(nextW - (this.unifiedViewportW || 0)) <= 4) return;
+      this.unifiedViewportW = nextW;
+      if (this.uniBuilt && this.getUnifiedWrapMetrics().sig !== this._lastUniWrapSig) {
+        this.scheduleDiffResizeReflow(cx);
+      }
+      return;
     }
-    const isDragging = this.hScrollDrag?.side === side;
-    const trackBg = hexWithAlpha(t.border, "24");
-    const thumbBg = hexWithAlpha(isDragging ? t.foreground : t.dim, isDragging ? "aa" : "66");
-    return h_flex()
-      .flex_1()
-      .min_w(0)
-      .h_full()
-      .px(4)
-      .items_center()
-      .on_scroll_wheel((e, cx) => this.handleHorizontalWheel(side, e, cx))
-      .child(
-        div()
-          .id(`git-diff-hscroll-${side}`)
-          .w_full()
-          .h(8)
-          .relative()
-          .rounded(4)
-          .bg(trackBg)
-          .cursor_pointer()
-          .on_mouse_down("left", (e, cx) => this.startHScrollDrag(side, e, metrics, contentW, viewportW, cx))
-          .child(
-            div()
-              .absolute()
-              .top_0()
-              .bottom_0()
-              .left(metrics.thumbX)
-              .w(metrics.thumbW)
-              .rounded(4)
-              .bg(thumbBg)
-              .hover((s) => s.bg(hexWithAlpha(t.muted, "99")))
-          )
-      );
+
+    const key = side === "right" ? "rightViewportW" : "leftViewportW";
+    if (Math.abs(nextW - (this[key] || 0)) <= 4) return;
+    this[key] = nextW;
+    if (this.sbsBuilt && this.getSbsWrapMetrics().sig !== this._lastSbsWrapSig) {
+      this.scheduleDiffResizeReflow(cx);
+    }
   }
 
-  renderCodeTokens(cacheKeyObj, tokens, plainText, syntaxPalette, fallbackColor) {
+  getWrappedCodeData(cacheKeyObj, tokens, plainText, syntaxPalette, fallbackColor, wrapCols) {
     const pal = syntaxPalette && syntaxPalette._isSyntaxPalette
       ? syntaxPalette
       : getDiffSyntaxPalette(syntaxPalette);
-    const bakeKey = `${pal._sig || ""}|${fallbackColor}`;
+    const cols = Number.isFinite(Number(wrapCols)) && Number(wrapCols) > 0 ? Math.floor(Number(wrapCols)) : 0;
+    const bakeKey = `${pal._sig || ""}|${fallbackColor}|${cols}`;
     const cacheable = cacheKeyObj && typeof cacheKeyObj === "object";
     let baked = cacheable ? lineBakeCache.get(cacheKeyObj) : null;
     if (!baked || baked.key !== bakeKey) {
-      const data = prepareRenderLineData(tokens, plainText, pal, fallbackColor, MAX_RENDER_TOKENS_PER_LINE);
-      baked = { key: bakeKey, data };
+      const segments = prepareWrappedRenderLines(
+        tokens,
+        plainText,
+        pal,
+        fallbackColor,
+        cols,
+        MAX_RENDER_TOKENS_PER_LINE
+      );
+      baked = { key: bakeKey, segments };
       if (cacheable) {
         lineBakeCache.set(cacheKeyObj, baked);
       }
     }
-    const data = baked.data;
-    if (data.kind === "single") {
-      return div()
-        .flex_none()
+    return baked.segments;
+  }
+
+  renderSegmentData(data, fillWidth = false) {
+    if (!data || data.kind === "single") {
+      const el = div()
         .whitespace_nowrap()
-        .pr(20)
-        .text_color(data.color)
-        .child(data.text);
+        .text_color(data?.color)
+        .child(data?.text || "\u00a0");
+      return fillWidth ? el.flex_1().min_w(0).overflow_hidden() : el.flex_none();
     }
     const spans = data.spans;
     const spanEls = new Array(spans.length);
@@ -2243,34 +2162,48 @@ export default class GitHistory extends View {
         .text_color(sp[0])
         .child(sp[1]);
     }
-    return h_flex().flex_none().whitespace_nowrap().items_center().pr(20).children(spanEls);
+    const el = h_flex().items_center().children(spanEls);
+    return fillWidth ? el.flex_1().min_w(0).overflow_hidden() : el.flex_none().whitespace_nowrap();
   }
 
-  renderWaveSideItem(item, side, t, dt, syntaxPalette) {
+  renderWaveSideItem(item, side, t, dt, syntaxPalette, wrapCols, hunkCols) {
     if (item.type === "hunk") {
-      let headerNbsp = "\u00a0";
+      const effectiveHunkCols = item.wrapCols || hunkCols || 72;
+      let headerLines = ["\u00a0"];
       if (side === "left" && item.header) {
+        const hKey = `${item.header}|${effectiveHunkCols}`;
         let cached = lineBakeCache.get(item);
-        if (!cached || cached.raw !== item.header) {
-          cached = { raw: item.header, nbsp: toNbspString(expandCodeTabs(item.header)) || "\u00a0" };
+        if (!cached || cached.key !== hKey) {
+          const expanded = expandCodeTabs(item.header);
+          const wrapped = wrapPlainText(expanded, effectiveHunkCols, { toNbsp: true });
+          cached = { key: hKey, lines: wrapped.map((s) => s || "\u00a0") };
           lineBakeCache.set(item, cached);
         }
-        headerNbsp = cached.nbsp;
+        headerLines = cached.lines;
       }
-      return h_flex()
+      return v_flex()
         .w_full()
-        .h(DIFF_HUNK_HEIGHT)
+        .h(item.height)
         .flex_none()
         .px(10)
-        .items_center()
+        .py(2)
+        .justify_center()
+        .overflow_hidden()
         .bg(t.raised)
         .border_t(1)
         .border_b(1)
         .border_color(t.border)
-        .text_size(11)
-        .text_color(t.dim)
-        .whitespace_nowrap()
-        .child(headerNbsp);
+        .children(
+          headerLines.map((lineText) =>
+            div()
+              .w_full()
+              .min_w(0)
+              .text_size(11)
+              .text_color(t.dim)
+              .whitespace_nowrap()
+              .child(lineText)
+          )
+        );
     }
 
     if (item.type === "spacer") {
@@ -2302,219 +2235,200 @@ export default class GitHistory extends View {
     const diffColor = isAdd ? dt.add : isDel ? dt.del : null;
     const rowBg = isAdd ? dt.addBg : isDel ? dt.delBg : null;
     const gutterSign = isAdd ? "+" : isDel ? "-" : " ";
+    const segments = this.getWrappedCodeData(
+      cell,
+      cell?.tokens,
+      cell?.text || "",
+      syntaxPalette,
+      diffColor || t.foreground,
+      wrapCols
+    );
 
-    let rowEl = h_flex()
+    const buildSubRow = (segData, isFirstSeg, attachOuterDecor) => {
+      let rowEl = h_flex()
+        .w_full()
+        .h(DIFF_ROW_HEIGHT)
+        .flex_none()
+        .items_center()
+        .gap(6)
+        .pr(side === "right" ? 14 : 10);
+      if (attachOuterDecor) {
+        if (side === "left") {
+          rowEl = rowEl.border_l(2).border_color(diffColor || t.background);
+        } else {
+          rowEl = rowEl.pl(4);
+        }
+        if (rowBg) rowEl = rowEl.bg(rowBg);
+      }
+      return rowEl
+        .child(
+          div()
+            .w(36)
+            .flex_none()
+            .text_right()
+            .text_color(diffColor || t.dim)
+            .child(isFirstSeg && cell?.lineNo != null ? String(cell.lineNo) : "\u00a0")
+        )
+        .child(
+          div()
+            .w(10)
+            .flex_none()
+            .text_center()
+            .font_semibold()
+            .text_color(diffColor || t.dim)
+            .child(isFirstSeg ? gutterSign : "\u00a0")
+        )
+        .child(this.renderSegmentData(segData, true));
+    };
+
+    if (segments.length <= 1 && item.height === DIFF_ROW_HEIGHT) {
+      return buildSubRow(segments[0], true, true);
+    }
+
+    let wrapper = v_flex()
       .w_full()
-      .h(DIFF_ROW_HEIGHT)
+      .h(item.height)
       .flex_none()
-      .items_center()
-      .gap(6);
+      .overflow_hidden();
     if (side === "left") {
-      rowEl = rowEl.border_l(2).border_color(diffColor || t.background);
+      wrapper = wrapper.border_l(2).border_color(diffColor || t.background);
     } else {
-      rowEl = rowEl.pl(4);
+      wrapper = wrapper.pl(4);
     }
     if (rowBg) {
-      rowEl = rowEl.bg(rowBg);
+      wrapper = wrapper.bg(rowBg);
     }
-
-    return rowEl
-      .child(
-        div()
-          .w(36)
-          .flex_none()
-          .text_right()
-          .text_color(diffColor || t.dim)
-          .child(cell?.lineNo != null ? String(cell.lineNo) : "")
-      )
-      .child(
-        div()
-          .w(10)
-          .flex_none()
-          .text_center()
-          .font_semibold()
-          .text_color(diffColor || t.dim)
-          .child(gutterSign)
-      )
-      .child(this.renderCodeTokens(cell, cell?.tokens, cell?.text || "", syntaxPalette, diffColor || t.foreground));
+    const subRows = new Array(segments.length);
+    for (let i = 0; i < segments.length; i++) {
+      subRows[i] = buildSubRow(segments[i], i === 0, false);
+    }
+    return wrapper.children(subRows);
   }
 
-  renderSidePaneContent(side) {
-    const waveLayout = this.sbsWaveLayout;
-    const isLeft = side === "left";
-    const id = isLeft ? "git-diff-left-pane" : "git-diff-right-pane";
-    if (!waveLayout) {
-      return div().id(id).w_full().min_w(0);
-    }
-    const t = theme();
-    const { dt, syntaxPalette } = getThemeBundle(t);
-    const mono = settings()?.font_family ?? "JetBrains Mono";
-    const bar = this.getHorizontalMetrics(side);
-    const contentW = isLeft ? this.leftWidth : this.rightWidth;
-    const items = isLeft ? waveLayout.leftItems : waveLayout.rightItems;
-    const itemEls = new Array(items.length);
-    for (let i = 0; i < items.length; i++) {
-      itemEls[i] = this.renderWaveSideItem(items[i], side, t, dt, syntaxPalette);
-    }
-    return v_flex()
-      .id(id)
-      .w_full()
-      .min_w(contentW)
-      .flex_none()
-      .relative()
-      .left(-bar.scrollX)
-      .pb(20)
-      .font_family(mono)
-      .text_size(11.5)
-      .children(itemEls);
-  }
-
-  renderWaveGutterContent() {
+  renderWaveGutterBlock(item, t, waveBrushes) {
     const W = DIFF_WAVE_GUTTER_WIDTH;
-    const waveLayout = this.sbsWaveLayout;
-    if (!waveLayout) {
-      return div().id("git-diff-wave-gutter").w(W).flex_none();
-    }
-    const t = theme();
-    const { waveBrushes } = getThemeBundle(t);
     const midX = W * 0.5;
     const centerLineX = Math.floor(W / 2);
-    const gutterItems = waveLayout.gutterItems || [];
-    const children = new Array(gutterItems.length);
 
-    for (let i = 0; i < gutterItems.length; i++) {
-      const item = gutterItems[i];
-      if (item.type === "hunk") {
-        children[i] = div()
-          .w_full()
-          .h(item.height)
-          .flex_none()
-          .bg(t.raised)
-          .border_t(1)
-          .border_b(1)
-          .border_color(t.border);
-        continue;
-      }
+    if (!item || item.type === "hunk") {
+      return div()
+        .w(W)
+        .h(item?.height || DIFF_HUNK_HEIGHT)
+        .flex_none()
+        .bg(t.raised)
+        .border_t(1)
+        .border_b(1)
+        .border_color(t.border);
+    }
 
-      if (item.type === "ctx") {
-        children[i] = div()
-          .w_full()
-          .h(item.height)
-          .flex_none()
-          .relative()
-          .child(div().absolute().left(centerLineX).top_0().bottom_0().w(1).bg(waveBrushes.centerDividerCol));
-        continue;
-      }
-
-      let cachedPaths = waveGutterPathCache.get(item);
-      if (!cachedPaths) {
-        const fillPath = PathBuilder.fill()
-          .move_to(0, item.leftTop)
-          .cubic_bezier_to(W, item.rightTop, midX, item.leftTop, midX, item.rightTop)
-          .line_to(W, item.rightBot)
-          .cubic_bezier_to(0, item.leftBot, midX, item.rightBot, midX, item.leftBot)
-          .close()
-          .build();
-
-        let strokePath = null;
-        const isCurved = item.leftTop !== item.rightTop || item.leftBot !== item.rightBot;
-        if (isCurved) {
-          if (item.leftTop === item.leftBot) {
-            strokePath = PathBuilder.stroke(1)
-              .move_to(W, item.rightTop)
-              .cubic_bezier_to(0, item.leftTop, midX, item.rightTop, midX, item.leftTop)
-              .cubic_bezier_to(W, item.rightBot, midX, item.leftBot, midX, item.rightBot)
-              .build();
-          } else if (item.rightTop === item.rightBot) {
-            strokePath = PathBuilder.stroke(1)
-              .move_to(0, item.leftTop)
-              .cubic_bezier_to(W, item.rightTop, midX, item.leftTop, midX, item.rightTop)
-              .cubic_bezier_to(0, item.leftBot, midX, item.rightBot, midX, item.rightBot)
-              .build();
-          } else {
-            strokePath = PathBuilder.stroke(1)
-              .move_to(0, item.leftTop)
-              .cubic_bezier_to(W, item.rightTop, midX, item.leftTop, midX, item.rightTop)
-              .move_to(0, item.leftBot)
-              .cubic_bezier_to(W, item.rightBot, midX, item.leftBot, midX, item.rightBot)
-              .build();
-          }
-        }
-        cachedPaths = { fillPath, strokePath };
-        waveGutterPathCache.set(item, cachedPaths);
-      }
-
-      let fillBg;
-      let edgeBg;
-      if (item.kind === "mod") {
-        fillBg = waveBrushes.modFill;
-        edgeBg = waveBrushes.modEdge;
-      } else if (item.kind === "add") {
-        fillBg = waveBrushes.addFill;
-        edgeBg = waveBrushes.addEdge;
-      } else {
-        fillBg = waveBrushes.delFill;
-        edgeBg = waveBrushes.delEdge;
-      }
-
-      let waveEl = div()
-        .w_full()
+    if (item.type === "ctx") {
+      return div()
+        .w(W)
         .h(item.height)
         .flex_none()
         .relative()
-        .overflow_hidden()
-        .child(window.paint_path(cachedPaths.fillPath, fillBg).absolute().inset_0());
-      if (cachedPaths.strokePath) {
-        waveEl = waveEl.child(window.paint_path(cachedPaths.strokePath, edgeBg).absolute().inset_0());
-      }
-      children[i] = waveEl;
+        .bg(t.background)
+        .child(div().absolute().left(centerLineX).top_0().bottom_0().w(1).bg(waveBrushes.centerDividerCol));
     }
 
-    return v_flex()
-      .id("git-diff-wave-gutter")
+    let cachedPaths = waveGutterPathCache.get(item);
+    if (!cachedPaths) {
+      const fillPath = PathBuilder.fill()
+        .move_to(0, item.leftTop)
+        .cubic_bezier_to(W, item.rightTop, midX, item.leftTop, midX, item.rightTop)
+        .line_to(W, item.rightBot)
+        .cubic_bezier_to(0, item.leftBot, midX, item.rightBot, midX, item.leftBot)
+        .close()
+        .build();
+
+      let strokePath = null;
+      const isCurved = item.leftTop !== item.rightTop || item.leftBot !== item.rightBot;
+      if (isCurved) {
+        if (item.leftTop === item.leftBot) {
+          strokePath = PathBuilder.stroke(1)
+            .move_to(W, item.rightTop)
+            .cubic_bezier_to(0, item.leftTop, midX, item.rightTop, midX, item.leftTop)
+            .cubic_bezier_to(W, item.rightBot, midX, item.leftBot, midX, item.rightBot)
+            .build();
+        } else if (item.rightTop === item.rightBot) {
+          strokePath = PathBuilder.stroke(1)
+            .move_to(0, item.leftTop)
+            .cubic_bezier_to(W, item.rightTop, midX, item.leftTop, midX, item.rightTop)
+            .cubic_bezier_to(0, item.leftBot, midX, item.rightBot, midX, item.rightBot)
+            .build();
+        } else {
+          strokePath = PathBuilder.stroke(1)
+            .move_to(0, item.leftTop)
+            .cubic_bezier_to(W, item.rightTop, midX, item.leftTop, midX, item.rightTop)
+            .move_to(0, item.leftBot)
+            .cubic_bezier_to(W, item.rightBot, midX, item.leftBot, midX, item.rightBot)
+            .build();
+        }
+      }
+      cachedPaths = { fillPath, strokePath };
+      waveGutterPathCache.set(item, cachedPaths);
+    }
+
+    let fillBg;
+    let edgeBg;
+    if (item.kind === "mod") {
+      fillBg = waveBrushes.modFill;
+      edgeBg = waveBrushes.modEdge;
+    } else if (item.kind === "add") {
+      fillBg = waveBrushes.addFill;
+      edgeBg = waveBrushes.addEdge;
+    } else {
+      fillBg = waveBrushes.delFill;
+      edgeBg = waveBrushes.delEdge;
+    }
+
+    let waveEl = div()
       .w(W)
+      .h(item.height)
       .flex_none()
-      .pb(20)
+      .relative()
+      .overflow_hidden()
       .bg(t.background)
-      .on_scroll_wheel((e, cx) => {
-        if (e?.modifiers?.shift) cx?.stop_propagation();
-      })
+      .child(window.paint_path(cachedPaths.fillPath, fillBg).absolute().inset_0());
+    if (cachedPaths.strokePath) {
+      waveEl = waveEl.child(window.paint_path(cachedPaths.strokePath, edgeBg).absolute().inset_0());
+    }
+    return waveEl;
+  }
+
+  renderSbsSideSlice(items, side, t, dt, syntaxPalette, wrapCols, hunkCols) {
+    if (!items || items.length === 0) {
+      return div().flex_1().min_w(0).h_full().bg(t.background);
+    }
+    if (items.length === 1) {
+      return div()
+        .flex_1()
+        .min_w(0)
+        .h_full()
+        .overflow_hidden()
+        .child(this.renderWaveSideItem(items[0], side, t, dt, syntaxPalette, wrapCols, hunkCols));
+    }
+    const children = new Array(items.length);
+    for (let i = 0; i < items.length; i++) {
+      children[i] = this.renderWaveSideItem(items[i], side, t, dt, syntaxPalette, wrapCols, hunkCols);
+    }
+    return v_flex()
+      .flex_1()
+      .min_w(0)
+      .h_full()
+      .overflow_hidden()
       .children(children);
   }
 
-  renderHScrollBarsContent() {
-    const t = theme();
-    if (this.diffMode === "unified") {
-      if (!this.uniRows || this.uniRows.length === 0) {
-        return div().h(0);
-      }
-      const uniBar = this.getHorizontalMetrics("unified");
-      if (!uniBar.visible) {
-        return div().h(0);
-      }
-      return h_flex()
-        .w_full()
-        .h(12)
-        .child(this.renderHorizontalScrollbar("unified", uniBar, this.unifiedWidth, this.unifiedViewportW, t))
-        .child(div().w(10).h_full().flex_none());
-    }
-
-    const pageRows = this.sbsPageInfo?.rows || [];
-    if (pageRows.length === 0) {
-      return div().h(0);
-    }
-    const leftBar = this.getHorizontalMetrics("left");
-    const rightBar = this.getHorizontalMetrics("right");
-    if (!leftBar.visible && !rightBar.visible) {
-      return div().h(0);
-    }
+  renderSbsBlock(block, t, dt, syntaxPalette, waveBrushes, wrapMetrics) {
     return h_flex()
       .w_full()
-      .h(12)
-      .child(this.renderHorizontalScrollbar("left", leftBar, this.leftWidth, this.leftViewportW, t))
-      .child(div().w(DIFF_WAVE_GUTTER_WIDTH).h_full().flex_none())
-      .child(this.renderHorizontalScrollbar("right", rightBar, this.rightWidth, this.rightViewportW, t))
-      .child(div().w(10).h_full().flex_none());
+      .h(block.height)
+      .min_w(0)
+      .items_start()
+      .child(this.renderSbsSideSlice(block.leftItems, "left", t, dt, syntaxPalette, wrapMetrics.leftCols, wrapMetrics.hunkCols))
+      .child(this.renderWaveGutterBlock(block.gutter, t, waveBrushes))
+      .child(this.renderSbsSideSlice(block.rightItems, "right", t, dt, syntaxPalette, wrapMetrics.rightCols, wrapMetrics.hunkCols));
   }
 
   renderUnifiedPaneContent() {
@@ -2524,67 +2438,81 @@ export default class GitHistory extends View {
     const t = theme();
     const { dt, syntaxPalette } = getThemeBundle(t);
     const mono = settings()?.font_family ?? "JetBrains Mono";
-    const uniBar = this.getHorizontalMetrics("unified");
+    const { uniCols, uniHunkCols } = this.getUnifiedWrapMetrics();
     const ext = this.loadedFileExt || "";
     return div()
       .id("git-diff-unified-pane")
       .size_full()
+      .min_w(0)
       .relative()
       .font_family(mono)
       .text_size(11.5)
       .child(
-        div()
-          .w_full()
-          .min_w(this.unifiedWidth)
-          .h_full()
-          .relative()
-          .left(-uniBar.scrollX)
-          .child(
-            v_virtual_list(
-              "git-diff-unified-y",
-              this.uniRows.length,
-              this.uniRowHeights,
-              (index) => `u-${index}`,
-              (range) => {
-                const rows = [];
-                for (let i = range.start; i < range.end; i++) {
-                  rows.push(this.renderUnifiedRow(this.uniRows[i], t, dt, syntaxPalette, ext));
-                }
-                return rows;
-              }
-            )
-              .size_full()
-              .track_scroll(this.uniScroll)
-          )
+        v_virtual_list(
+          "git-diff-unified-y",
+          this.uniRows.length,
+          this.uniRowHeights,
+          (index) => `u-${index}`,
+          (range) => {
+            const rows = [];
+            for (let i = range.start; i < range.end; i++) {
+              rows.push(
+                this.renderUnifiedRow(
+                  this.uniRows[i],
+                  t,
+                  dt,
+                  syntaxPalette,
+                  ext,
+                  uniCols,
+                  uniHunkCols,
+                  this.uniRowHeights[i]
+                )
+              );
+            }
+            return rows;
+          }
+        )
+          .size_full()
+          .track_scroll(this.uniScroll)
       )
       .child(Scrollbar.vertical("git-diff-unified-y").viewport_from_layout().absolute().inset_0());
   }
 
-  renderUnifiedRow(row, t, dt, syntaxPalette, ext) {
+  renderUnifiedRow(row, t, dt, syntaxPalette, ext, uniCols, uniHunkCols, expectedH) {
     if (row.kind === "hunk" || row.kind === "@") {
       const rawHeader = row.header ?? row.text ?? "";
+      const hCols = uniHunkCols || 72;
+      const hKey = `${rawHeader}|${hCols}`;
       let cached = lineBakeCache.get(row);
-      if (!cached || cached.raw !== rawHeader) {
-        cached = { raw: rawHeader, nbsp: toNbspString(expandCodeTabs(rawHeader)) || "\u00a0" };
+      if (!cached || cached.key !== hKey) {
+        const expanded = expandCodeTabs(rawHeader);
+        const wrapped = wrapPlainText(expanded, hCols, { toNbsp: true });
+        cached = { key: hKey, lines: wrapped.map((s) => s || "\u00a0") };
         lineBakeCache.set(row, cached);
       }
-      return h_flex()
+      const boxH = expectedH || Math.max(DIFF_HUNK_HEIGHT, cached.lines.length * DIFF_ROW_HEIGHT);
+      return v_flex()
         .w_full()
-        .h(DIFF_HUNK_HEIGHT)
+        .h(boxH)
         .flex_none()
         .px(12)
-        .items_center()
+        .py(2)
+        .justify_center()
+        .overflow_hidden()
         .bg(t.raised)
         .border_t(1)
         .border_b(1)
         .border_color(t.border)
-        .child(
-          div()
-            .flex_none()
-            .whitespace_nowrap()
-            .text_size(11)
-            .text_color(t.dim)
-            .child(cached.nbsp)
+        .children(
+          cached.lines.map((lineText) =>
+            div()
+              .w_full()
+              .min_w(0)
+              .text_size(11)
+              .text_color(t.dim)
+              .whitespace_nowrap()
+              .child(lineText)
+          )
         );
     }
 
@@ -2596,51 +2524,81 @@ export default class GitHistory extends View {
     const gutterSign = isAdd ? "+" : isDel ? "-" : " ";
     const oldNo = row.oldLineNo !== undefined ? row.oldLineNo : (isAdd ? null : (row.lineNo ?? row.number ?? null));
     const newNo = row.newLineNo !== undefined ? row.newLineNo : (isDel ? null : (row.lineNo ?? row.number ?? null));
+    const segments = this.getWrappedCodeData(
+      row,
+      row.tokens,
+      row.text || "",
+      syntaxPalette,
+      diffColor || t.foreground,
+      uniCols
+    );
 
-    let rowEl = h_flex()
+    const buildSubRow = (segData, isFirstSeg, attachOuterDecor) => {
+      let rowEl = h_flex()
+        .w_full()
+        .h(DIFF_ROW_HEIGHT)
+        .flex_none()
+        .items_center()
+        .gap(6)
+        .pr(14);
+      if (attachOuterDecor) {
+        rowEl = rowEl.border_l(2).border_color(diffColor || t.background);
+        if (rowBg) rowEl = rowEl.bg(rowBg);
+      }
+      return rowEl
+        .child(
+          div()
+            .w(34)
+            .flex_none()
+            .text_right()
+            .text_color(isDel ? dt.del : t.dim)
+            .child(isFirstSeg && oldNo != null ? String(oldNo) : "\u00a0")
+        )
+        .child(
+          div()
+            .w(34)
+            .flex_none()
+            .text_right()
+            .text_color(isAdd ? dt.add : t.dim)
+            .child(isFirstSeg && newNo != null ? String(newNo) : "\u00a0")
+        )
+        .child(
+          div()
+            .w(10)
+            .flex_none()
+            .text_center()
+            .font_semibold()
+            .text_color(diffColor || t.dim)
+            .child(isFirstSeg ? gutterSign : "\u00a0")
+        )
+        .child(this.renderSegmentData(segData, true));
+    };
+
+    const totalH = expectedH || segments.length * DIFF_ROW_HEIGHT;
+    if (segments.length <= 1 && totalH === DIFF_ROW_HEIGHT) {
+      return buildSubRow(segments[0], true, true);
+    }
+
+    let wrapper = v_flex()
       .w_full()
-      .h(DIFF_ROW_HEIGHT)
+      .h(totalH)
       .flex_none()
-      .items_center()
-      .gap(6)
+      .overflow_hidden()
       .border_l(2)
       .border_color(diffColor || t.background);
     if (rowBg) {
-      rowEl = rowEl.bg(rowBg);
+      wrapper = wrapper.bg(rowBg);
     }
-
-    return rowEl
-      .child(
-        div()
-          .w(34)
-          .flex_none()
-          .text_right()
-          .text_color(isDel ? dt.del : t.dim)
-          .child(oldNo != null ? String(oldNo) : "")
-      )
-      .child(
-        div()
-          .w(34)
-          .flex_none()
-          .text_right()
-          .text_color(isAdd ? dt.add : t.dim)
-          .child(newNo != null ? String(newNo) : "")
-      )
-      .child(
-        div()
-          .w(10)
-          .flex_none()
-          .text_center()
-          .font_semibold()
-          .text_color(diffColor || t.dim)
-          .child(gutterSign)
-      )
-      .child(this.renderCodeTokens(row, row.tokens, row.text || "", syntaxPalette, diffColor || t.foreground));
+    const subRows = new Array(segments.length);
+    for (let i = 0; i < segments.length; i++) {
+      subRows[i] = buildSubRow(segments[i], i === 0, false);
+    }
+    return wrapper.children(subRows);
   }
 
   renderViewer(cx) {
     const t = theme();
-    const { dt } = getThemeBundle(t);
+    const { dt, syntaxPalette, waveBrushes } = getThemeBundle(t);
     const mono = settings()?.font_family ?? "JetBrains Mono";
 
     const ctx = this.getSessionContext();
@@ -2684,9 +2642,18 @@ export default class GitHistory extends View {
       .track_focus(this.handle)
       .on_size_change((size, cx) => {
         const w = Math.round(size?.width || 0);
-        if (w > 0 && Math.abs(w - (this.viewerWidth || 960)) > 12) {
+        if (w <= 0) return;
+        const prevW = this.viewerWidth || 960;
+        if (Math.abs(w - prevW) > 12) {
+          const compactChanged = (prevW < 700) !== (w < 700);
+          const unmeasured =
+            this.diffMode === "unified"
+              ? !this.unifiedViewportW
+              : (!this.leftViewportW || !this.rightViewportW);
           this.viewerWidth = w;
-          cx.notify();
+          if (compactChanged || unmeasured) {
+            cx.notify();
+          }
         }
       })
       // Toolbar
@@ -3152,6 +3119,7 @@ export default class GitHistory extends View {
                     .min_w(0)
                     .px(10)
                     .items_center()
+                    .on_size_change((size, cx) => this.updateDiffViewportWidth("left", size, cx))
                     .child(div().truncate().font_medium().text_color(t.muted).child(`Before (${beforeLabel})`))
                 )
                 .child(
@@ -3169,6 +3137,7 @@ export default class GitHistory extends View {
                     .min_w(0)
                     .px(10)
                     .items_center()
+                    .on_size_change((size, cx) => this.updateDiffViewportWidth("right", size, cx))
                     .child(div().truncate().font_medium().text_color(t.muted).child(`After (${shortHash || "commit"})`))
                 )
             )
@@ -3179,78 +3148,55 @@ export default class GitHistory extends View {
                 .relative()
                 .font_family(mono)
                 .text_size(11.5)
-                .child(
-                  v_flex()
-                    .id("git-diff-y")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(this.diffScroll)
-                    .when(pageRows.length > 0, (y) =>
-                      y.child(
-                        h_flex()
-                          .w_full()
-                          .min_w(0)
-                          .items_start()
-                          .child(
-                            div()
-                              .id("git-diff-left-x")
-                              .flex_1()
-                              .min_w(0)
-                              .overflow_x_hidden()
-                              .on_size_change((size, cx) => this.updateHorizontalViewport("left", size, cx))
-                              .on_scroll_wheel((e, cx) => this.handleHorizontalWheel("left", e, cx))
-                              .child(this.leftDiffPane)
-                          )
-                          .child(
-                            div()
-                              .id("git-diff-wave-gutter-wrap")
-                              .w(DIFF_WAVE_GUTTER_WIDTH)
-                              .flex_none()
-                              .child(this.waveGutterPane)
-                          )
-                          .child(
-                            div()
-                              .id("git-diff-right-x")
-                              .flex_1()
-                              .min_w(0)
-                              .overflow_x_hidden()
-                              .on_size_change((size, cx) => this.updateHorizontalViewport("right", size, cx))
-                              .on_scroll_wheel((e, cx) => this.handleHorizontalWheel("right", e, cx))
-                              .child(this.rightDiffPane)
-                          )
-                      )
-                    )
-                    .when(pageRows.length === 0 && !this.viewerError, (y) =>
-                      y.child(
-                        h_flex()
-                          .size_full()
-                          .items_center()
-                          .justify_center()
-                          .child(
-                            div()
-                              .text_size(12)
-                              .text_color(t.dim)
-                              .child(
-                                openFile.status === "R"
-                                  ? `Renamed with no content changes (${openFile.oldPath} → ${openFile.path})`
-                                  : "No text changes in this file"
-                              )
-                          )
-                      )
-                    )
-                )
-                .when(pageRows.length > 0, (el) =>
-                  el
-                    .child(Scrollbar.vertical("git-diff-y").viewport_from_layout().absolute().inset_0())
+                .when(pageRows.length > 0 && (this.sbsBlocks?.blocks?.length || 0) > 0, (el) => {
+                  const blocksData = this.sbsBlocks;
+                  const wrapMetrics = this.getSbsWrapMetrics();
+                  return el
                     .child(
-                      div()
-                        .id("git-diff-hscroll-wrap")
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .child(this.hScrollBarPane)
+                      v_virtual_list(
+                        "git-diff-y",
+                        blocksData.blocks.length,
+                        blocksData.blockHeights,
+                        (index) => `b-${index}`,
+                        (range) => {
+                          const out = [];
+                          for (let i = range.start; i < range.end; i++) {
+                            out.push(
+                              this.renderSbsBlock(
+                                blocksData.blocks[i],
+                                t,
+                                dt,
+                                syntaxPalette,
+                                waveBrushes,
+                                wrapMetrics
+                              )
+                            );
+                          }
+                          return out;
+                        }
+                      )
+                        .size_full()
+                        .track_scroll(this.diffScroll)
                     )
+                    .child(Scrollbar.vertical("git-diff-y").viewport_from_layout().absolute().inset_0());
+                })
+                .when(pageRows.length === 0 && !this.viewerError, (el) =>
+                  el.child(
+                    h_flex()
+                      .size_full()
+                      .items_center()
+                      .justify_center()
+                      .child(
+                        div()
+                          .text_size(12)
+                          .text_color(t.dim)
+                          .child(
+                            openFile.status === "R"
+                              ? `Renamed with no content changes (${openFile.oldPath} → ${openFile.path})`
+                              : "No text changes in this file"
+                          )
+                      )
+                  )
                 )
             );
         }
@@ -3270,25 +3216,15 @@ export default class GitHistory extends View {
               .font_family(mono)
               .text_size(11.5)
               .when(this.uniRows.length > 0, (u) =>
-                u
-                  .child(
-                    div()
-                      .id("git-diff-unified-x")
-                      .size_full()
-                      .overflow_x_hidden()
-                      .on_size_change((size, cx) => this.updateHorizontalViewport("unified", size, cx))
-                      .on_scroll_wheel((e, cx) => this.handleHorizontalWheel("unified", e, cx))
-                      .child(this.unifiedDiffPane)
-                  )
-                  .child(
-                    div()
-                      .id("git-diff-unified-hscroll-wrap")
-                      .absolute()
-                      .left_0()
-                      .right_0()
-                      .bottom_0()
-                      .child(this.hScrollBarPane)
-                  )
+                u.child(
+                  div()
+                    .id("git-diff-unified-x")
+                    .size_full()
+                    .min_w(0)
+                    .overflow_hidden()
+                    .on_size_change((size, cx) => this.updateDiffViewportWidth("unified", size, cx))
+                    .child(this.unifiedDiffPane)
+                )
               )
               .when(this.uniRows.length === 0 && !this.viewerError, (u) =>
                 u.child(
@@ -3310,18 +3246,6 @@ export default class GitHistory extends View {
               )
           );
         }
-      )
-      .when(Boolean(this.hScrollDrag), (el) =>
-        el.child(
-          div()
-            .id("git-diff-hscroll-drag-cover")
-            .absolute()
-            .inset_0()
-            .on_mouse_down("left", (_e, cx) => cx?.stop_propagation())
-            .on_mouse_move((e, cx) => this.handleHScrollDragMove(e, cx))
-            .on_mouse_up("left", (_e, cx) => this.endHScrollDrag(cx))
-            .on_mouse_down_out((_e, cx) => this.endHScrollDrag(cx))
-        )
       );
   }
 
@@ -3680,9 +3604,13 @@ export default class GitHistory extends View {
       .track_focus(this.handle)
       .on_size_change((size, cx) => {
         const w = Math.round(size?.width || 0);
-        if (w > 0 && Math.abs(w - (this.panelWidth || 420)) > 12) {
+        const prevW = this.panelWidth || 420;
+        if (w > 0 && Math.abs(w - prevW) > 12) {
+          const compactChanged = (prevW < 380) !== (w < 380);
           this.panelWidth = w;
-          cx.notify();
+          if (compactChanged) {
+            cx.notify();
+          }
         }
       })
       .on_key_down((e, cx) => {
