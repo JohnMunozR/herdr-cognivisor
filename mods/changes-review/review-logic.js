@@ -1455,7 +1455,7 @@ async function readBaselineJsonFile(filePath, fsDeps = fsPromises) {
 
 export async function readDiskSessionBaseline(appHomeDir, tabId, workspaceRoot, branchesOrBranch, resumeArg = false, fsDeps = fsPromises) {
   if (!appHomeDir) return null;
-  const baseDir = join(String(appHomeDir), "mesh", "sessions");
+  const baseDir = join(String(appHomeDir), "cognivisor", "sessions");
   if (tabId) {
     const tabPath = join(baseDir, "tabs", `${safeBaselineTabId(tabId)}.json`);
     const fromTab = await readBaselineJsonFile(tabPath, fsDeps);
@@ -1497,7 +1497,7 @@ export async function writeDiskSessionBaseline(appHomeDir, tabId, workspaceRoot,
   );
   if (!normalized) return false;
   const json = JSON.stringify(normalized);
-  const baseDir = join(String(appHomeDir), "mesh", "sessions");
+  const baseDir = join(String(appHomeDir), "cognivisor", "sessions");
   const mk = typeof fsDeps?.mkdir === "function" ? fsDeps.mkdir : fsPromises.mkdir;
   const wr = typeof fsDeps?.writeFile === "function" ? fsDeps.writeFile : fsPromises.writeFile;
   let wrote = false;
@@ -1611,7 +1611,7 @@ export function parseCommitLogOutput(stdout, service) {
 }
 
 /**
- * Merge `mesh.services` candidates with any already-enriched service metadata so
+ * Merge `cognivisor.services` candidates with any already-enriched service metadata so
  * clean or recently pushed repositories are still inspected for session commits.
  */
 export function mergeBusCandidateServices(candidates, busServices = [], isWindows = false) {

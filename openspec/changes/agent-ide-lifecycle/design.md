@@ -2,31 +2,31 @@
 
 ## Architecture Overview
 
-The Agent IDE Lifecycle elevates Herdr Mesh from a passive file/diff sidebar into a tab-scoped, multi-microservice orchestration harness (`Plan → Build → Review → Test → PR → dev → CI → main`). Every feature tab acts as an isolated work unit with its own derived title, lead AI agent (`leadTerminal`), active pipeline stage, per-service review checklist, zero-pollution test plan, and cross-service promotion status.
+The Agent IDE Lifecycle elevates Herdr Cognivisor from a passive file/diff sidebar into a tab-scoped, multi-microservice orchestration harness (`Plan → Build → Review → Test → PR → dev → CI → main`). Every feature tab acts as an isolated work unit with its own derived title, lead AI agent (`leadTerminal`), active pipeline stage, per-service review checklist, zero-pollution test plan, and cross-service promotion status.
 
 ```text
 Developer opens tab ─▶ Launches agent (claude/gemini/codex/opencode/pi/antigravity)
                            │
                            ▼ (first message / Jira key / branch)
-   [mesh-tabs] + [mesh-flow] auto-name tab via hc get/read + run("tab.rename")
+   [cognivisor-tabs] + [cognivisor-flow] auto-name tab via hc get/read + run("tab.rename")
                            │ (preserves manual renames; Auto button re-syncs)
                            ▼
-   [mesh-flow (#flow, 38px)] ── Stage Click ──▶ updates shared("mesh.flows")[tabId].stage
+   [cognivisor-flow (#flow, 38px)] ── Stage Click ──▶ updates shared("cognivisor.flows")[tabId].stage
      1. Plan | 2. Build | 3. Review | 4. Test | 5. PR → dev | 6. CI → main
-                                 │          │             │
-            layout.select + show ▼          ▼             ▼
-                         [#changes]     [#test]       [#ship]
-                      (changes-review) (mesh-test)  (mesh-ship)
-                           │                │             │
-                           ├─ Per-svc branch├─ JSON plan  ├─ Chain: development→ci→main
-                           ├─ Checklist     │  under      ├─ PR template ({{ticket}},...)
-                           ├─ Approve ✓     │  appHome()  ├─ gh PR/CI/review threads
-                           └─ Checks        ├─ ss -tln    └─ Batch/single promote +
-                              (leadTerminal)├─ +Runner       Send Review Comments
-                                            └─ image() E2E
+                                 │           │                 │
+            layout.select + show ▼           ▼                 ▼
+                         [#changes]       [#test]           [#ship]
+                      (changes-review) (cognivisor-test) (cognivisor-ship)
+                           │                 │                 │
+                           ├─ Per-svc branch ├─ JSON plan      ├─ Chain: development→ci→main
+                           ├─ Checklist      │  under          ├─ PR template ({{ticket}},...)
+                           ├─ Approve ✓      │  appHome()      ├─ gh PR/CI/review threads
+                           └─ Checks         ├─ ss -tln        └─ Batch/single promote +
+                              (leadTerminal) ├─ +Runner           Send Review Comments
+                                             └─ image() E2E
 ```
 
-### Layout Topology (`layouts/mesh.json`)
+### Layout Topology (`layouts/cognivisor.json`)
 
 ```text
 root (row, titlebar: "none")
@@ -35,17 +35,17 @@ root (row, titlebar: "none")
 │   ├── sidebar-lists (spaces + agents)
 │   └── sidebar-footer (69px, workspace-chrome)
 └── work (column, flex)
-    ├── tabs (42px, mod: "mesh-tabs", window_drag: true)
-    ├── flow (38px, mod: "mesh-flow")
+    ├── tabs (42px, mod: "cognivisor-tabs", window_drag: true)
+    ├── flow (38px, mod: "cognivisor-flow")
     ├── work-body (row, flex, padding: 8, gap: 8)
     │   ├── main (block, flex, tab: active, pane header)
     │   └── panel (column, 368px [280..900], hidden: true)
     │       └── panel-body (stack, active: "files")
     │           ├── files (block, mod: "files-search")
     │           ├── changes (block, mod: "changes-review")
-    │           ├── test (block, mod: "mesh-test")
-    │           └── ship (block, mod: "mesh-ship")
-    └── status (28px, mod: "mesh-status")
+    │           ├── test (block, mod: "cognivisor-test")
+    │           └── ship (block, mod: "cognivisor-ship")
+    └── status (28px, mod: "cognivisor-status")
 ```
 
 ---
@@ -54,7 +54,7 @@ root (row, titlebar: "none")
 
 All UI views MUST be composed purely with `gpui-kit` (`View`, `div`, `svg`, `image`, `list`) and `gpui-base` (`h_flex`, `v_flex`, `Input`, `InputState`, `Textarea`, `TextareaState`, `Scrollbar`, `ScrollHandle`). No DOM, HTML, CSS classes, `.font_mono()`, hardcoded hex colors, or `localStorage` calls are permitted.
 
-### 1. `mods/mesh-tabs` (`Tabs` View)
+### 1. `mods/cognivisor-tabs` (`Tabs` View)
 
 ```text
 h_flex (size_full, chrome bg, border_b)
@@ -71,10 +71,10 @@ h_flex (size_full, chrome bg, border_b)
 └── [when window().buttons]: minimize / maximize / close
 ```
 
-- **Panel Persistence (`mesh.spacePanels`)**: Replaces `localStorage.getItem("panels")`/`setItem` with `shared("mesh.spacePanels") ?? {}` and `setShared("mesh.spacePanels", nextMap)` using the existing `pending` transition timer (`1000ms`) so space switching restores each space's open panel without flicker.
-- **Auto-Naming Detector**: Scans active space tabs whose names are generic (`/^tb\d+$/`, `/^\d+$/`, `!tab.named`, or equal to the bare `program.name` / `"Terminal"`). Never modifies tabs where `tab.named === true` or `mesh.flows[tab.id]?.manualTitle === true`.
+- **Panel Persistence (`cognivisor.spacePanels`)**: Replaces `localStorage.getItem("panels")`/`setItem` with `shared("cognivisor.spacePanels") ?? {}` and `setShared("cognivisor.spacePanels", nextMap)` using the existing `pending` transition timer (`1000ms`) so space switching restores each space's open panel without flicker.
+- **Auto-Naming Detector**: Scans active space tabs whose names are generic (`/^tb\d+$/`, `/^\d+$/`, `!tab.named`, or equal to the bare `program.name` / `"Terminal"`). Never modifies tabs where `tab.named === true` or `cognivisor.flows[tab.id]?.manualTitle === true`.
 
-### 2. `mods/mesh-flow` (`MeshFlow` View, `#flow` 38px)
+### 2. `mods/cognivisor-flow` (`CognivisorFlow` View, `#flow` 38px)
 
 ```text
 h_flex (size_full, h: 38, chrome/surface bg, border_b, px: 10, gap: 8, items_center)
@@ -92,7 +92,7 @@ h_flex (size_full, h: 38, chrome/surface bg, border_b, px: 10, gap: 8, items_cen
 ```
 
 - **Stage-to-Panel Mapping**:
-  - `plan`, `build`: update `mesh.flows[tabId].stage`; leave `#panel` untouched so terminal focus remains unobstructed.
+  - `plan`, `build`: update `cognivisor.flows[tabId].stage`; leave `#panel` untouched so terminal focus remains unobstructed.
   - `review`: set stage `"review"`, invoke `run("layout.select", { stack: "panel-body", child: "changes" })` + `run("layout.show", { id: "panel" })`.
   - `test`: set stage `"test"`, invoke `run("layout.select", { stack: "panel-body", child: "test" })` + `run("layout.show", { id: "panel" })`.
   - `pr_dev`, `promote`: set stage, invoke `run("layout.select", { stack: "panel-body", child: "ship" })` + `run("layout.show", { id: "panel" })`.
@@ -115,7 +115,7 @@ v_flex (size_full)
 └── Review Summary / Commit Footer (uses leadTerminal-prioritized findActiveAgent())
 ```
 
-### 4. `mods/mesh-test` (`MeshTest` View, `#test`)
+### 4. `mods/cognivisor-test` (`CognivisorTest` View, `#test`)
 
 ```text
 v_flex (size_full)
@@ -134,18 +134,18 @@ v_flex (size_full)
 │       ├── metrics row: httpCode (e.g. "200") + durationMs (e.g. "184ms") + [Re-run curl] button
 │       ├── summary / error text
 │       └── [when screenshot/screenshots]: GPUI image(absPath) thumbnail(s)
-│           └── on_click -> openOverlay({ mod: "mesh-test", kind: "dialog", props: { zoomImage: absPath } })
+│           └── on_click -> openOverlay({ mod: "cognivisor-test", kind: "dialog", props: { zoomImage: absPath } })
 └── [when props().zoomImage]: Screenshot Zoom Modal Viewer (full-resolution image() + close button)
 ```
 
-### 5. `mods/mesh-ship` (`MeshShip` View, `#ship`)
+### 5. `mods/cognivisor-ship` (`CognivisorShip` View, `#ship`)
 
 ```text
 v_flex (size_full)
 ├── Header ("Ship & Promote", Refresh PRs button, Config/Template toggle)
 ├── [when configOpen]: Pipeline & PR Template Drawer
 │   ├── Promotion chain editor (default: "development → ci → main") + per-repo override inputs
-│   └── PR Template editor (backed by shared + ${appHome()}/mesh/pr-template.md)
+│   └── PR Template editor (backed by shared + ${appHome()}/cognivisor/pr-template.md)
 │       showing supported placeholders: {{ticket}}, {{title}}, {{services}}, {{summary}}, {{testSummary}}
 ├── Action Toolbar
 │   ├── button ("Ask Agent to Create PRs") (injects rendered PR template)
@@ -159,14 +159,14 @@ v_flex (size_full)
         └── per-service actions: [Create PR (gh)] | [Promote → <next>] | [Send Comments]
 ```
 
-### 6. `mods/mesh-status` (`MeshStatus` View, `#status` 28px)
+### 6. `mods/cognivisor-status` (`CognivisorStatus` View, `#status` 28px)
 
 ```text
 h_flex (size_full, h: 28, px: 14, gap: 14, chrome bg, border_t)
 ├── machine indicator ("This computer" / space.machine)
 ├── branch / services summary (e.g. "4 services · 2 dirty" or active branch)
-├── active stage pill (from mesh.flows[tabId].stage, e.g. "4. Test")
-├── [when mesh.testAlert]: test status pill (passed/failed/running count, clicks -> #test)
+├── active stage pill (from cognivisor.flows[tabId].stage, e.g. "4. Test")
+├── [when cognivisor.testAlert]: test status pill (passed/failed/running count, clicks -> #test)
 ├── [when unresolved PR comments / failing CI]: ship alert pill (clicks -> #ship)
 ├── agent counter ("N agents · M needs you")
 ├── flex_1 spacer
@@ -181,8 +181,8 @@ h_flex (size_full, h: 28, px: 14, gap: 14, chrome bg, border_t)
 
 ```typescript
 // 1. Discovered workspace microservice repositories (published on topology signature change)
-// Key: "mesh.services"
-interface MeshServicesPayload {
+// Key: "cognivisor.services"
+interface CognivisorServicesPayload {
   workspaceRoot: string;
   on: string | null;
   services: Array<{
@@ -195,20 +195,20 @@ interface MeshServicesPayload {
   ts: number;
 }
 
-// 2. Active service filter across files-search, changes-review, mesh-test, mesh-ship
-// Key: "mesh.activeService"
-interface MeshActiveServicePayload {
+// 2. Active service filter across files-search, changes-review, cognivisor-test, cognivisor-ship
+// Key: "cognivisor.activeService"
+interface CognivisorActiveServicePayload {
   workspaceRoot: string;
   serviceId: string; // "all" or service.id
   ts: number;
 }
 
 // 3. Per-tab lifecycle orchestration state
-// Key: "mesh.flows"
+// Key: "cognivisor.flows"
 type FlowStage = "plan" | "build" | "review" | "test" | "pr_dev" | "promote";
 type ServiceReviewStatus = "pending" | "has_notes" | "approved";
 
-interface MeshFlowTabState {
+interface CognivisorFlowTabState {
   tabId: string;
   workspaceRoot: string;
   stage: FlowStage;
@@ -235,31 +235,31 @@ interface MeshFlowTabState {
   }>;
   updatedAt: number;
 }
-type MeshFlowsMap = Record<string, MeshFlowTabState>;
+type CognivisorFlowsMap = Record<string, CognivisorFlowTabState>;
 
 // 4. Promotion pipeline & PR template configuration
-// Key: "mesh.pipelineConfig"
+// Key: "cognivisor.pipelineConfig"
 interface WorkspacePipelineConfig {
   chain: string[];                          // Default: ["development", "ci", "main"]
   repoOverrides?: Record<string, string[]>; // serviceId -> custom branch chain
   prTemplate: string;                       // Markdown template with {{placeholders}}
-  prTemplatePath: string;                   // Default: `${appHome()}/mesh/pr-template.md`
+  prTemplatePath: string;                   // Default: `${appHome()}/cognivisor/pr-template.md`
   browserMode: "headless" | "headed";       // Default: "headless"
   updatedAt: number;
 }
-interface MeshPipelineConfigState {
+interface CognivisorPipelineConfigState {
   defaultChain: string[];
   defaultPrTemplate: string;
   workspaces: Record<string, WorkspacePipelineConfig>;
 }
 
-// 5. Per-space panel selection persistence (replaces localStorage in mesh-tabs)
-// Key: "mesh.spacePanels"
-type MeshSpacePanelsMap = Record<string, "files" | "changes" | "test" | "ship" | null>;
+// 5. Per-space panel selection persistence (replaces localStorage in cognivisor-tabs)
+// Key: "cognivisor.spacePanels"
+type CognivisorSpacePanelsMap = Record<string, "files" | "changes" | "test" | "ship" | null>;
 
-// 6. Live test alert surfaced by mesh-test to mesh-status & mesh-flow
-// Key: "mesh.testAlert"
-interface MeshTestAlertPayload {
+// 6. Live test alert surfaced by cognivisor-test to cognivisor-status & cognivisor-flow
+// Key: "cognivisor.testAlert"
+interface CognivisorTestAlertPayload {
   tabId: string;
   workspaceRoot: string;
   status: "plan_ready" | "running" | "passed" | "failed";
@@ -276,12 +276,12 @@ interface MeshTestAlertPayload {
 
 - **Workspace Hash**: Deterministic non-cryptographic FNV-1a / DJB2 hex slug (e.g. `<basename>-<8hex>`) computed from normalized `workspaceRoot` so directories remain human-inspectable and collision-resistant.
 - **Paths**:
-  - Test plan: `${appHome()}/mesh/workspaces/<workspaceHash>/test-plans/<tabId>.json`
-  - Screenshots: `${appHome()}/mesh/workspaces/<workspaceHash>/screenshots/<tabId>/<caseId>.png`
-  - Global default PR template mirror: `${appHome()}/mesh/pr-template.md`
+  - Test plan: `${appHome()}/cognivisor/workspaces/<workspaceHash>/test-plans/<tabId>.json`
+  - Screenshots: `${appHome()}/cognivisor/workspaces/<workspaceHash>/screenshots/<tabId>/<caseId>.png`
+  - Global default PR template mirror: `${appHome()}/cognivisor/pr-template.md`
 
 ```typescript
-interface MeshTestPlan {
+interface CognivisorTestPlan {
   title: string;
   approved: boolean;
   browserMode?: "headless" | "headed";
@@ -307,7 +307,7 @@ interface MeshTestPlan {
     durationMs?: number;
     summary?: string;
     error?: string;
-    screenshot?: string;     // Absolute path under ${appHome()}/mesh/.../screenshots/<tabId>/
+    screenshot?: string;     // Absolute path under ${appHome()}/cognivisor/.../screenshots/<tabId>/
     screenshots?: string[];  // Optional multiple screenshot paths for multi-step E2E flows
   }>;
 }
@@ -317,11 +317,11 @@ interface MeshTestPlan {
 
 ## Key Algorithmic & Operational Flows
 
-### 1. Tab Auto-Naming Algorithm (`mesh-tabs` & `mesh-flow`)
+### 1. Tab Auto-Naming Algorithm (`cognivisor-tabs` & `cognivisor-flow`)
 
-1. **Eligibility Check**: Skip tab if `tab.named === true` or `mesh.flows[tab.id]?.manualTitle === true`, unless invoked via the `#flow` `Auto` trigger. Consider a tab generic when `!tab.named` AND (`/^tb\d+$/.test(tab.name)`, `/^\d+$/.test(tab.name)`, or `tab.name === program?.name || tab.name === "Terminal"`).
+1. **Eligibility Check**: Skip tab if `tab.named === true` or `cognivisor.flows[tab.id]?.manualTitle === true`, unless invoked via the `#flow` `Auto` trigger. Consider a tab generic when `!tab.named` AND (`/^tb\d+$/.test(tab.name)`, `/^\d+$/.test(tab.name)`, or `tab.name === program?.name || tab.name === "Terminal"`).
 2. **Signal Gathering**:
-   - Locate tab's primary agent terminal (`mesh.flows[tab.id]?.leadTerminal` or first agent pane in `panes().filter(p => p.tab === tab.id)`).
+   - Locate tab's primary agent terminal (`cognivisor.flows[tab.id]?.leadTerminal` or first agent pane in `panes().filter(p => p.tab === tab.id)`).
    - Run `hc(["get", terminalId, "--json"])` to inspect `first_message`, `title`, `labels`, and `name`. If `first_message` is absent, run `hc(["read", terminalId, "--lines", "40"])` and parse the first non-boilerplate user prompt line.
    - Read current Git branch on the active microservice / workspace root using lock-free Git (`git --no-optional-locks -c core.fsmonitor=false -c diff.autoRefreshIndex=false rev-parse --abbrev-ref HEAD`).
 3. **Derivation Rules**:
@@ -330,17 +330,17 @@ interface MeshTestPlan {
    - Compose `name`: `${ticket} ${summary}` if both exist; else `${ticket} ${branchSlug}` or `${summary}` or clean branch slug (`feat/foo` → `foo`).
 4. **Application**: Call `run("tab.rename", { id: tab.id, name })` only when derived `name` differs from current `tab.name` and avoid repeating failed/unchanged attempts via per-tab derivation cache.
 
-### 2. `findActiveAgent()` Priority Resolution (`changes-review`, `mesh-test`, `mesh-ship`)
+### 2. `findActiveAgent()` Priority Resolution (`changes-review`, `cognivisor-test`, `cognivisor-ship`)
 
 ```text
-1. mesh.flows[activeTabId]?.leadTerminal -> match in agents() or terminals()
-2. focused()?.agent                     -> match in agents()
-3. panes() in activeTabId with agent    -> prefer non-runner agent (excluding panes labeled meshRunner=true)
-4. agents() in activeTabId              -> first agent in tab
-5. agents()[0]                          -> global fallback
+1. cognivisor.flows[activeTabId]?.leadTerminal -> match in agents() or terminals()
+2. focused()?.agent                           -> match in agents()
+3. panes() in activeTabId with agent          -> prefer non-runner agent (excluding panes labeled cognivisorRunner=true)
+4. agents() in activeTabId                    -> first agent in tab
+5. agents()[0]                                -> global fallback
 ```
 
-- When a user spawns `+ Service Runner` in `mesh-test`, the runner terminal is tagged (e.g., via `hc run --label meshRunner=true` or tracked in tab state) and NEVER replaces `mesh.flows[tabId].leadTerminal`.
+- When a user spawns `+ Service Runner` in `cognivisor-test`, the runner terminal is tagged (e.g., via `hc run --label cognivisorRunner=true` or tracked in tab state) and NEVER replaces `cognivisor.flows[tabId].leadTerminal`.
 
 ### 3. `Checks` Discovery in `changes-review`
 
@@ -357,20 +357,20 @@ Execute selected commands via `exec(cmd, args, { cwd: service.root, on, timeout:
 ## Concurrency, Watcher Debouncing, and Lock-Free Safeguards
 
 1. **Lock-Free Git Invariant**:
-   Every read-only `git` invocation across `mesh-flow`, `changes-review`, `mesh-ship`, and `mesh-status` MUST prepend:
+   Every read-only `git` invocation across `cognivisor-flow`, `changes-review`, `cognivisor-ship`, and `cognivisor-status` MUST prepend:
    ```javascript
    const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
    ```
 2. **Bounded `watchFolder` + Visible Polling Fallback**:
-   - `mesh-test` watches ONLY `${appHome()}/mesh/workspaces/<workspaceHash>/test-plans` (a flat folder containing only `<tabId>.json` files, safely staying far below Linux's 4096-directory `watchFolder` cap).
+   - `cognivisor-test` watches ONLY `${appHome()}/cognivisor/workspaces/<workspaceHash>/test-plans` (a flat folder containing only `<tabId>.json` files, safely staying far below Linux's 4096-directory `watchFolder` cap).
    - Debounces burst filesystem events (`150ms` coalescing window) before re-reading `<tabId>.json`.
    - When the `#test` panel is visible, runs a lightweight `1500ms` fallback timer (required for remote SSH spaces where `watchFolder` does not fire and as a safety net against coalesced writes); pauses/cancels the timer when `#test` is hidden or closed.
 3. **Optimistic Atomic Writes (`writeTextFile`)**:
    - Updating `approved: true`, manual `curl` re-run results, or `pr-template.md` MUST use Herdr's `writeTextFile(path, nextText, expectedText)` compare-and-swap API. On stale snapshot rejection, re-read the file, merge the field-level mutation (`approved` or specific `case` entry), and retry once without clobbering concurrent agent test status updates.
 4. **Non-Reentrant Shared Bus Updates**:
-   - Readers updating `mesh.flows`, `mesh.pipelineConfig`, `mesh.spacePanels`, or `mesh.testAlert` MUST compare serialized/timestamp values before calling `setShared(...)` to prevent infinite render loops.
-   - `mesh-tabs` preserves `pending = { want, until: Date.now() + 1000 }` when transitioning spaces so stale `layout()` reads do not overwrite `mesh.spacePanels[spaceId]`.
+   - Readers updating `cognivisor.flows`, `cognivisor.pipelineConfig`, `cognivisor.spacePanels`, or `cognivisor.testAlert` MUST compare serialized/timestamp values before calling `setShared(...)` to prevent infinite render loops.
+   - `cognivisor-tabs` preserves `pending = { want, until: Date.now() + 1000 }` when transitioning spaces so stale `layout()` reads do not overwrite `cognivisor.spacePanels[spaceId]`.
 5. **Subprocess Cancellation & Timeouts**:
    - Auto-naming `hc` probes cache per `(tabId, terminalId)` with cooldown (`>= 3000ms` while unnamed; stops once named or `manualTitle` is set).
    - `ss -tln` TCP port checks run at most once every `3000ms` while `#test` is active and use bounded `exec` timeouts (`5000ms`).
-   - `gh` queries in `mesh-ship` run in parallel per microservice with `15000ms` timeout and rate-limited manual/tab-switch refresh rather than tight background loops.
+   - `gh` queries in `cognivisor-ship` run in parallel per microservice with `15000ms` timeout and rate-limited manual/tab-switch refresh rather than tight background loops.

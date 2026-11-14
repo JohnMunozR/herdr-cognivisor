@@ -1,20 +1,20 @@
-# mesh
+# cognivisor
 
-A unified **Multi-Microservice Agent Workspace** layout recipe and 4-mod distribution package for the Herdr desktop app. It bundles `layouts/mesh.json`, the 4 active workspace mods (`files-search`, `changes-review`, `mesh-tabs`, `mesh-status`), and global keyboard shortcuts (`keys.json`) into a cohesive, terminal-first developer workspace.
+A unified **Multi-Microservice Agent Workspace** layout recipe and 4-mod distribution package for the Herdr desktop app. It bundles `layouts/cognivisor.json`, the 4 active workspace mods (`files-search`, `changes-review`, `cognivisor-tabs`, `cognivisor-status`), and global keyboard shortcuts (`keys.json`) into a cohesive, terminal-first developer workspace.
 
 ## What you see
 
 - **Left Navigation Sidebar (`#sidebar`, `268px`):**
   - `#brand` (`46px`, `workspace-chrome`, `window_drag: true`), `#spaces`, `#agents`, and `#sidebar-footer` (`69px`, `workspace-chrome`).
   - Displays active workspace spaces, remote SSH hosts, running AI coding agents, and layout preferences.
-- **Header & Organic Workspace Tabs Bar (`#tabs`, `42px`, `mod: "mesh-tabs"`, `window_drag: true`):**
+- **Header & Organic Workspace Tabs Bar (`#tabs`, `42px`, `mod: "cognivisor-tabs"`, `window_drag: true`):**
   - Renders workspace tabs with agent/program icons, concise auto-derived or user-edited titles, live activity spinners/dots, `+` new-tab menu, 2 drawer toggle buttons (`Files`, `Review`), and platform window controls.
 - **Main Agent Terminal Area (`#main`):**
   - Primary execution pane (`tab: "active"`, `pane` header `30px`, `lone: true`, `radius: 10`) hosting AI coding agents (`claude`, `gemini`, `codex`, `opencode`, `pi`, `antigravity`).
 - **Collapsible 2-Panel Stack (`#panel`, `420px` [300–960], `hidden: true` by default / `#panel-body` stack):**
   - **`#files` (`files-search`):** Docked session-scoped multi-repo file tree with folder modification badges, `repo` markers, synchronized service filter pills, and the floating **Search Everywhere** modal (`files-search-win`) with `All` / `Files` / `Text` tabs, normalized ripgrep streaming, live code preview, and corner resize grip.
   - **`#changes` (`changes-review`):** Per-service Git branch pills, working-tree/commit diff viewer in JetBrains Mono (`11px`), `Expand context` (`git diff -U99999`), inline comment cards, per-tab `reviewedServices` checklist (`Approve Service ✓`), and `leadTerminal`-prioritized feedback / multi-repo commit footer.
-- **Telemetry Status Bar (`#status`, `28px`, `mod: "mesh-status"`):**
+- **Telemetry Status Bar (`#status`, `28px`, `mod: "cognivisor-status"`):**
   - Displays active host (`This computer` / SSH machine), multi-service & dirty counts (`N services · M dirty`), active branch, live agent counter (`N agents · M needs you`), and `app.palette` shortcut hint.
 
 ## How it behaves
@@ -23,25 +23,25 @@ A unified **Multi-Microservice Agent Workspace** layout recipe and 4-mod distrib
   - Newly opened generic tabs (`^tb\d+$`, numeric indices, `!tab.named`, bare program names) are inspected via `hc get <t> --json` and `hc read <t> --lines 40` (with lock-free `git rev-parse --abbrev-ref HEAD` fallback) to derive concise Jira-key + summary titles via `run("tab.rename")`.
   - User-edited tabs (`tab.named === true` or double-click inline rename setting `manualTitle: true`) are never overwritten automatically.
 - **Session-Scoped Multi-Repo Discovery & Bus Sharing:**
-  - `files-search` discovers repositories under `space.folder` (plus sibling repos and active-tab pane `cwd`s), runs `git status --untracked-files=normal`, attributes repositories modified/visited by that tab's agent session in `mesh.flows[tabId].sessionRepos`, and publishes `mesh.services` with a `sig` change key.
-  - `changes-review` consumes fresh `mesh.services` entries (`BUS_MAX_AGE_MS = 90000`) and wakes only when `bus.sig` changes, eliminating duplicate polling and Windows PowerShell storms.
+  - `files-search` discovers repositories under `space.folder` (plus sibling repos and active-tab pane `cwd`s), runs `git status --untracked-files=normal`, attributes repositories modified/visited by that tab's agent session in `cognivisor.flows[tabId].sessionRepos`, and publishes `cognivisor.services` with a `sig` change key.
+  - `changes-review` consumes fresh `cognivisor.services` entries (`BUS_MAX_AGE_MS = 90000`) and wakes only when `bus.sig` changes, eliminating duplicate polling and Windows PowerShell storms.
 - **Space Panel Memory & Pure Render Frames:**
-  - `mesh-tabs` stores each space's open panel choice in `shared("mesh.spacePanels")` (zero `localStorage`) using deferred `cx.timer.after(0, ...)` syncs so `render()` stays pure across all mods.
+  - `cognivisor-tabs` stores each space's open panel choice in `shared("cognivisor.spacePanels")` (zero `localStorage`) using deferred `cx.timer.after(0, ...)` syncs so `render()` stays pure across all mods.
 - **Microservice Review & Lead Agent Targeting:**
-  - Adding inline diff notes marks `reviewedServices[serviceId]` as `"has_notes"`; clicking `Approve Service ✓` marks it `"approved"` and advances `mesh.activeService` to the next unreviewed dirty microservice.
-  - `changes-review` resolves `findActiveAgent()` with `mesh.flows[tabId].leadTerminal` first to deliver review notes directly to the tab's primary coding agent.
+  - Adding inline diff notes marks `reviewedServices[serviceId]` as `"has_notes"`; clicking `Approve Service ✓` marks it `"approved"` and advances `cognivisor.activeService` to the next unreviewed dirty microservice.
+  - `changes-review` resolves `findActiveAgent()` with `cognivisor.flows[tabId].leadTerminal` first to deliver review notes directly to the tab's primary coding agent.
 - **Global Search Everywhere:**
   - `Ctrl+P`, `Alt+F`, or double-tapping `Shift` in `#files` opens `files-search-win`; `Tab` / `Shift+Tab` cycles `All`, `Files`, and `Text`, and `Enter` expands the target file path in the tree.
 
 ## Built from
 
-- **Layout Definition (`layouts/mesh.json`):**
+- **Layout Definition (`layouts/cognivisor.json`):**
   - `#sidebar` (`brand`, `spaces`, `agents`, `sidebar-footer`) + `#work` (`#tabs` `42px` → `#work-body` [`#main` + collapsible `#panel` → `#panel-body` stack with `#files`, `#changes`] → `#status` `28px`).
 - **4 Active Extension Mods (`mods/`):**
   - `mods/files-search/main.js` & `mod.json`: Docked session-scoped multi-repo file tree + `files-search-win` Search Everywhere overlay.
   - `mods/changes-review/main.js` & `mod.json`: Per-service branch diffs, inline notes, `reviewedServices` checklist, and `leadTerminal` dispatch.
-  - `mods/mesh-tabs/main.js` & `mod.json`: Tab strip, organic auto-naming, double-click inline rename, 2-panel toggles (`Files`, `Review`), and `mesh.spacePanels`.
-  - `mods/mesh-status/main.js` & `mod.json`: `#status` bar telemetry for machine, service/dirty counts, active branch, agents, and command palette trigger.
+  - `mods/cognivisor-tabs/main.js` & `mod.json`: Tab strip, organic auto-naming, double-click inline rename, 2-panel toggles (`Files`, `Review`), and `cognivisor.spacePanels`.
+  - `mods/cognivisor-status/main.js` & `mod.json`: `#status` bar telemetry for machine, service/dirty counts, active branch, agents, and command palette trigger.
 - **Keybindings (`keys.json`):**
   - Global bindings: `"ctrl-p": "mod.open:files-search"` and `"alt-f": "mod.open:files-search"`.
 - **Herdr APIs Used:**
@@ -53,10 +53,10 @@ All cross-mod communication flows strictly through Herdr's persisted reactive bu
 
 | Bus Key | Producer(s) | Consumer(s) | Contract / Purpose |
 |---|---|---|---|
-| `mesh.services` | `files-search`, `changes-review` | `files-search`, `changes-review`, `mesh-status` | `{ tabId, workspaceRoot, on, services, candidates, sig, ts }` — emitted on topology/branch/dirty `sig` change or heartbeat. |
-| `mesh.activeService` | `changes-review`, `files-search` | `changes-review`, `files-search` | `{ workspaceRoot, serviceId, ts }` — monotonic timestamp-gated service filter (`"all"` or `serviceId`). |
-| `mesh.flows` | `mesh-tabs`, `changes-review` | `mesh-tabs`, `changes-review`, `files-search` | `Record<tabId, { tabId?, ticket?, derivedTitle?, autoNamed?, manualTitle?, leadTerminal?, reviewedServices?, sessionRepos?, updatedAt }>`. |
-| `mesh.spacePanels` | `mesh-tabs` | `mesh-tabs` | `Record<spaceId, "files" \| "changes" \| null>` — zero-`localStorage` per-space drawer memory. |
+| `cognivisor.services` | `files-search`, `changes-review` | `files-search`, `changes-review`, `cognivisor-status` | `{ tabId, workspaceRoot, on, services, candidates, sig, ts }` — emitted on topology/branch/dirty `sig` change or heartbeat. |
+| `cognivisor.activeService` | `changes-review`, `files-search` | `changes-review`, `files-search` | `{ workspaceRoot, serviceId, ts }` — monotonic timestamp-gated service filter (`"all"` or `serviceId`). |
+| `cognivisor.flows` | `cognivisor-tabs`, `changes-review` | `cognivisor-tabs`, `changes-review`, `files-search` | `Record<tabId, { tabId?, ticket?, derivedTitle?, autoNamed?, manualTitle?, leadTerminal?, reviewedServices?, sessionRepos?, updatedAt }>`. |
+| `cognivisor.spacePanels` | `cognivisor-tabs` | `cognivisor-tabs` | `Record<spaceId, "files" \| "changes" \| null>` — zero-`localStorage` per-space drawer memory. |
 | `files-search.select` | `files-search` | `files-search` | `{ root, path, line, ts }` — expands and highlights matched file in tree. |
 | `files-search.customSize` | `files-search` | `files-search` | `{ w, h }` — persists custom Search Everywhere dialog dimensions. |
 | `changes-review.focus` | `changes-review` | `changes-review` | `{ path, line? }` — jumps to a line in the diff viewer. |
@@ -64,7 +64,7 @@ All cross-mod communication flows strictly through Herdr's persisted reactive bu
 ## Watch out
 
 - **Shipped Layout & Core Mod Immutability:**
-  Herdr's built-in layouts (`main.json`, `terminals.json`, `win98.json`) and core mods are read-only and restored automatically. Customizations live exclusively in `layouts/mesh.json` and the `mods/*` directories.
+  Herdr's built-in layouts (`main.json`, `terminals.json`, `win98.json`) and core mods are read-only and restored automatically. Customizations live exclusively in `layouts/cognivisor.json` and the `mods/*` directories.
 - **Lock-Free Git Invariant:**
   Every read-only Git invocation (`rev-parse`, `status`, `diff`, `ls-files`, `log`, `grep`, `for-each-ref`, `rev-list`) MUST include:
   ```bash
@@ -86,8 +86,8 @@ All cross-mod communication flows strictly through Herdr's persisted reactive bu
    ```bash
    for d in mods/*/; do herdr-app check "$d" || exit 1; done
    ```
-2. All mod entrypoints pass `node --check mods/*/main.js`, and `layouts/mesh.json` and `keys.json` parse as valid JSON.
+2. All mod entrypoints pass `node --check mods/*/main.js`, and `layouts/cognivisor.json` and `keys.json` parse as valid JSON.
 3. `rg -n "localStorage|\.key\(" mods/*/main.js` returns zero matches, and all read-only Git queries include lock-free flags.
-4. Launching Herdr with `layouts/mesh.json` mounts `#sidebar`, `#tabs` (`mesh-tabs`), `#main`, `#panel-body` (`files`, `changes`), and `#status` (`mesh-status`).
-5. Opening an agent tab auto-derives a concise Jira/prompt/branch title without overwriting manual renames, and space panels persist in `mesh.spacePanels`.
+4. Launching Herdr with `layouts/cognivisor.json` mounts `#sidebar`, `#tabs` (`cognivisor-tabs`), `#main`, `#panel-body` (`files`, `changes`), and `#status` (`cognivisor-status`).
+5. Opening an agent tab auto-derives a concise Jira/prompt/branch title without overwriting manual renames, and space panels persist in `cognivisor.spacePanels`.
 6. In `files-search` and `changes-review`, only session-attributed touched repositories render, `Approve Service ✓` progresses across dirty services, and inline review notes dispatch directly to `leadTerminal`.

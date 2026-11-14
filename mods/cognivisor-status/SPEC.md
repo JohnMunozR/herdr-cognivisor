@@ -1,8 +1,8 @@
 ---
-id: submodule-mod-mesh-status
+id: submodule-mod-cognivisor-status
 type: submodule-design
 status: active
-title: Mesh Status Bar Mod (mods/mesh-status)
+title: Cognivisor Status Bar Mod (mods/cognivisor-status)
 parent: module-mods
 references: [module-layouts]
 covers: [workspace-status-bar, agent-counters]
@@ -11,19 +11,19 @@ tags: [mod, status-bar, telemetry]
 
 ## Responsibility
 
-The `submodule-mod-mesh-status` provides the bottom `28px` workspace telemetry bar (`#status`) in `layouts/mesh.json` (`[[module-layouts]]`). Upgrading Herdr's core `workspace-status` mod, it preserves core host, branch, live agent counters, and command palette controls while surfacing session-attributed multi-service and dirty counts from `shared("mesh.services")`.
+The `submodule-mod-cognivisor-status` provides the bottom `28px` workspace telemetry bar (`#status`) in `layouts/cognivisor.json` (`[[module-layouts]]`). Upgrading Herdr's core `workspace-status` mod, it preserves core host, branch, live agent counters, and command palette controls while surfacing session-attributed multi-service and dirty counts from `shared("cognivisor.services")`.
 
 ## Boundary
 
 - **Owns:**
-  - Manifest file: `mods/mesh-status/mod.json` (`{ "place": "none", "title": "Mesh Status" }`).
-  - Main view component: `mods/mesh-status/main.js` (`MeshStatus` extending `View`).
-  - Self-contained SVG icon assets: `mods/mesh-status/icons/{server,monitor,branch,layers}.svg`.
+  - Manifest file: `mods/cognivisor-status/mod.json` (`{ "place": "none", "title": "Cognivisor Status" }`).
+  - Main view component: `mods/cognivisor-status/main.js` (`CognivisorStatus` extending `View`).
+  - Self-contained SVG icon assets: `mods/cognivisor-status/icons/{server,monitor,branch,layers}.svg`.
 - **Public surface:**
-  - Registered mod identifier: `mesh-status`.
-  - Layout slot: `#status` (`28px` height) in `layouts/mesh.json`.
+  - Registered mod identifier: `cognivisor-status`.
+  - Layout slot: `#status` (`28px` height) in `layouts/cognivisor.json`.
   - Reactive read-only shared bus consumer:
-    - `shared("mesh.services")`: Multi-microservice topology and dirty summary.
+    - `shared("cognivisor.services")`: Multi-microservice topology and dirty summary.
   - Host command dispatches:
     - Palette click -> `run("app.palette")`.
 - **Allowed deps:**
@@ -33,7 +33,7 @@ The `submodule-mod-mesh-status` provides the bottom `28px` workspace telemetry b
 - **Forbidden:**
   - Any reference to `localStorage`, browser DOM globals, or non-GPUI elements.
   - Hardcoded hex color literals outside dynamic `theme()` tokens.
-  - Mutating `mesh.*` shared state or spawning subprocesses (`exec`, `hc`) during status bar rendering.
+  - Mutating `cognivisor.*` shared state or spawning subprocesses (`exec`, `hc`) during status bar rendering.
   - Reading or mutating internal closures of sibling mods.
 
 ## Architecture & Interaction Flow
@@ -50,7 +50,7 @@ The `submodule-mod-mesh-status` provides the bottom `28px` workspace telemetry b
 1. **Machine Badge (`#status-machine`):**
    Displays `space?.machine ?? "This computer"` paired with `server.svg` (remote machine) or `monitor.svg` (local host).
 2. **Services & Branch Summary (`#status-services`, `#status-branch`):**
-   When `shared("mesh.services")` matches the active space folder and reports more than 1 service (`services.length > 1`), displays `${services.length} services` (appending `· ${dirtyCount} dirty` when dirty counts are present) with `layers.svg`, alongside `space?.branch` with `branch.svg` when present. When 1 or fewer services exist, falls back to `space?.branch` only.
+   When `shared("cognivisor.services")` matches the active space folder and reports more than 1 service (`services.length > 1`), displays `${services.length} services` (appending `· ${dirtyCount} dirty` when dirty counts are present) with `layers.svg`, alongside `space?.branch` with `branch.svg` when present. When 1 or fewer services exist, falls back to `space?.branch` only.
 3. **Agent Counters (`#status-agents`):**
    Displays `${agents().length} agents` with status dot (`t.blocked`, `t.working`, or `t.dim`) and appends `· ${needs} needs you` in `t.blocked` when any agent reports `status === "blocked"`.
 4. **Command Palette Trigger (`#palette`):**
@@ -60,15 +60,15 @@ The `submodule-mod-mesh-status` provides the bottom `28px` workspace telemetry b
 
 | Key | Role | Expected Shape |
 | :--- | :--- | :--- |
-| `mesh.services` | Consumer | `{ workspaceRoot?: string, services: Array<{ id, name, relPath, root, workingCount?, dirty? }> }` |
+| `cognivisor.services` | Consumer | `{ workspaceRoot?: string, services: Array<{ id, name, relPath, root, workingCount?, dirty? }> }` |
 
 ## Invariants
 
 1. **Zero `localStorage` Invariant:**
-   `mods/mesh-status` contains zero `localStorage` references and persists no local state.
+   `mods/cognivisor-status` contains zero `localStorage` references and persists no local state.
 2. **Pure GPUI-Kit & Dynamic Theme Tokens:**
    All visual nodes use `gpui-kit` / `gpui-base` primitives (`View`, `div`, `svg`, `h_flex`) and derive all colors from `theme()` tokens without hardcoded hex literals.
 3. **Read-Only Non-Blocking Telemetry:**
-   `MeshStatus.render()` performs zero subprocess executions, zero filesystem I/O, and zero `setShared()` mutations, ensuring deterministic frame rendering.
+   `CognivisorStatus.render()` performs zero subprocess executions, zero filesystem I/O, and zero `setShared()` mutations, ensuring deterministic frame rendering.
 4. **Workspace Isolation:**
-   `mesh.services` entries are gated against the active space folder (normalized across platforms) when present to prevent cross-workspace leakage.
+   `cognivisor.services` entries are gated against the active space folder (normalized across platforms) when present to prevent cross-workspace leakage.

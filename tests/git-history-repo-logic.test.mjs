@@ -32,7 +32,7 @@ describe("git-history repo-logic", () => {
     assert.equal(isHomeDirectoryRoot("/home/alice"), true);
     assert.equal(isHomeDirectoryRoot("/Users/alice/"), true);
     assert.equal(isHomeDirectoryRoot("C:\\Users\\alice"), true);
-    assert.equal(isHomeDirectoryRoot("/home/alice/projects/mesh"), false);
+    assert.equal(isHomeDirectoryRoot("/home/alice/projects/cognivisor"), false);
     assert.equal(isHomeDirectoryRoot("/custom", null, "/custom/.herdr"), true);
 
     assert.equal(
@@ -40,16 +40,16 @@ describe("git-history repo-logic", () => {
       "/home/alice/work/api",
     );
     assert.equal(
-      resolveWorkspaceRoot({ folder: "/work/mesh" }, { cwd: "/work/mesh/services/auth" }),
-      "/work/mesh",
+      resolveWorkspaceRoot({ folder: "/work/cognivisor" }, { cwd: "/work/cognivisor/services/auth" }),
+      "/work/cognivisor",
     );
     assert.equal(
-      resolveWorkspaceRoot({ folder: "/work/mesh" }, { cwd: "/other/repo" }),
+      resolveWorkspaceRoot({ folder: "/work/cognivisor" }, { cwd: "/other/repo" }),
       "/other/repo",
     );
     assert.equal(
-      resolveWorkspaceRoot({ spaceFolder: "/work/mesh", paneCwd: null }),
-      "/work/mesh",
+      resolveWorkspaceRoot({ spaceFolder: "/work/cognivisor", paneCwd: null }),
+      "/work/cognivisor",
     );
     assert.equal(
       resolveWorkspaceRoot(null, { cwd: "/work/standalone" }),
@@ -130,9 +130,9 @@ describe("git-history repo-logic", () => {
     ]);
   });
 
-  test("mergeDiscoveredWithServices preserves clean repos and enriches dirty repos from mesh.services", () => {
+  test("mergeDiscoveredWithServices preserves clean repos and enriches dirty repos from cognivisor.services", () => {
     const discovered = ["/ws/clean-repo", "/ws/auth-service/"];
-    const meshServices = {
+    const cognivisorServices = {
       spaceId: "space-1",
       services: [
         {
@@ -153,7 +153,7 @@ describe("git-history repo-logic", () => {
       ],
     };
 
-    const repos = mergeDiscoveredWithServices(discovered, meshServices, "space-1");
+    const repos = mergeDiscoveredWithServices(discovered, cognivisorServices, "space-1");
     assert.deepEqual(repos, [
       {
         id: "clean-repo",
@@ -173,7 +173,7 @@ describe("git-history repo-logic", () => {
       },
     ]);
 
-    // Clean repos must still appear when mesh.services is null or belongs to another space
+    // Clean repos must still appear when cognivisor.services is null or belongs to another space
     const cleanOnly = mergeDiscoveredWithServices(["/ws/solo-clean"], { spaceId: "other", services: [{ id: "x", root: "/ws/x", workingCount: 2 }] }, "space-1");
     assert.equal(cleanOnly.length, 1);
     assert.equal(cleanOnly[0].isDirty, false);

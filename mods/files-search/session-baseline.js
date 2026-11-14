@@ -155,7 +155,7 @@ function matchesWorkspaceRoot(baseline, workspaceRoot) {
 
 export async function readDiskSessionBaseline(appHomeDir, tabId, workspaceRoot, branch, hasResumeCommand = false) {
   if (!appHomeDir) return null;
-  const baseDir = join(String(appHomeDir), "mesh", "sessions");
+  const baseDir = join(String(appHomeDir), "cognivisor", "sessions");
   if (tabId) {
     const tabPath = join(baseDir, "tabs", `${safeTabId(tabId)}.json`);
     const fromTab = await readBaselineJsonFile(tabPath);
@@ -179,7 +179,7 @@ export async function writeDiskSessionBaseline(appHomeDir, tabId, workspaceRoot,
   );
   if (!normalized) return false;
   const json = JSON.stringify(normalized);
-  const baseDir = join(String(appHomeDir), "mesh", "sessions");
+  const baseDir = join(String(appHomeDir), "cognivisor", "sessions");
   let wrote = false;
   if (tabId) {
     try {

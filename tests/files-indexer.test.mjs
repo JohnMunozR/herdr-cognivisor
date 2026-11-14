@@ -34,16 +34,16 @@ describe("files-search indexer — agent gate", () => {
     assert.equal(idx.hasOpenAgentInSpace(), false);
   });
 
-  test("ignores auxiliary runner splits marked with meshRunner=true", () => {
+  test("ignores auxiliary runner splits marked with cognivisorRunner=true", () => {
     resetHerdrMock({
       spaces: [{ id: "sp-1", active: true, tabs: [{ id: "tab-1" }] }],
       panes: [
         { id: "p-shell", tab: "tab-1", terminal: "term-shell", program: { name: "bash", agent: false } },
-        { id: "p-run", tab: "tab-1", terminal: "term-run", labels: { meshRunner: "true" }, program: { agent: true } },
+        { id: "p-run", tab: "tab-1", terminal: "term-run", labels: { cognivisorRunner: "true" }, program: { agent: true } },
       ],
       terminals: [
         { address: "term-shell", program: { name: "bash", agent: false }, labels: {} },
-        { address: "term-run", labels: { meshRunner: "true" }, program: { agent: true } },
+        { address: "term-run", labels: { cognivisorRunner: "true" }, program: { agent: true } },
       ],
       agents: [{ address: "term-run", space: "sp-1", tab: "tab-1" }],
       focused: { space: "sp-1", tab: "tab-1", agent: "term-run" },
@@ -100,11 +100,11 @@ describe("files-search indexer — terminal gate", () => {
     assert.equal(idx.hasOpenTerminalInSpace(), true);
   });
 
-  test("ignores auxiliary runner splits marked with meshRunner=true when no other terminal exists", () => {
+  test("ignores auxiliary runner splits marked with cognivisorRunner=true when no other terminal exists", () => {
     resetHerdrMock({
       spaces: [{ id: "sp-1", active: true, tabs: [{ id: "tab-1" }] }],
-      panes: [{ id: "p-run", tab: "tab-1", terminal: "term-run", labels: { meshRunner: "true" }, program: { agent: false } }],
-      terminals: [{ address: "term-run", labels: { meshRunner: "true" }, program: { agent: false } }],
+      panes: [{ id: "p-run", tab: "tab-1", terminal: "term-run", labels: { cognivisorRunner: "true" }, program: { agent: false } }],
+      terminals: [{ address: "term-run", labels: { cognivisorRunner: "true" }, program: { agent: false } }],
       agents: [],
       focused: { space: "sp-1", tab: "tab-1", terminal: "term-run", agent: null },
     });
@@ -162,7 +162,7 @@ describe("files-search indexer — cache, disk persistence & watch invalidation"
     assert.ok(r1.entries.some((e) => e.kind === "dir" && e.path === "src"));
     assert.ok(r1.entries.some((e) => e.kind === "file" && e.path === "src/app.js"));
 
-    const cacheParent = path.join(appHomeDir, "mesh", "workspaces");
+    const cacheParent = path.join(appHomeDir, "cognivisor", "workspaces");
     const slugDirs = await fs.readdir(cacheParent);
     assert.equal(slugDirs.length, 1);
     const diskJson = JSON.parse(await fs.readFile(path.join(cacheParent, slugDirs[0], "files-index.json"), "utf8"));

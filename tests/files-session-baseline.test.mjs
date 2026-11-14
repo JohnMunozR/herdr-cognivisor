@@ -33,7 +33,7 @@ describe("files-search session-baseline", () => {
             ".\\src\\App.js": { status: " M", sig: "120:1700000000000" },
           },
         },
-        "C:\\Users\\dev\\herdr-mesh": {
+        "C:\\Users\\dev\\herdr-cognivisor": {
           dirtyFiles: {},
         },
       },
@@ -47,7 +47,7 @@ describe("files-search session-baseline", () => {
         "src/App.js": { status: " M", sig: "120:1700000000000" },
       },
     });
-    assert.deepEqual(normalized.repos["C:/Users/dev/herdr-mesh"], {
+    assert.deepEqual(normalized.repos["C:/Users/dev/herdr-cognivisor"], {
       dirtyFiles: {},
     });
   });
@@ -147,7 +147,7 @@ describe("files-search session-baseline", () => {
           "/home/dev/projects/mypass": {
             dirtyFiles: { "package.json": { status: " M", sig: "300:1699999990000" } },
           },
-          "/home/dev/projects/herdr-mesh": {
+          "/home/dev/projects/herdr-cognivisor": {
             dirtyFiles: { "dirty.js": { status: "??", sig: "50:1699999980000" } },
           },
         },
@@ -181,7 +181,7 @@ describe("files-search session-baseline", () => {
   });
 
   it("ignores /resume inside paths or help banners and handles no-stat QuickJS binary/dir fallbacks", async () => {
-    assert.equal(terminalHasResumeCommand("ls ~/.config/herdr-app/mesh/sessions/resume\n"), false);
+    assert.equal(terminalHasResumeCommand("ls ~/.config/herdr-app/cognivisor/sessions/resume\n"), false);
     assert.equal(terminalHasResumeCommand("Type /resume to continue your previous conversation"), false);
     assert.equal(terminalHasResumeCommand("  /resume   Resume a previous session\n"), false);
     assert.equal(terminalHasResumeCommand("\x1b[32m❯\x1b[0m /resume my-prev-session\n"), true);
@@ -223,10 +223,10 @@ describe("files-search session-baseline", () => {
     assert.equal(
       resolveWorkspaceRoot({
         spaceFolder: "/home/nmr",
-        paneCwd: "/home/nmr/Projects/herdr-mesh",
+        paneCwd: "/home/nmr/Projects/herdr-cognivisor",
         appHomeDir,
       }),
-      "/home/nmr/Projects/herdr-mesh",
+      "/home/nmr/Projects/herdr-cognivisor",
     );
     assert.equal(
       resolveWorkspaceRoot({
@@ -239,22 +239,22 @@ describe("files-search session-baseline", () => {
     assert.equal(
       resolveWorkspaceRoot({
         spaceFolder: "/home/nmr/Projects",
-        paneCwd: "/home/nmr/Projects/herdr-mesh",
+        paneCwd: "/home/nmr/Projects/herdr-cognivisor",
         appHomeDir,
       }),
       "/home/nmr/Projects",
     );
     assert.equal(
       resolveWorkspaceRoot({
-        spaceFolder: "/home/nmr/Projects/herdr-mesh",
-        paneCwd: "/home/nmr/Projects/herdr-mesh/mods",
+        spaceFolder: "/home/nmr/Projects/herdr-cognivisor",
+        paneCwd: "/home/nmr/Projects/herdr-cognivisor/mods",
         appHomeDir,
       }),
-      "/home/nmr/Projects/herdr-mesh",
+      "/home/nmr/Projects/herdr-cognivisor",
     );
     assert.equal(
       resolveWorkspaceRoot({
-        spaceFolder: "/home/nmr/Projects/herdr-mesh",
+        spaceFolder: "/home/nmr/Projects/herdr-cognivisor",
         paneCwd: "/home/nmr/Projects/other-repo",
         appHomeDir,
       }),

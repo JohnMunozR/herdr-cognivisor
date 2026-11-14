@@ -386,11 +386,11 @@ describe("files-search search-logic", () => {
 
     // Windows drive and UNC paths normalize to forward slashes and resolve dot segments cleanly
     assert.equal(
-      resolveViewerFilePath("C:\\work\\mesh\\", "auth-service\\src\\..\\Main.java"),
-      "C:/work/mesh/auth-service/Main.java"
+      resolveViewerFilePath("C:\\work\\cognivisor\\", "auth-service\\src\\..\\Main.java"),
+      "C:/work/cognivisor/auth-service/Main.java"
     );
     assert.equal(
-      resolveViewerFilePath("C:/work/mesh", "D:\\elsewhere\\config.yml"),
+      resolveViewerFilePath("C:/work/cognivisor", "D:\\elsewhere\\config.yml"),
       "D:/elsewhere/config.yml"
     );
     assert.equal(
@@ -400,23 +400,23 @@ describe("files-search search-logic", () => {
   });
 
   test("buildFileViewerKey normalizes equivalent targets and respects case sensitivity", () => {
-    const k1 = buildFileViewerKey("/work/mesh", "auth-service/src/AuthController.java", false);
-    const k2 = buildFileViewerKey("/work/mesh/auth-service", "src/./AuthController.java", false);
-    const k3 = buildFileViewerKey("", "/work/mesh/auth-service/src/AuthController.java", false);
-    assert.equal(k1, "/work/mesh/auth-service/src/AuthController.java");
+    const k1 = buildFileViewerKey("/work/cognivisor", "auth-service/src/AuthController.java", false);
+    const k2 = buildFileViewerKey("/work/cognivisor/auth-service", "src/./AuthController.java", false);
+    const k3 = buildFileViewerKey("", "/work/cognivisor/auth-service/src/AuthController.java", false);
+    assert.equal(k1, "/work/cognivisor/auth-service/src/AuthController.java");
     assert.equal(k2, k1);
     assert.equal(k3, k1);
 
     // POSIX preserves case while Windows folds case for deduplication
     assert.notEqual(
-      buildFileViewerKey("/work/mesh", "src/Main.java", false),
-      buildFileViewerKey("/work/mesh", "src/main.java", false)
+      buildFileViewerKey("/work/cognivisor", "src/Main.java", false),
+      buildFileViewerKey("/work/cognivisor", "src/main.java", false)
     );
     assert.equal(
-      buildFileViewerKey("C:\\Work\\Mesh", "Src\\Main.Java", true),
-      buildFileViewerKey("C:/work/mesh", "src/main.java", true)
+      buildFileViewerKey("C:\\Work\\Cognivisor", "Src\\Main.Java", true),
+      buildFileViewerKey("C:/work/cognivisor", "src/main.java", true)
     );
-    assert.equal(buildFileViewerKey("/work/mesh", "   ", false), "");
+    assert.equal(buildFileViewerKey("/work/cognivisor", "   ", false), "");
   });
 
   test("formatFileTabTitle keeps concise basenames and disambiguates duplicate tab titles", () => {
@@ -489,23 +489,23 @@ describe("files-search search-logic", () => {
       "tab-space1-auth": {
         tabId: "tab-space1-auth",
         spaceId: "space-1",
-        root: "/workspace/mesh",
+        root: "/workspace/cognivisor",
         path: "auth-service/src/AuthController.java",
-        absPath: "/workspace/mesh/auth-service/src/AuthController.java",
+        absPath: "/workspace/cognivisor/auth-service/src/AuthController.java",
       },
       "tab-space2-auth": {
         tabId: "tab-space2-auth",
         spaceId: "space-2",
-        root: "/workspace/mesh",
+        root: "/workspace/cognivisor",
         path: "auth-service/src/AuthController.java",
-        absPath: "/workspace/mesh/auth-service/src/AuthController.java",
+        absPath: "/workspace/cognivisor/auth-service/src/AuthController.java",
       },
       "tab-win": {
         tabId: "tab-win",
         spaceId: "space-1",
-        root: "C:\\Work\\Mesh",
+        root: "C:\\Work\\Cognivisor",
         path: "gateway\\App.ts",
-        absPath: "C:/Work/Mesh/gateway/App.ts",
+        absPath: "C:/Work/Cognivisor/gateway/App.ts",
       },
     };
 
@@ -514,7 +514,7 @@ describe("files-search search-logic", () => {
       openTabs,
       ["tab-space1-auth", "tab-win"],
       ["tab-space1-auth", "tab-space2-auth", "tab-win"],
-      "/workspace/mesh/auth-service",
+      "/workspace/cognivisor/auth-service",
       "src/AuthController.java",
       false
     );
@@ -525,7 +525,7 @@ describe("files-search search-logic", () => {
       openTabs,
       ["tab-space3-term"],
       ["tab-space1-auth", "tab-space2-auth"],
-      "/workspace/mesh",
+      "/workspace/cognivisor",
       "auth-service/src/AuthController.java",
       false
     );
@@ -536,7 +536,7 @@ describe("files-search search-logic", () => {
       openTabs,
       ["tab-space1-auth"],
       ["tab-win"],
-      "/workspace/mesh",
+      "/workspace/cognivisor",
       "auth-service/src/AuthController.java",
       false
     );
@@ -547,7 +547,7 @@ describe("files-search search-logic", () => {
       openTabs,
       ["tab-space1-auth", "tab-win"],
       ["tab-space1-auth", "tab-win"],
-      "c:/work/mesh",
+      "c:/work/cognivisor",
       "GATEWAY/app.ts",
       true
     );

@@ -6,7 +6,7 @@ function normPath(p) {
   return String(p || "").replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
-export default class MeshStatus extends View {
+export default class CognivisorStatus extends View {
   // Format the actual bound key for app.palette; fall back to "commands" when unbound.
   hint() {
     const mac = window()?.platform === "macos";
@@ -29,11 +29,11 @@ export default class MeshStatus extends View {
     const spaceList = spaces() ?? [];
     const space = spaceList.find((s) => s.active) ?? null;
 
-    const meshServices = shared("mesh.services");
+    const cognivisorServices = shared("cognivisor.services");
     const activeFolder = space?.folder ? normPath(space.folder) : null;
-    const servicesRoot = meshServices?.workspaceRoot ? normPath(meshServices.workspaceRoot) : null;
+    const servicesRoot = cognivisorServices?.workspaceRoot ? normPath(cognivisorServices.workspaceRoot) : null;
     const servicesMatchSpace = !activeFolder || !servicesRoot || servicesRoot === activeFolder;
-    const services = servicesMatchSpace && Array.isArray(meshServices?.services) ? meshServices.services : [];
+    const services = servicesMatchSpace && Array.isArray(cognivisorServices?.services) ? cognivisorServices.services : [];
     const dirtyCount = services.filter((s) => (Number(s?.workingCount) || 0) > 0 || s?.dirty === true).length;
     const servicesText = dirtyCount > 0
       ? `${services.length} services · ${dirtyCount} dirty`
@@ -49,11 +49,11 @@ export default class MeshStatus extends View {
       .flex_none()
       .gap(5)
       .items_center()
-      .child(svg(`mods/mesh-status/icons/${icon}.svg`).size(12.5).flex_none())
+      .child(svg(`mods/cognivisor-status/icons/${icon}.svg`).size(12.5).flex_none())
       .child(div().truncate().child(text));
 
     return h_flex()
-      .id("mesh-status")
+      .id("cognivisor-status")
       .size_full()
       .h(28)
       .px(14)

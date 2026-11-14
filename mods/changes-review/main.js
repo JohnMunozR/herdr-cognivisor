@@ -71,7 +71,7 @@ function mergeSessionBaselineIntoFlow(tabId, baseline, sessionRepos = null) {
   if (!tabId) return;
   const normalized = normalizeSessionBaseline(baseline);
   if (!normalized) return;
-  const flows = readPlainObject(shared("mesh.flows"));
+  const flows = readPlainObject(shared("cognivisor.flows"));
   const cur = flows[tabId] && typeof flows[tabId] === "object" ? flows[tabId] : {};
   const curReposCount = Object.keys(cur.sessionBaseline?.repos || {}).length;
   const nextReposCount = Object.keys(normalized.repos || {}).length;
@@ -84,7 +84,7 @@ function mergeSessionBaselineIntoFlow(tabId, baseline, sessionRepos = null) {
     cur.sessionStartedAt !== normalized.startedAt ||
     curReposCount !== nextReposCount;
   if (!baselineChanged && !reposChanged) return;
-  setShared("mesh.flows", {
+  setShared("cognivisor.flows", {
     ...flows,
     [tabId]: {
       ...cur,
@@ -107,7 +107,7 @@ async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTer
     new Set((serviceResults || []).map((r) => String(r.branch || r.service?.branch || "").trim()).filter(Boolean))
   );
 
-  const flows = readPlainObject(shared("mesh.flows"));
+  const flows = readPlainObject(shared("cognivisor.flows"));
   const rawExisting = flows[sessionTabId]?.sessionBaseline;
   const existing = normalizeSessionBaseline(rawExisting);
   if (existing && (!normWs || !existing.workspaceRoot || existing.workspaceRoot === normWs)) {
@@ -168,7 +168,7 @@ function location() {
   const space = (spaces() || []).find((s) => s.active) || null;
   const f = focused();
   const allPanes = panes() || [];
-  const storedAgentTabs = readPlainObject(shared("mesh.spaceAgentTabs"));
+  const storedAgentTabs = readPlainObject(shared("cognivisor.spaceAgentTabs"));
   const sessionTabId = resolveSessionAgentTabId(space, allPanes, storedAgentTabs);
   const spaceTabs = new Set((space?.tabs ?? []).map((t) => t.id));
   const spacePanes = allPanes.filter((p) => spaceTabs.has(p.tab));
@@ -478,7 +478,7 @@ async function loadServiceWorkingSnapshot(service, on, includeCommits = true) {
 }
 
 function readFlows() {
-  return readPlainObject(shared("mesh.flows"));
+  return readPlainObject(shared("cognivisor.flows"));
 }
 
 function readAllActiveDiffs() {
@@ -567,7 +567,7 @@ function getActiveSpaceAndTab() {
   const allPanes = panes() || [];
   const activeSpace = allSpaces.find((s) => s.active) || null;
   const activeTab = activeSpace?.tabs?.find((t) => t.active) || null;
-  const storedAgentTabs = readPlainObject(shared("mesh.spaceAgentTabs"));
+  const storedAgentTabs = readPlainObject(shared("cognivisor.spaceAgentTabs"));
   const sessionTabId = resolveSessionAgentTabId(activeSpace, allPanes, storedAgentTabs);
   return { activeSpace, activeTab, activeTabId: activeTab?.id || null, sessionTabId };
 }
@@ -596,7 +596,7 @@ function updateTabFlow(tabId, mutator, workspaceRoot = "") {
     workspaceRoot: prev.workspaceRoot || workspaceRoot || "",
     updatedAt: Date.now(),
   };
-  setShared("mesh.flows", { ...flows, [tabId]: nextFlow });
+  setShared("cognivisor.flows", { ...flows, [tabId]: nextFlow });
   return nextFlow;
 }
 
@@ -615,7 +615,7 @@ export default class ChangesReview extends View {
     this.diffViewportWidth = 0;
     this.handle = cx.focus_handle();
     this.bottomTab = "review"; // "review" | "commit"
-    this.reviews = []; // Cached mirror of shared("mesh.reviewNotes")[sessionKey]
+    this.reviews = []; // Cached mirror of shared("cognivisor.reviewNotes")[sessionKey]
     this.activeComment = null; // { fileKey, serviceId, serviceName, repoRoot, file, displayPath, line, snippet }
     this.commentText = "";
     this.sendingReview = false;
@@ -750,7 +750,7 @@ export default class ChangesReview extends View {
     const vp = props() || this.viewerProps || {};
     const allSpaces = spaces() || [];
     const allPanes = panes() || [];
-    const storedAgentTabs = readPlainObject(shared("mesh.spaceAgentTabs"));
+    const storedAgentTabs = readPlainObject(shared("cognivisor.spaceAgentTabs"));
 
     if (this.isViewerMode()) {
       const targetSpaceId = vp.spaceId || null;
@@ -793,9 +793,9 @@ export default class ChangesReview extends View {
     if (!activeTab?.id) return;
     const hasTerminal = allPanes.some((p) => p.tab === activeTab.id && Boolean(p.terminal));
     if (!hasTerminal) return;
-    const prev = readPlainObject(shared("mesh.spaceAgentTabs"));
+    const prev = readPlainObject(shared("cognivisor.spaceAgentTabs"));
     if (prev[activeSpace.id] === activeTab.id) return;
-    setShared("mesh.spaceAgentTabs", { ...prev, [activeSpace.id]: activeTab.id });
+    setShared("cognivisor.spaceAgentTabs", { ...prev, [activeSpace.id]: activeTab.id });
   }
 
   scheduleAgentTabSync(cx) {
@@ -814,7 +814,7 @@ export default class ChangesReview extends View {
       const ctx = this.getSessionContext();
       const diff = readActiveDiff(ctx.spaceId);
       const revTab = findReviewTabInSpace(ctx.spaceId);
-      const sharedActive = shared("mesh.activeService");
+      const sharedActive = shared("cognivisor.activeService");
       let changed = false;
 
       if (sharedActive && normPathStr(sharedActive.workspaceRoot) === normPathStr(this.workspaceRoot) && typeof sharedActive.ts === "number") {
@@ -849,17 +849,17 @@ export default class ChangesReview extends View {
 
   getSessionReviews(ctx = null) {
     const c = ctx || this.getSessionContext();
-    const allNotes = readPlainObject(shared("mesh.reviewNotes"));
+    const allNotes = readPlainObject(shared("cognivisor.reviewNotes"));
     const list = allNotes[c.notesKey];
     return Array.isArray(list) ? list : [];
   }
 
   saveSessionReviews(nextReviews, ctx = null) {
     const c = ctx || this.getSessionContext();
-    const prevAll = readPlainObject(shared("mesh.reviewNotes"));
+    const prevAll = readPlainObject(shared("cognivisor.reviewNotes"));
     const safeList = Array.isArray(nextReviews) ? nextReviews : [];
     this.reviews = safeList;
-    setShared("mesh.reviewNotes", { ...prevAll, [c.notesKey]: safeList });
+    setShared("cognivisor.reviewNotes", { ...prevAll, [c.notesKey]: safeList });
     return safeList;
   }
 
@@ -1149,7 +1149,7 @@ export default class ChangesReview extends View {
       const now = Date.now();
       this.lastActiveServiceTs = now;
       if (this.workspaceRoot) {
-        setShared("mesh.activeService", {
+        setShared("cognivisor.activeService", {
           workspaceRoot: this.workspaceRoot,
           serviceId: this.activeService,
           ts: now,
@@ -1198,9 +1198,9 @@ export default class ChangesReview extends View {
     const termMap = new Map(allTerminals.map((t) => [t.address, t]));
 
     const isRunner = (addr, pane) => {
-      if (pane?.labels?.meshRunner === "true") return true;
+      if (pane?.labels?.cognivisorRunner === "true") return true;
       const term = addr ? termMap.get(addr) : null;
-      return term?.labels?.meshRunner === "true";
+      return term?.labels?.cognivisorRunner === "true";
     };
 
     const toTerminalAgent = (term, fallbackTabId) => {
@@ -1214,7 +1214,7 @@ export default class ChangesReview extends View {
       };
     };
 
-    // 1. mesh.flows[targetTabId]?.leadTerminal -> match in agents() or terminals() (excluding runners)
+    // 1. cognivisor.flows[targetTabId]?.leadTerminal -> match in agents() or terminals() (excluding runners)
     if (targetTabId) {
       const flows = readFlows();
       const leadAddr = flows[targetTabId]?.leadTerminal || null;
@@ -1226,13 +1226,13 @@ export default class ChangesReview extends View {
       }
     }
 
-    // 2. focused()?.agent -> match in agents() (excluding meshRunner=true)
+    // 2. focused()?.agent -> match in agents() (excluding cognivisorRunner=true)
     if (f?.agent && !isRunner(f.agent, null)) {
       const focusedAgent = agentMap.get(f.agent);
       if (focusedAgent) return focusedAgent;
     }
 
-    // 3. Non-runner agent in targetTabId (panes() + terminals() + agents(), excluding labels?.meshRunner === "true")
+    // 3. Non-runner agent in targetTabId (panes() + terminals() + agents(), excluding labels?.cognivisorRunner === "true")
     if (targetTabId) {
       const tabPanes = allPanes.filter((p) => p.tab === targetTabId && p.terminal && !isRunner(p.terminal, p));
       const sortedTabPanes = [...tabPanes].sort((a, b) => Number(Boolean(b.focused)) - Number(Boolean(a.focused)));
@@ -1495,7 +1495,7 @@ export default class ChangesReview extends View {
     const now = Date.now();
     this.lastActiveServiceTs = now;
     if (this.workspaceRoot && opts.broadcast !== false) {
-      setShared("mesh.activeService", {
+      setShared("cognivisor.activeService", {
         workspaceRoot: this.workspaceRoot,
         serviceId: this.activeService,
         ts: now,
@@ -1846,7 +1846,7 @@ export default class ChangesReview extends View {
     this.hasLoadedOnce = true;
     const { activeSpace, sessionTabId } = getActiveSpaceAndTab();
     const normWs = normPathStr(workspaceRoot);
-    const bus = !force ? shared("mesh.services") : null;
+    const bus = !force ? shared("cognivisor.services") : null;
     if (typeof bus?.ts === "number") {
       this.lastConsumedBusTs = bus.ts;
       this.lastConsumedBusSig = bus.sig || String(bus.ts);
@@ -1888,12 +1888,12 @@ export default class ChangesReview extends View {
       ? Array.from(new Set(allPanesList.filter((p) => p?.cwd && p.tab === sessionTabId).map((p) => p.cwd)))
       : [];
     const tabPaneCwds = extraCwds;
-    const tabFlowObj = sessionTabId && shared("mesh.flows")?.[sessionTabId];
+    const tabFlowObj = sessionTabId && shared("cognivisor.flows")?.[sessionTabId];
     const tabTermAddrs = sessionTabId
       ? Array.from(
           new Set([
             ...(tabFlowObj?.leadTerminal ? [tabFlowObj.leadTerminal] : []),
-            ...allPanesList.filter((p) => p.tab === sessionTabId && p.terminal && p.labels?.meshRunner !== "true").map((p) => p.terminal),
+            ...allPanesList.filter((p) => p.tab === sessionTabId && p.terminal && p.labels?.cognivisorRunner !== "true").map((p) => p.terminal),
             ...(agents() || []).filter((a) => a.tab === sessionTabId).map((a) => a.address),
           ])
         )
@@ -2008,7 +2008,7 @@ export default class ChangesReview extends View {
 
         if (sessionTabId && sessionBaseline) {
           const startedAt = sessionBaseline.startedAt || 0;
-          const flowsNow = readPlainObject(shared("mesh.flows"));
+          const flowsNow = readPlainObject(shared("cognivisor.flows"));
           const curFlowNow = readPlainObject(flowsNow[sessionTabId]);
           const prevSessionRepos = new Set(
             Array.isArray(curFlowNow.sessionRepos) ? curFlowNow.sessionRepos.map((r) => normPathStr(r)).filter(Boolean) : []
@@ -2103,8 +2103,8 @@ export default class ChangesReview extends View {
         this.services = services;
         this.root = services[0]?.root || workspaceRoot;
 
-        // Check external mesh.activeService
-        const sharedActive = shared("mesh.activeService");
+        // Check external cognivisor.activeService
+        const sharedActive = shared("cognivisor.activeService");
         if (sharedActive && normPathStr(sharedActive.workspaceRoot) === normWs && typeof sharedActive.ts === "number") {
           if (!this.lastActiveServiceTs || sharedActive.ts > this.lastActiveServiceTs) {
             this.lastActiveServiceTs = sharedActive.ts;
@@ -2117,7 +2117,7 @@ export default class ChangesReview extends View {
           this.activeService = "all";
         }
 
-        const existingBus = shared("mesh.services");
+        const existingBus = shared("cognivisor.services");
         const sameBusWorkspace = Boolean(existingBus && normPathStr(existingBus.workspaceRoot) === normWs);
         const nextCandidates = (sameBusWorkspace && Array.isArray(existingBus.candidates))
           ? existingBus.candidates
@@ -2138,7 +2138,7 @@ export default class ChangesReview extends View {
           const pubTs = Date.now();
           this.lastConsumedBusTs = pubTs;
           this.lastConsumedBusSig = servicesSig;
-          setShared("mesh.services", {
+          setShared("cognivisor.services", {
             tabId: sessionTabId || null,
             workspaceRoot,
             on,
@@ -3590,7 +3590,7 @@ export default class ChangesReview extends View {
 
   renderPanel(cx) {
     const visible = isChangesVisible();
-    const bus = shared("mesh.services");
+    const bus = shared("cognivisor.services");
     const busTs = typeof bus?.ts === "number" ? bus.ts : 0;
     const busSig = bus?.sig || (busTs > 0 ? String(busTs) : "");
     const busChanged = Boolean(busSig && busSig !== this.lastConsumedBusSig);
@@ -3609,7 +3609,7 @@ export default class ChangesReview extends View {
     const curSpace = allSpaces.find((s) => s.active);
     const curTab = (curSpace?.tabs || []).find((t) => t.active);
     if (curSpace?.id && curTab?.id && allPanes.some((p) => p.tab === curTab.id && Boolean(p.terminal))) {
-      const storedAgentTabs = readPlainObject(shared("mesh.spaceAgentTabs"));
+      const storedAgentTabs = readPlainObject(shared("cognivisor.spaceAgentTabs"));
       if (storedAgentTabs[curSpace.id] !== curTab.id) {
         this.scheduleAgentTabSync(cx);
       }
@@ -3618,7 +3618,7 @@ export default class ChangesReview extends View {
     const ctx = this.getSessionContext();
     const activeDiff = readActiveDiff(ctx.spaceId);
     const revTab = findReviewTabInSpace(ctx.spaceId, allSpaces, allPanes);
-    const sharedActive = shared("mesh.activeService");
+    const sharedActive = shared("cognivisor.activeService");
     const extServiceChanged = Boolean(
       sharedActive &&
       normPathStr(sharedActive.workspaceRoot) === normPathStr(this.workspaceRoot) &&

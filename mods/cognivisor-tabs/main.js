@@ -25,15 +25,15 @@ const READ_GIT = [
 ];
 
 const PANEL_DEFS = [
-  { id: "files", label: "Files", icon: "mods/mesh-tabs/icons/files.svg" },
-  { id: "changes", label: "Review", icon: "mods/mesh-tabs/icons/changes.svg" },
-  { id: "git", label: "Git", icon: "mods/mesh-tabs/icons/git.svg" },
+  { id: "files", label: "Files", icon: "mods/cognivisor-tabs/icons/files.svg" },
+  { id: "changes", label: "Review", icon: "mods/cognivisor-tabs/icons/changes.svg" },
+  { id: "git", label: "Git", icon: "mods/cognivisor-tabs/icons/git.svg" },
 ];
 
 const PROBE_COOLDOWN_MS = 8000;
 const ACTIVE_STATUSES = new Set(["working", "done", "blocked"]);
 
-export default class MeshTabs extends View {
+export default class CognivisorTabs extends View {
   init(_props, cx) {
     this.pressed = null;
     this.scroll = ScrollHandle.new();
@@ -100,13 +100,13 @@ export default class MeshTabs extends View {
     this.editingTabId = null;
 
     const ownerSpace = spaces().find((s) => (s.tabs ?? []).some((t) => t.id === id)) || spaces().find((s) => s.active);
-    const flows = asPlainObject(shared("mesh.flows"));
+    const flows = asPlainObject(shared("cognivisor.flows"));
     const existing = asPlainObject(flows[id]);
 
     if (raw) {
       run("tab.rename", { id, name: raw });
       const ticket = extractJiraKey(raw) || existing.ticket || null;
-      setShared("mesh.flows", {
+      setShared("cognivisor.flows", {
         ...flows,
         [id]: {
           ...existing,
@@ -128,7 +128,7 @@ export default class MeshTabs extends View {
           this.probeCache.delete(cacheKey);
         }
       }
-      setShared("mesh.flows", {
+      setShared("cognivisor.flows", {
         ...flows,
         [id]: {
           ...existing,
@@ -148,10 +148,10 @@ export default class MeshTabs extends View {
     cx.notify();
   }
 
-  // Persist per-space panel choices in shared("mesh.spacePanels") without leaving stale transitions.
+  // Persist per-space panel choices in shared("cognivisor.spacePanels") without leaving stale transitions.
   syncPanel(space, panel, body, enabled, cx) {
     if (!space || !panel || !cx) return;
-    const panels = asPlainObject(shared("mesh.spacePanels"));
+    const panels = asPlainObject(shared("cognivisor.spacePanels"));
     const now = panel.hidden ? null : body?.active ?? null;
     if (space.id !== this.space) {
       const first = this.space === undefined;
@@ -187,9 +187,9 @@ export default class MeshTabs extends View {
     try { this.pendingPanelSyncTask?.cancel(); } catch {}
     this.pendingPanelSyncTask = cx.timer.after(0, () => {
       this.pendingPanelSyncTask = null;
-      const latestPanels = asPlainObject(shared("mesh.spacePanels"));
+      const latestPanels = asPlainObject(shared("cognivisor.spacePanels"));
       if (Object.prototype.hasOwnProperty.call(latestPanels, spaceId) && latestPanels[spaceId] === now) return;
-      setShared("mesh.spacePanels", { ...latestPanels, [spaceId]: now });
+      setShared("cognivisor.spacePanels", { ...latestPanels, [spaceId]: now });
     });
   }
 
@@ -197,7 +197,7 @@ export default class MeshTabs extends View {
     const allSpaces = spaces();
     const allPanes = panes();
     const allTerminals = terminals();
-    const flows = asPlainObject(shared("mesh.flows"));
+    const flows = asPlainObject(shared("cognivisor.flows"));
     const now = Date.now();
 
     for (const space of allSpaces) {
@@ -236,7 +236,7 @@ export default class MeshTabs extends View {
       } catch {
         return;
       }
-      if (!info || info.labels?.meshRunner === "true") return;
+      if (!info || info.labels?.cognivisorRunner === "true") return;
 
       const infoStatus = typeof info.status === "string" ? info.status : info.status?.state;
       const firstMessage = typeof info.first_message === "string" ? info.first_message.trim() : "";
@@ -292,7 +292,7 @@ export default class MeshTabs extends View {
       // Re-validate current tab and flow state after async awaits so manual renames always win.
       const freshSpace = spaces().find((s) => s.id === space.id);
       const freshTab = (freshSpace?.tabs ?? []).find((t) => t.id === tab.id);
-      const freshFlows = asPlainObject(shared("mesh.flows"));
+      const freshFlows = asPlainObject(shared("cognivisor.flows"));
       const existing = asPlainObject(freshFlows[tab.id]);
       if (!freshTab || freshTab.named || this.editingTabId === tab.id) return;
       if (existing.manualTitle === true || existing.autoNamed === true) return;
@@ -300,7 +300,7 @@ export default class MeshTabs extends View {
       if (derivedName !== freshTab.name) {
         run("tab.rename", { id: tab.id, name: derivedName });
       }
-      setShared("mesh.flows", {
+      setShared("cognivisor.flows", {
         ...freshFlows,
         [tab.id]: {
           ...existing,
@@ -340,7 +340,7 @@ export default class MeshTabs extends View {
     }
 
     const allPanes = panes();
-    const openFileTabs = asPlainObject(shared("mesh.openFileTabs"));
+    const openFileTabs = asPlainObject(shared("cognivisor.openFileTabs"));
     const stop = (_e, cx) => cx.stop_propagation();
     const button = (id, label, action) =>
       div()
@@ -472,7 +472,7 @@ export default class MeshTabs extends View {
           el.child(div().max_w(170).truncate().child(c.zoomed ? `${displayName} Z` : displayName)),
         )
         .when(c.status === "working", (el) =>
-          el.child(svg("mods/mesh-tabs/icons/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)),
+          el.child(svg("mods/cognivisor-tabs/icons/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)),
         )
         .when(c.status === "blocked" || c.status === "done", (el) =>
           el.child(div().size(6).rounded(3).bg(t[c.status])),
@@ -489,7 +489,7 @@ export default class MeshTabs extends View {
                 cx.stop_propagation();
                 run("tab.close", { id: c.id });
               })
-              .child(svg("mods/mesh-tabs/icons/close.svg").size(12)),
+              .child(svg("mods/cognivisor-tabs/icons/close.svg").size(12)),
           ),
         );
     };
@@ -604,7 +604,7 @@ export default class MeshTabs extends View {
         .child(
           button(
             "minimize",
-            w.platform === "windows" ? svg("mods/mesh-tabs/icons/win-min.svg").size(16) : "−",
+            w.platform === "windows" ? svg("mods/cognivisor-tabs/icons/win-min.svg").size(16) : "−",
             () => run("window.minimize"),
           ),
         )
@@ -612,7 +612,7 @@ export default class MeshTabs extends View {
           button(
             "maximize",
             w.platform === "windows"
-              ? svg(`mods/mesh-tabs/${w.maximized ? "icons/win-restore.svg" : "icons/win-max.svg"}`).size(16)
+              ? svg(`mods/cognivisor-tabs/${w.maximized ? "icons/win-restore.svg" : "icons/win-max.svg"}`).size(16)
               : "□",
             () => run("window.maximize"),
           ),
@@ -621,8 +621,8 @@ export default class MeshTabs extends View {
           button(
             "close-window",
             w.platform === "windows"
-              ? svg("mods/mesh-tabs/icons/win-close.svg").size(16)
-              : svg("mods/mesh-tabs/icons/close.svg").size(13),
+              ? svg("mods/cognivisor-tabs/icons/win-close.svg").size(16)
+              : svg("mods/cognivisor-tabs/icons/close.svg").size(13),
             () => run("window.close"),
           ),
         ),

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# herdr-mesh: installer for the Herdr Multi-Repo Agent IDE mesh layout package
-# Integrates the mesh layout and 5 active mods (files-search, changes-review, git-history, mesh-tabs, mesh-status).
+# herdr-cognivisor: installer for the Herdr Multi-Repo Agent IDE cognivisor layout package
+# Integrates the cognivisor layout and 5 active mods (files-search, changes-review, git-history, cognivisor-tabs, cognivisor-status).
 #
 # Usage:
 #   ./install.sh [--home DIR] [--app-bin PATH]
@@ -9,25 +9,25 @@
 # Options:
 #   --home DIR        Herdr configuration directory (default: $HERDR_APP_HOME or ~/.config/herdr-app)
 #   --app-bin PATH    Path to herdr-app executable
-#   --uninstall       Revert to standard layout, remove mesh layout, shortcuts, and all mods
+#   --uninstall       Revert to standard layout, remove cognivisor layout, shortcuts, and all mods
 #   -h, --help        Show this help message
 
 set -euo pipefail
 
-MODS=(files-search changes-review git-history mesh-tabs mesh-status)
-LEGACY_MODS=(mesh-flow mesh-test mesh-ship)
+MODS=(files-search changes-review git-history cognivisor-tabs cognivisor-status)
+LEGACY_MODS=(mesh-tabs mesh-status mesh-flow mesh-test mesh-ship cognivisor-flow cognivisor-test cognivisor-ship)
 
 here="$(cd "$(dirname "$0")" && pwd)"
 pkg_root="$here"
-layout_src="$pkg_root/layouts/mesh.json"
+layout_src="$pkg_root/layouts/cognivisor.json"
 home="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
 app_bin="${HERDR_APP_BIN:-}"
 mode="install"
-repo_url="https://github.com/JohnMunozR/herdr-mesh"
+repo_url="https://github.com/JohnMunozR/herdr-cognivisor"
 branch="main"
 
-say() { echo "herdr-mesh: $*"; }
-die() { echo "herdr-mesh: error: $*" >&2; exit 1; }
+say() { echo "herdr-cognivisor: $*"; }
+die() { echo "herdr-cognivisor: error: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -57,25 +57,23 @@ layouts_dir="$home/layouts"
 keys_file="$home/keys.json"
 
 if [ "$mode" = "uninstall" ]; then
-  say "Uninstalling herdr-mesh layout and mods..."
+  say "Uninstalling herdr-cognivisor layout and mods..."
 
-  # 1. Switch layout back to main if mesh was active
+  # 1. Switch layout back to main if cognivisor or legacy mesh was active
   if [ -n "$HERDR_BIN" ]; then
     say "Switching active layout back to 'main'..."
     "$HERDR_BIN" do layout.switch '{"name":"main"}' 2>/dev/null || true
   fi
 
-  # 2. Remove mesh layout and cached state
-  if [ -f "$layouts_dir/mesh.json" ]; then
-    rm -f "$layouts_dir/mesh.json"
-    say "Removed $layouts_dir/mesh.json"
-  fi
-  if [ -f "$layouts_dir/.state/mesh.json" ]; then
-    rm -f "$layouts_dir/.state/mesh.json"
-    say "Removed cached state $layouts_dir/.state/mesh.json"
-  fi
+  # 2. Remove cognivisor (and any legacy mesh) layout and cached state
+  for stale_layout in "$layouts_dir/cognivisor.json" "$layouts_dir/.state/cognivisor.json" "$layouts_dir/mesh.json" "$layouts_dir/.state/mesh.json"; do
+    if [ -f "$stale_layout" ]; then
+      rm -f "$stale_layout"
+      say "Removed $stale_layout"
+    fi
+  done
 
-  # 3. Clean up keys.json (files-search, changes-review, git-history, and mesh-* bindings)
+  # 3. Clean up keys.json (files-search, changes-review, git-history, cognivisor-*, and legacy mesh-* bindings)
   if [ -f "$keys_file" ] && command -v python3 >/dev/null 2>&1; then
     KEYS_FILE="$keys_file" python3 -c '
 import json, os, re
@@ -87,7 +85,7 @@ try:
             keys = json.load(f)
         changed = False
         if isinstance(keys, dict):
-            pattern = re.compile(r"(files-search|changes-review|git-history|mesh-[a-z0-9-]+)")
+            pattern = re.compile(r"(files-search|changes-review|git-history|cognivisor-[a-z0-9-]+|mesh-[a-z0-9-]+)")
             for sec in ("global", "window"):
                 section = keys.get(sec)
                 if isinstance(section, dict):
@@ -99,13 +97,13 @@ try:
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump(keys, f, indent=2)
                     f.write("\n")
-                print("herdr-mesh: Removed herdr-mesh shortcuts from keys.json")
+                print("herdr-cognivisor: Removed herdr-cognivisor shortcuts from keys.json")
 except Exception:
     pass
 '
   fi
 
-  # 4. Remove all mod directories (including legacy mesh-flow, mesh-test, and mesh-ship if present)
+  # 4. Remove all mod directories (including legacy mesh-* and retired cognivisor-* mods if present)
   for mod in "${MODS[@]}" "${LEGACY_MODS[@]}"; do
     target_mod="$target_mods/$mod"
     if [ -d "$target_mod" ]; then
@@ -114,12 +112,12 @@ except Exception:
     fi
   done
 
-  say "✓ herdr-mesh uninstallation complete."
+  say "✓ herdr-cognivisor uninstallation complete."
   exit 0
 fi
 
 # Mode: install
-say "Installing Herdr Mesh layout and ${#MODS[@]} mods into: $home"
+say "Installing Herdr Cognivisor layout and ${#MODS[@]} mods into: $home"
 
 tmp_dir=""
 cleanup() {
@@ -143,21 +141,21 @@ fi
 
 # Fallback: fetch from repository if local sources are missing
 if [ "$sources_present" = false ]; then
-  say "Fetching herdr-mesh package files from GitHub..."
+  say "Fetching herdr-cognivisor package files from GitHub..."
   tmp_dir="$(mktemp -d)"
   if command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
     curl -fsSL "${repo_url}/archive/refs/heads/${branch}.tar.gz" | tar -xz -C "$tmp_dir"
-    pkg_root="$tmp_dir/herdr-mesh-${branch}"
+    pkg_root="$tmp_dir/herdr-cognivisor-${branch}"
   elif command -v git >/dev/null 2>&1; then
     git clone --depth 1 "$repo_url.git" "$tmp_dir/repo"
     pkg_root="$tmp_dir/repo"
   else
     die "Cannot download files: neither curl+tar nor git are available"
   fi
-  layout_src="$pkg_root/layouts/mesh.json"
+  layout_src="$pkg_root/layouts/cognivisor.json"
 fi
 
-[ -f "$layout_src" ] || die "Mesh layout definition not found: $layout_src"
+[ -f "$layout_src" ] || die "Cognivisor layout definition not found: $layout_src"
 for mod in "${MODS[@]}"; do
   [ -d "$pkg_root/mods/$mod" ] || die "Mod source not found: $pkg_root/mods/$mod"
 done
@@ -180,6 +178,12 @@ copy_mod_clean() {
     rm -f "$dest/SPEC.md" "$dest/jsconfig.json" "$dest/gpui-kit.d.ts"
   fi
 }
+
+# Migrate legacy runtime directory from mesh -> cognivisor when upgrading cleanly
+if [ -d "$home/mesh" ] && [ ! -e "$home/cognivisor" ]; then
+  mv "$home/mesh" "$home/cognivisor"
+  say "Migrated runtime state from $home/mesh to $home/cognivisor"
+fi
 
 mkdir -p "$target_mods"
 for legacy_mod in "${LEGACY_MODS[@]}"; do
@@ -214,15 +218,21 @@ if [ -n "$HERDR_BIN" ]; then
   done
 fi
 
-# Install mesh layout
+# Install cognivisor layout and clean up legacy mesh layout files if present
 mkdir -p "$layouts_dir"
-say "Installing mesh layout: $layouts_dir/mesh.json"
-cp "$layout_src" "$layouts_dir/mesh.json"
+for stale_layout in "$layouts_dir/mesh.json" "$layouts_dir/.state/mesh.json"; do
+  if [ -f "$stale_layout" ]; then
+    rm -f "$stale_layout"
+    say "Removed legacy layout file $stale_layout"
+  fi
+done
+say "Installing cognivisor layout: $layouts_dir/cognivisor.json"
+cp "$layout_src" "$layouts_dir/cognivisor.json"
 
 # Invalidate stale layout cache state if present
-if [ -f "$layouts_dir/.state/mesh.json" ]; then
-  rm -f "$layouts_dir/.state/mesh.json"
-  say "Refreshed layout cache state for mesh.json"
+if [ -f "$layouts_dir/.state/cognivisor.json" ]; then
+  rm -f "$layouts_dir/.state/cognivisor.json"
+  say "Refreshed layout cache state for cognivisor.json"
 fi
 
 # Merge shortcuts into keys.json using setdefault safely
@@ -254,16 +264,16 @@ keys["global"].setdefault("alt-f", "mod.open:files-search")
 with open(path, "w", encoding="utf-8") as f:
     json.dump(keys, f, indent=2)
     f.write("\n")
-print("herdr-mesh: Registered Ctrl+P and Alt+F in keys.json")
+print("herdr-cognivisor: Registered Ctrl+P and Alt+F in keys.json")
 '
 fi
 
-# Activate mesh layout and select initial panel safely if herdr-app is reachable
+# Activate cognivisor layout and select initial panel safely if herdr-app is reachable
 if [ -n "$HERDR_BIN" ]; then
-  say "Activating mesh layout in Herdr..."
-  "$HERDR_BIN" do layout.switch '{"name":"mesh"}' 2>/dev/null || true
+  say "Activating cognivisor layout in Herdr..."
+  "$HERDR_BIN" do layout.switch '{"name":"cognivisor"}' 2>/dev/null || true
   "$HERDR_BIN" do layout.select --stack panel-body --child files 2>/dev/null || true
   "$HERDR_BIN" do layout.show --id panel 2>/dev/null || true
 fi
 
-say "✓ Herdr Mesh layout and ${#MODS[@]} mods installed successfully!"
+say "✓ Herdr Cognivisor layout and ${#MODS[@]} mods installed successfully!"

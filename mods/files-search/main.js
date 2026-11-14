@@ -175,7 +175,7 @@ function syncSpaceAgentTabs() {
   const allSpaces = spaces() || [];
   if (!allSpaces.length) return;
   const allPanes = panes() || [];
-  const prev = asPlainObject(shared("mesh.spaceAgentTabs"));
+  const prev = asPlainObject(shared("cognivisor.spaceAgentTabs"));
   const next = {};
 
   for (const space of allSpaces) {
@@ -199,7 +199,7 @@ function syncSpaceAgentTabs() {
   }
 
   if (!shallowEqualStringMap(prev, next)) {
-    setShared("mesh.spaceAgentTabs", next);
+    setShared("cognivisor.spaceAgentTabs", next);
   }
 }
 
@@ -221,7 +221,7 @@ function location() {
     || null;
 
   const tabHasTerminal = tabId => Boolean(tabId && spacePanes.some(p => p.tab === tabId && Boolean(p.terminal)));
-  const openFileTabs = asPlainObject(shared("mesh.openFileTabs"));
+  const openFileTabs = asPlainObject(shared("cognivisor.openFileTabs"));
   const isFileViewerTab = tabId => Boolean(
     tabId && (
       openFileTabs[tabId] ||
@@ -236,7 +236,7 @@ function location() {
   if (activeTab && !isNonTerminalActive) {
     anchoredTabId = activeTab.id;
   } else {
-    const storedAgentTabId = space?.id ? asPlainObject(shared("mesh.spaceAgentTabs"))[space.id] : null;
+    const storedAgentTabId = space?.id ? asPlainObject(shared("cognivisor.spaceAgentTabs"))[space.id] : null;
     if (storedAgentTabId && spaceTabIds.has(storedAgentTabId) && tabHasTerminal(storedAgentTabId)) {
       anchoredTabId = storedAgentTabId;
     } else {
@@ -279,7 +279,7 @@ function location() {
 }
 
 function resolveServiceForFile(root, relOrPath, absPath, isWin = false, localServices = null) {
-  const bus = asPlainObject(shared("mesh.services"));
+  const bus = asPlainObject(shared("cognivisor.services"));
   const merged = [];
   const seenKeys = new Set();
   const addList = list => {
@@ -381,7 +381,7 @@ function openFileInTab({
   );
   const spaceTabIds = new Set((targetSpace.tabs || []).map(t => t?.id).filter(Boolean));
 
-  const rawOpenTabs = asPlainObject(shared("mesh.openFileTabs"));
+  const rawOpenTabs = asPlainObject(shared("cognivisor.openFileTabs"));
   const { tabs: prunedTabs, changed: prunedChanged } = pruneOpenFileTabs(rawOpenTabs, allLiveTabIds, filePaneTabIds);
   const resolvedIcon = resolveFileIcon(absPath, theme());
   const iconPath = resolvedIcon.path;
@@ -407,7 +407,7 @@ function openFileInTab({
         updatedAt: Date.now(),
       },
     };
-    setShared("mesh.openFileTabs", nextTabs);
+    setShared("cognivisor.openFileTabs", nextTabs);
     run("tab.select", { id: match.tabId });
     return { reused: true, tabId: match.tabId, absPath };
   }
@@ -427,7 +427,7 @@ function openFileInTab({
     );
     if (unclaimedTab) {
       if (prunedChanged) {
-        setShared("mesh.openFileTabs", prunedTabs);
+        setShared("cognivisor.openFileTabs", prunedTabs);
       }
       run("tab.select", { id: unclaimedTab.id });
       return { reused: true, tabId: unclaimedTab.id, absPath };
@@ -435,7 +435,7 @@ function openFileInTab({
   }
 
   if (prunedChanged) {
-    setShared("mesh.openFileTabs", prunedTabs);
+    setShared("cognivisor.openFileTabs", prunedTabs);
   }
 
   const existingTitles = new Set();
@@ -1202,7 +1202,7 @@ export default class FilesSearch extends View {
       dirty = true;
     }
 
-    const activeReq = shared("mesh.activeService");
+    const activeReq = shared("cognivisor.activeService");
     if (activeReq && activeReq.ts && activeReq.ts > (this.lastActiveServiceTs || 0)) {
       this.lastActiveServiceTs = activeReq.ts;
       const isWin = Boolean(this.context?.isWindows);
@@ -1255,7 +1255,7 @@ export default class FilesSearch extends View {
 
     const activeSpace = (spaces() || []).find(s => s.active) || null;
     const activeTab = (activeSpace?.tabs || []).find(t => t.active) || null;
-    const openFileTabs = asPlainObject(shared("mesh.openFileTabs"));
+    const openFileTabs = asPlainObject(shared("cognivisor.openFileTabs"));
     const activeViewerEntry = activeTab?.id ? openFileTabs[activeTab.id] : null;
     if (activeViewerEntry && activeViewerEntry.tabId !== this.lastSyncedViewerTabId) {
       this.lastSyncedViewerTabId = activeViewerEntry.tabId;
@@ -1286,7 +1286,7 @@ export default class FilesSearch extends View {
       }
     }
     this.lastActiveServiceTs = Date.now();
-    setShared("mesh.activeService", {
+    setShared("cognivisor.activeService", {
       workspaceRoot: this.root,
       serviceId: this.serviceFilter,
       ts: this.lastActiveServiceTs,
@@ -1297,7 +1297,7 @@ export default class FilesSearch extends View {
   resetServiceFilter(cx) {
     this.serviceFilter = "all";
     this.lastActiveServiceTs = Date.now();
-    setShared("mesh.activeService", {
+    setShared("cognivisor.activeService", {
       workspaceRoot: this.root,
       serviceId: "all",
       ts: this.lastActiveServiceTs,
@@ -1619,12 +1619,12 @@ export default class FilesSearch extends View {
     const tabPaneCwds = activeTabId
       ? Array.from(new Set(allPanesList.filter(p => p.tab === activeTabId && p.cwd).map(p => p.cwd)))
       : [];
-    const tabFlowObj = activeTabId && shared("mesh.flows")?.[activeTabId];
+    const tabFlowObj = activeTabId && shared("cognivisor.flows")?.[activeTabId];
     const tabTermAddrs = activeTabId
       ? Array.from(
           new Set([
             ...(tabFlowObj?.leadTerminal ? [tabFlowObj.leadTerminal] : []),
-            ...allPanesList.filter(p => p.tab === activeTabId && p.terminal && p.labels?.meshRunner !== "true").map(p => p.terminal),
+            ...allPanesList.filter(p => p.tab === activeTabId && p.terminal && p.labels?.cognivisorRunner !== "true").map(p => p.terminal),
             ...(agents() || []).filter(a => a.tab === activeTabId).map(a => a.address),
           ])
         )
@@ -1709,7 +1709,7 @@ export default class FilesSearch extends View {
         if (!this.current(context)) return;
 
         const normCwd = normPathStr(cwd);
-        const prevBus = shared("mesh.services");
+        const prevBus = shared("cognivisor.services");
         const normBusRoot = prevBus?.workspaceRoot ? normPathStr(prevBus.workspaceRoot) : "";
         const prevByRoot = new Map();
         if (prevBus && normBusRoot === normCwd && Array.isArray(prevBus.services)) {
@@ -1729,7 +1729,7 @@ export default class FilesSearch extends View {
             || null;
           const primaryBranch = primaryStatus?.branch || "";
 
-          const freshFlowObj = asPlainObject(shared("mesh.flows"))[activeTabId];
+          const freshFlowObj = asPlainObject(shared("cognivisor.flows"))[activeTabId];
           let sessionBaseline = normalizeSessionBaseline(freshFlowObj?.sessionBaseline);
           if (sessionBaseline && sessionBaseline.workspaceRoot && normCwd && sessionBaseline.workspaceRoot !== normCwd) {
             sessionBaseline = null;
@@ -1887,13 +1887,13 @@ export default class FilesSearch extends View {
           }
 
           const sessionRepos = enrichedServices.map(s => normPathStr(s.root)).filter(Boolean);
-          const latestFlows = asPlainObject(shared("mesh.flows"));
+          const latestFlows = asPlainObject(shared("cognivisor.flows"));
           const curFlow = asPlainObject(latestFlows[activeTabId]);
           const prevRepos = Array.isArray(curFlow.sessionRepos) ? curFlow.sessionRepos.map(r => normPathStr(r)) : [];
           const reposChanged = prevRepos.length !== sessionRepos.length || prevRepos.some((r, idx) => r !== sessionRepos[idx]);
 
           if (baselineDirtyChanged || reposChanged || !curFlow.sessionBaseline || curFlow.sessionStartedAt !== sessionBaseline.startedAt) {
-            setShared("mesh.flows", {
+            setShared("cognivisor.flows", {
               ...latestFlows,
               [activeTabId]: {
                 ...curFlow,
@@ -1943,7 +1943,7 @@ export default class FilesSearch extends View {
         const busStale = !prevBus || !prevBus.ts || (Date.now() - prevBus.ts) >= 45000;
         if (servicesSig !== this.lastPublishedServicesSig || servicesSig !== busSig || busStale) {
           this.lastPublishedServicesSig = servicesSig;
-          setShared("mesh.services", {
+          setShared("cognivisor.services", {
             tabId: activeTabId || null,
             workspaceRoot: cwd,
             on: on || null,
@@ -2444,7 +2444,7 @@ export default class FilesSearch extends View {
     const becameVisible = visible && !this.wasVisible;
     this.wasVisible = visible;
 
-    const activeReq = shared("mesh.activeService");
+    const activeReq = shared("cognivisor.activeService");
     const hasActiveReq = Boolean(activeReq && activeReq.ts && activeReq.ts > (this.lastActiveServiceTs || 0));
     const selectReq = shared("files-search.select");
     const hasSelectReq = Boolean(selectReq && selectReq.ts && selectReq.ts > (this.lastSelectedTs || 0));
@@ -2456,9 +2456,9 @@ export default class FilesSearch extends View {
     );
     const needsAgentAnchorSync = Boolean(
       activeSpace?.id && activeTab?.id && activeTabHasTerminal &&
-      asPlainObject(shared("mesh.spaceAgentTabs"))[activeSpace.id] !== activeTab.id
+      asPlainObject(shared("cognivisor.spaceAgentTabs"))[activeSpace.id] !== activeTab.id
     );
-    const openFileTabs = asPlainObject(shared("mesh.openFileTabs"));
+    const openFileTabs = asPlainObject(shared("cognivisor.openFileTabs"));
     const activeViewerEntry = activeTab?.id ? openFileTabs[activeTab.id] : null;
     const needsViewerSelectionSync = Boolean(
       (activeViewerEntry && activeViewerEntry.tabId !== this.lastSyncedViewerTabId) ||
@@ -2675,7 +2675,7 @@ export default class FilesSearch extends View {
     syncSpaceAgentTabs();
     const loc = location();
     this.searchSpaceId = p?.spaceId || loc.space || spaces().find(s => s.active)?.id || null;
-    this.searchRoot = p?.root || loc.cwd || shared("mesh.services")?.workspaceRoot;
+    this.searchRoot = p?.root || loc.cwd || shared("cognivisor.services")?.workspaceRoot;
     this.searchOn = p?.on ?? loc.on ?? null;
     this.searchIsWindows = !this.searchOn && window()?.platform === "windows";
     this._overlayClosed = false;
@@ -3611,7 +3611,7 @@ export default class FilesSearch extends View {
                 parseSearchOutputLines(gitRes.stdout, q, "", MAX_TEXT_RESULTS, results);
               }
             } else {
-              const bus = shared("mesh.services");
+              const bus = shared("cognivisor.services");
               const hasBusCandidates = Boolean(
                 bus &&
                 normPathStr(bus.workspaceRoot) === normPathStr(root) &&
@@ -3622,7 +3622,7 @@ export default class FilesSearch extends View {
               const services = hasBusCandidates ? bus.candidates : await discoverRepos(root, on, isWindows);
               if (this._overlayClosed || seq !== this.searchSeq) return;
               if (services && services.length > 0) {
-                const activeId = shared("mesh.activeService")?.serviceId;
+                const activeId = shared("cognivisor.activeService")?.serviceId;
                 const ordered = activeId
                   ? [...services].sort((a, b) => (b.id === activeId ? 1 : 0) - (a.id === activeId ? 1 : 0))
                   : services;
@@ -4417,14 +4417,14 @@ export default class FilesSearch extends View {
 
     const visible = (start, end) => !fixed || (end > this.scroll && start < this.scroll + listH);
 
-    const meshInfo = shared("mesh.services");
-    const meshServices = meshInfo?.services || [];
-    const hasMultipleServices = meshServices.length > 1;
+    const cognivisorInfo = shared("cognivisor.services");
+    const cognivisorServices = cognivisorInfo?.services || [];
+    const hasMultipleServices = cognivisorServices.length > 1;
 
     const findServiceForPath = (filePath) => {
       if (!hasMultipleServices || !filePath) return null;
       let best = null;
-      for (const s of meshServices) {
+      for (const s of cognivisorServices) {
         if (s.relPath && (filePath === s.relPath || filePath.startsWith(s.relPath + "/"))) {
           if (!best || s.relPath.length > best.relPath.length) {
             best = s;
@@ -4980,7 +4980,7 @@ export default class FilesSearch extends View {
       allPanes.filter(p => p?.mod === "files-search" && p?.tab).map(p => p.tab)
     );
 
-    const rawOpenTabs = asPlainObject(shared("mesh.openFileTabs"));
+    const rawOpenTabs = asPlainObject(shared("cognivisor.openFileTabs"));
     const { tabs: nextTabs, changed: prunedChanged } = pruneOpenFileTabs(rawOpenTabs, allLiveTabIds, filePaneTabIds);
     let sharedChanged = prunedChanged;
     let dirty = false;
@@ -5033,7 +5033,7 @@ export default class FilesSearch extends View {
     }
 
     if (!this.viewerTabId) {
-      if (sharedChanged) setShared("mesh.openFileTabs", nextTabs);
+      if (sharedChanged) setShared("cognivisor.openFileTabs", nextTabs);
       if (this.viewerClaimRetries < 12) {
         this.viewerClaimRetries++;
         this.scheduleViewerSync(cx, 35);
@@ -5108,7 +5108,7 @@ export default class FilesSearch extends View {
       sharedChanged = true;
     }
     if (sharedChanged) {
-      setShared("mesh.openFileTabs", nextTabs);
+      setShared("cognivisor.openFileTabs", nextTabs);
     }
 
     const syntaxCfg = getEditorSyntaxConfig(t);
@@ -5373,7 +5373,7 @@ export default class FilesSearch extends View {
     const t = theme();
     const allSpaces = spaces() || [];
     const activeSpace = allSpaces.find(s => s.active) || null;
-    const openTabs = asPlainObject(shared("mesh.openFileTabs"));
+    const openTabs = asPlainObject(shared("cognivisor.openFileTabs"));
     const sharedEntry = this.viewerTabId ? openTabs[this.viewerTabId] : null;
     const isActiveNow = Boolean(
       this.viewerTabId && activeSpace && (activeSpace.tabs || []).some(tab => tab.id === this.viewerTabId && tab.active)

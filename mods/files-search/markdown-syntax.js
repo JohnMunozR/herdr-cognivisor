@@ -1,4 +1,4 @@
-// Pure dependency-free, single-pass O(n) Markdown syntax tokenizer shared across herdr-mesh mods.
+// Pure dependency-free, single-pass O(n) Markdown syntax tokenizer shared across herdr-cognivisor mods.
 
 const FENCE_LANG_ALIASES = {
   javascript: "js",

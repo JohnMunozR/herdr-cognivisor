@@ -94,7 +94,7 @@
           },
           "window_drag": true,
           "content": {
-            "mod": "mesh-tabs"
+            "mod": "cognivisor-tabs"
           }
         },
         {
@@ -181,7 +181,7 @@
             "px": 28
           },
           "content": {
-            "mod": "mesh-status"
+            "mod": "cognivisor-status"
           }
         },
         {

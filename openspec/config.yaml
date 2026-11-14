@@ -4,9 +4,9 @@ context: |
   Herdr Layout & GPUI-kit JavaScript mods package for multi-microservice Agent IDE.
   Fractal Spec-Graph governance: goal-and-requirements.md, architecture.md, **/SPEC.md.
   Runtime: Herdr desktop app (gpui-shell 0.7.x) executing GPUI-kit JS views.
-  Shared State: Mod-scoped event bus via shared() and setShared() with mesh.* and mod.* keys.
+  Shared State: Mod-scoped event bus via shared() and setShared() with cognivisor.* and mod.* keys.
   Git access: Strict lock-free flags (--no-optional-locks -c core.fsmonitor=false -c diff.autoRefreshIndex=false).
-  Layouts: layouts/mesh.json is the owned custom layout package.
+  Layouts: layouts/cognivisor.json is the owned custom layout package.
 
 rules:
   proposal:

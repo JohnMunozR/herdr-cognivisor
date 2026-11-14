@@ -2,47 +2,47 @@
 
 ## Intent
 
-Herdr Mesh currently delivers workspace-wide navigation (`files-search`) and multi-repo diff review (`changes-review`), but stops short of orchestrating the full multi-microservice engineering lifecycle. Developers using autonomous CLI agents (`claude`, `gemini`, `codex`, `opencode`, `pi`, `antigravity`) still manually rename generic tabs, track workflow stages mentally, write ad-hoc test artifacts inside repository working trees, poll local service ports and GitHub PRs in separate terminals, and lose track of which terminal is the tab's lead agent versus auxiliary service runners.
+Herdr Cognivisor currently delivers workspace-wide navigation (`files-search`) and multi-repo diff review (`changes-review`), but stops short of orchestrating the full multi-microservice engineering lifecycle. Developers using autonomous CLI agents (`claude`, `gemini`, `codex`, `opencode`, `pi`, `antigravity`) still manually rename generic tabs, track workflow stages mentally, write ad-hoc test artifacts inside repository working trees, poll local service ports and GitHub PRs in separate terminals, and lose track of which terminal is the tab's lead agent versus auxiliary service runners.
 
-This change introduces the complete **Agent IDE Lifecycle** across `layouts/mesh.json`, five new GPUI-kit mods (`mesh-tabs`, `mesh-flow`, `mesh-test`, `mesh-ship`, `mesh-status`), and targeted enhancements to `changes-review`, anchored on an organic terminal-first workflow and strict zero-pollution persistence.
+This change introduces the complete **Agent IDE Lifecycle** across `layouts/cognivisor.json`, five new GPUI-kit mods (`cognivisor-tabs`, `cognivisor-flow`, `cognivisor-test`, `cognivisor-ship`, `cognivisor-status`), and targeted enhancements to `changes-review`, anchored on an organic terminal-first workflow and strict zero-pollution persistence.
 
 ## Scope
 
 ### In Scope
 
-1. **Organic Terminal-First Workflow & Auto-Naming (`mods/mesh-tabs`, `mods/mesh-flow`)**:
+1. **Organic Terminal-First Workflow & Auto-Naming (`mods/cognivisor-tabs`, `mods/cognivisor-flow`)**:
    - Auto-detect generic tab names (`^tb\d+$`, unnamed/index labels, program titles) and derive representative names by extracting Jira keys (`[A-Z][A-Z0-9]{1,9}-\d+`) and summarizing `first_message` via `hc get <t> --json` / `hc read <t>` or falling back to active git branch.
    - Rename tabs via `run("tab.rename", { id, name })` without overwriting manual user renames.
    - Provide 1-click inline tab rename and an explicit `Auto` re-sync trigger in `#flow`.
 
-2. **Six-Stage Tab-Scoped Pipeline & Layout Upgrade (`mods/mesh-flow`, `layouts/mesh.json`)**:
-   - Track per-tab stages (`plan` → `build` → `review` → `test` → `pr_dev` → `promote`) in `shared("mesh.flows")[tabId].stage`.
+2. **Six-Stage Tab-Scoped Pipeline & Layout Upgrade (`mods/cognivisor-flow`, `layouts/cognivisor.json`)**:
+   - Track per-tab stages (`plan` → `build` → `review` → `test` → `pr_dev` → `promote`) in `shared("cognivisor.flows")[tabId].stage`.
    - Couple stage selection with `#panel-body` (`review` → `changes`, `test` → `test`, `pr_dev` / `promote` → `ship`).
-   - Update `layouts/mesh.json` to mount `#flow` (`38px`, `mod: "mesh-flow"`), upgrade `#tabs` (`mesh-tabs`) and `#status` (`mesh-status`), and expand `#panel-body` with `#test` (`mesh-test`) and `#ship` (`mesh-ship`).
+   - Update `layouts/cognivisor.json` to mount `#flow` (`38px`, `mod: "cognivisor-flow"`), upgrade `#tabs` (`cognivisor-tabs`) and `#status` (`cognivisor-status`), and expand `#panel-body` with `#test` (`cognivisor-test`) and `#ship` (`cognivisor-ship`).
 
 3. **Microservice-by-Microservice Review & Checks (`mods/changes-review`)**:
    - Display current Git branch per microservice.
-   - Maintain per-tab, per-service review state (`pending | has_notes | approved`) in `mesh.flows[tabId].reviewedServices`.
+   - Maintain per-tab, per-service review state (`pending | has_notes | approved`) in `cognivisor.flows[tabId].reviewedServices`.
    - Add `Approve Service ✓` (marks service approved and jumps to next unreviewed dirty microservice) and `Checks` (discovers `AGENTS.md`, `CLAUDE.md`, `SPEC.md`, `package.json`, `pom.xml`, `Cargo.toml`, `Makefile`, executes lint/test/check commands, and dispatches failures to the active agent).
-   - Prioritize `mesh.flows[tabId].leadTerminal` in `findActiveAgent()`.
+   - Prioritize `cognivisor.flows[tabId].leadTerminal` in `findActiveAgent()`.
 
-4. **Live Agent-Driven Testing & Playwright E2E (`mods/mesh-test`)**:
-   - Zero-pollution runtime storage under `${appHome()}/mesh/workspaces/<workspaceHash>/test-plans/<tabId>.json` and `screenshots/<tabId>/`.
+4. **Live Agent-Driven Testing & Playwright E2E (`mods/cognivisor-test`)**:
+   - Zero-pollution runtime storage under `${appHome()}/cognivisor/workspaces/<workspaceHash>/test-plans/<tabId>.json` and `screenshots/<tabId>/`.
    - `Ask Agent for Test Plan`, live `watchFolder` + visible polling rendering (`curl` & `e2e` cases), headed/headless browser mode toggle, inline PNG rendering via `image(absPath)` with click-to-zoom overlay, `Approve Plan`, TCP port probing via `ss -tln`, 1-click `+ Service Runner` split panes, optional manual `curl` re-run, and `Send Failures to Agent`.
 
-5. **PR Template & Multi-Service GitHub Promotion (`mods/mesh-ship`)**:
-   - Configurable branch promotion chain (`["development", "ci", "main"]` default) in `shared("mesh.pipelineConfig")` with workspace editing and per-repo overrides.
-   - Configurable PR template (`shared("mesh.pipelineConfig").prTemplate` / `${appHome()}/mesh/pr-template.md`) with `{{ticket}}`, `{{title}}`, `{{services}}`, `{{summary}}`, and `{{testSummary}}` injected into both `gh pr create` and `Ask Agent to Create PRs`.
+5. **PR Template & Multi-Service GitHub Promotion (`mods/cognivisor-ship`)**:
+   - Configurable branch promotion chain (`["development", "ci", "main"]` default) in `shared("cognivisor.pipelineConfig")` with workspace editing and per-repo overrides.
+   - Configurable PR template (`shared("cognivisor.pipelineConfig").prTemplate` / `${appHome()}/cognivisor/pr-template.md`) with `{{ticket}}`, `{{title}}`, `{{services}}`, `{{summary}}`, and `{{testSummary}}` injected into both `gh pr create` and `Ask Agent to Create PRs`.
    - Live `gh` PR monitoring (`statusCheckRollup`, `reviewDecision`, unresolved comments/threads), 1-click `Send Review Comments to Agent`, and single-service or batch promotion PRs.
 
-6. **Status Telemetry & Persistence Hygiene (`mods/mesh-status`, `mods/mesh-tabs`)**:
-   - Replace `tabs`'s `localStorage` `"panels"` store with `shared("mesh.spacePanels")`.
-   - Standardize all `mesh.*` shared bus keys (`mesh.services`, `mesh.activeService`, `mesh.flows`, `mesh.pipelineConfig`, `mesh.spacePanels`, `mesh.testAlert`).
-   - Surface active stage, service status, `mesh.testAlert`, and PR review telemetry in `#status` (`mesh-status`).
+6. **Status Telemetry & Persistence Hygiene (`mods/cognivisor-status`, `mods/cognivisor-tabs`)**:
+   - Replace `tabs`'s `localStorage` `"panels"` store with `shared("cognivisor.spacePanels")`.
+   - Standardize all `cognivisor.*` shared bus keys (`cognivisor.services`, `cognivisor.activeService`, `cognivisor.flows`, `cognivisor.pipelineConfig`, `cognivisor.spacePanels`, `cognivisor.testAlert`).
+   - Surface active stage, service status, `cognivisor.testAlert`, and PR review telemetry in `#status` (`cognivisor-status`).
 
 ### Out of Scope
 
-- Full LSP source-code editing inside Herdr Mesh (remains out of scope per `[[goal-and-requirements]]`).
+- Full LSP source-code editing inside Herdr Cognivisor (remains out of scope per `[[goal-and-requirements]]`).
 - Modifying Herdr's shipped built-in layouts (`main.json`, `terminals.json`, `win98.json`) or built-in mods inside Herdr's core distribution.
 - Automated force-push, interactive rebase, or automated conflict merging from UI panels.
 
@@ -50,26 +50,26 @@ This change introduces the complete **Agent IDE Lifecycle** across `layouts/mesh
 
 ## Impact Analysis
 
-### Layout Blocks (`layouts/mesh.json`)
+### Layout Blocks (`layouts/cognivisor.json`)
 
 | Block ID | Current State | Proposed Change | Impact & Compatibility |
 |---|---|---|---|
-| `#tabs` | `42px`, `mod: "tabs"`, `window_drag: true` | `42px`, `mod: "mesh-tabs"`, `window_drag: true` | Replaces built-in `tabs` only inside `layouts/mesh.json`; adds `test`/`ship` panel buttons, auto-naming, inline rename, and replaces `localStorage` with `mesh.spacePanels`. |
-| `#flow` | Absent | New `38px` block (`mod: "mesh-flow"`) in `#work` above `#work-body` | Reduces `#work-body` vertical viewport by `38px` while providing immediate tab-scoped stage controls and `Auto` re-sync without cluttering `#tabs` or `#main`. |
-| `#panel-body` | Stack with `#files` (`files-search`) and `#changes` (`changes-review`) | Stack with `#files`, `#changes`, `#test` (`mesh-test`), `#ship` (`mesh-ship`) | Preserves `"files"` and `"changes"` child IDs verbatim and keeps `type: "stack"` mutual exclusion; only mounts 1 active child per frame. |
-| `#status` | `28px`, `mod: "workspace-status"` | `28px`, `mod: "mesh-status"` | Preserves machine, branch, agent count, and `app.palette` hint while adding stage, `mesh.testAlert`, and PR review alerts. |
+| `#tabs` | `42px`, `mod: "tabs"`, `window_drag: true` | `42px`, `mod: "cognivisor-tabs"`, `window_drag: true` | Replaces built-in `tabs` only inside `layouts/cognivisor.json`; adds `test`/`ship` panel buttons, auto-naming, inline rename, and replaces `localStorage` with `cognivisor.spacePanels`. |
+| `#flow` | Absent | New `38px` block (`mod: "cognivisor-flow"`) in `#work` above `#work-body` | Reduces `#work-body` vertical viewport by `38px` while providing immediate tab-scoped stage controls and `Auto` re-sync without cluttering `#tabs` or `#main`. |
+| `#panel-body` | Stack with `#files` (`files-search`) and `#changes` (`changes-review`) | Stack with `#files`, `#changes`, `#test` (`cognivisor-test`), `#ship` (`cognivisor-ship`) | Preserves `"files"` and `"changes"` child IDs verbatim and keeps `type: "stack"` mutual exclusion; only mounts 1 active child per frame. |
+| `#status` | `28px`, `mod: "workspace-status"` | `28px`, `mod: "cognivisor-status"` | Preserves machine, branch, agent count, and `app.palette` hint while adding stage, `cognivisor.testAlert`, and PR review alerts. |
 
 ### Shared State Keys (`shared()` / `setShared()`)
 
 | Key | Status | Impact |
 |---|---|---|
-| `mesh.services` | Existing (extended) | Optionally carries `branch` per service; signature check preserves loop-free discovery between `files-search` and `changes-review`, consumed by `mesh-flow`, `mesh-test`, `mesh-ship`, `mesh-status`. |
-| `mesh.activeService` | Existing | Unchanged payload; consumed and updated by `changes-review`, `files-search`, `mesh-test`, and `mesh-ship`. |
-| `mesh.flows` | New | Stores per-tab `stage`, derived/locked title metadata, `leadTerminal`, `reviewedServices`, and PR cache keyed by `tabId`. |
-| `mesh.pipelineConfig` | New | Stores workspace promotion chain (default `["development", "ci", "main"]`), per-repo overrides, PR template string/path, and Playwright browser mode. |
-| `mesh.spacePanels` | New | Replaces `localStorage.getItem("panels")` / `setItem("panels")` in `mesh-tabs`, enforcing zero-`localStorage` invariant across all `herdr-mesh` mods. |
-| `mesh.testAlert` | New | Broadcasts active tab's live test status (`running`, `passed`, `failed`, `plan_ready`) from `mesh-test` to `mesh-status` and `mesh-flow`. |
-| `workspace.panels` | Existing Herdr key | `mesh-tabs` honors `shared("workspace.panels")` fallback `["files", "changes", "test", "ship"]` inside `mesh` layout while avoiding interference with built-in `tabs`. |
+| `cognivisor.services` | Existing (extended) | Optionally carries `branch` per service; signature check preserves loop-free discovery between `files-search` and `changes-review`, consumed by `cognivisor-flow`, `cognivisor-test`, `cognivisor-ship`, `cognivisor-status`. |
+| `cognivisor.activeService` | Existing | Unchanged payload; consumed and updated by `changes-review`, `files-search`, `cognivisor-test`, and `cognivisor-ship`. |
+| `cognivisor.flows` | New | Stores per-tab `stage`, derived/locked title metadata, `leadTerminal`, `reviewedServices`, and PR cache keyed by `tabId`. |
+| `cognivisor.pipelineConfig` | New | Stores workspace promotion chain (default `["development", "ci", "main"]`), per-repo overrides, PR template string/path, and Playwright browser mode. |
+| `cognivisor.spacePanels` | New | Replaces `localStorage.getItem("panels")` / `setItem("panels")` in `cognivisor-tabs`, enforcing zero-`localStorage` invariant across all `herdr-cognivisor` mods. |
+| `cognivisor.testAlert` | New | Broadcasts active tab's live test status (`running`, `passed`, `failed`, `plan_ready`) from `cognivisor-test` to `cognivisor-status` and `cognivisor-flow`. |
+| `workspace.panels` | Existing Herdr key | `cognivisor-tabs` honors `shared("workspace.panels")` fallback `["files", "changes", "test", "ship"]` inside `cognivisor` layout while avoiding interference with built-in `tabs`. |
 | `files-search.*`, `changes-review.*` | Existing | Unchanged; isolated mod-private namespaces remain intact. |
 
 ---
@@ -77,7 +77,7 @@ This change introduces the complete **Agent IDE Lifecycle** across `layouts/mesh
 ## Backwards-Compatibility
 
 1. **Default Herdr Layouts (`main.json`, `terminals.json`, `win98.json`)**:
-   - `herdr-mesh` never mutates or shadows Herdr's shipped `tabs` or `workspace-status` mod directories; the new mods carry distinct `mesh-*` IDs (`mesh-tabs`, `mesh-flow`, `mesh-test`, `mesh-ship`, `mesh-status`) and are bound exclusively inside `layouts/mesh.json`.
+   - `herdr-cognivisor` never mutates or shadows Herdr's shipped `tabs` or `workspace-status` mod directories; the new mods carry distinct `cognivisor-*` IDs (`cognivisor-tabs`, `cognivisor-flow`, `cognivisor-test`, `cognivisor-ship`, `cognivisor-status`) and are bound exclusively inside `layouts/cognivisor.json`.
    - Switching back to `main`, `terminals`, or `win98` continues using stock Herdr mods unaffected.
 2. **Existing `keys.json` Bindings**:
    - Existing `ctrl-p` and `alt-f` (`mod.open:files-search`) bindings remain unchanged.
@@ -92,7 +92,7 @@ This change introduces the complete **Agent IDE Lifecycle** across `layouts/mesh
 | Risk | Mitigation |
 |---|---|
 | `hc get`/`hc read` polling spikes CPU on busy tabs | Debounce and throttle `hc` auto-naming queries; skip already-named (`tab.named === true`) and cached `tabId` sessions unless `Auto` is clicked. |
-| Test artifacts or Playwright screenshots dirty microservice repos | Enforce `${appHome()}/mesh/workspaces/<workspaceHash>/...` paths in prompts and UI writes; never emit files under `space.folder`. |
-| `watchFolder` hits Linux directory limit or misses rapid writes | Watch only the small `${appHome()}/mesh/workspaces/<workspaceHash>/test-plans` folder and pair `watchFolder` with a bounded visible-only polling fallback (`1500ms`). |
-| `gh` CLI unauthenticated or rate-limited | Degrade gracefully in `mesh-ship` with explicit auth/error banners and on-demand refresh rather than aggressive background polling. |
-| Auxiliary service runner splits steal `findActiveAgent()` focus | Persist `leadTerminal` per tab in `mesh.flows[tabId]` and prioritize it across `changes-review`, `mesh-test`, and `mesh-ship`. |
+| Test artifacts or Playwright screenshots dirty microservice repos | Enforce `${appHome()}/cognivisor/workspaces/<workspaceHash>/...` paths in prompts and UI writes; never emit files under `space.folder`. |
+| `watchFolder` hits Linux directory limit or misses rapid writes | Watch only the small `${appHome()}/cognivisor/workspaces/<workspaceHash>/test-plans` folder and pair `watchFolder` with a bounded visible-only polling fallback (`1500ms`). |
+| `gh` CLI unauthenticated or rate-limited | Degrade gracefully in `cognivisor-ship` with explicit auth/error banners and on-demand refresh rather than aggressive background polling. |
+| Auxiliary service runner splits steal `findActiveAgent()` focus | Persist `leadTerminal` per tab in `cognivisor.flows[tabId]` and prioritize it across `changes-review`, `cognivisor-test`, and `cognivisor-ship`. |

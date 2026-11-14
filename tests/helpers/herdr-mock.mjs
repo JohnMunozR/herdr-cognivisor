@@ -104,7 +104,7 @@ export function installHerdrHooks() {
   });
 }
 
-export async function createTempDir(prefix = "herdr-mesh-test-") {
+export async function createTempDir(prefix = "herdr-cognivisor-test-") {
   return fs.mkdtemp(path.join(os.tmpdir(), prefix));
 }
 

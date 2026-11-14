@@ -13,9 +13,9 @@ import {
   trimCleanly,
   summarizePrompt,
   cleanBranchSlug,
-} from "../mods/mesh-tabs/tab-logic.js";
+} from "../mods/cognivisor-tabs/tab-logic.js";
 
-describe("mesh-tabs tab-logic", () => {
+describe("cognivisor-tabs tab-logic", () => {
   test("findNode traverses nested layout nodes", () => {
     const tree = { id: "root", children: [{ id: "panel", children: [{ id: "panel-body" }] }] };
     assert.equal(findNode(tree, "panel-body")?.id, "panel-body");
@@ -33,15 +33,15 @@ describe("mesh-tabs tab-logic", () => {
     assert.equal(isGenericTab({ name: "tb1", named: true }, { name: "claude" }), false);
   });
 
-  test("findLeadPane prefers explicit leadTerminal, ignores meshRunner splits, and prefers agent panes", () => {
+  test("findLeadPane prefers explicit leadTerminal, ignores cognivisorRunner splits, and prefers agent panes", () => {
     const panes = [
       { tab: "t1", terminal: "term-shell", program: { name: "bash", agent: false } },
-      { tab: "t1", terminal: "term-runner", labels: { meshRunner: "true" }, program: { name: "claude", agent: true } },
+      { tab: "t1", terminal: "term-runner", labels: { cognivisorRunner: "true" }, program: { name: "claude", agent: true } },
       { tab: "t1", terminal: "term-lead", program: { name: "claude", agent: true } },
     ];
     const terms = [
       { address: "term-shell", labels: {} },
-      { address: "term-runner", labels: { meshRunner: "true" } },
+      { address: "term-runner", labels: { cognivisorRunner: "true" } },
       { address: "term-lead", labels: {} },
     ];
 
@@ -97,7 +97,7 @@ describe("mesh-tabs tab-logic", () => {
       isReviewTab: false,
       isGitTab: true,
       isViewerTab: true,
-      modIconPath: "mods/mesh-tabs/icons/git.svg",
+      modIconPath: "mods/cognivisor-tabs/icons/git.svg",
       usesAccentTint: true,
     });
 
@@ -107,7 +107,7 @@ describe("mesh-tabs tab-logic", () => {
       isReviewTab: true,
       isGitTab: false,
       isViewerTab: true,
-      modIconPath: "mods/mesh-tabs/icons/changes.svg",
+      modIconPath: "mods/cognivisor-tabs/icons/changes.svg",
       usesAccentTint: true,
     });
 
@@ -135,7 +135,7 @@ describe("mesh-tabs tab-logic", () => {
     });
   });
 
-  test("resolveSpacePanelTarget supports files, changes, and git panels via mesh.spacePanels", () => {
+  test("resolveSpacePanelTarget supports files, changes, and git panels via cognivisor.spacePanels", () => {
     const enabled = ["files", "changes", "git"];
     assert.equal(resolveSpacePanelTarget("files", enabled), "files");
     assert.equal(resolveSpacePanelTarget("changes", enabled), "changes");

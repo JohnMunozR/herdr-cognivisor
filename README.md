@@ -1,26 +1,26 @@
-# Herdr Mesh
+# Herdr Cognivisor
 
 > A unified **Multi-Microservice Agent Workspace** layout and 4-mod suite for the [Herdr](https://github.com/herdr-app) desktop application.
 
-Herdr Mesh adapts Herdr for modern multi-repository and microservice workflows without visual noise or heavyweight IDE chrome. Instead of listing unrelated clean repositories under `/Projects` or hiding sibling microservices edited by an agent started in a single folder, Herdr Mesh tracks session-attributed repositories per tab, auto-names agent tabs from Jira keys and prompts, provides service-by-service code review with per-service checklist tracking, and delivers cross-platform Search Everywhere navigation.
+Herdr Cognivisor adapts Herdr for modern multi-repository and microservice workflows without visual noise or heavyweight IDE chrome. Instead of listing unrelated clean repositories under `/Projects` or hiding sibling microservices edited by an agent started in a single folder, Herdr Cognivisor tracks session-attributed repositories per tab, auto-names agent tabs from Jira keys and prompts, provides service-by-service code review with per-service checklist tracking, and delivers cross-platform Search Everywhere navigation.
 
 ---
 
 ## Key Features & 4-Mod Suite
 
-- **Organic Tab Auto-Naming & Space Panel Memory (`mods/mesh-tabs`):**
+- **Organic Tab Auto-Naming & Space Panel Memory (`mods/cognivisor-tabs`):**
   - Automatically detects generic or unnamed tabs (`^tb\d+$`, numeric indices, `!tab.named`, bare program titles) and inspects `hc get <t> --json` / `hc read <t>` to extract Jira ticket keys (`[A-Z][A-Z0-9]{1,9}-\d+`) and summarize `first_message` (falling back to lock-free `git rev-parse --abbrev-ref HEAD`).
   - Applies concise titles via `run("tab.rename")` while strictly protecting manual user renames (`tab.named === true` or `manualTitle: true`).
-  - Supports double-click inline `InputState` tab renaming, panel drawer toggles (`Files`, `Review`), and per-space panel persistence via `shared("mesh.spacePanels")` with zero `localStorage`.
+  - Supports double-click inline `InputState` tab renaming, panel drawer toggles (`Files`, `Review`), and per-space panel persistence via `shared("cognivisor.spacePanels")` with zero `localStorage`.
 - **Session-Scoped Multi-Repo File Tree & Search Everywhere (`mods/files-search`):**
-  - Anchors the tree root to `space.folder`, discovers repositories (including parent siblings and extra pane `cwd`s), runs lock-free `git status --untracked-files=normal`, and exposes only session-attributed touched repositories via `mesh.services`.
+  - Anchors the tree root to `space.folder`, discovers repositories (including parent siblings and extra pane `cwd`s), runs lock-free `git status --untracked-files=normal`, and exposes only session-attributed touched repositories via `cognivisor.services`.
   - Uses debounced `watchFolder` (ignoring `target/`, `node_modules/`, internal `.git/` lock churn), cached repo discovery (`REPO_CACHE_TTL_MS = 60000`), incremental dirty-folder reloads, hidden-panel polling throttling, and native `fs/promises` local scans on Windows/Linux/macOS.
   - Multi-tab floating Search Everywhere overlay (`All`, `Files`, `Text`) with normalized ripgrep paths (`--path-separator /`), fixed-string `-F` retry on regex characters, exit-code-aware fallback, and clamped live code preview.
 - **Microservice-by-Microservice Review (`mods/changes-review`):**
-  - Consumes `mesh.services` (`sig`-gated, `BUS_MAX_AGE_MS = 90000`) to avoid duplicate scanning, displaying per-service Git branches, JetBrains Mono diffs, `git diff -U99999` hunk context expansion, and inline multi-line review notes.
-  - Maintains a tab-scoped per-service checklist (`pending | has_notes | approved`) in `mesh.flows[tabId].reviewedServices`; `Approve Service ✓` marks the current service approved and advances to the next unreviewed dirty microservice.
+  - Consumes `cognivisor.services` (`sig`-gated, `BUS_MAX_AGE_MS = 90000`) to avoid duplicate scanning, displaying per-service Git branches, JetBrains Mono diffs, `git diff -U99999` hunk context expansion, and inline multi-line review notes.
+  - Maintains a tab-scoped per-service checklist (`pending | has_notes | approved`) in `cognivisor.flows[tabId].reviewedServices`; `Approve Service ✓` marks the current service approved and advances to the next unreviewed dirty microservice.
   - Dispatches structured code review feedback directly to the tab's prioritized `leadTerminal` agent and supports sequential multi-repository commits.
-- **Workspace Telemetry Status Bar (`mods/mesh-status`):**
+- **Workspace Telemetry Status Bar (`mods/cognivisor-status`):**
   - Upgrades `#status` (`28px`) to display active host/machine, multi-service/dirty counts, active branch, live agent activity counters, and `app.palette` shortcut hint.
 - **Lock-Free & Native GPUI Guarantees:**
   - All read-only Git queries enforce `--no-optional-locks -c core.fsmonitor=false -c diff.autoRefreshIndex=false`, and all 4 active mods run purely on `gpui-kit` / `gpui-base` with zero `localStorage`, pure `render()` frames (no synchronous `cx.notify()`/`setShared()` during render), and dynamic `theme()` colors.
@@ -29,25 +29,25 @@ Herdr Mesh adapts Herdr for modern multi-repository and microservice workflows w
 
 ## Spec-Graph & Architecture Overview
 
-Herdr Mesh is structured using the **Fractal Spec-Graph** paired with **OpenSpec**:
+Herdr Cognivisor is structured using the **Fractal Spec-Graph** paired with **OpenSpec**:
 
-- [`goal-and-requirements.md`](file:///home/nmr/Projects/herdr-mesh/goal-and-requirements.md): Product vision, user personas, value drivers, principles, capabilities, and non-goals.
-- [`architecture.md`](file:///home/nmr/Projects/herdr-mesh/architecture.md): Top-level system topology, 4-mod catalog, cross-mod shared state bus contracts, and repo-wide invariants.
-- [`openspec/specs/lifecycle/spec.md`](file:///home/nmr/Projects/herdr-mesh/openspec/specs/lifecycle/spec.md): Authoritative Agent IDE domain specification (`spec-lifecycle`).
-- [`AGENTS.md`](file:///home/nmr/Projects/herdr-mesh/AGENTS.md): Repository instructions and boundary rules for AI execution workers.
-- [`openspec/config.yaml`](file:///home/nmr/Projects/herdr-mesh/openspec/config.yaml): OpenSpec SDD configuration for proposed architectural changes and delta specs.
-- [`.atl/skill-registry.md`](file:///home/nmr/Projects/herdr-mesh/.atl/skill-registry.md): Skill registry indexing Spec-Graph and OpenSpec conventions.
+- [`goal-and-requirements.md`](file:///home/nmr/Projects/herdr-cognivisor/goal-and-requirements.md): Product vision, user personas, value drivers, principles, capabilities, and non-goals.
+- [`architecture.md`](file:///home/nmr/Projects/herdr-cognivisor/architecture.md): Top-level system topology, 4-mod catalog, cross-mod shared state bus contracts, and repo-wide invariants.
+- [`openspec/specs/lifecycle/spec.md`](file:///home/nmr/Projects/herdr-cognivisor/openspec/specs/lifecycle/spec.md): Authoritative Agent IDE domain specification (`spec-lifecycle`).
+- [`AGENTS.md`](file:///home/nmr/Projects/herdr-cognivisor/AGENTS.md): Repository instructions and boundary rules for AI execution workers.
+- [`openspec/config.yaml`](file:///home/nmr/Projects/herdr-cognivisor/openspec/config.yaml): OpenSpec SDD configuration for proposed architectural changes and delta specs.
+- [`.atl/skill-registry.md`](file:///home/nmr/Projects/herdr-cognivisor/.atl/skill-registry.md): Skill registry indexing Spec-Graph and OpenSpec conventions.
 
 ```text
 goal-and-requirements.md (Root requirements)
    └── architecture.md (System topology, shared bus & invariants)
          ├── openspec/specs/lifecycle/spec.md (Agent IDE spec)
-         ├── layouts/SPEC.md (Layout module & layouts/mesh.json)
+         ├── layouts/SPEC.md (Layout module & layouts/cognivisor.json)
          └── mods/SPEC.md (4-mod active suite catalog)
                ├── mods/files-search/SPEC.md (Search Everywhere & session file tree)
                ├── mods/changes-review/SPEC.md (Per-service diff review & checklist)
-               ├── mods/mesh-tabs/SPEC.md (Organic auto-naming & mesh.spacePanels)
-               └── mods/mesh-status/SPEC.md (Workspace status telemetry bar)
+               ├── mods/cognivisor-tabs/SPEC.md (Organic auto-naming & cognivisor.spacePanels)
+               └── mods/cognivisor-status/SPEC.md (Workspace status telemetry bar)
 ```
 
 ---
@@ -72,10 +72,10 @@ goal-and-requirements.md (Root requirements)
 
 ### Automated Installer
 
-Run the included installer to install the 4 active mods (`files-search`, `changes-review`, `mesh-tabs`, `mesh-status`), clean up legacy `mesh-flow` / `mesh-test` / `mesh-ship` directories if present, copy `layouts/mesh.json`, validate each mod with `herdr-app check`, register global keyboard shortcuts safely, and activate the `mesh` layout:
+Run the included installer to install the 4 active mods (`files-search`, `changes-review`, `cognivisor-tabs`, `cognivisor-status`), clean up legacy `cognivisor-flow` / `cognivisor-test` / `cognivisor-ship` directories if present, copy `layouts/cognivisor.json`, validate each mod with `herdr-app check`, register global keyboard shortcuts safely, and activate the `cognivisor` layout:
 
 ```bash
-# Install Herdr Mesh layout, 4 mods, and shortcuts
+# Install Herdr Cognivisor layout, 4 mods, and shortcuts
 ./install.sh
 
 # Target a custom Herdr config directory or custom binary
@@ -87,8 +87,8 @@ Run the included installer to install the 4 active mods (`files-search`, `change
 
 ### Manual Installation
 
-1. Copy the 4 active mod directories (`files-search`, `changes-review`, `mesh-tabs`, `mesh-status`) from `mods/` into `~/.config/herdr-app/mods/` (excluding `SPEC.md`, `jsconfig.json`, and `gpui-kit.d.ts` if you want minimal runtime directories).
-2. Copy `layouts/mesh.json` to `~/.config/herdr-app/layouts/mesh.json` and remove any cached `~/.config/herdr-app/layouts/.state/mesh.json`.
+1. Copy the 4 active mod directories (`files-search`, `changes-review`, `cognivisor-tabs`, `cognivisor-status`) from `mods/` into `~/.config/herdr-app/mods/` (excluding `SPEC.md`, `jsconfig.json`, and `gpui-kit.d.ts` if you want minimal runtime directories).
+2. Copy `layouts/cognivisor.json` to `~/.config/herdr-app/layouts/cognivisor.json` and remove any cached `~/.config/herdr-app/layouts/.state/cognivisor.json`.
 3. Merge keybindings from `keys.json` into `~/.config/herdr-app/keys.json` without overwriting existing user bindings:
    ```json
    {
@@ -98,16 +98,16 @@ Run the included installer to install the 4 active mods (`files-search`, `change
      }
    }
    ```
-4. Activate the **Mesh** layout in Herdr:
+4. Activate the **Cognivisor** layout in Herdr:
    ```bash
-   herdr-app do layout.switch '{"name":"mesh"}'
+   herdr-app do layout.switch '{"name":"cognivisor"}'
    ```
 
 ---
 
 ## Development & Verification
 
-Herdr Mesh views are written in native JavaScript using `gpui-kit` and `gpui-base`, with pure business logic decoupled into intra-mod helper modules (`indexer.js`, `*-logic.js`) so core rules can be unit-tested with Node's native test runner (`node --test`). Every feature or bug fix is expected to add or update unit tests in `tests/*.test.mjs`.
+Herdr Cognivisor views are written in native JavaScript using `gpui-kit` and `gpui-base`, with pure business logic decoupled into intra-mod helper modules (`indexer.js`, `*-logic.js`) so core rules can be unit-tested with Node's native test runner (`node --test`). Every feature or bug fix is expected to add or update unit tests in `tests/*.test.mjs`.
 
 Verify unit tests, mods, scripts, JSON files, and runtime invariants before delivery:
 
@@ -122,7 +122,7 @@ for d in mods/*/; do herdr-app check "$d" || exit 1; done
 for f in mods/*/*.js; do node --check "$f" || exit 1; done
 
 # Verify JSON schema integrity
-node -e 'for (const p of ["package.json", "layouts/mesh.json", "keys.json"]) JSON.parse(require("fs").readFileSync(p, "utf8"));'
+node -e 'for (const p of ["package.json", "layouts/cognivisor.json", "keys.json"]) JSON.parse(require("fs").readFileSync(p, "utf8"));'
 
 # Verify zero localStorage usage across all mod implementations
 ! rg -n "localStorage" mods/*/*.js
@@ -135,4 +135,4 @@ bash -n install.sh && ./install.sh --help
 
 ## License
 
-This project is licensed under the Apache License 2.0. See [LICENSE](file:///home/nmr/Projects/herdr-mesh/LICENSE) for details.
+This project is licensed under the Apache License 2.0. See [LICENSE](file:///home/nmr/Projects/herdr-cognivisor/LICENSE) for details.

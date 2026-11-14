@@ -60,7 +60,7 @@ function extractTicket(text) {
 }
 
 function readFlows() {
-  const value = shared("mesh.flows");
+  const value = shared("cognivisor.flows");
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
@@ -89,7 +89,7 @@ function updateTabFlow(tabId, patch, workspaceRoot = "") {
     !flows[tabId] ||
     Object.keys(patch).some((k) => JSON.stringify(prev[k]) !== JSON.stringify(nextFlow[k]));
   if (!changed) return prev;
-  setShared("mesh.flows", { ...flows, [tabId]: nextFlow });
+  setShared("cognivisor.flows", { ...flows, [tabId]: nextFlow });
   return nextFlow;
 }
 
@@ -105,7 +105,7 @@ function resolveWorkspaceRoot(activeSpace, tabPanes) {
     }
     return paneCwd;
   }
-  const busRoot = shared("mesh.services")?.workspaceRoot;
+  const busRoot = shared("cognivisor.services")?.workspaceRoot;
   return paneCwd || busRoot || "";
 }
 
@@ -128,7 +128,7 @@ function resolveTabAgents(activeTab, flow) {
   for (const pane of tabPanes) {
     if (!pane.terminal || seen.has(pane.terminal)) continue;
     const term = termMap.get(pane.terminal) || null;
-    if (term?.labels?.meshRunner === "true") continue;
+    if (term?.labels?.cognivisorRunner === "true") continue;
     seen.add(pane.terminal);
 
     const agent = agentMap.get(pane.terminal) || null;
@@ -173,7 +173,7 @@ function resolveTabAgents(activeTab, flow) {
 
 function readTabTestAlert(tabId) {
   if (!tabId) return null;
-  const raw = shared("mesh.testAlert");
+  const raw = shared("cognivisor.testAlert");
   if (!raw || typeof raw !== "object") return null;
   if (raw.tabId === tabId) return raw;
   const nested = raw[tabId];
@@ -354,7 +354,7 @@ async function discoverRepos(workspaceRoot, on, isWindows = false) {
   });
 }
 
-export default class MeshFlow extends View {
+export default class CognivisorFlow extends View {
   init(_props, cx) {
     const p = props() || {};
     if (p.role === "shellMenu") {
@@ -364,7 +364,7 @@ export default class MeshFlow extends View {
       this.discoveredServices = null;
       this.loadingServices = false;
 
-      const busServices = shared("mesh.services");
+      const busServices = shared("cognivisor.services");
       const busMatches =
         busServices &&
         Array.isArray(busServices.services) &&
@@ -600,7 +600,7 @@ export default class MeshFlow extends View {
         if (svc.root) args.push("--cwd", svc.root);
         if (spaceId) args.push("--label", `herdr.space=${stripMachinePrefix(spaceId, on)}`);
         if (tabId) args.push("--label", `herdr.tab=${stripMachinePrefix(tabId, on)}`);
-        args.push("--label", "meshRunner=true");
+        args.push("--label", "cognivisorRunner=true");
 
         const res = await hc(args).catch((err) => ({ code: 1, stderr: String(err), stdout: "" }));
         if (!res || res.code !== 0) {
@@ -628,7 +628,7 @@ export default class MeshFlow extends View {
     const spaceId = space?.id || p.spaceId || null;
     const on = p.on !== undefined ? p.on : (space?.machine ?? null);
 
-    const busServices = shared("mesh.services");
+    const busServices = shared("cognivisor.services");
     const workspaceRoot = p.workspaceRoot || space?.folder || busServices?.workspaceRoot || "";
     const normRoot = normalizePath(workspaceRoot);
 
@@ -684,7 +684,7 @@ export default class MeshFlow extends View {
     }
 
     return v_flex()
-      .id("mesh-flow-shell-menu")
+      .id("cognivisor-flow-shell-menu")
       .size_full()
       .min_h(0)
       .p(6)
@@ -703,7 +703,7 @@ export default class MeshFlow extends View {
       )
       .child(
         v_flex()
-          .id("mesh-flow-shell-list")
+          .id("cognivisor-flow-shell-list")
           .flex_1()
           .min_h(0)
           .gap(2)
@@ -725,7 +725,7 @@ export default class MeshFlow extends View {
                 .hover((s) => s.bg(t.hover))
                 .on_click((_e, cx) => this.spawnServiceShell(entry, tabId, spaceId, on, p.overlay, cx))
                 .child(
-                  svg(`mods/mesh-flow/icons/${entry.isRoot ? "terminal" : "layers"}.svg`)
+                  svg(`mods/cognivisor-flow/icons/${entry.isRoot ? "terminal" : "layers"}.svg`)
                     .size(14)
                     .flex_none()
                     .text_color(entry.isRoot ? t.accent : t.muted),
@@ -801,7 +801,7 @@ export default class MeshFlow extends View {
     const stop = (_e, cx) => cx.stop_propagation();
 
     return h_flex()
-      .id("mesh-flow-bar")
+      .id("cognivisor-flow-bar")
       .size_full()
       .min_w(0)
       .px(10)
@@ -868,7 +868,7 @@ export default class MeshFlow extends View {
                     .child(activeTab ? displayTitle : "No active tab"),
                 )
                 .when(Boolean(activeTab), (btn) =>
-                  btn.child(svg("mods/mesh-flow/icons/pencil.svg").size(11).flex_none().text_color(t.dim)),
+                  btn.child(svg("mods/cognivisor-flow/icons/pencil.svg").size(11).flex_none().text_color(t.dim)),
                 ),
             ),
           )
@@ -918,7 +918,7 @@ export default class MeshFlow extends View {
                   .on_mouse_down("left", stop)
                   .on_click((_e, cx) => this.autoDeriveTitle(activeTab, activeSpace, lead, tabPanes, cx)),
               )
-              .child(svg("mods/mesh-flow/icons/sparkles.svg").size(11).flex_none().text_color(isAutoSyncing ? t.accent : t.muted))
+              .child(svg("mods/cognivisor-flow/icons/sparkles.svg").size(11).flex_none().text_color(isAutoSyncing ? t.accent : t.muted))
               .child(isAutoSyncing ? "Syncing…" : "Auto"),
           ),
       )
@@ -959,13 +959,13 @@ export default class MeshFlow extends View {
                     .on_click((_e, cx) => this.selectStage(activeTab, activeSpace, stage, cx)),
                 )
                 .when(isDone, (el) =>
-                  el.child(svg("mods/mesh-flow/icons/check.svg").size(11).flex_none().text_color(t.done || t.accent)),
+                  el.child(svg("mods/cognivisor-flow/icons/check.svg").size(11).flex_none().text_color(t.done || t.accent)),
                 )
                 .child(div().whitespace_nowrap().child(stage.short));
 
               if (idx === 0) return [pill];
               return [
-                svg("mods/mesh-flow/icons/chevron-right.svg").size(11).flex_none().text_color(t.dim),
+                svg("mods/cognivisor-flow/icons/chevron-right.svg").size(11).flex_none().text_color(t.dim),
                 pill,
               ];
             }),
@@ -999,7 +999,7 @@ export default class MeshFlow extends View {
                 .on_mouse_down("left", stop)
                 .on_click((_e, cx) => this.selectStage(activeTab, activeSpace, STAGES[3], cx))
                 .child(
-                  svg("mods/mesh-flow/icons/flask.svg")
+                  svg("mods/cognivisor-flow/icons/flask.svg")
                     .size(11)
                     .flex_none()
                     .text_color(hasFailedTests ? t.blocked : t.working),
@@ -1077,7 +1077,7 @@ export default class MeshFlow extends View {
                   .on_mouse_down("left", stop)
                   .on_click((_e, cx) => this.cycleLeadTerminal(activeTab, activeSpace, cycleCandidates, lead, cx)),
               )
-              .child(svg("mods/mesh-flow/icons/bot.svg").size(11).flex_none().text_color(lead ? t.muted : t.dim))
+              .child(svg("mods/cognivisor-flow/icons/bot.svg").size(11).flex_none().text_color(lead ? t.muted : t.dim))
               .when(Boolean(lead), (el) =>
                 el.child(div().size(6).flex_none().rounded_full().bg(leadStatusColor)),
               )
@@ -1106,7 +1106,7 @@ export default class MeshFlow extends View {
                   .on_mouse_down("left", stop)
                   .on_click(() => {
                     openOverlay({
-                      mod: "mesh-flow",
+                      mod: "cognivisor-flow",
                       kind: "popup",
                       width: 250,
                       height: 320,
@@ -1120,7 +1120,7 @@ export default class MeshFlow extends View {
                     });
                   }),
               )
-              .child(svg("mods/mesh-flow/icons/terminal.svg").size(11).flex_none().text_color(activeTab ? t.muted : t.dim))
+              .child(svg("mods/cognivisor-flow/icons/terminal.svg").size(11).flex_none().text_color(activeTab ? t.muted : t.dim))
               .child("+ Shell"),
           ),
       );

@@ -25,5 +25,5 @@
   - `for d in mods/*/; do herdr-app check "$d" || exit 1; done`
   - `for f in mods/*/*.js shared/*.js; do node --check "$f" || exit 1; done`
   - `bash -n install.sh`
-  - JSON validation (`package.json`, `layouts/mesh.json`, `keys.json`)
+  - JSON validation (`package.json`, `layouts/cognivisor.json`, `keys.json`)
 - [x] 3.2 Run `./install.sh` cleanly and confirm runtime install + verification.

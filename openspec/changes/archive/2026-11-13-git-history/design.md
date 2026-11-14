@@ -34,7 +34,7 @@ Docked Panel (#git, props.role !== "viewer")                Main Comparison Tab 
    - Paired-row layout inside ONE vertical scroll container (`#git-diff-y`) containing two side-by-side columns (`#git-diff-left-x` and `#git-diff-right-x`), each with its own `overflow_x_scrollbar()` and identical explicit row heights (`22px` code lines, `26px` hunk bars).
    - Because `gpui-kit` `ScrollHandle` / `VirtualListScrollHandle` do not expose imperative `scrollOffset` synchronization between two independent vertical scroll areas, putting both columns inside one shared vertical scroll parent guarantees 1:1 native vertical sync while preserving independent horizontal scrolling for long lines on either side.
 3. **All Workspace Repos (Clean + Dirty)**:
-   - Discovers all Git repos under `workspaceRoot` (depth 2 + parent siblings for single-repo workspaces + active-tab `pane.cwd`) regardless of dirty state, enriching matches with `mesh.services` branch/dirty badges when available.
+   - Discovers all Git repos under `workspaceRoot` (depth 2 + parent siblings for single-repo workspaces + active-tab `pane.cwd`) regardless of dirty state, enriching matches with `cognivisor.services` branch/dirty badges when available.
 4. **Read-Only v1 Scope**:
    - All Git invocations (`log`, `for-each-ref`, `diff-tree`, `show`, `diff`, `rev-parse`) are read-only with `READ_GIT` lock-free flags.
 
@@ -121,13 +121,13 @@ v_flex#git-diff-tab-viewer (size_full, bg: t.background)
         └── Scrollbar.vertical("git-diff-unified-y").viewport_from_layout().absolute().inset_0()
 ```
 
-### 3. `mods/mesh-tabs` (`PANEL_DEFS` & Viewer Tab Icon)
+### 3. `mods/cognivisor-tabs` (`PANEL_DEFS` & Viewer Tab Icon)
 
-- Extend `PANEL_DEFS` (`mods/mesh-tabs/main.js`):
-  - `{ id: "files", label: "Files", icon: "mods/mesh-tabs/icons/files.svg" }`
-  - `{ id: "changes", label: "Review", icon: "mods/mesh-tabs/icons/changes.svg" }`
-  - `{ id: "git", label: "Git", icon: "mods/mesh-tabs/icons/git.svg" }`
-- Detect `isGitTab = tabPanes.some((p) => p.mod === "git-history")` in `mesh-tabs` item renderer and render `mods/mesh-tabs/icons/git.svg` with accent tint when active.
+- Extend `PANEL_DEFS` (`mods/cognivisor-tabs/main.js`):
+  - `{ id: "files", label: "Files", icon: "mods/cognivisor-tabs/icons/files.svg" }`
+  - `{ id: "changes", label: "Review", icon: "mods/cognivisor-tabs/icons/changes.svg" }`
+  - `{ id: "git", label: "Git", icon: "mods/cognivisor-tabs/icons/git.svg" }`
+- Detect `isGitTab = tabPanes.some((p) => p.mod === "git-history")` in `cognivisor-tabs` item renderer and render `mods/cognivisor-tabs/icons/git.svg` with accent tint when active.
 
 ---
 
@@ -174,9 +174,9 @@ Never hardcode hex colors inside UI rendering; derive lane palette array dynamic
 |---|---|---|---|
 | `git-history.activeDiff` | `Record<spaceId, GitDiffViewerState>` | `{ spaceId, sourceTabId, repoRoot, repoName, on, commitHash, shortHash, parentHashes, commitSubject, commitAuthor, commitTimestamp, diffMode, openFileKey, openFile, files, expanded, requestSeq, ts }` | Drives the space's single `#main` `git-history` viewer tab. Bumping `requestSeq` on commit or file click triggers deferred `loadViewerDiffNow` via `cx.timer.after(0, ...)`. |
 | `git-history.selectedRepo` | `Record<spaceId, { repoRoot, ts }>` | `{ repoRoot: string, ts: number }` | Persists the selected repo (clean or dirty) per space in `#git`. |
-| `mesh.spacePanels` | `Record<spaceId, "files" \| "changes" \| "git" \| null>` | Panel child ID or `null` | Read/written by `mesh-tabs` for space panel memory. |
-| `mesh.activeService` | `{ workspaceRoot, serviceId, ts }` | Existing format | Synced cleanly by `git-history` on monotonic `ts` changes without overwriting clean-repo inspections. |
-| `mesh.spaceAgentTabs` | `Record<spaceId, tabId>` | Existing format | Updated by `git-history` prior to `tab.new` so `sessionTabId` stays anchored to the space's terminal tab. |
+| `cognivisor.spacePanels` | `Record<spaceId, "files" \| "changes" \| "git" \| null>` | Panel child ID or `null` | Read/written by `cognivisor-tabs` for space panel memory. |
+| `cognivisor.activeService` | `{ workspaceRoot, serviceId, ts }` | Existing format | Synced cleanly by `git-history` on monotonic `ts` changes without overwriting clean-repo inspections. |
+| `cognivisor.spaceAgentTabs` | `Record<spaceId, tabId>` | Existing format | Updated by `git-history` prior to `tab.new` so `sessionTabId` stays anchored to the space's terminal tab. |
 
 ---
 

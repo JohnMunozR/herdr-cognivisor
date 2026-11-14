@@ -289,7 +289,7 @@ export function hasOpenAgentInSpace(targetSpace = null) {
     if (term?.address) termByAddr.set(term.address, term);
   }
   const isRunner = (pane, term) =>
-    pane?.labels?.meshRunner === "true" || term?.labels?.meshRunner === "true";
+    pane?.labels?.cognivisorRunner === "true" || term?.labels?.cognivisorRunner === "true";
 
   const spaceId = space?.id || f?.space || null;
   const spaceTabIds = new Set((space?.tabs || []).map(t => t?.id).filter(Boolean));
@@ -341,7 +341,7 @@ export function hasOpenTerminalInSpace(targetSpace = null) {
     if (term?.address) termByAddr.set(term.address, term);
   }
   const isRunner = (pane, term) =>
-    pane?.labels?.meshRunner === "true" || term?.labels?.meshRunner === "true";
+    pane?.labels?.cognivisorRunner === "true" || term?.labels?.cognivisorRunner === "true";
 
   const spaceId = space?.id || f?.space || null;
   const spaceTabIds = new Set((space?.tabs || []).map(t => t?.id).filter(Boolean));
@@ -415,7 +415,7 @@ function getWorkspaceCachePath(root, on, isWindows) {
   const normRoot = normPathStr(root);
   const baseName = normRoot.split("/").filter(Boolean).pop() || "root";
   const hash = fnv1aHex(makeIndexKey(root, on, isWindows));
-  const dir = join(baseAppHome, "mesh", "workspaces", `${sanitizeSlug(baseName)}-${hash}`);
+  const dir = join(baseAppHome, "cognivisor", "workspaces", `${sanitizeSlug(baseName)}-${hash}`);
   return { dir, filePath: join(dir, "files-index.json") };
 }
 
@@ -741,7 +741,7 @@ export async function ensureWorkspaceIndex({ root, on = null, isWindows = false,
           files = parseIndexedPaths(gitRes.stdout, MAX_OVERLAY_FILES);
         }
       } else {
-        const bus = shared("mesh.services");
+        const bus = shared("cognivisor.services");
         const hasBusCandidates = Boolean(
           bus &&
           normPathStr(bus.workspaceRoot) === normPathStr(root) &&

@@ -1,5 +1,5 @@
 // Pure dependency-free Markdown preview preparation, link validation, and diff planning engine
-// shared across herdr-mesh mods. Keep free of gpui-kit, gpui-base, herdr, and Node imports.
+// shared across herdr-cognivisor mods. Keep free of gpui-kit, gpui-base, herdr, and Node imports.
 import {
   isMarkdownExt,
   isFrontmatterDelimiter,

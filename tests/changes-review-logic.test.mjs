@@ -524,17 +524,17 @@ describe("changes-review review-logic", () => {
   });
 
   test("extractResumeKeyFromTranscript and readDiskSessionBaseline prevent false /resume & cross-workspace collisions", async () => {
-    assert.equal(extractResumeKeyFromTranscript("/home/nmr/.config/herdr-app/mesh/sessions/resume", "/ws"), "");
+    assert.equal(extractResumeKeyFromTranscript("/home/nmr/.config/herdr-app/cognivisor/sessions/resume", "/ws"), "");
     assert.equal(extractResumeKeyFromTranscript("Use /resume to restore a session\n  /resume   Resume chat", "/ws"), "");
     assert.equal(extractResumeKeyFromTranscript("\x1b[36m❯\x1b[0m /resume sess-42", "/ws"), "resume:sess-42");
-    assert.equal(extractResumeKeyFromTranscript("user@dev:~/herdr-mesh$ claude --resume", "/ws"), "resume:/ws");
+    assert.equal(extractResumeKeyFromTranscript("user@dev:~/herdr-cognivisor$ claude --resume", "/ws"), "resume:/ws");
 
     const fs = await import("node:fs/promises");
     const os = await import("node:os");
     const path = await import("node:path");
     const appHomeDir = await fs.mkdtemp(path.join(os.tmpdir(), "herdr-cr-baseline-"));
     try {
-      const ws = "/home/nmr/Projects/herdr-mesh";
+      const ws = "/home/nmr/Projects/herdr-cognivisor";
       const baseline = {
         version: 1,
         startedAt: 1700000000000,
@@ -558,27 +558,27 @@ describe("changes-review review-logic", () => {
   test("resolveWorkspaceRoot defers to paneCwd when spaceFolder is $HOME and matches files-search", () => {
     const appHomeDir = "/home/nmr/.config/herdr-app";
     const cases = [
-      { spaceFolder: "/home/nmr", paneCwd: "/home/nmr/Projects/herdr-mesh", appHomeDir },
+      { spaceFolder: "/home/nmr", paneCwd: "/home/nmr/Projects/herdr-cognivisor", appHomeDir },
       { spaceFolder: "/home/nmr", paneCwd: "/home/nmr", appHomeDir },
       { spaceFolder: "/home/nmr", paneCwd: null, appHomeDir },
-      { spaceFolder: "/home/nmr/Projects", paneCwd: "/home/nmr/Projects/herdr-mesh", appHomeDir },
-      { spaceFolder: "/home/nmr/Projects/herdr-mesh", paneCwd: "/home/nmr/Projects/herdr-mesh/mods", appHomeDir },
-      { spaceFolder: "/home/nmr/Projects/herdr-mesh", paneCwd: "/tmp/scratch", appHomeDir },
+      { spaceFolder: "/home/nmr/Projects", paneCwd: "/home/nmr/Projects/herdr-cognivisor", appHomeDir },
+      { spaceFolder: "/home/nmr/Projects/herdr-cognivisor", paneCwd: "/home/nmr/Projects/herdr-cognivisor/mods", appHomeDir },
+      { spaceFolder: "/home/nmr/Projects/herdr-cognivisor", paneCwd: "/tmp/scratch", appHomeDir },
       { spaceFolder: "C:\\Users\\nmr", paneCwd: "C:\\Users\\nmr\\work\\app", isWindows: true, appHomeDir: "C:\\Users\\nmr\\AppData\\Roaming\\herdr-app" },
     ];
     for (const c of cases) {
       assert.equal(resolveWorkspaceRoot(c), filesSearchResolveWorkspaceRoot(c));
     }
     assert.equal(isHomeDirectoryRoot("/home/nmr", null, appHomeDir), true);
-    assert.equal(resolveWorkspaceRoot(cases[0]), "/home/nmr/Projects/herdr-mesh");
+    assert.equal(resolveWorkspaceRoot(cases[0]), "/home/nmr/Projects/herdr-cognivisor");
     assert.equal(resolveWorkspaceRoot(cases[3]), "/home/nmr/Projects");
-    assert.equal(resolveWorkspaceRoot(cases[4]), "/home/nmr/Projects/herdr-mesh");
+    assert.equal(resolveWorkspaceRoot(cases[4]), "/home/nmr/Projects/herdr-cognivisor");
     assert.equal(resolveWorkspaceRoot(cases[5]), "/tmp/scratch");
     assert.equal(resolveWorkspaceRoot(cases[6]), "C:\\Users\\nmr\\work\\app");
   });
 
   test("parseCommitLogOutput and mergeBusCandidateServices retain clean pushed repos and enrich metadata", () => {
-    const svc = { id: ".", name: "herdr-mesh", root: "/ws/herdr-mesh" };
+    const svc = { id: ".", name: "herdr-cognivisor", root: "/ws/herdr-cognivisor" };
     const logOut = [
       "845bbd4\tfeat(git-history): wave transitions\tJohnMunozR\t2 minutes ago\t845bbd44c7b586209dacee3c495946a6116b3edf\t1794625047",
       "2283aba\tfix(files-search): session baseline\tJohnMunozR\t2 hours ago\t2283abaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1794615446",
@@ -593,13 +593,13 @@ describe("changes-review review-logic", () => {
       hash: "845bbd44c7b586209dacee3c495946a6116b3edf",
       timestamp: 1794625047,
       serviceId: ".",
-      serviceName: "herdr-mesh",
-      repoRoot: "/ws/herdr-mesh",
+      serviceName: "herdr-cognivisor",
+      repoRoot: "/ws/herdr-cognivisor",
     });
     assert.deepEqual(parseCommitLogOutput("", svc), []);
 
     const candidates = [
-      { id: ".", name: "herdr-mesh", relPath: "", root: "/ws/herdr-mesh", isSibling: false, branch: "" },
+      { id: ".", name: "herdr-cognivisor", relPath: "", root: "/ws/herdr-cognivisor", isSibling: false, branch: "" },
       { id: "../mypass", name: "mypass", relPath: "", root: "/ws/mypass", isSibling: true, branch: "dev" },
     ];
     const busServices = [
@@ -610,7 +610,7 @@ describe("changes-review review-logic", () => {
     assert.deepEqual(
       merged.map((s) => ({ root: s.root, workingCount: s.workingCount ?? 0, branch: s.branch })),
       [
-        { root: "/ws/herdr-mesh", workingCount: 0, branch: "" },
+        { root: "/ws/herdr-cognivisor", workingCount: 0, branch: "" },
         { root: "/ws/mypass", workingCount: 2, branch: "dev" },
         { root: "/ws/extra", workingCount: 1, branch: "feat/x" },
       ],
@@ -638,7 +638,7 @@ describe("changes-review review-logic", () => {
       throw new Error(`Unexpected git args: ${args.join(" ")}`);
     };
 
-    const service = { id: ".", name: "herdr-mesh", relPath: "", root: "/ws/herdr-mesh", isSibling: false };
+    const service = { id: ".", name: "herdr-cognivisor", relPath: "", root: "/ws/herdr-cognivisor", isSibling: false };
     const snap = await collectServiceWorkingSnapshot({ ...service }, null, true, { exec: mockExec });
     assert.equal(snap.rawCount, 0);
     assert.equal(snap.files.length, 0);

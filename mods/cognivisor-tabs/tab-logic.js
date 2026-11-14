@@ -1,4 +1,4 @@
-// Pure helper logic for mesh-tabs: layout lookup, lead pane resolution, Jira key extraction, and prompt/branch summarization.
+// Pure helper logic for cognivisor-tabs: layout lookup, lead pane resolution, Jira key extraction, and prompt/branch summarization.
 
 export const JIRA_KEY_RE = /\b([A-Z][A-Z0-9]{1,9}-\d+)\b/;
 export const NON_TICKET_RE = /^(UTF|ISO|SHA|MD|TLS|SSL)-\d+$/i;
@@ -31,11 +31,11 @@ export function classifyViewerTab(tabPanes, openFileEntry = null) {
   const isGitTab = list.some((p) => p?.mod === "git-history");
   const isViewerTab = isFilesTab || isReviewTab || isGitTab;
   const modIconPath = isReviewTab
-    ? "mods/mesh-tabs/icons/changes.svg"
+    ? "mods/cognivisor-tabs/icons/changes.svg"
     : isGitTab
-      ? "mods/mesh-tabs/icons/git.svg"
+      ? "mods/cognivisor-tabs/icons/git.svg"
       : isFilesTab
-        ? (openFileEntry?.iconPath || "mods/mesh-tabs/icons/files.svg")
+        ? (openFileEntry?.iconPath || "mods/cognivisor-tabs/icons/files.svg")
         : null;
   return {
     isFilesTab,
@@ -68,7 +68,7 @@ export function findLeadPane(tabId, allPanes, allTerminals, preferredAddress) {
   }
   const isRunner = (pane) => {
     const term = pane?.terminal ? termByAddr.get(pane.terminal) : null;
-    return pane?.labels?.meshRunner === "true" || term?.labels?.meshRunner === "true";
+    return pane?.labels?.cognivisorRunner === "true" || term?.labels?.cognivisorRunner === "true";
   };
 
   if (preferredAddress) {

@@ -508,7 +508,7 @@ function getLocationContext() {
   const allPanes = panes() || [];
   const space = allSpaces.find((s) => s.active) || null;
   const f = focused();
-  const storedAgentTabs = readPlainObject(shared("mesh.spaceAgentTabs"));
+  const storedAgentTabs = readPlainObject(shared("cognivisor.spaceAgentTabs"));
   const sessionTabId = resolveSessionAgentTabId(space, allPanes, storedAgentTabs);
   const spaceTabs = new Set((space?.tabs ?? []).map((t) => t.id));
   const spacePanes = allPanes.filter((p) => spaceTabs.has(p.tab));
@@ -872,7 +872,7 @@ export default class GitHistory extends View {
     const vp = props() || this.viewerProps || {};
     const allSpaces = spaces() || [];
     const allPanes = panes() || [];
-    const storedAgentTabs = readPlainObject(shared("mesh.spaceAgentTabs"));
+    const storedAgentTabs = readPlainObject(shared("cognivisor.spaceAgentTabs"));
 
     if (this.isViewerMode()) {
       const targetSpaceId = vp.spaceId || null;
@@ -913,9 +913,9 @@ export default class GitHistory extends View {
     if (!activeTab?.id) return;
     const hasTerminal = allPanes.some((p) => p.tab === activeTab.id && Boolean(p.terminal));
     if (!hasTerminal) return;
-    const prev = readPlainObject(shared("mesh.spaceAgentTabs"));
+    const prev = readPlainObject(shared("cognivisor.spaceAgentTabs"));
     if (prev[activeSpace.id] === activeTab.id) return;
-    setShared("mesh.spaceAgentTabs", { ...prev, [activeSpace.id]: activeTab.id });
+    setShared("cognivisor.spaceAgentTabs", { ...prev, [activeSpace.id]: activeTab.id });
   }
 
   scheduleAgentTabSync(cx) {
@@ -945,7 +945,7 @@ export default class GitHistory extends View {
     if (this.sharedSyncTask || !cx?.timer || this.isViewerMode()) return;
     this.sharedSyncTask = cx.timer.after(0, (cx) => {
       this.sharedSyncTask = null;
-      const sharedActive = shared("mesh.activeService");
+      const sharedActive = shared("cognivisor.activeService");
       if (
         sharedActive &&
         normPathStr(sharedActive.workspaceRoot) === normPathStr(this.workspaceRoot) &&
@@ -1130,7 +1130,7 @@ export default class GitHistory extends View {
       )
     );
 
-    const bus = shared("mesh.services");
+    const bus = shared("cognivisor.services");
     const busSigVal = bus?.sig || (typeof bus?.ts === "number" ? String(bus.ts) : "");
     if (busSigVal) this.lastConsumedBusSig = busSigVal;
 
@@ -1152,8 +1152,8 @@ export default class GitHistory extends View {
           this.repoCache = { key: cacheKey, roots: discoveredRoots.slice(), ts: Date.now() };
         }
 
-        // Also include any candidate roots already discovered by mesh.services for the same workspace
-        const freshBus = shared("mesh.services");
+        // Also include any candidate roots already discovered by cognivisor.services for the same workspace
+        const freshBus = shared("cognivisor.services");
         if (
           freshBus &&
           normPathStr(freshBus.workspaceRoot) === normPathStr(loc.cwd) &&
@@ -1190,7 +1190,7 @@ export default class GitHistory extends View {
 
         this.error = null;
         const selectedRepoState = readSelectedRepoEntry(loc.spaceId || "default");
-        const activeServiceState = shared("mesh.activeService");
+        const activeServiceState = shared("cognivisor.activeService");
         const picked =
           resolveSelectedRepo(mergedRepos, selectedRepoState, activeServiceState) ||
           mergedRepos[0];
@@ -1233,9 +1233,9 @@ export default class GitHistory extends View {
     const spaceId = this.getSessionContext().spaceId;
     writeSelectedRepoEntry(spaceId, repo.root);
 
-    // Only broadcast mesh.activeService when the selected repo is in mesh.services (so clean repos don't blank changes-review)
+    // Only broadcast cognivisor.activeService when the selected repo is in cognivisor.services (so clean repos don't blank changes-review)
     if (opts.syncActiveService !== false && this.workspaceRoot) {
-      const bus = shared("mesh.services");
+      const bus = shared("cognivisor.services");
       const busServices = Array.isArray(bus?.services) ? bus.services : [];
       const matchingSvc = busServices.find(
         (s) => normPathStr(s?.root) === normPathStr(repo.root) || (repo.id && s?.id === repo.id)
@@ -1243,7 +1243,7 @@ export default class GitHistory extends View {
       if (matchingSvc?.id) {
         const ts = Date.now();
         this.lastActiveServiceTs = ts;
-        setShared("mesh.activeService", {
+        setShared("cognivisor.activeService", {
           workspaceRoot: this.workspaceRoot,
           serviceId: matchingSvc.id,
           ts,
@@ -3887,7 +3887,7 @@ export default class GitHistory extends View {
 
   renderPanel(cx) {
     const visible = isGitPanelVisible();
-    const bus = shared("mesh.services");
+    const bus = shared("cognivisor.services");
     const busSig = bus?.sig || (typeof bus?.ts === "number" ? String(bus.ts) : "");
     const busChanged = Boolean(busSig && busSig !== this.lastConsumedBusSig);
     const becameVisible = visible && !this.wasVisible;
@@ -3913,13 +3913,13 @@ export default class GitHistory extends View {
     const curSpace = allSpaces.find((s) => s.active);
     const curTab = (curSpace?.tabs || []).find((t) => t.active);
     if (curSpace?.id && curTab?.id && allPanes.some((p) => p.tab === curTab.id && Boolean(p.terminal))) {
-      const storedAgentTabs = readPlainObject(shared("mesh.spaceAgentTabs"));
+      const storedAgentTabs = readPlainObject(shared("cognivisor.spaceAgentTabs"));
       if (storedAgentTabs[curSpace.id] !== curTab.id) {
         this.scheduleAgentTabSync(cx);
       }
     }
 
-    const sharedActive = shared("mesh.activeService");
+    const sharedActive = shared("cognivisor.activeService");
     const extServiceChanged = Boolean(
       sharedActive &&
       normPathStr(sharedActive.workspaceRoot) === normPathStr(this.workspaceRoot) &&

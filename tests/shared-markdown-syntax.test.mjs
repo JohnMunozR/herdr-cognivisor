@@ -470,7 +470,7 @@ describe("shared markdown-syntax tokenizer & mod parity", () => {
       "+++ b/README.md",
       "@@ -1,6 +1,8 @@",
       " ---",
-      " title: Mesh",
+      " title: Cognivisor",
       " ---",
       "-Old prose in class and 12",
       "+New prose in class with `inlineCode` and [link](https://x.dev)",
@@ -483,7 +483,7 @@ describe("shared markdown-syntax tokenizer & mod parity", () => {
     assert.deepEqual(sbsEager.rows[2].left.tokens, [
       ["type", "title"],
       ["comment", ":"],
-      ["plain", " Mesh"],
+      ["plain", " Cognivisor"],
     ]);
     assert.deepEqual(sbsEager.rows[4].left.tokens, [["plain", "Old prose in class and 12"]]);
     assert.ok(sbsEager.rows[4].right.tokens.some(([k, v]) => k === "string" && v === "`inlineCode`"));
@@ -500,7 +500,7 @@ describe("shared markdown-syntax tokenizer & mod parity", () => {
 
     // Deferred Unified + out-of-order tokenizeDeferredRow preserves fence and frontmatter state
     const uniDeferred = buildUnifiedRows(patch, "README.md", { deferTokens: true });
-    const fmRow = uniDeferred.rows.find((r) => r.text === "title: Mesh");
+    const fmRow = uniDeferred.rows.find((r) => r.text === "title: Cognivisor");
     const fenceCodeRow = uniDeferred.rows.find((r) => r.text === "const added = 42;");
     const proseRow = uniDeferred.rows.find((r) => r.text === "Old prose in class and 12");
     tokenizeDeferredRow(fenceCodeRow, "md");
@@ -509,7 +509,7 @@ describe("shared markdown-syntax tokenizer & mod parity", () => {
     assert.deepEqual(fmRow.tokens, [
       ["type", "title"],
       ["comment", ":"],
-      ["plain", " Mesh"],
+      ["plain", " Cognivisor"],
     ]);
     assert.ok(fenceCodeRow.tokens.some(([k, v]) => k === "keyword" && v === "const"));
     assert.deepEqual(proseRow.tokens, [["plain", "Old prose in class and 12"]]);

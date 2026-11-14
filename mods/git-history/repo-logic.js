@@ -131,8 +131,8 @@ export function parseBranchesOutput(stdout) {
   return branches;
 }
 
-export function mergeDiscoveredWithServices(discoveredRoots, meshServices, spaceId = undefined) {
-  let bus = meshServices;
+export function mergeDiscoveredWithServices(discoveredRoots, cognivisorServices, spaceId = undefined) {
+  let bus = cognivisorServices;
   if (
     spaceId &&
     bus &&

@@ -2,7 +2,7 @@
 
 ## Intent
 
-Markdown specifications, proposals, and READMEs (`.md`, `.mdx`) are viewed across four surfaces in Herdr Mesh: the `files-search` File Viewer Tab, the `files-search` Search Everywhere preview pane, the `changes-review` Review Diff Viewer, and the `git-history` Commit Diff Viewer. Today every surface only renders raw text or unified/side-by-side diffs. While raw code remains essential for default speed, line numbers, search matches, and inline review comments, developers frequently want to inspect formatted headings, lists, code blocks, links, and tables cleanly.
+Markdown specifications, proposals, and READMEs (`.md`, `.mdx`) are viewed across four surfaces in Herdr Cognivisor: the `files-search` File Viewer Tab, the `files-search` Search Everywhere preview pane, the `changes-review` Review Diff Viewer, and the `git-history` Commit Diff Viewer. Today every surface only renders raw text or unified/side-by-side diffs. While raw code remains essential for default speed, line numbers, search matches, and inline review comments, developers frequently want to inspect formatted headings, lists, code blocks, links, and tables cleanly.
 
 This change introduces an on-demand **Markdown Rendered Preview toggle** backed by a shared pure preparation engine (`shared/markdown-view-logic.js`) and reusable GPUI adapter (`shared/markdown-view.js`) wrapping Herdr's native `TextView.markdown(...)`.
 
@@ -26,10 +26,10 @@ This change introduces an on-demand **Markdown Rendered Preview toggle** backed 
 - Markdown WYSIWYG editing or saving modified Markdown back to disk.
 - Replacing `TextView.markdown` with a custom HTML/CSS parser.
 - Rendering Markdown by default on file/diff open (raw/diff always opens first per requirement).
-- Changes to `layouts/mesh.json`, `keys.json`, or `mesh.*` cross-mod shared state contracts.
+- Changes to `layouts/cognivisor.json`, `keys.json`, or `cognivisor.*` cross-mod shared state contracts.
 
 ## Impact Analysis
 
-- **Layouts & Keybindings**: No modifications to `layouts/mesh.json` or `keys.json`; zero backwards-compatibility impact on existing `main.json`, `terminals.json`, or `win98.json` layouts.
-- **Shared Bus Contracts**: No new `mesh.*` global keys required; toggle state remains local to each viewer instance (`viewerMarkdownRendered`, `previewMarkdownRendered`, etc.).
+- **Layouts & Keybindings**: No modifications to `layouts/cognivisor.json` or `keys.json`; zero backwards-compatibility impact on existing `main.json`, `terminals.json`, or `win98.json` layouts.
+- **Shared Bus Contracts**: No new `cognivisor.*` global keys required; toggle state remains local to each viewer instance (`viewerMarkdownRendered`, `previewMarkdownRendered`, etc.).
 - **Performance & Memory**: Zero allocations, zero extra disk/git reads, and zero `TextView.markdown` builds while rendered preview is OFF (the default).

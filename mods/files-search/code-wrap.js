@@ -1,4 +1,4 @@
-// Shared soft line-wrapping engine for Herdr Mesh viewers (Node + QuickJS).
+// Shared soft line-wrapping engine for Herdr Cognivisor viewers (Node + QuickJS).
 // Canonical source: shared/code-wrap.js -> synced to mods/{files-search,changes-review,git-history}/code-wrap.js.
 
 export const DEFAULT_TAB_SIZE = 4;

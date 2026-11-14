@@ -11,7 +11,7 @@ tags: [shared, pure-logic, ui-adapters, wrapping, dropdown, markdown, sync]
 
 ## Responsibility
 
-The `module-shared` directory holds the canonical source of truth for reusable pure JavaScript engines and shared GPUI UI adapters consumed across multiple `herdr-mesh` mods without violating Herdr's per-mod bundling and `herdr-app check` sandboxing rules (which disallow relative `../` imports across `mods/*/` directories).
+The `module-shared` directory holds the canonical source of truth for reusable pure JavaScript engines and shared GPUI UI adapters consumed across multiple `herdr-cognivisor` mods without violating Herdr's per-mod bundling and `herdr-app check` sandboxing rules (which disallow relative `../` imports across `mods/*/` directories).
 
 Developers and AI agents MUST inspect `shared/` first before creating any new wrapper, dropdown popover, syntax tokenizer, rendered Markdown viewer, or reusable GPUI widget inside an individual mod, and extend or reuse these canonical components via `scripts/sync-shared.mjs` and `install.sh`.
 
