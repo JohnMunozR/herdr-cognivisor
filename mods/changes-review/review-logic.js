@@ -1429,3 +1429,229 @@ export function filterUnbaselinedRepoEntries(entries, sessionStartedAt, opts = {
   }
   return { sessionFiles: [], backfillDirtyFiles };
 }
+
+export const READ_GIT_FLAGS = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
+export const BASE_BRANCH_NAMES = new Set(["main", "master", "development", "develop", "ci", "HEAD", ""]);
+
+/** Parse tab-delimited `git log` output into commit selector entries. */
+export function parseCommitLogOutput(stdout, service) {
+  const lines = String(stdout || "").trim().split("\n").filter(Boolean);
+  return lines.map((line) => {
+    const [shortHash, subject, author, date, hash, ts] = line.split("\t");
+    return {
+      shortHash,
+      subject,
+      author,
+      date,
+      hash,
+      timestamp: Number(ts) || 0,
+      serviceId: service?.id || ".",
+      serviceName: service?.name || "root",
+      repoRoot: service?.root || "",
+    };
+  });
+}
+
+/**
+ * Merge `mesh.services` candidates with any already-enriched service metadata so
+ * clean or recently pushed repositories are still inspected for session commits.
+ */
+export function mergeBusCandidateServices(candidates, busServices = [], isWindows = false) {
+  const byRoot = new Map();
+  const byId = new Map();
+  for (const s of Array.isArray(busServices) ? busServices : []) {
+    if (!s) continue;
+    const rootKey = s.root ? normCmpStr(s.root, isWindows) : "";
+    if (rootKey && !byRoot.has(rootKey)) byRoot.set(rootKey, s);
+    if (s.id && !byId.has(s.id)) byId.set(s.id, s);
+  }
+
+  const merged = [];
+  const seenRoots = new Set();
+  for (const c of Array.isArray(candidates) ? candidates : []) {
+    if (!c) continue;
+    const rootKey = c.root ? normCmpStr(c.root, isWindows) : "";
+    if (rootKey) {
+      if (seenRoots.has(rootKey)) continue;
+      seenRoots.add(rootKey);
+    }
+    const enriched = (rootKey && byRoot.get(rootKey)) || (c.id && byId.get(c.id)) || null;
+    merged.push({
+      ...c,
+      ...(enriched || {}),
+      branch: enriched?.branch || c.branch || "",
+    });
+  }
+
+  for (const s of Array.isArray(busServices) ? busServices : []) {
+    if (!s) continue;
+    const rootKey = s.root ? normCmpStr(s.root, isWindows) : "";
+    if (rootKey) {
+      if (seenRoots.has(rootKey)) continue;
+      seenRoots.add(rootKey);
+    }
+    merged.push({ ...s });
+  }
+  return merged;
+}
+
+/** Count unpushed commits relative to the first matching base branch via `exec`. */
+export async function repoAheadCountWithExec(root, branch, on, execFn, opts = {}) {
+  const baseBranches = opts.baseBranches || BASE_BRANCH_NAMES;
+  const readFlags = opts.readFlags || READ_GIT_FLAGS;
+  if (!branch || baseBranches.has(branch) || typeof execFn !== "function") return 0;
+  const refs = await execFn(
+    "git",
+    [...readFlags, "for-each-ref", "--format=%(refname:short)", "refs/heads/development", "refs/heads/main", "refs/heads/master", "refs/heads/ci"],
+    { cwd: root, on },
+  ).catch(() => null);
+  const avail = new Set((refs?.code === 0 ? refs.stdout : "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
+  for (const base of ["development", "main", "master", "ci"]) {
+    if (!avail.has(base)) continue;
+    const check = await execFn("git", [...readFlags, "rev-list", "--count", `${base}..HEAD`], { cwd: root, on }).catch(() => null);
+    if (check && check.code === 0) {
+      const n = parseInt((check.stdout || "").trim(), 10);
+      if (!Number.isNaN(n)) return n;
+    }
+  }
+  return 0;
+}
+
+/** Fetch recent commits for `ref` using lock-free Git flags and `--` disambiguation. */
+export async function listCommitsWithExec(root, ref, on, service, execFn, readFlags = READ_GIT_FLAGS) {
+  if (!ref || typeof execFn !== "function") return [];
+  const r = await execFn(
+    "git",
+    [...readFlags, "log", "-n", "30", "--format=%h%x09%s%x09%an%x09%cr%x09%H%x09%ct", ref, "--"],
+    { cwd: root, on },
+  ).catch(() => null);
+  if (!r || r.code !== 0) return [];
+  return parseCommitLogOutput(r.stdout, { ...(service || {}), root: service?.root || root });
+}
+
+/**
+ * Inspect working tree status, ahead count, and optional commit history for one repository.
+ * Always loads recent commits when `includeCommits` is true, even on clean pushed repos.
+ */
+export async function collectServiceWorkingSnapshot(service, on, includeCommits = true, deps = {}) {
+  const execFn = deps.exec;
+  const fsDeps = deps.fsPromises || fsPromises;
+  const readFlags = deps.readFlags || READ_GIT_FLAGS;
+  const baseBranches = deps.baseBranches || BASE_BRANCH_NAMES;
+
+  try {
+    if (typeof execFn !== "function") throw new Error("Missing exec helper");
+    const git = (args) => execFn("git", [...readFlags, ...args], { cwd: service.root, on });
+    const status = await git(["status", "--porcelain=v1", "-b", "-z", "--no-renames", "--untracked-files=normal"]);
+    if (status.code !== 0) throw new Error(status.stderr || `status failed on ${service.name}`);
+
+    const records = status.stdout.split("\0").filter(Boolean);
+    let branch = service.branch || "HEAD";
+    let parsedAhead = null;
+    const rawEntries = [];
+    for (const rec of records) {
+      if (rec.startsWith("## ")) {
+        const parsed = parsePorcelainHeader(rec);
+        branch = parsed.branch || branch;
+        parsedAhead = parsed.ahead;
+      } else {
+        rawEntries.push(rec);
+      }
+    }
+
+    const aheadCount = parsedAhead !== null
+      ? parsedAhead
+      : await repoAheadCountWithExec(service.root, branch, on, execFn, { readFlags, baseBranches });
+
+    if (rawEntries.length === 0) {
+      const commits = includeCommits
+        ? await listCommitsWithExec(service.root, branch, on, service, execFn, readFlags)
+        : [];
+      service.workingCount = 0;
+      service.aheadCount = aheadCount;
+      service.branch = branch;
+      return { service, files: [], commits, branch, rawCount: 0, touched: aheadCount > 0 || commits.length > 0 };
+    }
+
+    const dirEntries = [];
+    const fileEntries = [];
+    for (const entry of rawEntries) {
+      const xy = entry.slice(0, 2);
+      const p = entry.slice(3);
+      if (!p) continue;
+      if (xy === "??" && p.endsWith("/")) {
+        dirEntries.push(p.replace(/\/+$/, ""));
+      } else {
+        fileEntries.push({ xy, path: p.replace(/\/+$/, "") });
+      }
+    }
+    if (dirEntries.length > 0) {
+      const ls = await git(["ls-files", "--others", "--exclude-standard", "-z", "--", ...dirEntries]).catch(() => null);
+      if (ls?.code === 0 && ls.stdout) {
+        for (const expandedPath of ls.stdout.split("\0").filter(Boolean)) {
+          fileEntries.push({ xy: "??", path: expandedPath });
+        }
+      }
+    }
+
+    const commits = includeCommits
+      ? await listCommitsWithExec(service.root, branch, on, service, execFn, readFlags)
+      : [];
+    let serviceHasHead = true;
+    const stats = {};
+    if (fileEntries.length > 0) {
+      const head = await git(["rev-parse", "--verify", "HEAD"]);
+      serviceHasHead = head.code === 0;
+      const results = serviceHasHead
+        ? [await git(["diff", "HEAD", "--numstat", "-z", "--no-renames"])]
+        : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]), await git(["diff", "--numstat", "-z", "--no-renames"])];
+
+      for (const result of results) {
+        if (result.code !== 0) throw new Error(result.stderr || `diff failed on ${service.name}`);
+        for (const entry of result.stdout.split("\0")) {
+          const [a, d, ...parts] = entry.split("\t");
+          if (!parts.length) continue;
+          const p = parts.join("\t"), old = stats[p] ?? { add: 0, del: 0 };
+          stats[p] = { add: old.add + (Number(a) || 0), del: old.del + (Number(d) || 0), binary: a === "-" };
+        }
+      }
+    }
+
+    const files = await Promise.all(
+      fileEntries.map(async ({ xy, path }) => {
+        const fresh = xy === "??";
+        const s = normalizeGitStatusMark(xy);
+        const lineStat = stats[path] ?? { add: 0, del: 0 };
+        const { sig, mtimeMs } = s === "D"
+          ? { sig: "deleted", mtimeMs: 0 }
+          : await statFileEntry(join(service.root, path), s, on, fsDeps);
+        return {
+          key: `${service.id}::${path}`,
+          serviceId: service.id,
+          serviceName: service.name,
+          relPrefix: service.relPath,
+          repoRoot: service.root,
+          hasHead: serviceHasHead,
+          path,
+          relFile: path,
+          displayPath: service.relPath ? `${service.relPath}/${path}` : (service.isSibling ? `${service.name}/${path}` : path),
+          status: s,
+          fresh,
+          sig,
+          mtimeMs,
+          ...lineStat,
+        };
+      }),
+    );
+
+    service.workingCount = rawEntries.length;
+    service.aheadCount = aheadCount;
+    service.branch = branch;
+    return { service, files, commits, branch, rawCount: rawEntries.length, touched: true };
+  } catch (e) {
+    service.workingCount = 0;
+    service.aheadCount = 0;
+    service.branch = service.branch || "HEAD";
+    return { service, files: [], commits: [], branch: service.branch, rawCount: 0, touched: false, error: e };
+  }
+}

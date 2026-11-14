@@ -38,6 +38,9 @@ import {
   extractResumeKeyFromTranscript,
   filterUnbaselinedRepoEntries,
   resolveWorkspaceRoot,
+  READ_GIT_FLAGS,
+  mergeBusCandidateServices,
+  collectServiceWorkingSnapshot,
 } from "./review-logic.js";
 
 function readPlainObject(val) {
@@ -184,7 +187,7 @@ const key = () => {
 
 // Reads write nothing under .git (no index refresh or lock, no fsmonitor cookie):
 // the folder watch would see it, and every refresh would start the next one.
-const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
+const READ = READ_GIT_FLAGS;
 const countLines = (text) => text ? text.split("\n").length - Number(text.endsWith("\n")) : 0;
 
 function getDiffColors(t) {
@@ -227,7 +230,6 @@ function syntaxTokenColor(kind, t) {
   return diffSyntaxTokenColor(kind, t);
 }
 
-const BASE_BRANCHES = new Set(["main", "master", "development", "develop", "ci", "HEAD", ""]);
 const REPO_CACHE_TTL_MS = 60000;
 const BUS_MAX_AGE_MS = 90000;
 const WATCH_DEBOUNCE_MS = 800;
@@ -459,156 +461,8 @@ function repoMatchesTranscript(service, files, transcript) {
   return false;
 }
 
-async function repoAheadCount(root, branch, on) {
-  if (!branch || BASE_BRANCHES.has(branch)) return 0;
-  const refs = await exec(
-    "git",
-    [...READ, "for-each-ref", "--format=%(refname:short)", "refs/heads/development", "refs/heads/main", "refs/heads/master", "refs/heads/ci"],
-    { cwd: root, on }
-  ).catch(() => null);
-  const avail = new Set((refs?.code === 0 ? refs.stdout : "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
-  for (const base of ["development", "main", "master", "ci"]) {
-    if (!avail.has(base)) continue;
-    const check = await exec("git", [...READ, "rev-list", "--count", `${base}..HEAD`], { cwd: root, on }).catch(() => null);
-    if (check && check.code === 0) {
-      const n = parseInt((check.stdout || "").trim(), 10);
-      if (!Number.isNaN(n)) return n;
-    }
-  }
-  return 0;
-}
-
-async function listCommits(root, ref, on, service) {
-  if (!ref) return [];
-  const r = await exec("git", [...READ, "log", ref, "-n", "30", "--format=%h%x09%s%x09%an%x09%cr%x09%H%x09%ct"], { cwd: root, on }).catch(() => null);
-  if (!r || r.code !== 0) return [];
-  const lines = (r.stdout || "").trim().split("\n").filter(Boolean);
-  return lines.map((line) => {
-    const [shortHash, subject, author, date, hash, ts] = line.split("\t");
-    return {
-      shortHash,
-      subject,
-      author,
-      date,
-      hash,
-      timestamp: Number(ts) || 0,
-      serviceId: service?.id || ".",
-      serviceName: service?.name || "root",
-      repoRoot: service?.root || root,
-    };
-  });
-}
-
 async function loadServiceWorkingSnapshot(service, on, includeCommits = true) {
-  try {
-    const git = (args) => exec("git", [...READ, ...args], { cwd: service.root, on });
-    const status = await git(["status", "--porcelain=v1", "-b", "-z", "--no-renames", "--untracked-files=normal"]);
-    if (status.code !== 0) throw new Error(status.stderr || `status failed on ${service.name}`);
-
-    const records = status.stdout.split("\0").filter(Boolean);
-    let branch = service.branch || "HEAD";
-    let parsedAhead = null;
-    const rawEntries = [];
-    for (const rec of records) {
-      if (rec.startsWith("## ")) {
-        const parsed = parsePorcelainHeader(rec);
-        branch = parsed.branch || branch;
-        parsedAhead = parsed.ahead;
-      } else {
-        rawEntries.push(rec);
-      }
-    }
-
-    const aheadCount = parsedAhead !== null
-      ? parsedAhead
-      : await repoAheadCount(service.root, branch, on);
-
-    if (rawEntries.length === 0 && aheadCount === 0) {
-      service.workingCount = 0;
-      service.aheadCount = 0;
-      service.branch = branch;
-      return { service, files: [], commits: [], branch, rawCount: 0, touched: false };
-    }
-
-    const dirEntries = [];
-    const fileEntries = [];
-    for (const entry of rawEntries) {
-      const xy = entry.slice(0, 2);
-      const p = entry.slice(3);
-      if (!p) continue;
-      if (xy === "??" && p.endsWith("/")) {
-        dirEntries.push(p.replace(/\/+$/, ""));
-      } else {
-        fileEntries.push({ xy, path: p.replace(/\/+$/, "") });
-      }
-    }
-    if (dirEntries.length > 0) {
-      const ls = await git(["ls-files", "--others", "--exclude-standard", "-z", "--", ...dirEntries]).catch(() => null);
-      if (ls?.code === 0 && ls.stdout) {
-        for (const expandedPath of ls.stdout.split("\0").filter(Boolean)) {
-          fileEntries.push({ xy: "??", path: expandedPath });
-        }
-      }
-    }
-
-    const commits = includeCommits ? await listCommits(service.root, branch, on, service) : [];
-    let serviceHasHead = true;
-    const stats = {};
-    if (fileEntries.length > 0) {
-      const head = await git(["rev-parse", "--verify", "HEAD"]);
-      serviceHasHead = head.code === 0;
-      const results = serviceHasHead
-        ? [await git(["diff", "HEAD", "--numstat", "-z", "--no-renames"])]
-        : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]), await git(["diff", "--numstat", "-z", "--no-renames"])];
-
-      for (const result of results) {
-        if (result.code !== 0) throw new Error(result.stderr || `diff failed on ${service.name}`);
-        for (const entry of result.stdout.split("\0")) {
-          const [a, d, ...parts] = entry.split("\t");
-          if (!parts.length) continue;
-          const p = parts.join("\t"), old = stats[p] ?? { add: 0, del: 0 };
-          stats[p] = { add: old.add + (Number(a) || 0), del: old.del + (Number(d) || 0), binary: a === "-" };
-        }
-      }
-    }
-
-    const files = await Promise.all(
-      fileEntries.map(async ({ xy, path }) => {
-        const fresh = xy === "??";
-        const s = normalizeGitStatusMark(xy);
-        const lineStat = stats[path] ?? { add: 0, del: 0 };
-        const { sig, mtimeMs } = s === "D"
-          ? { sig: "deleted", mtimeMs: 0 }
-          : await statFileEntry(join(service.root, path), s, on, fsPromises);
-        return {
-          key: `${service.id}::${path}`,
-          serviceId: service.id,
-          serviceName: service.name,
-          relPrefix: service.relPath,
-          repoRoot: service.root,
-          hasHead: serviceHasHead,
-          path,
-          relFile: path,
-          displayPath: service.relPath ? `${service.relPath}/${path}` : (service.isSibling ? `${service.name}/${path}` : path),
-          status: s,
-          fresh,
-          sig,
-          mtimeMs,
-          ...lineStat,
-        };
-      })
-    );
-
-    service.workingCount = rawEntries.length;
-    service.aheadCount = aheadCount;
-    service.branch = branch;
-    return { service, files, commits, branch, rawCount: rawEntries.length, touched: true };
-  } catch (e) {
-    service.workingCount = 0;
-    service.aheadCount = 0;
-    service.branch = service.branch || "HEAD";
-    return { service, files: [], commits: [], branch: service.branch, rawCount: 0, touched: false, error: e };
-  }
+  return collectServiceWorkingSnapshot(service, on, includeCommits, { exec, fsPromises });
 }
 
 function readFlows() {
@@ -1973,24 +1827,6 @@ export default class ChangesReview extends View {
       return;
     }
 
-    if (busFresh && Array.isArray(bus.candidates) && bus.candidates.length > 0 && bus.services.length === 0) {
-      this.workspaceRoot = workspaceRoot;
-      this.services = [];
-      this.root = workspaceRoot;
-      this.allWorkingFiles = [];
-      this.workingFiles = [];
-      this.workingFilesCount = 0;
-      this.allCommits = [];
-      this.serviceCommitsMap.clear();
-      this.files = [];
-      this.open = null;
-      this.stopAllWatchers();
-      this.error = null;
-      this.applyServiceFilter(null, { syncReviewTab: false });
-      cx.notify();
-      return;
-    }
-
     this.loading = true;
     const isWindows = this.isWindows;
     const allPanesList = panes() || [];
@@ -2012,9 +1848,9 @@ export default class ChangesReview extends View {
     cx.spawn(async (cx) => {
       try {
         let candidateServices;
-        const usingBusServices = Boolean(busFresh && Array.isArray(bus?.services) && bus.services.length > 0);
-        if (usingBusServices) {
-          candidateServices = bus.services.map((s) => ({ ...s }));
+        const usingBusCandidates = Boolean(busFresh && Array.isArray(bus?.candidates) && bus.candidates.length > 0);
+        if (usingBusCandidates) {
+          candidateServices = mergeBusCandidateServices(bus.candidates, bus.services, isWindows);
         } else {
           const cacheKey = `${workspaceRoot}|${on || ""}|${extraCwds.slice().sort().join(",")}`;
           const now = Date.now();
@@ -2121,6 +1957,7 @@ export default class ChangesReview extends View {
             res.commits = sessionCommits;
             if (res.service) {
               res.service.workingCount = sessionFiles.length;
+              res.service.sessionCommitCount = sessionCommits.length;
             }
             res.touched = sessionFiles.length > 0 || sessionCommits.length > 0;
           }
@@ -2178,7 +2015,7 @@ export default class ChangesReview extends View {
         const existingBusSig = existingBus && normPathStr(existingBus.workspaceRoot) === normWs && (existingBus.tabId || null) === (sessionTabId || null)
           ? (existingBus.sig || ((sessionTabId || "") + "::" + normWs + "::" + (existingBus.candidates?.length ?? -1) + "::" + (existingBus.services || []).map((s) => `${normPathStr(s.root)}@${s.branch || ""}:${s.workingCount || 0}:${s.aheadCount || 0}`).join(",")))
           : null;
-        if ((!usingBusServices || force || servicesSig !== existingBusSig) && servicesSig !== this.lastPublishedServicesSig) {
+        if ((!usingBusCandidates || force || servicesSig !== existingBusSig) && servicesSig !== this.lastPublishedServicesSig) {
           this.lastPublishedServicesSig = servicesSig;
           const pubTs = Date.now();
           this.lastConsumedBusTs = pubTs;
@@ -2196,6 +2033,7 @@ export default class ChangesReview extends View {
               branch: s.branch || "",
               workingCount: s.workingCount || 0,
               aheadCount: s.aheadCount || 0,
+              sessionCommitCount: Number(s.sessionCommitCount) || 0,
             })),
             candidates: nextCandidates,
             sig: servicesSig,

@@ -33,6 +33,10 @@ import {
   filterUnbaselinedRepoEntries,
   isHomeDirectoryRoot,
   resolveWorkspaceRoot,
+  READ_GIT_FLAGS,
+  parseCommitLogOutput,
+  mergeBusCandidateServices,
+  collectServiceWorkingSnapshot,
 } from "../mods/changes-review/review-logic.js";
 import {
   statFileEntry as filesSearchStatFileEntry,
@@ -595,5 +599,90 @@ describe("changes-review review-logic", () => {
     assert.equal(resolveWorkspaceRoot(cases[4]), "/home/nmr/Projects/herdr-mesh");
     assert.equal(resolveWorkspaceRoot(cases[5]), "/tmp/scratch");
     assert.equal(resolveWorkspaceRoot(cases[6]), "C:\\Users\\nmr\\work\\app");
+  });
+
+  test("parseCommitLogOutput and mergeBusCandidateServices retain clean pushed repos and enrich metadata", () => {
+    const svc = { id: ".", name: "herdr-mesh", root: "/ws/herdr-mesh" };
+    const logOut = [
+      "845bbd4\tfeat(git-history): wave transitions\tJohnMunozR\t2 minutes ago\t845bbd44c7b586209dacee3c495946a6116b3edf\t1794625047",
+      "2283aba\tfix(files-search): session baseline\tJohnMunozR\t2 hours ago\t2283abaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1794615446",
+    ].join("\n");
+    const commits = parseCommitLogOutput(logOut, svc);
+    assert.equal(commits.length, 2);
+    assert.deepEqual(commits[0], {
+      shortHash: "845bbd4",
+      subject: "feat(git-history): wave transitions",
+      author: "JohnMunozR",
+      date: "2 minutes ago",
+      hash: "845bbd44c7b586209dacee3c495946a6116b3edf",
+      timestamp: 1794625047,
+      serviceId: ".",
+      serviceName: "herdr-mesh",
+      repoRoot: "/ws/herdr-mesh",
+    });
+    assert.deepEqual(parseCommitLogOutput("", svc), []);
+
+    const candidates = [
+      { id: ".", name: "herdr-mesh", relPath: "", root: "/ws/herdr-mesh", isSibling: false, branch: "" },
+      { id: "../mypass", name: "mypass", relPath: "", root: "/ws/mypass", isSibling: true, branch: "dev" },
+    ];
+    const busServices = [
+      { id: "../mypass", name: "mypass", root: "/ws/mypass", branch: "dev", workingCount: 2, aheadCount: 1 },
+      { id: "extra", name: "extra", root: "/ws/extra", branch: "feat/x", workingCount: 1, aheadCount: 0 },
+    ];
+    const merged = mergeBusCandidateServices(candidates, busServices, false);
+    assert.deepEqual(
+      merged.map((s) => ({ root: s.root, workingCount: s.workingCount ?? 0, branch: s.branch })),
+      [
+        { root: "/ws/herdr-mesh", workingCount: 0, branch: "" },
+        { root: "/ws/mypass", workingCount: 2, branch: "dev" },
+        { root: "/ws/extra", workingCount: 1, branch: "feat/x" },
+      ],
+    );
+  });
+
+  test("collectServiceWorkingSnapshot loads session commits even when working tree is clean and pushed", async () => {
+    const calls = [];
+    const sessionStartMs = 1794615367673;
+    const mockExec = async (cmd, args) => {
+      calls.push({ cmd, args });
+      if (args.includes("status")) {
+        return { code: 0, stdout: "## main...origin/main\0", stderr: "" };
+      }
+      if (args.includes("log")) {
+        return {
+          code: 0,
+          stdout: [
+            "845bbd4\tfeat(git-history): wave transitions\tJohnMunozR\t2 mins ago\t845bbd44c7b586209dacee3c495946a6116b3edf\t1794625047",
+            "ba0ca0a\told commit\tJohnMunozR\t10 hours ago\tba0ca0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1794590000",
+          ].join("\n"),
+          stderr: "",
+        };
+      }
+      throw new Error(`Unexpected git args: ${args.join(" ")}`);
+    };
+
+    const service = { id: ".", name: "herdr-mesh", relPath: "", root: "/ws/herdr-mesh", isSibling: false };
+    const snap = await collectServiceWorkingSnapshot({ ...service }, null, true, { exec: mockExec });
+    assert.equal(snap.rawCount, 0);
+    assert.equal(snap.files.length, 0);
+    assert.equal(snap.touched, true);
+    assert.equal(snap.branch, "main");
+    assert.equal(snap.commits.length, 2);
+    assert.equal(calls.length, 2);
+    assert.ok(calls.every((c) => READ_GIT_FLAGS.every((flag) => c.args.includes(flag))));
+    const logCall = calls.find((c) => c.args.includes("log"));
+    assert.deepEqual(logCall.args.slice(-2), ["main", "--"]);
+
+    // Session filter retains only post-session commit alongside clean working tree
+    const sessionCommits = filterSessionCommits(snap.commits, sessionStartMs);
+    assert.deepEqual(sessionCommits.map((c) => c.shortHash), ["845bbd4"]);
+
+    // Respects includeCommits = false for clean pushed repos without invoking git log
+    const beforeCalls = calls.length;
+    const noCommitSnap = await collectServiceWorkingSnapshot({ ...service }, null, false, { exec: mockExec });
+    assert.equal(noCommitSnap.commits.length, 0);
+    assert.equal(noCommitSnap.touched, false);
+    assert.equal(calls.length, beforeCalls + 1);
   });
 });
