@@ -1,4 +1,4 @@
-import { View, div, svg, PathBuilder } from "gpui-kit";
+import { View, div, svg, PathBuilder, Background } from "gpui-kit";
 import {
   v_flex,
   h_flex,
@@ -41,18 +41,28 @@ import {
   MAX_VIEWER_DIFF_LINES,
   DEFAULT_SBS_PAGE_ROWS,
   MAX_RENDER_TOKENS_PER_LINE,
+  DIFF_ROW_HEIGHT,
+  DIFF_HUNK_HEIGHT,
+  DIFF_WAVE_GUTTER_WIDTH,
   parseCommitFiles,
   buildSideBySideRows,
   buildUnifiedRows,
+  buildWaveDiffLayout,
+  getFileExt,
   getDiffSyntaxPalette,
-  diffSyntaxTokenColor,
+  prepareRenderLineData,
+  toNbspString,
+  tokenizeDeferredRow,
+  tokenizeSideBySidePage,
   resolveGitFileIcon,
   computeDiffColumnWidths,
+  computeHorizontalWheelDelta,
+  computeHorizontalScrollbarMetrics,
+  computeScrollXFromTrackClick,
   computeViewerLoadedKey,
   formatGitTabTitle,
   expandCodeTabs,
   paginateDiffRows,
-  capRenderTokens,
 } from "./diff-logic.js";
 import {
   READ_GIT,
@@ -69,14 +79,47 @@ import {
 const ROW_HEIGHT = 30;
 const FILE_ROW_HEIGHT = 26;
 const Y_MID = ROW_HEIGHT / 2;
+const HSCROLL_AXIS_CONFIG = {
+  left: { contentKey: "leftWidth", viewportKey: "leftViewportW", scrollKey: "leftScrollX" },
+  right: { contentKey: "rightWidth", viewportKey: "rightViewportW", scrollKey: "rightScrollX" },
+  unified: { contentKey: "unifiedWidth", viewportKey: "unifiedViewportW", scrollKey: "unifiedScrollX" },
+};
 const LANE_WIDTH = 16;
 const LANE_PAD_LEFT = 10;
 const COMMIT_PAGE_SIZE = 200;
 const WATCH_DEBOUNCE_MS = 800;
 const REPO_CACHE_TTL_MS = 60000;
+const SEARCH_DEBOUNCE_MS = 60;
+const MAX_COMMIT_FILES_CACHE = 32;
+const MAX_VIEWER_PATCH_CACHE = 24;
+const GIT_EXEC_TIMEOUT_MS = 15000;
 const EXPANDED_VIEWER_DIFF_LINES = 4000;
-const GIT_LOG_FORMAT = "%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s%x1f%b%x1e";
+const GIT_LOG_FORMAT = "%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s%x1e";
 const GIT_BRANCH_FORMAT = "%(HEAD)%x1f%(refname:short)%x1f%(refname)%x1f%(objectname:short)";
+
+const viewerHostsById = new Map();
+let nextViewerHostId = 1;
+const lineBakeCache = new WeakMap();
+const waveGutterPathCache = new WeakMap();
+const graphRowPathCache = new WeakMap();
+
+function lruGet(map, key) {
+  if (!map || !map.has(key)) return undefined;
+  const val = map.get(key);
+  map.delete(key);
+  map.set(key, val);
+  return val;
+}
+
+function lruSet(map, key, val, limit) {
+  if (!map) return;
+  if (map.has(key)) map.delete(key);
+  map.set(key, val);
+  if (map.size > limit) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+}
 
 function readPlainObject(val) {
   return val && typeof val === "object" && !Array.isArray(val) ? val : {};
@@ -128,21 +171,37 @@ function hexWithAlpha(color, alphaHex) {
   return color;
 }
 
-function getColorsMap(t) {
-  const s = typeof settings === "function" ? settings() : {};
-  const l = typeof layout === "function" ? layout() : {};
-  return {
-    ...(t || {}),
-    ...(s?.colors || {}),
-    ...(l?.colors || {}),
-  };
+let cachedThemeBundleSig = "";
+let cachedThemeBundle = null;
+
+function getThemeColorsSignature(t, sColors, lColors) {
+  return [
+    t?.is_dark, t?.appearance, t?.background, t?.foreground, t?.border, t?.chrome, t?.raised,
+    t?.hover, t?.selected, t?.dim, t?.muted, t?.accent, t?.done, t?.working, t?.blocked,
+    t?.ansi1, t?.ansi2, t?.ansi3, t?.ansi4, t?.ansi5, t?.ansi6,
+    t?.ansi10, t?.ansi11, t?.ansi12, t?.ansi13, t?.ansi14,
+    sColors?.diff_add, sColors?.added, sColors?.addition, sColors?.diff_del, sColors?.diff_remove, sColors?.removed, sColors?.deletion,
+    sColors?.accent, sColors?.ansi1, sColors?.ansi2, sColors?.ansi3, sColors?.ansi4, sColors?.ansi5, sColors?.ansi6,
+    lColors?.diff_add, lColors?.added, lColors?.addition, lColors?.diff_del, lColors?.diff_remove, lColors?.removed, lColors?.deletion,
+    lColors?.accent,
+  ].join("|");
 }
 
-function getDiffTheme(t) {
-  const colors = getColorsMap(t);
+function getThemeBundle(t) {
+  const sColors = typeof settings === "function" ? settings()?.colors : null;
+  const lColors = typeof layout === "function" ? layout()?.colors : null;
+  const sig = getThemeColorsSignature(t, sColors, lColors);
+  if (cachedThemeBundle && sig === cachedThemeBundleSig) {
+    return cachedThemeBundle;
+  }
+  const colors = {
+    ...(t || {}),
+    ...(sColors || {}),
+    ...(lColors || {}),
+  };
   const add = colors.diff_add || colors.added || colors.addition || colors.ansi2 || colors.done || colors.accent || colors.foreground;
   const del = colors.diff_del || colors.diff_remove || colors.removed || colors.deletion || colors.ansi1 || colors.blocked || colors.foreground;
-  return {
+  const dt = {
     add,
     del,
     addBg: hexWithAlpha(add, "22"),
@@ -150,38 +209,47 @@ function getDiffTheme(t) {
     addHover: hexWithAlpha(add, "35"),
     delHover: hexWithAlpha(del, "35"),
   };
-}
 
-function getLanePalette(t) {
-  const c = getColorsMap(t);
   const candidates = [
-    c.accent,
-    c.ansi4,
-    c.ansi2,
-    c.ansi5,
-    c.ansi3,
-    c.ansi6,
-    c.ansi1,
-    c.ansi12,
-    c.ansi10,
-    c.ansi13,
-    c.ansi14,
-    c.ansi11,
+    colors.accent, colors.ansi4, colors.ansi2, colors.ansi5, colors.ansi3, colors.ansi6,
+    colors.ansi1, colors.ansi12, colors.ansi10, colors.ansi13, colors.ansi14, colors.ansi11,
   ];
-  const out = [];
+  const lanePalette = [];
   for (const col of candidates) {
-    if (typeof col === "string" && col.trim() && !out.includes(col)) {
-      out.push(col);
+    if (typeof col === "string" && col.trim() && !lanePalette.includes(col)) {
+      lanePalette.push(col);
     }
   }
-  if (out.length === 0) {
+  if (lanePalette.length === 0) {
     for (const fb of [t?.accent, t?.foreground, t?.muted]) {
-      if (typeof fb === "string" && fb.trim() && !out.includes(fb)) {
-        out.push(fb);
+      if (typeof fb === "string" && fb.trim() && !lanePalette.includes(fb)) {
+        lanePalette.push(fb);
       }
     }
   }
-  return out;
+
+  const syntaxPalette = getDiffSyntaxPalette(t);
+  const waveBrushes = {
+    centerDividerCol: hexWithAlpha(t?.border, "18"),
+    modFill: Background.linear_gradient(90, dt.delBg, dt.addBg),
+    modEdge: Background.linear_gradient(90, hexWithAlpha(dt.del, "28"), hexWithAlpha(dt.add, "28")),
+    addFill: Background.linear_gradient(90, hexWithAlpha(dt.add, "0c"), dt.addBg),
+    addEdge: hexWithAlpha(dt.add, "28"),
+    delFill: Background.linear_gradient(90, dt.delBg, hexWithAlpha(dt.del, "0c")),
+    delEdge: hexWithAlpha(dt.del, "28"),
+  };
+
+  cachedThemeBundleSig = sig;
+  cachedThemeBundle = { dt, lanePalette, syntaxPalette, waveBrushes };
+  return cachedThemeBundle;
+}
+
+function getDiffTheme(t) {
+  return getThemeBundle(t).dt;
+}
+
+function getLanePalette(t) {
+  return getThemeBundle(t).lanePalette;
 }
 
 function laneColor(colorIndex, palette) {
@@ -404,18 +472,28 @@ async function discoverRepoRoots(workspaceRoot, on, isWindows = false, extraCwds
     }
   }
 
+  const pendingExtras = [];
   for (const extra of extraCwds || []) {
     if (!extra) continue;
     const normExtra = normPathStr(extra);
     if (!normExtra || repoPaths.some((r) => isSameOrChildPath(normExtra, r, isWindows))) continue;
-    const localTop = !on ? await findLocalGitRoot(extra) : null;
-    if (localTop) {
-      addUnique(localTop);
-      continue;
-    }
-    const top = await exec("git", [...READ_GIT, "rev-parse", "--show-toplevel"], { cwd: extra, on }).catch(() => null);
-    if (top && top.code === 0 && top.stdout.trim()) {
-      addUnique(top.stdout.trim());
+    pendingExtras.push(extra);
+  }
+  if (pendingExtras.length > 0) {
+    const extraResults = await Promise.all(
+      pendingExtras.map(async (extra) => {
+        const localTop = !on ? await findLocalGitRoot(extra) : null;
+        if (localTop) return localTop;
+        const top = await exec("git", [...READ_GIT, "rev-parse", "--show-toplevel"], {
+          cwd: extra,
+          on,
+          timeout: GIT_EXEC_TIMEOUT_MS,
+        }).catch(() => null);
+        return top && top.code === 0 && top.stdout.trim() ? top.stdout.trim() : null;
+      })
+    );
+    for (const root of extraResults) {
+      if (root) addUnique(root);
     }
   }
 
@@ -535,12 +613,76 @@ function buildRefBadgeColors(ref, t) {
   };
 }
 
+class GitDiffSideView extends View {
+  init(initProps) {
+    const p = initProps ?? {};
+    this.hostId = p.hostId || "";
+    this.side = p.side === "right" ? "right" : "left";
+  }
+
+  update(nextProps) {
+    if (nextProps?.hostId) this.hostId = nextProps.hostId;
+    if (nextProps?.side) this.side = nextProps.side === "right" ? "right" : "left";
+  }
+
+  render() {
+    const host = viewerHostsById.get(this.hostId);
+    return host ? host.renderSidePaneContent(this.side) : div();
+  }
+}
+
+class GitDiffWaveGutterView extends View {
+  init(initProps) {
+    this.hostId = initProps?.hostId || "";
+  }
+
+  update(nextProps) {
+    if (nextProps?.hostId) this.hostId = nextProps.hostId;
+  }
+
+  render() {
+    const host = viewerHostsById.get(this.hostId);
+    return host ? host.renderWaveGutterContent() : div();
+  }
+}
+
+class GitDiffHScrollView extends View {
+  init(initProps) {
+    this.hostId = initProps?.hostId || "";
+  }
+
+  update(nextProps) {
+    if (nextProps?.hostId) this.hostId = nextProps.hostId;
+  }
+
+  render() {
+    const host = viewerHostsById.get(this.hostId);
+    return host ? host.renderHScrollBarsContent() : div().h(0);
+  }
+}
+
+class GitDiffUnifiedView extends View {
+  init(initProps) {
+    this.hostId = initProps?.hostId || "";
+  }
+
+  update(nextProps) {
+    if (nextProps?.hostId) this.hostId = nextProps.hostId;
+  }
+
+  render() {
+    const host = viewerHostsById.get(this.hostId);
+    return host ? host.renderUnifiedPaneContent() : div();
+  }
+}
+
 export default class GitHistory extends View {
   init(initProps, cx) {
     const p = initProps ?? props();
     this.viewerProps = p || null;
     this.isViewer = p?.role === "viewer";
 
+    this.hostCx = cx || null;
     this.handle = cx.focus_handle();
     this.hostIsWindows = herdrWindow()?.platform === "windows";
     this.isWindows = this.hostIsWindows;
@@ -571,7 +713,7 @@ export default class GitHistory extends View {
     this.panelWidth = 420;
     this.viewerWidth = 960;
 
-    // Async generation counters
+    // Async generation counters & caches
     this.repoDiscoverGen = 0;
     this.logGen = 0;
     this.commitFilesGen = 0;
@@ -579,7 +721,14 @@ export default class GitHistory extends View {
     this.lastRequestSeq = 0;
     this.lastActiveServiceTs = 0;
     this.lastConsumedBusSig = "";
+    this.lastRefSigKey = "";
+    this.lastRefSig = "";
     this.repoCache = null;
+    this.commitFilesCache = new Map();
+    this.viewerPatchCache = new Map();
+    this._cachedFilterState = null;
+    this._cachedRowMapState = null;
+    this._cachedBranchState = null;
 
     // Viewer state
     this.diffMode = "side-by-side"; // "side-by-side" | "unified"
@@ -591,18 +740,32 @@ export default class GitHistory extends View {
     this.isBinaryDiff = false;
     this.diffTruncated = false;
     this.diffTotalLines = 0;
+    this.loadedPatchSource = null;
+    this.loadedFileExt = "";
+    this.sbsBuilt = false;
+    this.uniBuilt = false;
     this.sbsRows = [];
     this.sbsPage = 0;
+    this.sbsPageInfo = paginateDiffRows([], 0, DEFAULT_SBS_PAGE_ROWS);
+    this.sbsWaveLayout = null;
     this.uniRows = [];
     this.uniRowHeights = [];
-    this.leftWidth = 420;
-    this.rightWidth = 420;
+    this.leftWidth = 260;
+    this.rightWidth = 260;
     this.unifiedWidth = 600;
+    this.leftViewportW = 0;
+    this.rightViewportW = 0;
+    this.unifiedViewportW = 0;
+    this.leftScrollX = 0;
+    this.rightScrollX = 0;
+    this.unifiedScrollX = 0;
+    this.hScrollDrag = null;
     this.open = null;
 
     // Watchers & timers
     this.watchedGitDirs = new Map();
     this.watchDebounceTask = null;
+    this.searchDebounceTask = null;
     this.renderRefreshTask = null;
     this.agentTabSyncTask = null;
     this.sharedSyncTask = null;
@@ -612,52 +775,82 @@ export default class GitHistory extends View {
     this.hasLoadedOnce = false;
     this.needsRefreshOnShow = false;
 
-    // Retained UI handles
-    this.commitsScroll = VirtualListScrollHandle.new();
-    this.filesScroll = VirtualListScrollHandle.new();
-    this.uniScroll = VirtualListScrollHandle.new();
-    this.diffScroll = ScrollHandle.new();
-    this.repoDropdownScroll = ScrollHandle.new();
-    this.branchDropdownScroll = ScrollHandle.new();
-    this.searchInput = InputState.new({ placeholder: "Filter message, author, SHA..." });
-    this.searchInput.on("change", (_e, cx) => {
-      const next = this.searchInput.value() ?? "";
-      if (next !== this.searchQuery) {
-        this.searchQuery = next;
+    // Retained UI handles & child sub-views
+    if (this.isViewer) {
+      this.viewerHostId = `vh-${nextViewerHostId++}`;
+      viewerHostsById.set(this.viewerHostId, this);
+      this.uniScroll = VirtualListScrollHandle.new();
+      this.diffScroll = ScrollHandle.new();
+      this.leftDiffPane = cx.new(GitDiffSideView, { hostId: this.viewerHostId, side: "left" });
+      this.rightDiffPane = cx.new(GitDiffSideView, { hostId: this.viewerHostId, side: "right" });
+      this.waveGutterPane = cx.new(GitDiffWaveGutterView, { hostId: this.viewerHostId });
+      this.hScrollBarPane = cx.new(GitDiffHScrollView, { hostId: this.viewerHostId });
+      this.unifiedDiffPane = cx.new(GitDiffUnifiedView, { hostId: this.viewerHostId });
+    } else {
+      this.commitsScroll = VirtualListScrollHandle.new();
+      this.filesScroll = VirtualListScrollHandle.new();
+      this.repoDropdownScroll = ScrollHandle.new();
+      this.branchDropdownScroll = ScrollHandle.new();
+      this.searchInput = InputState.new({ placeholder: "Filter message, author, SHA..." });
+      this.searchInput.on("change", (_e, cx) => {
+        const next = this.searchInput.value() ?? "";
+        if (next === this.searchQuery) return;
+        if (this.searchDebounceTask) {
+          try { this.searchDebounceTask.cancel(); } catch {}
+          this.searchDebounceTask = null;
+        }
+        if (!next.trim() || !cx?.timer) {
+          this.searchQuery = next;
+          cx.notify();
+          return;
+        }
+        this.searchDebounceTask = cx.timer.after(SEARCH_DEBOUNCE_MS, (cx) => {
+          this.searchDebounceTask = null;
+          const latest = this.searchInput.value() ?? "";
+          if (latest !== this.searchQuery) {
+            this.searchQuery = latest;
+            cx.notify();
+          }
+        });
+      });
+      this.searchInput.on("focus", (_e, cx) => {
+        this.typingSearch = true;
         cx.notify();
-      }
-    });
-    this.searchInput.on("focus", (_e, cx) => {
-      this.typingSearch = true;
-      cx.notify();
-    });
-    this.searchInput.on("blur", (_e, cx) => {
-      this.typingSearch = false;
-      cx.notify();
-    });
+      });
+      this.searchInput.on("blur", (_e, cx) => {
+        this.typingSearch = false;
+        cx.notify();
+      });
 
-    if (!this.isViewer) {
       if (this.wasVisible) {
         this.refresh(cx);
       }
       this.pollTask = cx.timer.every(30000, (cx) => {
         if (isGitPanelVisible()) {
-          this.refresh(cx, { fromPoll: true });
+          this.refresh(cx, { fromPoll: true, backgroundRefresh: true });
         }
       });
     }
   }
 
   close() {
+    this.hostCx = null;
     this.repoDiscoverGen += 1;
     this.logGen += 1;
     this.commitFilesGen += 1;
     this.viewerLoadGen += 1;
 
+    if (this.viewerHostId) {
+      viewerHostsById.delete(this.viewerHostId);
+      this.viewerHostId = null;
+    }
+
     try { this.renderRefreshTask?.cancel?.(); } catch {}
     this.renderRefreshTask = null;
     try { this.watchDebounceTask?.cancel?.(); } catch {}
     this.watchDebounceTask = null;
+    try { this.searchDebounceTask?.cancel?.(); } catch {}
+    this.searchDebounceTask = null;
     try { this.agentTabSyncTask?.cancel?.(); } catch {}
     this.agentTabSyncTask = null;
     try { this.sharedSyncTask?.cancel?.(); } catch {}
@@ -669,6 +862,11 @@ export default class GitHistory extends View {
 
     this.stopAllWatchers();
 
+    try { this.leftDiffPane?.release?.(); } catch {}
+    try { this.rightDiffPane?.release?.(); } catch {}
+    try { this.waveGutterPane?.release?.(); } catch {}
+    try { this.hScrollBarPane?.release?.(); } catch {}
+    try { this.unifiedDiffPane?.release?.(); } catch {}
     try { this.searchInput?.release?.(); } catch {}
     try { this.commitsScroll?.release?.(); } catch {}
     try { this.filesScroll?.release?.(); } catch {}
@@ -742,12 +940,17 @@ export default class GitHistory extends View {
     });
   }
 
-  scheduleRenderRefresh(cx) {
-    if (this.isViewerMode() || this.renderRefreshTask || !cx?.timer) return;
+  scheduleRenderRefresh(cx, isBg = false) {
+    if (this.isViewerMode() || !cx?.timer) return;
+    if (!isBg) this.renderRefreshBg = false;
+    if (this.renderRefreshTask) return;
+    this.renderRefreshBg = Boolean(isBg);
     this.renderRefreshTask = cx.timer.after(0, (cx) => {
       this.renderRefreshTask = null;
+      const bg = Boolean(this.renderRefreshBg);
+      this.renderRefreshBg = false;
       if (isGitPanelVisible()) {
-        this.refresh(cx);
+        this.refresh(cx, { backgroundRefresh: bg });
       }
     });
   }
@@ -812,7 +1015,10 @@ export default class GitHistory extends View {
         return;
       }
       if (this.selectedRepo) {
-        this.loadBranchesAndCommits(this.selectedRepo, cx, { preserveSelection: true });
+        this.loadBranchesAndCommits(this.selectedRepo, cx, {
+          preserveSelection: true,
+          backgroundRefresh: true,
+        });
       }
     });
   }
@@ -827,7 +1033,11 @@ export default class GitHistory extends View {
     try {
       const hasHeadInside = await exists(join(gitDir, "HEAD")).catch(() => false);
       if (!hasHeadInside) {
-        const res = await exec("git", [...READ_GIT, "rev-parse", "--git-dir"], { cwd: repo.root, on: null }).catch(() => null);
+        const res = await exec("git", [...READ_GIT, "rev-parse", "--git-dir"], {
+          cwd: repo.root,
+          on: null,
+          timeout: GIT_EXEC_TIMEOUT_MS,
+        }).catch(() => null);
         if (res && res.code === 0 && res.stdout.trim()) {
           const rawDir = res.stdout.trim();
           gitDir = rawDir.startsWith("/") || /^[A-Za-z]:/.test(rawDir) ? rawDir : join(repo.root, rawDir);
@@ -881,6 +1091,13 @@ export default class GitHistory extends View {
       tabId: loc.tabId,
     });
     const force = Boolean(opts.force);
+    if (force) {
+      this.repoCache = null;
+      this.commitFilesCache?.clear();
+      this.viewerPatchCache?.clear();
+      this.lastRefSigKey = "";
+      this.lastRefSig = "";
+    }
 
     if (ctxKey !== this.context) {
       this.context = ctxKey;
@@ -928,7 +1145,8 @@ export default class GitHistory extends View {
     );
 
     const bus = shared("mesh.services");
-    if (bus?.sig) this.lastConsumedBusSig = bus.sig;
+    const busSigVal = bus?.sig || (typeof bus?.ts === "number" ? String(bus.ts) : "");
+    if (busSigVal) this.lastConsumedBusSig = busSigVal;
 
     cx.spawn(async (cx) => {
       try {
@@ -997,6 +1215,7 @@ export default class GitHistory extends View {
           this.watchSelectedRepoGitDir(picked, cx);
           await this.loadBranchesAndCommits(picked, cx, {
             preserveSelection: !repoChanged && !opts.fromBranchChange,
+            backgroundRefresh: Boolean(opts.backgroundRefresh && !force && !repoChanged && !opts.fromBranchChange),
           });
         }
       } catch (e) {
@@ -1078,15 +1297,44 @@ export default class GitHistory extends View {
     const gen = ++this.logGen;
     const repoRoot = repo.root;
     const on = this.on;
-    this.loadingCommits = true;
+    const targetBranch = this.selectedBranch || "__all__";
+    const refSigKey = `${normPathStr(repoRoot)}|${on || ""}|${targetBranch}`;
+    let prefetchedRefSig = null;
+
+    if (
+      opts.backgroundRefresh &&
+      this.commits.length > 0 &&
+      !this.error &&
+      this.lastRefSigKey === refSigKey &&
+      this.lastRefSig
+    ) {
+      const sigRes = await exec("git", [...READ_GIT, "show-ref", "--head"], {
+        cwd: repoRoot,
+        on,
+        timeout: 10000,
+      }).catch(() => null);
+      if (gen !== this.logGen) return;
+      if (sigRes && sigRes.code === 0) {
+        if (sigRes.stdout === this.lastRefSig) {
+          return;
+        }
+        prefetchedRefSig = sigRes.stdout;
+      }
+    }
+
     this.error = null;
-    cx?.notify();
+    if (this.commits.length === 0) {
+      this.loadingCommits = true;
+      cx?.notify();
+    } else {
+      this.loadingCommits = true;
+    }
 
     try {
       const branchPromise = exec(
         "git",
         [...READ_GIT, "for-each-ref", `--format=${GIT_BRANCH_FORMAT}`, "refs/heads", "refs/remotes"],
-        { cwd: repoRoot, on }
+        { cwd: repoRoot, on, timeout: GIT_EXEC_TIMEOUT_MS }
       ).catch(() => null);
 
       const refArgs =
@@ -1105,10 +1353,27 @@ export default class GitHistory extends View {
         "--skip=0",
         `--format=${GIT_LOG_FORMAT}`,
       ];
-      const logPromise = exec("git", logArgs, { cwd: repoRoot, on }).catch((e) => ({ code: 1, stderr: String(e?.message || e), stdout: "" }));
+      const logPromise = exec("git", logArgs, {
+        cwd: repoRoot,
+        on,
+        timeout: GIT_EXEC_TIMEOUT_MS,
+      }).catch((e) => ({ code: 1, stderr: String(e?.message || e), stdout: "" }));
+      const sigPromise =
+        prefetchedRefSig !== null
+          ? Promise.resolve({ code: 0, stdout: prefetchedRefSig })
+          : exec("git", [...READ_GIT, "show-ref", "--head"], {
+              cwd: repoRoot,
+              on,
+              timeout: 10000,
+            }).catch(() => null);
 
-      const [branchRes, logRes] = await Promise.all([branchPromise, logPromise]);
+      const [branchRes, logRes, freshSigRes] = await Promise.all([branchPromise, logPromise, sigPromise]);
       if (gen !== this.logGen) return;
+
+      if (freshSigRes && freshSigRes.code === 0) {
+        this.lastRefSigKey = refSigKey;
+        this.lastRefSig = freshSigRes.stdout || "";
+      }
 
       if (branchRes && branchRes.code === 0) {
         this.branches = parseBranchesOutput(branchRes.stdout || "");
@@ -1189,7 +1454,7 @@ export default class GitHistory extends View {
         `--skip=${skip}`,
         `--format=${GIT_LOG_FORMAT}`,
       ];
-      const res = await exec("git", logArgs, { cwd: repoRoot, on });
+      const res = await exec("git", logArgs, { cwd: repoRoot, on, timeout: GIT_EXEC_TIMEOUT_MS });
       if (gen !== this.logGen) return;
       if (res.code !== 0) {
         throw new Error(res.stderr || "Failed to load older commits");
@@ -1223,11 +1488,24 @@ export default class GitHistory extends View {
     const gen = ++this.commitFilesGen;
     const repo = this.selectedRepo;
     const on = this.on;
-    this.loadingCommitFiles = true;
-    this.commitFiles = [];
-    this.selectedFileKey = null;
-    cx?.notify();
+    const cacheKey = `${normPathStr(repo.root)}|${on || ""}|${commit.hash}`;
+    const cachedFiles = !opts.force ? lruGet(this.commitFilesCache, cacheKey) : undefined;
+    if (cachedFiles) {
+      this.loadingCommitFiles = false;
+      this.commitFiles = cachedFiles;
+      const firstFile = cachedFiles[0] || null;
+      this.selectedFileKey = firstFile ? makeCommitFileKey(commit, firstFile) : null;
+      if (opts.openViewer) {
+        this.openGitDiffTabForCommit(repo, commit, firstFile, cachedFiles, {
+          create: true,
+          select: true,
+        });
+      }
+      cx?.notify();
+      return;
+    }
 
+    this.loadingCommitFiles = true;
     try {
       const numArgs = [
         ...READ_GIT,
@@ -1254,14 +1532,15 @@ export default class GitHistory extends View {
         commit.hash,
       ];
       const [numRes, statRes] = await Promise.all([
-        exec("git", numArgs, { cwd: repo.root, on }),
-        exec("git", statArgs, { cwd: repo.root, on }),
+        exec("git", numArgs, { cwd: repo.root, on, timeout: GIT_EXEC_TIMEOUT_MS }),
+        exec("git", statArgs, { cwd: repo.root, on, timeout: GIT_EXEC_TIMEOUT_MS }),
       ]);
       if (gen !== this.commitFilesGen) return;
       if (numRes.code !== 0) {
         throw new Error(numRes.stderr || "Failed to inspect commit files");
       }
       const parsedFiles = parseCommitFiles(numRes.stdout || "", statRes?.stdout || "");
+      lruSet(this.commitFilesCache, cacheKey, parsedFiles, MAX_COMMIT_FILES_CACHE);
       this.commitFiles = parsedFiles;
       const firstFile = parsedFiles[0] || null;
       this.selectedFileKey = firstFile ? makeCommitFileKey(commit, firstFile) : null;
@@ -1403,7 +1682,38 @@ export default class GitHistory extends View {
     });
   }
 
-  async fetchCommitFilePatch(diff, openFile, isExpanded) {
+  makeViewerPatchCacheKey(diff, openFile, isExpanded) {
+    const repoRoot = normPathStr(diff?.repoRoot || openFile?.repoRoot);
+    const commitHash = diff?.commitHash || "";
+    const on = diff?.on ?? "";
+    return `${repoRoot}|${on}|${commitHash}|${openFile?.key || openFile?.path || ""}|${isExpanded ? 1 : 0}`;
+  }
+
+  notifyViewerChildren(cx, targets = "all") {
+    if (!this.isViewerMode()) return;
+    const primaryCx = cx || this.hostCx;
+    const targetSet = targets === "all" ? null : (Array.isArray(targets) ? targets : [targets]);
+    const want = (name) => !targetSet || targetSet.includes(name);
+    const ping = (entity) => {
+      if (!entity) return;
+      try {
+        primaryCx?.notify(entity);
+      } catch {
+        if (this.hostCx && this.hostCx !== primaryCx) {
+          try {
+            this.hostCx.notify(entity);
+          } catch {}
+        }
+      }
+    };
+    if (want("left")) ping(this.leftDiffPane);
+    if (want("right")) ping(this.rightDiffPane);
+    if (want("gutter")) ping(this.waveGutterPane);
+    if (want("hscroll")) ping(this.hScrollBarPane);
+    if (want("unified")) ping(this.unifiedDiffPane);
+  }
+
+  async fetchCommitFilePatch(diff, openFile, isExpanded, opts = {}) {
     const repoRoot = diff?.repoRoot || openFile?.repoRoot;
     const commitHash = diff?.commitHash;
     const on = diff?.on ?? null;
@@ -1412,6 +1722,12 @@ export default class GitHistory extends View {
     }
     if (openFile.binary) {
       return { patchText: "", isBinary: true };
+    }
+
+    const cacheKey = this.makeViewerPatchCacheKey(diff, openFile, isExpanded);
+    if (!opts.forceReload) {
+      const cached = lruGet(this.viewerPatchCache, cacheKey);
+      if (cached) return cached;
     }
 
     const ctxFlag = isExpanded ? "-U99999" : "-U3";
@@ -1429,14 +1745,42 @@ export default class GitHistory extends View {
       args = [...READ_GIT, "diff", ...commonFlags, parents[0], commitHash, "--", ...pathArgs];
     }
 
-    const res = await exec("git", args, { cwd: repoRoot, on });
+    const res = await exec("git", args, { cwd: repoRoot, on, timeout: GIT_EXEC_TIMEOUT_MS });
     if (res.code !== 0) {
       throw new Error(res.stderr || "git diff failed");
     }
     const patchText = res.stdout || "";
     const isBinary =
       /^(?:Binary files .* differ|GIT binary patch)$/m.test(patchText);
-    return { patchText, isBinary };
+    const result = { patchText, isBinary };
+    lruSet(this.viewerPatchCache, cacheKey, result, MAX_VIEWER_PATCH_CACHE);
+    return result;
+  }
+
+  buildActiveDiffModeData() {
+    const src = this.loadedPatchSource;
+    if (!src) return;
+    const { patchText, filePath, maxLines } = src;
+    if (this.diffMode === "unified") {
+      if (this.uniBuilt) return;
+      const uni = buildUnifiedRows(patchText, filePath, { maxLines, deferTokens: true });
+      this.isBinaryDiff = Boolean(this.isBinaryDiff || uni.isBinary);
+      this.uniRows = uni.rows || [];
+      this.uniRowHeights = this.uniRows.map((r) => (r.kind === "hunk" || r.kind === "@" ? DIFF_HUNK_HEIGHT : DIFF_ROW_HEIGHT));
+      this.diffTruncated = Boolean(this.diffTruncated || uni.truncated);
+      this.diffTotalLines = Number(uni.totalLines || this.diffTotalLines || 0);
+      this.unifiedWidth = Math.max(520, computeDiffColumnWidths(this.uniRows, 7.6).unifiedWidth);
+      this.uniBuilt = true;
+    } else {
+      if (this.sbsBuilt) return;
+      const sbs = buildSideBySideRows(patchText, filePath, { maxLines, deferTokens: true });
+      this.isBinaryDiff = Boolean(this.isBinaryDiff || sbs.isBinary);
+      this.sbsRows = sbs.rows || [];
+      this.diffTruncated = Boolean(this.diffTruncated || sbs.truncated);
+      this.diffTotalLines = Number(sbs.totalLines || this.diffTotalLines || 0);
+      this.rebuildSbsPageCache();
+      this.sbsBuilt = true;
+    }
   }
 
   async loadViewerDiffNow(diff, cx, opts = {}) {
@@ -1468,8 +1812,14 @@ export default class GitHistory extends View {
     this.viewerError = null;
 
     if (!openFile) {
+      this.loadedPatchSource = null;
+      this.loadedFileExt = "";
+      this.sbsBuilt = false;
+      this.uniBuilt = false;
       this.sbsRows = [];
       this.sbsPage = 0;
+      this.sbsPageInfo = paginateDiffRows([], 0, DEFAULT_SBS_PAGE_ROWS);
+      this.sbsWaveLayout = null;
       this.uniRows = [];
       this.uniRowHeights = [];
       this.isBinaryDiff = false;
@@ -1477,6 +1827,7 @@ export default class GitHistory extends View {
       this.diffTotalLines = 0;
       this.viewerLoading = false;
       cx?.notify();
+      this.notifyViewerChildren(cx, "all");
       return;
     }
 
@@ -1489,48 +1840,119 @@ export default class GitHistory extends View {
       this.sbsPage = 0;
     }
 
+    const maxLines = isExpanded ? EXPANDED_VIEWER_DIFF_LINES : MAX_VIEWER_DIFF_LINES;
+    const cacheKey = this.makeViewerPatchCacheKey(diff, openFile, isExpanded);
+    const cachedPatch = !opts.forceReload && !openFile.binary ? lruGet(this.viewerPatchCache, cacheKey) : undefined;
+
+    if (openFile.binary || cachedPatch) {
+      try {
+        const { patchText, isBinary } = openFile.binary
+          ? { patchText: "", isBinary: true }
+          : cachedPatch;
+        if (isBinary || openFile.binary) {
+          this.loadedPatchSource = null;
+          this.loadedFileExt = "";
+          this.sbsBuilt = false;
+          this.uniBuilt = false;
+          this.isBinaryDiff = true;
+          this.sbsRows = [];
+          this.sbsPage = 0;
+          this.sbsPageInfo = paginateDiffRows([], 0, DEFAULT_SBS_PAGE_ROWS);
+          this.sbsWaveLayout = null;
+          this.uniRows = [];
+          this.uniRowHeights = [];
+          this.diffTruncated = false;
+          this.diffTotalLines = 0;
+        } else {
+          this.sbsBuilt = false;
+          this.uniBuilt = false;
+          this.sbsRows = [];
+          this.sbsWaveLayout = null;
+          this.uniRows = [];
+          this.uniRowHeights = [];
+          this.isBinaryDiff = false;
+          this.diffTruncated = false;
+          this.diffTotalLines = 0;
+          this.loadedPatchSource = { patchText, filePath: openFile.path, maxLines };
+          this.loadedFileExt = getFileExt(openFile.path);
+          this.buildActiveDiffModeData();
+        }
+        if (prevOpenKey !== openFile.key || opts.forceScrollTop) {
+          this.resetHorizontalScroll();
+          try { this.diffScroll?.scroll_to_item(0); } catch {}
+          try { this.uniScroll?.scroll_to_item(0); } catch {}
+        }
+      } catch (e) {
+        this.loadedPatchSource = null;
+        this.loadedFileExt = "";
+        this.sbsBuilt = false;
+        this.uniBuilt = false;
+        this.sbsRows = [];
+        this.sbsPage = 0;
+        this.sbsPageInfo = paginateDiffRows([], 0, DEFAULT_SBS_PAGE_ROWS);
+        this.sbsWaveLayout = null;
+        this.uniRows = [];
+        this.uniRowHeights = [];
+        this.viewerError = `Cannot load diff: ${e?.message || e}`;
+      } finally {
+        this.viewerLoading = false;
+        cx?.notify();
+        this.notifyViewerChildren(cx, "all");
+      }
+      return;
+    }
+
     this.viewerLoading = true;
     cx?.notify();
 
     try {
-      const { patchText, isBinary } = await this.fetchCommitFilePatch(diff, openFile, isExpanded);
+      const { patchText, isBinary } = await this.fetchCommitFilePatch(diff, openFile, isExpanded, opts);
       if (gen !== this.viewerLoadGen) return;
 
-      const maxLines = isExpanded ? EXPANDED_VIEWER_DIFF_LINES : MAX_VIEWER_DIFF_LINES;
       if (isBinary || openFile.binary) {
+        this.loadedPatchSource = null;
+        this.loadedFileExt = "";
+        this.sbsBuilt = false;
+        this.uniBuilt = false;
         this.isBinaryDiff = true;
         this.sbsRows = [];
         this.sbsPage = 0;
+        this.sbsPageInfo = paginateDiffRows([], 0, DEFAULT_SBS_PAGE_ROWS);
+        this.sbsWaveLayout = null;
         this.uniRows = [];
         this.uniRowHeights = [];
         this.diffTruncated = false;
         this.diffTotalLines = 0;
       } else {
-        const sbs = buildSideBySideRows(patchText, openFile.path, { maxLines });
-        const uni = buildUnifiedRows(patchText, openFile.path, { maxLines });
-        this.isBinaryDiff = Boolean(sbs.isBinary || uni.isBinary);
-        this.sbsRows = sbs.rows || [];
-        this.uniRows = uni.rows || [];
-        this.uniRowHeights = this.uniRows.map((r) => (r.kind === "hunk" || r.kind === "@" ? 26 : 22));
-        this.diffTruncated = Boolean(sbs.truncated || uni.truncated);
-        this.diffTotalLines = Number(sbs.totalLines || uni.totalLines || 0);
-        const pageInfo = paginateDiffRows(this.sbsRows, this.sbsPage, DEFAULT_SBS_PAGE_ROWS);
-        this.sbsPage = pageInfo.pageIndex;
-        const pageWidths = computeDiffColumnWidths(pageInfo.rows, 7.2);
-        this.leftWidth = Math.max(360, Number(pageWidths?.leftWidth) || 360);
-        this.rightWidth = Math.max(360, Number(pageWidths?.rightWidth) || 360);
-        const uniMaxChars = Number(uni.maxChars || 0);
-        this.unifiedWidth = Math.max(520, Math.ceil(uniMaxChars * 7.2 + 120));
+        this.sbsBuilt = false;
+        this.uniBuilt = false;
+        this.sbsRows = [];
+        this.sbsWaveLayout = null;
+        this.uniRows = [];
+        this.uniRowHeights = [];
+        this.isBinaryDiff = false;
+        this.diffTruncated = false;
+        this.diffTotalLines = 0;
+        this.loadedPatchSource = { patchText, filePath: openFile.path, maxLines };
+        this.loadedFileExt = getFileExt(openFile.path);
+        this.buildActiveDiffModeData();
       }
 
       if (prevOpenKey !== openFile.key || opts.forceScrollTop) {
+        this.resetHorizontalScroll();
         try { this.diffScroll?.scroll_to_item(0); } catch {}
         try { this.uniScroll?.scroll_to_item(0); } catch {}
       }
     } catch (e) {
       if (gen !== this.viewerLoadGen) return;
+      this.loadedPatchSource = null;
+      this.loadedFileExt = "";
+      this.sbsBuilt = false;
+      this.uniBuilt = false;
       this.sbsRows = [];
       this.sbsPage = 0;
+      this.sbsPageInfo = paginateDiffRows([], 0, DEFAULT_SBS_PAGE_ROWS);
+      this.sbsWaveLayout = null;
       this.uniRows = [];
       this.uniRowHeights = [];
       this.viewerError = `Cannot load diff: ${e?.message || e}`;
@@ -1538,18 +1960,32 @@ export default class GitHistory extends View {
       if (gen === this.viewerLoadGen) {
         this.viewerLoading = false;
         cx?.notify();
+        this.notifyViewerChildren(cx, "all");
       }
     }
   }
 
-  setSbsPage(nextPage, cx) {
-    const pageInfo = paginateDiffRows(this.sbsRows, nextPage, DEFAULT_SBS_PAGE_ROWS);
+  rebuildSbsPageCache() {
+    const pageInfo = paginateDiffRows(this.sbsRows, this.sbsPage, DEFAULT_SBS_PAGE_ROWS);
     this.sbsPage = pageInfo.pageIndex;
-    const pageWidths = computeDiffColumnWidths(pageInfo.rows, 7.2);
-    this.leftWidth = Math.max(360, Number(pageWidths?.leftWidth) || 360);
-    this.rightWidth = Math.max(360, Number(pageWidths?.rightWidth) || 360);
+    this.sbsPageInfo = pageInfo;
+    tokenizeSideBySidePage(pageInfo.rows, this.loadedFileExt);
+    this.sbsWaveLayout = buildWaveDiffLayout(pageInfo.rows, {
+      rowHeight: DIFF_ROW_HEIGHT,
+      hunkHeight: DIFF_HUNK_HEIGHT,
+    });
+    const pageWidths = computeDiffColumnWidths(pageInfo.rows, 7.6);
+    this.leftWidth = Math.max(260, Number(pageWidths?.leftWidth) || 260);
+    this.rightWidth = Math.max(260, Number(pageWidths?.rightWidth) || 260);
+  }
+
+  setSbsPage(nextPage, cx) {
+    this.sbsPage = nextPage;
+    this.rebuildSbsPageCache();
+    this.resetHorizontalScroll();
     try { this.diffScroll?.scroll_to_item(0); } catch {}
     cx?.notify();
+    this.notifyViewerChildren(cx, ["left", "right", "gutter", "hscroll"]);
   }
 
   openViewerFileInPlace(nextFile, diff, ctx, cx, overrides = {}) {
@@ -1623,6 +2059,7 @@ export default class GitHistory extends View {
     if (mode !== "side-by-side" && mode !== "unified") return;
     this._userSetDiffMode = true;
     this.diffMode = mode;
+    this.buildActiveDiffModeData();
     const ctx = this.getSessionContext();
     if (diff) {
       writeActiveDiff(ctx.spaceId, {
@@ -1631,50 +2068,198 @@ export default class GitHistory extends View {
         ts: Date.now(),
       });
     }
+    this.resetHorizontalScroll();
     try { this.diffScroll?.scroll_to_item(0); } catch {}
     try { this.uniScroll?.scroll_to_item(0); } catch {}
     cx.notify();
+    this.notifyViewerChildren(cx, "all");
   }
 
-  renderCodeTokens(tokens, plainText, fallbackColor, t) {
-    const tokList = Array.isArray(tokens) && tokens.length > 0
-      ? capRenderTokens(tokens, MAX_RENDER_TOKENS_PER_LINE)
-      : null;
-    if (tokList && tokList.length > 1) {
-      return h_flex().flex_none().whitespace_nowrap().items_center().pr(16).children(
-        tokList.map(([tokKind, tokText]) =>
-          div()
-            .flex_none()
-            .whitespace_nowrap()
-            .text_color(diffSyntaxTokenColor(tokKind, t))
-            .child(String(tokText || "").replace(/ /g, "\u00a0"))
-        )
-      );
+  resetHorizontalScroll() {
+    this.leftScrollX = 0;
+    this.rightScrollX = 0;
+    this.unifiedScrollX = 0;
+    this.hScrollDrag = null;
+  }
+
+  getHorizontalMetrics(side) {
+    const cfg = HSCROLL_AXIS_CONFIG[side];
+    if (!cfg) return computeHorizontalScrollbarMetrics(0, 0, 0, 0);
+    const viewportW = Number(this[cfg.viewportKey]) || 0;
+    const contentW = Number(this[cfg.contentKey]) || 0;
+    const trackW = Math.max(0, viewportW - 8);
+    return computeHorizontalScrollbarMetrics(contentW, viewportW, Number(this[cfg.scrollKey]) || 0, trackW);
+  }
+
+  updateHorizontalViewport(side, size, cx) {
+    const cfg = HSCROLL_AXIS_CONFIG[side];
+    if (!cfg) return;
+    const nextW = Math.round(Number(size?.width) || 0);
+    if (nextW > 0 && Math.abs(nextW - (Number(this[cfg.viewportKey]) || 0)) > 1) {
+      this[cfg.viewportKey] = nextW;
+      const metrics = this.getHorizontalMetrics(side);
+      const scrollChanged = (Number(this[cfg.scrollKey]) || 0) !== metrics.scrollX;
+      if (scrollChanged) {
+        this[cfg.scrollKey] = metrics.scrollX;
+      }
+      this.notifyViewerChildren(cx, scrollChanged ? [side, "hscroll"] : ["hscroll"]);
     }
-    if (tokList && tokList.length === 1) {
-      const [tokKind, tokText] = tokList[0];
+  }
+
+  handleHorizontalWheel(side, e, cx) {
+    const cfg = HSCROLL_AXIS_CONFIG[side];
+    if (!cfg) return;
+    const res = computeHorizontalWheelDelta(e);
+    if (!res.handled) return;
+    cx?.stop_propagation();
+    if (res.deltaX === 0) return;
+    const metrics = this.getHorizontalMetrics(side);
+    if (!metrics.visible || metrics.maxScroll <= 0) return;
+    const prev = metrics.scrollX;
+    const next = Math.max(0, Math.min(metrics.maxScroll, Math.round(prev + res.deltaX)));
+    if (next !== prev) {
+      this[cfg.scrollKey] = next;
+      this.notifyViewerChildren(cx, [side, "hscroll"]);
+    }
+  }
+
+  startHScrollDrag(side, e, metrics, contentW, viewportW, cx) {
+    const cfg = HSCROLL_AXIS_CONFIG[side];
+    if (!cfg || !metrics.visible) return;
+    const trackLeft = Number(e?.bounds?.x) || 0;
+    const trackW = Number(e?.bounds?.width) > 0 ? Number(e.bounds.width) : metrics.trackW;
+    const localX = e?.local_position?.x != null
+      ? Number(e.local_position.x)
+      : (Number(e?.position?.x) || 0) - trackLeft;
+    const onThumb = localX >= metrics.thumbX && localX <= metrics.thumbX + metrics.thumbW;
+    const startScrollX = onThumb
+      ? metrics.scrollX
+      : computeScrollXFromTrackClick(localX, contentW, viewportW, trackW);
+    const scrollChanged = !onThumb && startScrollX !== (Number(this[cfg.scrollKey]) || 0);
+    if (scrollChanged) {
+      this[cfg.scrollKey] = startScrollX;
+    }
+    this.hScrollDrag = {
+      side,
+      startMouseX: Number(e?.position?.x) || 0,
+      startScrollX,
+      maxScroll: metrics.maxScroll,
+      travelW: metrics.travelW,
+    };
+    cx?.stop_propagation();
+    try { this.hostCx?.notify(); } catch { cx?.notify(); }
+    this.notifyViewerChildren(cx, scrollChanged ? [side, "hscroll"] : ["hscroll"]);
+  }
+
+  handleHScrollDragMove(e, cx) {
+    const drag = this.hScrollDrag;
+    if (!drag) return;
+    const cfg = HSCROLL_AXIS_CONFIG[drag.side];
+    if (!cfg || drag.travelW <= 0 || drag.maxScroll <= 0) return;
+    const dx = (Number(e?.position?.x) || 0) - drag.startMouseX;
+    const deltaScroll = (dx / drag.travelW) * drag.maxScroll;
+    const next = Math.max(0, Math.min(drag.maxScroll, Math.round(drag.startScrollX + deltaScroll)));
+    if (next !== (Number(this[cfg.scrollKey]) || 0)) {
+      this[cfg.scrollKey] = next;
+      this.notifyViewerChildren(cx, [drag.side, "hscroll"]);
+    }
+  }
+
+  endHScrollDrag(cx) {
+    if (!this.hScrollDrag) return;
+    this.hScrollDrag = null;
+    cx?.notify();
+    this.notifyViewerChildren(cx, ["hscroll"]);
+  }
+
+  renderHorizontalScrollbar(side, metrics, contentW, viewportW, t) {
+    if (!metrics.visible) {
+      return div().flex_1().min_w(0).h_full();
+    }
+    const isDragging = this.hScrollDrag?.side === side;
+    const trackBg = hexWithAlpha(t.border, "24");
+    const thumbBg = hexWithAlpha(isDragging ? t.foreground : t.dim, isDragging ? "aa" : "66");
+    return h_flex()
+      .flex_1()
+      .min_w(0)
+      .h_full()
+      .px(4)
+      .items_center()
+      .on_scroll_wheel((e, cx) => this.handleHorizontalWheel(side, e, cx))
+      .child(
+        div()
+          .id(`git-diff-hscroll-${side}`)
+          .w_full()
+          .h(8)
+          .relative()
+          .rounded(4)
+          .bg(trackBg)
+          .cursor_pointer()
+          .on_mouse_down("left", (e, cx) => this.startHScrollDrag(side, e, metrics, contentW, viewportW, cx))
+          .child(
+            div()
+              .absolute()
+              .top_0()
+              .bottom_0()
+              .left(metrics.thumbX)
+              .w(metrics.thumbW)
+              .rounded(4)
+              .bg(thumbBg)
+              .hover((s) => s.bg(hexWithAlpha(t.muted, "99")))
+          )
+      );
+  }
+
+  renderCodeTokens(cacheKeyObj, tokens, plainText, syntaxPalette, fallbackColor) {
+    const pal = syntaxPalette && syntaxPalette._isSyntaxPalette
+      ? syntaxPalette
+      : getDiffSyntaxPalette(syntaxPalette);
+    const bakeKey = `${pal._sig || ""}|${fallbackColor}`;
+    const cacheable = cacheKeyObj && typeof cacheKeyObj === "object";
+    let baked = cacheable ? lineBakeCache.get(cacheKeyObj) : null;
+    if (!baked || baked.key !== bakeKey) {
+      const data = prepareRenderLineData(tokens, plainText, pal, fallbackColor, MAX_RENDER_TOKENS_PER_LINE);
+      baked = { key: bakeKey, data };
+      if (cacheable) {
+        lineBakeCache.set(cacheKeyObj, baked);
+      }
+    }
+    const data = baked.data;
+    if (data.kind === "single") {
       return div()
         .flex_none()
         .whitespace_nowrap()
-        .pr(16)
-        .text_color(diffSyntaxTokenColor(tokKind, t))
-        .child(String(tokText || " ").replace(/ /g, "\u00a0"));
+        .pr(20)
+        .text_color(data.color)
+        .child(data.text);
     }
-    const expanded = expandCodeTabs(plainText || " ");
-    return div()
-      .flex_none()
-      .whitespace_nowrap()
-      .pr(16)
-      .text_color(fallbackColor)
-      .child(expanded.replace(/ /g, "\u00a0"));
+    const spans = data.spans;
+    const spanEls = new Array(spans.length);
+    for (let i = 0; i < spans.length; i++) {
+      const sp = spans[i];
+      spanEls[i] = div()
+        .flex_none()
+        .whitespace_nowrap()
+        .text_color(sp[0])
+        .child(sp[1]);
+    }
+    return h_flex().flex_none().whitespace_nowrap().items_center().pr(20).children(spanEls);
   }
 
-  renderSideCell(row, side, t, dt, ext) {
-    if (row.kind === "hunk") {
-      const headerText = side === "left" ? expandCodeTabs(row.header || "") : "";
+  renderWaveSideItem(item, side, t, dt, syntaxPalette) {
+    if (item.type === "hunk") {
+      let headerNbsp = "\u00a0";
+      if (side === "left" && item.header) {
+        let cached = lineBakeCache.get(item);
+        if (!cached || cached.raw !== item.header) {
+          cached = { raw: item.header, nbsp: toNbspString(expandCodeTabs(item.header)) || "\u00a0" };
+          lineBakeCache.set(item, cached);
+        }
+        headerNbsp = cached.nbsp;
+      }
       return h_flex()
         .w_full()
-        .h(26)
+        .h(DIFF_HUNK_HEIGHT)
         .flex_none()
         .px(10)
         .items_center()
@@ -1685,38 +2270,55 @@ export default class GitHistory extends View {
         .text_size(11)
         .text_color(t.dim)
         .whitespace_nowrap()
-        .child(headerText ? headerText.replace(/ /g, "\u00a0") : "\u00a0");
+        .child(headerNbsp);
     }
 
-    const cell = side === "left" ? row.left : row.right;
-    const kind = cell?.kind || "empty";
-    if (kind === "empty") {
-      return h_flex()
+    if (item.type === "spacer") {
+      const seamCol = item.markerKind === "add" ? dt.add : item.markerKind === "del" ? dt.del : null;
+      let spacer = div()
         .w_full()
-        .h(22)
+        .h(item.height)
         .flex_none()
-        .items_center()
-        .bg(hexWithAlpha(t.raised, "66"))
-        .border_l(2)
-        .border_color(t.background)
-        .child("\u00a0");
+        .relative()
+        .bg(t.background);
+      if (item.markerOffsetY != null && seamCol) {
+        spacer = spacer.child(
+          div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .top(Math.max(0, item.markerOffsetY))
+            .h(1)
+            .bg(hexWithAlpha(seamCol, "28"))
+        );
+      }
+      return spacer;
     }
 
+    const cell = item.cell;
+    const kind = cell?.kind || "ctx";
     const isAdd = kind === "add";
     const isDel = kind === "del";
     const diffColor = isAdd ? dt.add : isDel ? dt.del : null;
     const rowBg = isAdd ? dt.addBg : isDel ? dt.delBg : null;
     const gutterSign = isAdd ? "+" : isDel ? "-" : " ";
 
-    return h_flex()
+    let rowEl = h_flex()
       .w_full()
-      .h(22)
+      .h(DIFF_ROW_HEIGHT)
       .flex_none()
       .items_center()
-      .gap(6)
-      .border_l(2)
-      .border_color(diffColor || t.background)
-      .when(Boolean(rowBg), (e) => e.bg(rowBg))
+      .gap(6);
+    if (side === "left") {
+      rowEl = rowEl.border_l(2).border_color(diffColor || t.background);
+    } else {
+      rowEl = rowEl.pl(4);
+    }
+    if (rowBg) {
+      rowEl = rowEl.bg(rowBg);
+    }
+
+    return rowEl
       .child(
         div()
           .w(36)
@@ -1734,15 +2336,241 @@ export default class GitHistory extends View {
           .text_color(diffColor || t.dim)
           .child(gutterSign)
       )
-      .child(this.renderCodeTokens(cell?.tokens, cell?.text || "", diffColor || t.foreground, t));
+      .child(this.renderCodeTokens(cell, cell?.tokens, cell?.text || "", syntaxPalette, diffColor || t.foreground));
   }
 
-  renderUnifiedRow(row, t, dt, ext) {
-    if (row.kind === "hunk" || row.kind === "@") {
-      const header = expandCodeTabs(row.header ?? row.text ?? "");
+  renderSidePaneContent(side) {
+    const waveLayout = this.sbsWaveLayout;
+    const isLeft = side === "left";
+    const id = isLeft ? "git-diff-left-pane" : "git-diff-right-pane";
+    if (!waveLayout) {
+      return div().id(id).w_full().min_w(0);
+    }
+    const t = theme();
+    const { dt, syntaxPalette } = getThemeBundle(t);
+    const mono = settings()?.font_family ?? "JetBrains Mono";
+    const bar = this.getHorizontalMetrics(side);
+    const contentW = isLeft ? this.leftWidth : this.rightWidth;
+    const items = isLeft ? waveLayout.leftItems : waveLayout.rightItems;
+    const itemEls = new Array(items.length);
+    for (let i = 0; i < items.length; i++) {
+      itemEls[i] = this.renderWaveSideItem(items[i], side, t, dt, syntaxPalette);
+    }
+    return v_flex()
+      .id(id)
+      .w_full()
+      .min_w(contentW)
+      .flex_none()
+      .relative()
+      .left(-bar.scrollX)
+      .pb(20)
+      .font_family(mono)
+      .text_size(11.5)
+      .children(itemEls);
+  }
+
+  renderWaveGutterContent() {
+    const W = DIFF_WAVE_GUTTER_WIDTH;
+    const waveLayout = this.sbsWaveLayout;
+    if (!waveLayout) {
+      return div().id("git-diff-wave-gutter").w(W).flex_none();
+    }
+    const t = theme();
+    const { waveBrushes } = getThemeBundle(t);
+    const midX = W * 0.5;
+    const centerLineX = Math.floor(W / 2);
+    const gutterItems = waveLayout.gutterItems || [];
+    const children = new Array(gutterItems.length);
+
+    for (let i = 0; i < gutterItems.length; i++) {
+      const item = gutterItems[i];
+      if (item.type === "hunk") {
+        children[i] = div()
+          .w_full()
+          .h(item.height)
+          .flex_none()
+          .bg(t.raised)
+          .border_t(1)
+          .border_b(1)
+          .border_color(t.border);
+        continue;
+      }
+
+      if (item.type === "ctx") {
+        children[i] = div()
+          .w_full()
+          .h(item.height)
+          .flex_none()
+          .relative()
+          .child(div().absolute().left(centerLineX).top_0().bottom_0().w(1).bg(waveBrushes.centerDividerCol));
+        continue;
+      }
+
+      let cachedPaths = waveGutterPathCache.get(item);
+      if (!cachedPaths) {
+        const fillPath = PathBuilder.fill()
+          .move_to(0, item.leftTop)
+          .cubic_bezier_to(W, item.rightTop, midX, item.leftTop, midX, item.rightTop)
+          .line_to(W, item.rightBot)
+          .cubic_bezier_to(0, item.leftBot, midX, item.rightBot, midX, item.leftBot)
+          .close()
+          .build();
+
+        let strokePath = null;
+        const isCurved = item.leftTop !== item.rightTop || item.leftBot !== item.rightBot;
+        if (isCurved) {
+          if (item.leftTop === item.leftBot) {
+            strokePath = PathBuilder.stroke(1)
+              .move_to(W, item.rightTop)
+              .cubic_bezier_to(0, item.leftTop, midX, item.rightTop, midX, item.leftTop)
+              .cubic_bezier_to(W, item.rightBot, midX, item.leftBot, midX, item.rightBot)
+              .build();
+          } else if (item.rightTop === item.rightBot) {
+            strokePath = PathBuilder.stroke(1)
+              .move_to(0, item.leftTop)
+              .cubic_bezier_to(W, item.rightTop, midX, item.leftTop, midX, item.rightTop)
+              .cubic_bezier_to(0, item.leftBot, midX, item.rightBot, midX, item.rightBot)
+              .build();
+          } else {
+            strokePath = PathBuilder.stroke(1)
+              .move_to(0, item.leftTop)
+              .cubic_bezier_to(W, item.rightTop, midX, item.leftTop, midX, item.rightTop)
+              .move_to(0, item.leftBot)
+              .cubic_bezier_to(W, item.rightBot, midX, item.leftBot, midX, item.rightBot)
+              .build();
+          }
+        }
+        cachedPaths = { fillPath, strokePath };
+        waveGutterPathCache.set(item, cachedPaths);
+      }
+
+      let fillBg;
+      let edgeBg;
+      if (item.kind === "mod") {
+        fillBg = waveBrushes.modFill;
+        edgeBg = waveBrushes.modEdge;
+      } else if (item.kind === "add") {
+        fillBg = waveBrushes.addFill;
+        edgeBg = waveBrushes.addEdge;
+      } else {
+        fillBg = waveBrushes.delFill;
+        edgeBg = waveBrushes.delEdge;
+      }
+
+      let waveEl = div()
+        .w_full()
+        .h(item.height)
+        .flex_none()
+        .relative()
+        .overflow_hidden()
+        .child(window.paint_path(cachedPaths.fillPath, fillBg).absolute().inset_0());
+      if (cachedPaths.strokePath) {
+        waveEl = waveEl.child(window.paint_path(cachedPaths.strokePath, edgeBg).absolute().inset_0());
+      }
+      children[i] = waveEl;
+    }
+
+    return v_flex()
+      .id("git-diff-wave-gutter")
+      .w(W)
+      .flex_none()
+      .pb(20)
+      .bg(t.background)
+      .on_scroll_wheel((e, cx) => {
+        if (e?.modifiers?.shift) cx?.stop_propagation();
+      })
+      .children(children);
+  }
+
+  renderHScrollBarsContent() {
+    const t = theme();
+    if (this.diffMode === "unified") {
+      if (!this.uniRows || this.uniRows.length === 0) {
+        return div().h(0);
+      }
+      const uniBar = this.getHorizontalMetrics("unified");
+      if (!uniBar.visible) {
+        return div().h(0);
+      }
       return h_flex()
         .w_full()
-        .h(26)
+        .h(12)
+        .child(this.renderHorizontalScrollbar("unified", uniBar, this.unifiedWidth, this.unifiedViewportW, t))
+        .child(div().w(10).h_full().flex_none());
+    }
+
+    const pageRows = this.sbsPageInfo?.rows || [];
+    if (pageRows.length === 0) {
+      return div().h(0);
+    }
+    const leftBar = this.getHorizontalMetrics("left");
+    const rightBar = this.getHorizontalMetrics("right");
+    if (!leftBar.visible && !rightBar.visible) {
+      return div().h(0);
+    }
+    return h_flex()
+      .w_full()
+      .h(12)
+      .child(this.renderHorizontalScrollbar("left", leftBar, this.leftWidth, this.leftViewportW, t))
+      .child(div().w(DIFF_WAVE_GUTTER_WIDTH).h_full().flex_none())
+      .child(this.renderHorizontalScrollbar("right", rightBar, this.rightWidth, this.rightViewportW, t))
+      .child(div().w(10).h_full().flex_none());
+  }
+
+  renderUnifiedPaneContent() {
+    if (!this.uniRows || this.uniRows.length === 0) {
+      return div().size_full();
+    }
+    const t = theme();
+    const { dt, syntaxPalette } = getThemeBundle(t);
+    const mono = settings()?.font_family ?? "JetBrains Mono";
+    const uniBar = this.getHorizontalMetrics("unified");
+    const ext = this.loadedFileExt || "";
+    return div()
+      .id("git-diff-unified-pane")
+      .size_full()
+      .relative()
+      .font_family(mono)
+      .text_size(11.5)
+      .child(
+        div()
+          .w_full()
+          .min_w(this.unifiedWidth)
+          .h_full()
+          .relative()
+          .left(-uniBar.scrollX)
+          .child(
+            v_virtual_list(
+              "git-diff-unified-y",
+              this.uniRows.length,
+              this.uniRowHeights,
+              (index) => `u-${index}`,
+              (range) => {
+                const rows = [];
+                for (let i = range.start; i < range.end; i++) {
+                  rows.push(this.renderUnifiedRow(this.uniRows[i], t, dt, syntaxPalette, ext));
+                }
+                return rows;
+              }
+            )
+              .size_full()
+              .track_scroll(this.uniScroll)
+          )
+      )
+      .child(Scrollbar.vertical("git-diff-unified-y").viewport_from_layout().absolute().inset_0());
+  }
+
+  renderUnifiedRow(row, t, dt, syntaxPalette, ext) {
+    if (row.kind === "hunk" || row.kind === "@") {
+      const rawHeader = row.header ?? row.text ?? "";
+      let cached = lineBakeCache.get(row);
+      if (!cached || cached.raw !== rawHeader) {
+        cached = { raw: rawHeader, nbsp: toNbspString(expandCodeTabs(rawHeader)) || "\u00a0" };
+        lineBakeCache.set(row, cached);
+      }
+      return h_flex()
+        .w_full()
+        .h(DIFF_HUNK_HEIGHT)
         .flex_none()
         .px(12)
         .items_center()
@@ -1756,10 +2584,11 @@ export default class GitHistory extends View {
             .whitespace_nowrap()
             .text_size(11)
             .text_color(t.dim)
-            .child(header.replace(/ /g, "\u00a0"))
+            .child(cached.nbsp)
         );
     }
 
+    tokenizeDeferredRow(row, ext);
     const isAdd = row.kind === "add" || row.kind === "+";
     const isDel = row.kind === "del" || row.kind === "-";
     const diffColor = isAdd ? dt.add : isDel ? dt.del : null;
@@ -1768,15 +2597,19 @@ export default class GitHistory extends View {
     const oldNo = row.oldLineNo !== undefined ? row.oldLineNo : (isAdd ? null : (row.lineNo ?? row.number ?? null));
     const newNo = row.newLineNo !== undefined ? row.newLineNo : (isDel ? null : (row.lineNo ?? row.number ?? null));
 
-    return h_flex()
+    let rowEl = h_flex()
       .w_full()
-      .h(22)
+      .h(DIFF_ROW_HEIGHT)
       .flex_none()
       .items_center()
       .gap(6)
       .border_l(2)
-      .border_color(diffColor || t.background)
-      .when(Boolean(rowBg), (e) => e.bg(rowBg))
+      .border_color(diffColor || t.background);
+    if (rowBg) {
+      rowEl = rowEl.bg(rowBg);
+    }
+
+    return rowEl
       .child(
         div()
           .w(34)
@@ -1802,15 +2635,13 @@ export default class GitHistory extends View {
           .text_color(diffColor || t.dim)
           .child(gutterSign)
       )
-      .child(this.renderCodeTokens(row.tokens, row.text || "", diffColor || t.foreground, t, ext));
+      .child(this.renderCodeTokens(row, row.tokens, row.text || "", syntaxPalette, diffColor || t.foreground));
   }
 
   renderViewer(cx) {
     const t = theme();
-    const dt = getDiffTheme(t);
+    const { dt } = getThemeBundle(t);
     const mono = settings()?.font_family ?? "JetBrains Mono";
-    // Prime syntax palette cache with current theme
-    getDiffSyntaxPalette(t);
 
     const ctx = this.getSessionContext();
     const diff = readActiveDiff(ctx.spaceId);
@@ -1826,7 +2657,6 @@ export default class GitHistory extends View {
     const canStep = files.length > 1;
     const isExpanded = Boolean(openKey && (diff?.expanded || this.expandedFiles.has(openKey)));
     const fileIcon = openFile ? resolveGitFileIcon(openFile.path || openFile.displayPath, t) : null;
-    const ext = openFile?.path ? (openFile.path.split(".").pop() || "").toLowerCase() : "";
     const shortHash = diff?.shortHash || (diff?.commitHash ? diff.commitHash.slice(0, 7) : "");
     const parents = Array.isArray(diff?.parentHashes) ? diff.parentHashes.filter(Boolean) : [];
     const parentLabel =
@@ -2110,7 +2940,7 @@ export default class GitHistory extends View {
                   .cursor_pointer()
                   .hover((s) => s.bg(t.hover).text_color(t.foreground))
                   .tooltip("Reload diff")
-                  .on_click((_e, cx) => this.loadViewerDiffNow(diff, cx, { preserveLocalDiffMode: true }))
+                  .on_click((_e, cx) => this.loadViewerDiffNow(diff, cx, { preserveLocalDiffMode: true, forceReload: true }))
                   .child("↻")
               )
           )
@@ -2235,7 +3065,10 @@ export default class GitHistory extends View {
           this.diffMode === "side-by-side" &&
           !(this.viewerLoading && this.sbsRows.length === 0),
         (el) => {
-          const sbsPageInfo = paginateDiffRows(this.sbsRows, this.sbsPage, DEFAULT_SBS_PAGE_ROWS);
+          const sbsPageInfo =
+            this.sbsPageInfo && this.sbsPageInfo.totalRows === this.sbsRows.length && this.sbsPageInfo.pageIndex === this.sbsPage
+              ? this.sbsPageInfo
+              : paginateDiffRows(this.sbsRows, this.sbsPage, DEFAULT_SBS_PAGE_ROWS);
           const pageRows = sbsPageInfo.rows;
           return el
             .when(sbsPageInfo.totalPages > 1, (p) =>
@@ -2323,12 +3156,19 @@ export default class GitHistory extends View {
                 )
                 .child(
                   h_flex()
+                    .w(DIFF_WAVE_GUTTER_WIDTH)
+                    .h_full()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .child(svg("mods/git-history/icons/git-compare.svg").size(11).text_color(t.dim))
+                )
+                .child(
+                  h_flex()
                     .flex_1()
                     .min_w(0)
                     .px(10)
                     .items_center()
-                    .border_l(1)
-                    .border_color(t.border)
                     .child(div().truncate().font_medium().text_color(t.muted).child(`After (${shortHash || "commit"})`))
                 )
             )
@@ -2356,30 +3196,27 @@ export default class GitHistory extends View {
                               .id("git-diff-left-x")
                               .flex_1()
                               .min_w(0)
-                              .overflow_x_scrollbar()
-                              .child(
-                                v_flex()
-                                  .w_full()
-                                  .min_w(this.leftWidth)
-                                  .pb(16)
-                                  .children(pageRows.map((row) => this.renderSideCell(row, "left", t, dt, ext)))
-                              )
+                              .overflow_x_hidden()
+                              .on_size_change((size, cx) => this.updateHorizontalViewport("left", size, cx))
+                              .on_scroll_wheel((e, cx) => this.handleHorizontalWheel("left", e, cx))
+                              .child(this.leftDiffPane)
+                          )
+                          .child(
+                            div()
+                              .id("git-diff-wave-gutter-wrap")
+                              .w(DIFF_WAVE_GUTTER_WIDTH)
+                              .flex_none()
+                              .child(this.waveGutterPane)
                           )
                           .child(
                             div()
                               .id("git-diff-right-x")
                               .flex_1()
                               .min_w(0)
-                              .overflow_x_scrollbar()
-                              .border_l(1)
-                              .border_color(t.border)
-                              .child(
-                                v_flex()
-                                  .w_full()
-                                  .min_w(this.rightWidth)
-                                  .pb(16)
-                                  .children(pageRows.map((row) => this.renderSideCell(row, "right", t, dt, ext)))
-                              )
+                              .overflow_x_hidden()
+                              .on_size_change((size, cx) => this.updateHorizontalViewport("right", size, cx))
+                              .on_scroll_wheel((e, cx) => this.handleHorizontalWheel("right", e, cx))
+                              .child(this.rightDiffPane)
                           )
                       )
                     )
@@ -2402,7 +3239,19 @@ export default class GitHistory extends View {
                       )
                     )
                 )
-                .child(Scrollbar.vertical("git-diff-y").viewport_from_layout().absolute().inset_0())
+                .when(pageRows.length > 0, (el) =>
+                  el
+                    .child(Scrollbar.vertical("git-diff-y").viewport_from_layout().absolute().inset_0())
+                    .child(
+                      div()
+                        .id("git-diff-hscroll-wrap")
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .child(this.hScrollBarPane)
+                    )
+                )
             );
         }
       )
@@ -2412,8 +3261,8 @@ export default class GitHistory extends View {
           !openFile.binary &&
           this.diffMode === "unified" &&
           !(this.viewerLoading && this.uniRows.length === 0),
-        (el) =>
-          el.child(
+        (el) => {
+          return el.child(
             div()
               .flex_1()
               .min_h(0)
@@ -2426,32 +3275,20 @@ export default class GitHistory extends View {
                     div()
                       .id("git-diff-unified-x")
                       .size_full()
-                      .overflow_x_scrollbar()
-                      .child(
-                        div()
-                          .w_full()
-                          .min_w(this.unifiedWidth)
-                          .h_full()
-                          .child(
-                            v_virtual_list(
-                              "git-diff-unified-y",
-                              this.uniRows.length,
-                              this.uniRowHeights,
-                              (index) => `u-${index}`,
-                              (range) => {
-                                const rows = [];
-                                for (let i = range.start; i < range.end; i++) {
-                                  rows.push(this.renderUnifiedRow(this.uniRows[i], t, dt, ext));
-                                }
-                                return rows;
-                              }
-                            )
-                              .size_full()
-                              .track_scroll(this.uniScroll)
-                          )
-                      )
+                      .overflow_x_hidden()
+                      .on_size_change((size, cx) => this.updateHorizontalViewport("unified", size, cx))
+                      .on_scroll_wheel((e, cx) => this.handleHorizontalWheel("unified", e, cx))
+                      .child(this.unifiedDiffPane)
                   )
-                  .child(Scrollbar.vertical("git-diff-unified-y").viewport_from_layout().absolute().inset_0())
+                  .child(
+                    div()
+                      .id("git-diff-unified-hscroll-wrap")
+                      .absolute()
+                      .left_0()
+                      .right_0()
+                      .bottom_0()
+                      .child(this.hScrollBarPane)
+                  )
               )
               .when(this.uniRows.length === 0 && !this.viewerError, (u) =>
                 u.child(
@@ -2471,7 +3308,20 @@ export default class GitHistory extends View {
                     )
                 )
               )
-          )
+          );
+        }
+      )
+      .when(Boolean(this.hScrollDrag), (el) =>
+        el.child(
+          div()
+            .id("git-diff-hscroll-drag-cover")
+            .absolute()
+            .inset_0()
+            .on_mouse_down("left", (_e, cx) => cx?.stop_propagation())
+            .on_mouse_move((e, cx) => this.handleHScrollDragMove(e, cx))
+            .on_mouse_up("left", (_e, cx) => this.endHScrollDrag(cx))
+            .on_mouse_down_out((_e, cx) => this.endHScrollDrag(cx))
+        )
       );
   }
 
@@ -2484,40 +3334,61 @@ export default class GitHistory extends View {
     const paths = [];
 
     if (rowLayout) {
-      for (const pass of rowLayout.passThroughLanes || []) {
-        const x = laneX(pass.lane);
-        if (x > graphWidth + 4) continue;
-        const col = laneColor(pass.colorIndex, lanePalette) || t.foreground;
-        const p = PathBuilder.stroke(2).move_to(x, 0).line_to(x, ROW_HEIGHT).build();
-        paths.push(window.paint_path(p, col).absolute().inset_0());
+      let cached = graphRowPathCache.get(rowLayout);
+      if (!cached || cached.width !== graphWidth) {
+        const buildersByColor = new Map();
+        const getBuilder = (colorIndex) => {
+          const idx = colorIndex ?? 0;
+          let pb = buildersByColor.get(idx);
+          if (!pb) {
+            pb = PathBuilder.stroke(2);
+            buildersByColor.set(idx, pb);
+          }
+          return pb;
+        };
+
+        for (const pass of rowLayout.passThroughLanes || []) {
+          const x = laneX(pass.lane);
+          if (x > graphWidth + 4) continue;
+          getBuilder(pass.colorIndex).move_to(x, 0).line_to(x, ROW_HEIGHT);
+        }
+
+        for (const edge of rowLayout.incomingEdges || []) {
+          const x0 = laneX(edge.fromLane);
+          const x1 = laneX(edge.toLane);
+          if (x0 > graphWidth + 4 && x1 > graphWidth + 4) continue;
+          const pb = getBuilder(edge.colorIndex).move_to(x0, 0);
+          if (edge.fromLane === edge.toLane) {
+            pb.line_to(x1, Y_MID);
+          } else {
+            pb.cubic_bezier_to(x1, Y_MID, x0, Y_MID * 0.55, x1, Y_MID * 0.45);
+          }
+        }
+
+        for (const edge of rowLayout.outgoingEdges || []) {
+          const x0 = laneX(edge.fromLane);
+          const x1 = laneX(edge.toLane);
+          if (x0 > graphWidth + 4 && x1 > graphWidth + 4) continue;
+          const pb = getBuilder(edge.colorIndex).move_to(x0, Y_MID);
+          if (edge.fromLane === edge.toLane) {
+            pb.line_to(x1, ROW_HEIGHT);
+          } else {
+            pb.cubic_bezier_to(x1, ROW_HEIGHT, x0, Y_MID + Y_MID * 0.55, x1, Y_MID + Y_MID * 0.45);
+          }
+        }
+
+        const entries = [];
+        for (const [colorIndex, pb] of buildersByColor.entries()) {
+          entries.push({ colorIndex, path: pb.build() });
+        }
+        cached = { width: graphWidth, entries };
+        graphRowPathCache.set(rowLayout, cached);
       }
 
-      for (const edge of rowLayout.incomingEdges || []) {
-        const x0 = laneX(edge.fromLane);
-        const x1 = laneX(edge.toLane);
-        if (x0 > graphWidth + 4 && x1 > graphWidth + 4) continue;
-        const col = laneColor(edge.colorIndex, lanePalette) || t.foreground;
-        const pb = PathBuilder.stroke(2).move_to(x0, 0);
-        if (edge.fromLane === edge.toLane) {
-          pb.line_to(x1, Y_MID);
-        } else {
-          pb.cubic_bezier_to(x1, Y_MID, x0, Y_MID * 0.55, x1, Y_MID * 0.45);
-        }
-        paths.push(window.paint_path(pb.build(), col).absolute().inset_0());
-      }
-
-      for (const edge of rowLayout.outgoingEdges || []) {
-        const x0 = laneX(edge.fromLane);
-        const x1 = laneX(edge.toLane);
-        if (x0 > graphWidth + 4 && x1 > graphWidth + 4) continue;
-        const col = laneColor(edge.colorIndex, lanePalette) || t.foreground;
-        const pb = PathBuilder.stroke(2).move_to(x0, Y_MID);
-        if (edge.fromLane === edge.toLane) {
-          pb.line_to(x1, ROW_HEIGHT);
-        } else {
-          pb.cubic_bezier_to(x1, ROW_HEIGHT, x0, Y_MID + Y_MID * 0.55, x1, Y_MID + Y_MID * 0.45);
-        }
-        paths.push(window.paint_path(pb.build(), col).absolute().inset_0());
+      for (let i = 0; i < cached.entries.length; i++) {
+        const entry = cached.entries[i];
+        const col = laneColor(entry.colorIndex, lanePalette) || t.foreground;
+        paths.push(window.paint_path(entry.path, col).absolute().inset_0());
       }
     }
 
@@ -2529,16 +3400,20 @@ export default class GitHistory extends View {
     const dotSize = isHead || isMerge ? 10 : 8;
     const half = dotSize / 2;
 
-    const nodeDot = div()
+    let nodeDot = div()
       .absolute()
       .left(Math.max(1, nodeX - half))
       .top(Y_MID - half)
       .w(dotSize)
       .h(dotSize)
-      .rounded_full()
-      .when(isMerge && !isHead, (d) => d.bg(rowBg).border(2).border_color(nodeColor))
-      .when(isHead, (d) => d.bg(nodeColor).border(2).border_color(t.foreground))
-      .when(!isMerge && !isHead, (d) => d.bg(nodeColor).border(1.5).border_color(rowBg));
+      .rounded_full();
+    if (isHead) {
+      nodeDot = nodeDot.bg(nodeColor).border(2).border_color(t.foreground);
+    } else if (isMerge) {
+      nodeDot = nodeDot.bg(rowBg).border(2).border_color(nodeColor);
+    } else {
+      nodeDot = nodeDot.bg(nodeColor).border(1.5).border_color(rowBg);
+    }
 
     return div()
       .id(`git-lane-${commit.shortHash}`)
@@ -2698,13 +3573,20 @@ export default class GitHistory extends View {
     const busChanged = Boolean(busSig && busSig !== this.lastConsumedBusSig);
     const becameVisible = visible && !this.wasVisible;
     this.wasVisible = visible;
-    const ctxKey = buildContextKey();
 
-    if (visible && (ctxKey !== this.context || becameVisible || this.needsRefreshOnShow || !this.hasLoadedOnce || busChanged)) {
+    if (!visible) {
+      if (busChanged) {
+        this.needsRefreshOnShow = true;
+      }
+      return div().id("git-history").size_full();
+    }
+
+    const ctxKey = buildContextKey();
+    const needsRefresh = ctxKey !== this.context || becameVisible || this.needsRefreshOnShow || !this.hasLoadedOnce || busChanged;
+    if (needsRefresh) {
+      const isBusOnly = ctxKey === this.context && !becameVisible && !this.needsRefreshOnShow && this.hasLoadedOnce && busChanged;
       this.needsRefreshOnShow = false;
-      this.scheduleRenderRefresh(cx);
-    } else if (!visible && busChanged) {
-      this.needsRefreshOnShow = true;
+      this.scheduleRenderRefresh(cx, isBusOnly);
     }
 
     const allSpaces = spaces() || [];
@@ -2743,25 +3625,45 @@ export default class GitHistory extends View {
     }
 
     const t = theme();
-    const dt = getDiffTheme(t);
-    const lanePalette = getLanePalette(t);
+    const { dt, lanePalette } = getThemeBundle(t);
     const mono = settings()?.font_family ?? "JetBrains Mono";
     const isCompact = (this.panelWidth || 420) < 380;
 
-    const filteredCommits = filterCommits(this.commits, this.searchQuery);
-    const rowByHash = new Map();
-    for (const row of this.graphLayout?.rows || []) {
-      if (row?.hash) rowByHash.set(row.hash, row);
+    if (!this._cachedFilterState || this._cachedFilterState.commits !== this.commits || this._cachedFilterState.query !== this.searchQuery) {
+      this._cachedFilterState = {
+        commits: this.commits,
+        query: this.searchQuery,
+        result: filterCommits(this.commits, this.searchQuery),
+      };
     }
-    const maxLaneCount = Math.max(1, this.graphLayout?.maxLaneCount || 1);
-    const graphWidth = Math.min(180, LANE_PAD_LEFT * 2 + Math.max(0, maxLaneCount - 1) * LANE_WIDTH + 6);
+    const filteredCommits = this._cachedFilterState.result;
+
+    if (!this._cachedRowMapState || this._cachedRowMapState.layout !== this.graphLayout) {
+      const rowByHash = new Map();
+      for (const row of this.graphLayout?.rows || []) {
+        if (row?.hash) rowByHash.set(row.hash, row);
+      }
+      const maxLaneCount = Math.max(1, this.graphLayout?.maxLaneCount || 1);
+      const graphWidth = Math.min(180, LANE_PAD_LEFT * 2 + Math.max(0, maxLaneCount - 1) * LANE_WIDTH + 6);
+      this._cachedRowMapState = { layout: this.graphLayout, rowByHash, graphWidth };
+    }
+    const { rowByHash, graphWidth } = this._cachedRowMapState;
+
     const showLoadMoreRow = Boolean(this.hasMore && !this.searchQuery.trim() && filteredCommits.length > 0);
     const listCount = filteredCommits.length + (showLoadMoreRow ? 1 : 0);
 
     const activeRepo = this.selectedRepo;
     const branchDisplay = this.selectedBranch === "__all__" ? "All Branches" : this.selectedBranch;
-    const localBranches = (this.branches || []).filter((b) => b.kind === "local");
-    const remoteBranches = (this.branches || []).filter((b) => b.kind === "remote");
+    if (!this._cachedBranchState || this._cachedBranchState.branches !== this.branches) {
+      const localBranches = [];
+      const remoteBranches = [];
+      for (const b of this.branches || []) {
+        if (b.kind === "local") localBranches.push(b);
+        else if (b.kind === "remote") remoteBranches.push(b);
+      }
+      this._cachedBranchState = { branches: this.branches, localBranches, remoteBranches };
+    }
+    const { localBranches, remoteBranches } = this._cachedBranchState;
 
     return v_flex()
       .id("git-history")
@@ -2947,6 +3849,10 @@ export default class GitHistory extends View {
                 .hover((s) => s.bg(t.hover).text_color(t.foreground))
                 .tooltip("Clear search filter")
                 .on_click((_e, cx) => {
+                  if (this.searchDebounceTask) {
+                    try { this.searchDebounceTask.cancel(); } catch {}
+                    this.searchDebounceTask = null;
+                  }
                   this.searchQuery = "";
                   this.searchInput.set_value("");
                   cx.notify();

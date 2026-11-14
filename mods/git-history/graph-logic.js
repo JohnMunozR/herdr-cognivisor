@@ -173,16 +173,36 @@ function findLowestFreeLane(activeLanes) {
 }
 
 function allocateColorIndex(activeLanes, paletteSize, cursorRef) {
-  const used = new Set();
-  for (const slot of activeLanes) {
-    if (slot !== null) used.add(slot.colorIndex);
-  }
-
-  for (let offset = 0; offset < paletteSize; offset++) {
-    const candidate = (cursorRef.value + offset) % paletteSize;
-    if (!used.has(candidate)) {
-      cursorRef.value = (candidate + 1) % paletteSize;
-      return candidate;
+  if (paletteSize <= 30) {
+    let usedMask = 0;
+    for (let i = 0; i < activeLanes.length; i++) {
+      const slot = activeLanes[i];
+      if (slot !== null) {
+        const idx = slot.colorIndex;
+        if (idx >= 0 && idx < paletteSize) usedMask |= 1 << idx;
+      }
+    }
+    for (let offset = 0; offset < paletteSize; offset++) {
+      const candidate = (cursorRef.value + offset) % paletteSize;
+      if ((usedMask & (1 << candidate)) === 0) {
+        cursorRef.value = (candidate + 1) % paletteSize;
+        return candidate;
+      }
+    }
+  } else {
+    const used = new Uint8Array(paletteSize);
+    for (let i = 0; i < activeLanes.length; i++) {
+      const slot = activeLanes[i];
+      if (slot !== null && slot.colorIndex >= 0 && slot.colorIndex < paletteSize) {
+        used[slot.colorIndex] = 1;
+      }
+    }
+    for (let offset = 0; offset < paletteSize; offset++) {
+      const candidate = (cursorRef.value + offset) % paletteSize;
+      if (used[candidate] === 0) {
+        cursorRef.value = (candidate + 1) % paletteSize;
+        return candidate;
+      }
     }
   }
 
@@ -399,7 +419,7 @@ export function computeCommitGraphLayout(commits, options = {}) {
 export function filterCommits(commits, query) {
   if (!Array.isArray(commits)) return [];
   const q = typeof query === "string" ? query.trim().toLowerCase() : "";
-  if (!q) return commits.slice();
+  if (!q) return commits;
 
   return commits.filter((c) => {
     if (!c) return false;

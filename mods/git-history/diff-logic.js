@@ -4,6 +4,10 @@ export const MAX_DIFF_SYNTAX_LINE_CHARS = 500;
 export const MAX_VIEWER_DIFF_LINES = 1500;
 export const DEFAULT_SBS_PAGE_ROWS = 180;
 export const MAX_RENDER_TOKENS_PER_LINE = 28;
+export const DIFF_ROW_HEIGHT = 24;
+export const DIFF_HUNK_HEIGHT = 28;
+export const DIFF_WAVE_GUTTER_WIDTH = 40;
+export const DIFF_WAVE_MAX_CENTER_OFFSET_ROWS = 2;
 const MAX_EXPANDED_VIEWER_DIFF_LINES = 4000;
 const MAX_WIDTH_ESTIMATE_COLS = 4000;
 
@@ -115,15 +119,29 @@ function pickTone(candidate, fallback, isDark, minDarkLuma = 0.36, maxLightLuma 
 }
 
 let cachedDiffThemeRef = null;
+let cachedDiffThemeSig = "";
 let cachedDiffPalette = null;
+
+function buildThemePaletteSig(t) {
+  if (!t || typeof t !== "object") return "default";
+  return `${t.is_dark}|${t.appearance}|${t.background}|${t.foreground}|${t.dim}|${t.muted}|${t.ansi1}|${t.ansi2}|${t.ansi3}|${t.ansi4}|${t.ansi5}|${t.ansi6}`;
+}
 
 export function getDiffSyntaxPalette(t) {
   if (t && t === cachedDiffThemeRef && cachedDiffPalette) return cachedDiffPalette;
+  if (t && t._isSyntaxPalette) return t;
+  const sig = buildThemePaletteSig(t);
+  if (cachedDiffPalette && sig === cachedDiffThemeSig) {
+    if (t) cachedDiffThemeRef = t;
+    return cachedDiffPalette;
+  }
   const isDark = isDarkTheme(t);
   const warmAmber = isDark ? "#d19a66" : "#b35900";
   const cyan = pickTone(t?.ansi6, isDark ? "#56b6c2" : "#0e7490", isDark);
   const coral = pickTone(t?.ansi1, isDark ? "#e06c75" : "#cf222e", isDark);
   const palette = {
+    _isSyntaxPalette: true,
+    _sig: sig,
     isDark,
     keyword: pickTone(t?.ansi5, isDark ? "#c678dd" : "#8250df", isDark),
     string: pickTone(t?.ansi2, isDark ? "#98c379" : "#116329", isDark),
@@ -140,15 +158,16 @@ export function getDiffSyntaxPalette(t) {
     plain: pickTone(t?.foreground, isDark ? "#abb2bf" : "#24292f", isDark, 0.45, 0.45),
     muted: pickTone(t?.muted || t?.dim, isDark ? "#8b93a2" : "#57606a", isDark, 0.34, 0.56),
   };
+  cachedDiffThemeSig = sig;
+  cachedDiffPalette = palette;
   if (t) {
     cachedDiffThemeRef = t;
-    cachedDiffPalette = palette;
   }
   return palette;
 }
 
 export function diffSyntaxTokenColor(kind, t) {
-  const p = getDiffSyntaxPalette(t);
+  const p = t && t._isSyntaxPalette ? t : getDiffSyntaxPalette(t);
   switch (kind) {
     case "keyword": return p.keyword;
     case "string": return p.string;
@@ -164,6 +183,63 @@ export function diffSyntaxTokenColor(kind, t) {
     case "operator": return p.operator;
     default: return p.plain;
   }
+}
+
+export function toNbspString(text) {
+  if (!text) return "";
+  const s = typeof text === "string" ? text : String(text);
+  return s.indexOf(" ") === -1 ? s : s.replace(/ /g, "\u00a0");
+}
+
+/**
+ * Resolves, caps, converts spaces to non-breaking spaces, and merges adjacent
+ * identically colored syntax spans once so hot GPUI render loops allocate no
+ * intermediate token arrays or regex replacements.
+ */
+export function prepareRenderLineData(tokens, plainText, paletteOrTheme, fallbackColor, maxTokens = MAX_RENDER_TOKENS_PER_LINE) {
+  const palette = paletteOrTheme && paletteOrTheme._isSyntaxPalette
+    ? paletteOrTheme
+    : getDiffSyntaxPalette(paletteOrTheme);
+  if (!Array.isArray(tokens) || tokens.length === 0) {
+    const expanded = plainText ? expandCodeTabs(plainText) : " ";
+    return {
+      kind: "single",
+      color: fallbackColor,
+      text: toNbspString(expanded || " "),
+    };
+  }
+
+  const tokList = capRenderTokens(tokens, maxTokens);
+  if (tokList.length === 1) {
+    const [tokKind, tokText] = tokList[0];
+    return {
+      kind: "single",
+      color: diffSyntaxTokenColor(tokKind, palette),
+      text: toNbspString(tokText || " "),
+    };
+  }
+
+  const spans = [];
+  for (let i = 0; i < tokList.length; i++) {
+    const tok = tokList[i];
+    const color = diffSyntaxTokenColor(tok[0], palette);
+    const nbsp = toNbspString(tok[1] || "");
+    if (!nbsp) continue;
+    const prev = spans.length > 0 ? spans[spans.length - 1] : null;
+    if (prev && prev[0] === color) {
+      prev[1] += nbsp;
+    } else {
+      spans.push([color, nbsp]);
+    }
+  }
+
+  if (spans.length === 0) {
+    return { kind: "single", color: fallbackColor, text: "\u00a0" };
+  }
+  if (spans.length === 1) {
+    return { kind: "single", color: spans[0][0], text: spans[0][1] };
+  }
+  return { kind: "multi", spans };
 }
 
 export function getFileExt(filePath) {
@@ -235,6 +311,38 @@ function emitDiffComment(tokens, slice, enableDocTags) {
   if (last < slice.length) pushSyntaxToken(tokens, "comment", slice.slice(last));
 }
 
+const TPL_VAR_NAME_RE = /^[a-zA-Z0-9_.:-]+$/;
+const PATH_VAR_NAME_RE = /^[a-zA-Z_][a-zA-Z0-9_.-]*$/;
+const PROP_NUMBER_RE = /^-?(?:0x[0-9a-fA-F_]+|\d+(?:\.\d+)?)(?:ms|s|m|h|d|kb|mb|gb)?$/i;
+const MD_HEADING_RE = /^\s*#{1,6}\s/;
+const DOC_LINE_START_RE = /^\s*\*\s*(?:$|\*\/|@(?:param|returns?|throws|exception|see|since|deprecated|author|version|implSpec|implNote|apiNote|code|linkplain|link|value|inheritDoc)\b)/;
+const UPPER_CONST_RE = /^[A-Z][A-Z0-9_]+$/;
+const PASCAL_TYPE_RE = /^[A-Z][a-zA-Z0-9_]*$/;
+
+function isHexDigitChar(ch) {
+  const c = ch.charCodeAt(0);
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102);
+}
+
+function isAsciiAlphaChar(ch) {
+  const c = ch.charCodeAt(0);
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+function isDigitUnderscoreChar(ch) {
+  const c = ch.charCodeAt(0);
+  return (c >= 48 && c <= 57) || c === 95;
+}
+
+function isDecDotChar(ch) {
+  const c = ch.charCodeAt(0);
+  return (c >= 48 && c <= 57) || c === 46 || c === 95;
+}
+
+function isNumSuffixChar(ch) {
+  return isAsciiAlphaChar(ch) || ch === "%";
+}
+
 function emitDiffStringSegments(tokens, slice, baseKind, opts = {}) {
   if (baseKind !== "string") {
     pushSyntaxToken(tokens, baseKind, slice);
@@ -259,7 +367,7 @@ function emitDiffStringSegments(tokens, slice, baseKind, opts = {}) {
     }
     if (ch === "$" && i + 1 < len && slice[i + 1] === "{") {
       const close = slice.indexOf("}", i + 2);
-      if (close > i + 2 && (isTemplate || /^[a-zA-Z0-9_.:-]+$/.test(slice.slice(i + 2, close)))) {
+      if (close > i + 2 && (isTemplate || TPL_VAR_NAME_RE.test(slice.slice(i + 2, close)))) {
         flushSeg(i);
         pushSyntaxToken(tokens, "string.escape", slice.slice(i, close + 1));
         i = segStart = close + 1;
@@ -276,7 +384,7 @@ function emitDiffStringSegments(tokens, slice, baseKind, opts = {}) {
       const close = slice.indexOf("}", i + 1);
       if (close > i) {
         const inner = slice.slice(i + 1, close);
-        const isPathOrSlf4j = allowPathVars && (inner === "" || (slice[i - 1] === "/" && /^[a-zA-Z_][a-zA-Z0-9_.-]*$/.test(inner)));
+        const isPathOrSlf4j = allowPathVars && (inner === "" || (slice[i - 1] === "/" && PATH_VAR_NAME_RE.test(inner)));
         const isPyInterp = isFString && inner.length > 0 && !inner.includes("\n");
         if (isPathOrSlf4j || isPyInterp) {
           flushSeg(i);
@@ -333,7 +441,7 @@ function tokenizeDiffPropertiesLine(text, tokens) {
       pushSyntaxToken(tokens, "boolean", valTrim);
     } else if (DIFF_CONSTANTS.has(valTrim)) {
       pushSyntaxToken(tokens, "constant", valTrim);
-    } else if (/^-?(?:0x[0-9a-fA-F_]+|\d+(?:\.\d+)?)(?:ms|s|m|h|d|kb|mb|gb)?$/i.test(valTrim)) {
+    } else if (PROP_NUMBER_RE.test(valTrim)) {
       pushSyntaxToken(tokens, "number", valTrim);
     } else {
       emitDiffStringSegments(tokens, valTrim, "string", { allowPathVars: false });
@@ -368,10 +476,10 @@ export function tokenizeDiffLine(line, ext) {
   const isMd = normExt === "md" || normExt === "mdx";
   const docTagsEnabled = DOC_COMMENT_EXTS.has(normExt);
 
-  if (isMd && /^\s*#{1,6}\s/.test(text)) {
+  if (isMd && MD_HEADING_RE.test(text)) {
     return [["keyword", text]];
   }
-  if (docTagsEnabled && /^\s*\*\s*(?:$|\*\/|@(?:param|returns?|throws|exception|see|since|deprecated|author|version|implSpec|implNote|apiNote|code|linkplain|link|value|inheritDoc)\b)/.test(text)) {
+  if (docTagsEnabled && DOC_LINE_START_RE.test(text)) {
     emitDiffComment(tokens, text, true);
     return tokens;
   }
@@ -514,9 +622,9 @@ export function tokenizeDiffLine(line, ext) {
       continue;
     }
 
-    if (isCss && ch === "#" && i + 1 < len && /[0-9a-fA-F]/.test(text[i + 1])) {
+    if (isCss && ch === "#" && i + 1 < len && isHexDigitChar(text[i + 1])) {
       let end = i + 1;
-      while (end < len && /[0-9a-fA-F]/.test(text[end])) end++;
+      while (end < len && isHexDigitChar(text[end])) end++;
       flushPlain(i);
       pushSyntaxToken(tokens, "number", text.slice(i, end));
       i = plainStart = end;
@@ -535,7 +643,7 @@ export function tokenizeDiffLine(line, ext) {
     if (ch === "<" && i + 1 < len && (markup || normExt === "jsx" || normExt === "tsx")) {
       let tagStart = i + 1;
       if (text[tagStart] === "/") tagStart++;
-      if (tagStart < len && /[A-Za-z]/.test(text[tagStart])) {
+      if (tagStart < len && isAsciiAlphaChar(text[tagStart])) {
         let end = tagStart + 1;
         while (end < len && (isIdentPart(text[end]) || text[end] === "-" || text[end] === ":" || text[end] === ".")) end++;
         flushPlain(tagStart);
@@ -551,14 +659,19 @@ export function tokenizeDiffLine(line, ext) {
       let end = i + 1;
       if (ch === "0" && end < len && (text[end] === "x" || text[end] === "X" || text[end] === "b" || text[end] === "B")) {
         end++;
-        while (end < len && /[0-9a-fA-F_]/.test(text[end])) end++;
+        while (end < len && (isHexDigitChar(text[end]) || text[end] === "_")) end++;
       } else {
-        while (end < len && /[0-9._]/.test(text[end])) end++;
-        if (end < len && (text[end] === "e" || text[end] === "E") && end + 1 < len && /[0-9+\-]/.test(text[end + 1])) {
+        while (end < len && isDecDotChar(text[end])) end++;
+        if (
+          end < len &&
+          (text[end] === "e" || text[end] === "E") &&
+          end + 1 < len &&
+          (isDigit(text[end + 1]) || text[end + 1] === "+" || text[end + 1] === "-")
+        ) {
           end += 2;
-          while (end < len && /[0-9_]/.test(text[end])) end++;
+          while (end < len && isDigitUnderscoreChar(text[end])) end++;
         }
-        while (end < len && /[a-zA-Z%]/.test(text[end])) end++;
+        while (end < len && isNumSuffixChar(text[end])) end++;
       }
       flushPlain(i);
       pushSyntaxToken(tokens, "number", text.slice(i, end));
@@ -623,13 +736,13 @@ export function tokenizeDiffLine(line, ext) {
         kind = "variable";
       } else if (DIFF_BOOLEANS.has(word)) {
         kind = "boolean";
-      } else if (DIFF_CONSTANTS.has(word) || (word.length > 1 && /^[A-Z][A-Z0-9_]+$/.test(word) && !(isSql && DIFF_KEYWORDS.has(word)))) {
+      } else if (DIFF_CONSTANTS.has(word) || (word.length > 1 && UPPER_CONST_RE.test(word) && !(isSql && DIFF_KEYWORDS.has(word)))) {
         kind = "constant";
       } else if (isPython && word === "type" && isCall) {
         kind = "function";
       } else if (DIFF_KEYWORDS.has(word) || (isSql && SQL_LOWER_KEYWORDS.has(word.toLowerCase()))) {
         kind = "keyword";
-      } else if (/^[A-Z][a-zA-Z0-9_]*$/.test(word) || (DIFF_TYPES.has(word) && !isCall)) {
+      } else if (PASCAL_TYPE_RE.test(word) || (DIFF_TYPES.has(word) && !isCall)) {
         kind = "type";
       } else if (isCall || prevTwo === "::") {
         kind = "function";
@@ -936,6 +1049,46 @@ function resolveMaxDiffLines(options) {
   return options?.expanded ? MAX_EXPANDED_VIEWER_DIFF_LINES : MAX_VIEWER_DIFF_LINES;
 }
 
+export function tokenizeDeferredRow(row, ext) {
+  if (!row || typeof row !== "object") return row;
+  if (row.kind === "pair") {
+    const left = row.left;
+    const right = row.right;
+    if (left && right && left.kind === "ctx" && right.kind === "ctx") {
+      if (left._tokPending || right._tokPending) {
+        const toks = tokenizeDiffLine(left.text, ext);
+        left.tokens = toks;
+        right.tokens = toks;
+        left._tokPending = false;
+        right._tokPending = false;
+      }
+      return row;
+    }
+    if (left && left._tokPending) {
+      left.tokens = tokenizeDiffLine(left.text, ext);
+      left._tokPending = false;
+    }
+    if (right && right._tokPending) {
+      right.tokens = tokenizeDiffLine(right.text, ext);
+      right._tokPending = false;
+    }
+    return row;
+  }
+  if (row._tokPending) {
+    row.tokens = tokenizeDiffLine(row.text, ext);
+    row._tokPending = false;
+  }
+  return row;
+}
+
+export function tokenizeSideBySidePage(rows, ext) {
+  if (!Array.isArray(rows) || rows.length === 0) return rows;
+  for (let i = 0; i < rows.length; i++) {
+    tokenizeDeferredRow(rows[i], ext);
+  }
+  return rows;
+}
+
 export function buildSideBySideRows(patchText, filePath = "", options = {}) {
   if (typeof patchText !== "string" || !patchText) {
     return { rows: [], isBinary: false, truncated: false, totalLines: 0, leftMaxChars: 0, rightMaxChars: 0 };
@@ -945,6 +1098,7 @@ export function buildSideBySideRows(patchText, filePath = "", options = {}) {
   }
 
   const ext = getFileExt(filePath);
+  const deferTokens = Boolean(options?.deferTokens);
   const allRows = [];
   const rawLines = patchText.split("\n");
 
@@ -961,14 +1115,18 @@ export function buildSideBySideRows(patchText, filePath = "", options = {}) {
       let left;
       if (k < dels.length) {
         const text = expandCodeTabs(dels[k]);
-        left = { lineNo: oldLine++, text, kind: "del", tokens: tokenizeDiffLine(text, ext) };
+        left = deferTokens
+          ? { lineNo: oldLine++, text, kind: "del", tokens: null, _tokPending: true }
+          : { lineNo: oldLine++, text, kind: "del", tokens: tokenizeDiffLine(text, ext) };
       } else {
         left = { lineNo: null, text: "", kind: "empty", tokens: null };
       }
       let right;
       if (k < adds.length) {
         const text = expandCodeTabs(adds[k]);
-        right = { lineNo: newLine++, text, kind: "add", tokens: tokenizeDiffLine(text, ext) };
+        right = deferTokens
+          ? { lineNo: newLine++, text, kind: "add", tokens: null, _tokPending: true }
+          : { lineNo: newLine++, text, kind: "add", tokens: tokenizeDiffLine(text, ext) };
       } else {
         right = { lineNo: null, text: "", kind: "empty", tokens: null };
       }
@@ -1016,12 +1174,20 @@ export function buildSideBySideRows(patchText, filePath = "", options = {}) {
       if (line === "" && i === rawLines.length - 1) continue;
       flushChangeBlock();
       const text = expandCodeTabs(line === "" ? "" : line.slice(1));
-      const tokens = tokenizeDiffLine(text, ext);
-      allRows.push({
-        kind: "pair",
-        left: { lineNo: oldLine++, text, kind: "ctx", tokens },
-        right: { lineNo: newLine++, text, kind: "ctx", tokens },
-      });
+      if (deferTokens) {
+        allRows.push({
+          kind: "pair",
+          left: { lineNo: oldLine++, text, kind: "ctx", tokens: null, _tokPending: true },
+          right: { lineNo: newLine++, text, kind: "ctx", tokens: null, _tokPending: true },
+        });
+      } else {
+        const tokens = tokenizeDiffLine(text, ext);
+        allRows.push({
+          kind: "pair",
+          left: { lineNo: oldLine++, text, kind: "ctx", tokens },
+          right: { lineNo: newLine++, text, kind: "ctx", tokens },
+        });
+      }
     }
   }
   flushChangeBlock();
@@ -1051,6 +1217,7 @@ export function buildUnifiedRows(patchText, filePath = "", options = {}) {
   }
 
   const ext = getFileExt(filePath);
+  const deferTokens = Boolean(options?.deferTokens);
   const allRows = [];
   const rawLines = patchText.split("\n");
 
@@ -1094,7 +1261,8 @@ export function buildUnifiedRows(patchText, filePath = "", options = {}) {
         oldLineNo: oldLine++,
         newLineNo: null,
         text,
-        tokens: tokenizeDiffLine(text, ext),
+        tokens: deferTokens ? null : tokenizeDiffLine(text, ext),
+        ...(deferTokens ? { _tokPending: true } : {}),
       });
     } else if (prefix === "+") {
       const text = expandCodeTabs(line.slice(1));
@@ -1103,7 +1271,8 @@ export function buildUnifiedRows(patchText, filePath = "", options = {}) {
         oldLineNo: null,
         newLineNo: newLine++,
         text,
-        tokens: tokenizeDiffLine(text, ext),
+        tokens: deferTokens ? null : tokenizeDiffLine(text, ext),
+        ...(deferTokens ? { _tokPending: true } : {}),
       });
     } else if (prefix === " " || line === "") {
       if (line === "" && i === rawLines.length - 1) continue;
@@ -1113,7 +1282,8 @@ export function buildUnifiedRows(patchText, filePath = "", options = {}) {
         oldLineNo: oldLine++,
         newLineNo: newLine++,
         text,
-        tokens: tokenizeDiffLine(text, ext),
+        tokens: deferTokens ? null : tokenizeDiffLine(text, ext),
+        ...(deferTokens ? { _tokPending: true } : {}),
       });
     }
   }
@@ -1132,6 +1302,14 @@ export function buildUnifiedRows(patchText, filePath = "", options = {}) {
   return { rows, isBinary: false, truncated, totalLines, maxChars };
 }
 
+function expandedLineCols(text) {
+  if (!text) return 0;
+  if (typeof text === "string" && text.indexOf("\t") === -1) {
+    return text.length > MAX_WIDTH_ESTIMATE_COLS ? MAX_WIDTH_ESTIMATE_COLS : text.length;
+  }
+  return Math.min(expandCodeTabs(text).length, MAX_WIDTH_ESTIMATE_COLS);
+}
+
 export function computeDiffColumnWidths(rows, charPx = 7.2) {
   const pxPerChar = Number.isFinite(Number(charPx)) && Number(charPx) > 0 ? Number(charPx) : 7.2;
   let leftCols = 0;
@@ -1141,17 +1319,18 @@ export function computeDiffColumnWidths(rows, charPx = 7.2) {
   for (const row of rows || []) {
     if (!row) continue;
     if (row.kind === "pair") {
-      const lLen = Math.min(row.left?.text?.length || 0, MAX_WIDTH_ESTIMATE_COLS);
-      const rLen = Math.min(row.right?.text?.length || 0, MAX_WIDTH_ESTIMATE_COLS);
+      const lLen = expandedLineCols(row.left?.text);
+      const rLen = expandedLineCols(row.right?.text);
       if (lLen > leftCols) leftCols = lLen;
       if (rLen > rightCols) rightCols = rLen;
       if (lLen > unifiedCols) unifiedCols = lLen;
       if (rLen > unifiedCols) unifiedCols = rLen;
     } else if (row.kind === "hunk") {
-      const hLen = Math.min(row.header?.length || 0, MAX_WIDTH_ESTIMATE_COLS);
+      const hLen = expandedLineCols(row.header);
+      if (hLen > leftCols) leftCols = hLen;
       if (hLen > unifiedCols) unifiedCols = hLen;
     } else if (typeof row.text === "string") {
-      const tLen = Math.min(row.text.length, MAX_WIDTH_ESTIMATE_COLS);
+      const tLen = expandedLineCols(row.text);
       if (tLen > unifiedCols) unifiedCols = tLen;
       if (row.kind === "del" || row.kind === "ctx") {
         if (tLen > leftCols) leftCols = tLen;
@@ -1163,10 +1342,84 @@ export function computeDiffColumnWidths(rows, charPx = 7.2) {
   }
 
   return {
-    leftWidth: Math.max(260, Math.ceil(leftCols * pxPerChar) + 68),
-    rightWidth: Math.max(260, Math.ceil(rightCols * pxPerChar) + 68),
-    unifiedWidth: Math.max(300, Math.ceil(unifiedCols * pxPerChar) + 96),
+    leftWidth: leftCols > 0 ? Math.max(260, Math.ceil(leftCols * pxPerChar) + 92) : 260,
+    rightWidth: rightCols > 0 ? Math.max(260, Math.ceil(rightCols * pxPerChar) + 92) : 260,
+    unifiedWidth: unifiedCols > 0 ? Math.max(300, Math.ceil(unifiedCols * pxPerChar) + 120) : 300,
   };
+}
+
+/**
+ * Resolves whether a wheel event should horizontally scroll a diff column.
+ * Plain vertical wheel is never hijacked so vertical sync remains undisturbed;
+ * Shift+Wheel (on either delta.y or delta.x depending on OS) or explicit horizontal
+ * trackpad swipes scroll only the hovered column horizontally.
+ */
+export function computeHorizontalWheelDelta(event) {
+  const dx = Number(event?.delta?.x) || 0;
+  const dy = Number(event?.delta?.y) || 0;
+  if (event?.modifiers?.shift) {
+    const raw = Math.abs(dx) >= Math.abs(dy) ? dx : dy;
+    return {
+      handled: true,
+      deltaX: raw === 0 ? 0 : -raw,
+    };
+  }
+  if (dx !== 0 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+    return {
+      handled: true,
+      deltaX: -dx,
+    };
+  }
+  return { handled: false, deltaX: 0 };
+}
+
+/**
+ * Computes clamped horizontal scroll position and thumb geometry for a column.
+ */
+export function computeHorizontalScrollbarMetrics(contentWidth, viewportWidth, scrollX = 0, trackWidth = null) {
+  const cW = Number.isFinite(Number(contentWidth)) ? Math.max(0, Number(contentWidth)) : 0;
+  const vW = Number.isFinite(Number(viewportWidth)) ? Math.max(0, Number(viewportWidth)) : 0;
+  const maxScroll = vW > 0 ? Math.max(0, Math.ceil(cW - vW)) : 0;
+  const rawScroll = Number.isFinite(Number(scrollX)) ? Number(scrollX) : 0;
+  const clampedScroll = Math.max(0, Math.min(Math.round(rawScroll), maxScroll));
+  const usableTrackW = Math.max(
+    0,
+    Math.floor(Number.isFinite(Number(trackWidth)) && Number(trackWidth) > 0 ? Number(trackWidth) : vW)
+  );
+  if (vW <= 0 || maxScroll <= 1 || usableTrackW <= 0) {
+    return {
+      visible: false,
+      maxScroll: 0,
+      scrollX: 0,
+      trackW: usableTrackW,
+      thumbX: 0,
+      thumbW: 0,
+      travelW: 0,
+    };
+  }
+  const thumbW = Math.max(24, Math.min(usableTrackW, Math.round((vW / Math.max(1, cW)) * usableTrackW)));
+  const travelW = Math.max(0, usableTrackW - thumbW);
+  const thumbX = travelW > 0 ? Math.round((clampedScroll / maxScroll) * travelW) : 0;
+  return {
+    visible: true,
+    maxScroll,
+    scrollX: clampedScroll,
+    trackW: usableTrackW,
+    thumbX,
+    thumbW,
+    travelW,
+  };
+}
+
+/**
+ * Maps a click position inside a horizontal scrollbar track to a centered scroll offset.
+ */
+export function computeScrollXFromTrackClick(localX, contentWidth, viewportWidth, trackWidth = null) {
+  const metrics = computeHorizontalScrollbarMetrics(contentWidth, viewportWidth, 0, trackWidth);
+  if (!metrics.visible || metrics.travelW <= 0 || metrics.maxScroll <= 0) return 0;
+  const x = Number.isFinite(Number(localX)) ? Number(localX) : 0;
+  const targetThumbLeft = Math.max(0, Math.min(metrics.travelW, x - metrics.thumbW / 2));
+  return Math.max(0, Math.min(metrics.maxScroll, Math.round((targetThumbLeft / metrics.travelW) * metrics.maxScroll)));
 }
 
 const EXACT_GIT_FILE_ICONS = {
@@ -1409,4 +1662,143 @@ export function capRenderTokens(tokens, maxTokens = MAX_RENDER_TOKENS_PER_LINE) 
     head.push(["plain", tailText]);
   }
   return head;
+}
+
+function layoutWaveSide(items, lines, blockH, cursorY, rowHeight, maxOffsetPx, markerKindOnZero) {
+  if (lines.length === 0) {
+    const markerY = Math.min(Math.floor(blockH / 2), maxOffsetPx);
+    items.push({ type: "spacer", height: blockH, markerOffsetY: markerY, markerKind: markerKindOnZero });
+    return {
+      top: cursorY + markerY,
+      bot: cursorY + markerY,
+      localTop: markerY,
+      localBot: markerY,
+    };
+  }
+  const sideH = lines.length * rowHeight;
+  const topPad = sideH < blockH ? Math.min(Math.floor((blockH - sideH) / 2), maxOffsetPx) : 0;
+  const botPad = blockH - sideH - topPad;
+  if (topPad > 0) {
+    items.push({ type: "spacer", height: topPad, markerOffsetY: null, markerKind: null });
+  }
+  for (const cell of lines) {
+    items.push({ type: "line", height: rowHeight, cell });
+  }
+  if (botPad > 0) {
+    items.push({ type: "spacer", height: botPad, markerOffsetY: null, markerKind: null });
+  }
+  return {
+    top: cursorY + topPad,
+    bot: cursorY + topPad + sideH,
+    localTop: topPad,
+    localBot: topPad + sideH,
+  };
+}
+
+/**
+ * Computes compact, aligned Left/Right column items, per-block center gutter items,
+ * and bezier wave ribbon geometry for a bounded page of side-by-side diff rows.
+ * Using matching v_flex gutterItems keeps vertical alignment exact across HiDPI scales.
+ */
+export function buildWaveDiffLayout(pageRows, options = {}) {
+  const rows = Array.isArray(pageRows) ? pageRows : [];
+  const rowHeight = Number.isFinite(Number(options?.rowHeight)) && Number(options.rowHeight) > 0
+    ? Math.floor(Number(options.rowHeight))
+    : DIFF_ROW_HEIGHT;
+  const hunkHeight = Number.isFinite(Number(options?.hunkHeight)) && Number(options.hunkHeight) > 0
+    ? Math.floor(Number(options.hunkHeight))
+    : DIFF_HUNK_HEIGHT;
+  const maxCenterOffsetRows =
+    Number.isFinite(Number(options?.maxCenterOffsetRows)) && Number(options.maxCenterOffsetRows) >= 0
+      ? Math.floor(Number(options.maxCenterOffsetRows))
+      : DIFF_WAVE_MAX_CENTER_OFFSET_ROWS;
+  const maxOffsetPx = maxCenterOffsetRows * rowHeight;
+
+  const leftItems = [];
+  const rightItems = [];
+  const gutterItems = [];
+  const hunkBands = [];
+  const waves = [];
+  let cursorY = 0;
+  let pendingDels = [];
+  let pendingAdds = [];
+
+  const flushChange = () => {
+    const dCount = pendingDels.length;
+    const aCount = pendingAdds.length;
+    if (dCount === 0 && aCount === 0) return;
+    const blockH = Math.max(dCount, aCount) * rowHeight;
+    const leftSpan = layoutWaveSide(leftItems, pendingDels, blockH, cursorY, rowHeight, maxOffsetPx, "add");
+    const rightSpan = layoutWaveSide(rightItems, pendingAdds, blockH, cursorY, rowHeight, maxOffsetPx, "del");
+    const kind = dCount > 0 && aCount > 0 ? "mod" : dCount === 0 ? "add" : "del";
+    waves.push({
+      kind,
+      leftTop: leftSpan.top,
+      leftBot: leftSpan.bot,
+      rightTop: rightSpan.top,
+      rightBot: rightSpan.bot,
+    });
+    gutterItems.push({
+      type: "wave",
+      height: blockH,
+      kind,
+      leftTop: leftSpan.localTop,
+      leftBot: leftSpan.localBot,
+      rightTop: rightSpan.localTop,
+      rightBot: rightSpan.localBot,
+    });
+    cursorY += blockH;
+    pendingDels = [];
+    pendingAdds = [];
+  };
+
+  for (const row of rows) {
+    if (!row) continue;
+    if (row.kind === "hunk") {
+      flushChange();
+      leftItems.push({
+        type: "hunk",
+        height: hunkHeight,
+        header: row.header || "",
+        hunkIndex: row.hunkIndex,
+      });
+      rightItems.push({
+        type: "hunk",
+        height: hunkHeight,
+      });
+      gutterItems.push({
+        type: "hunk",
+        height: hunkHeight,
+      });
+      hunkBands.push({ y: cursorY, height: hunkHeight });
+      cursorY += hunkHeight;
+      continue;
+    }
+
+    if (row.kind !== "pair") continue;
+    const left = row.left || { kind: "empty", lineNo: null, text: "", tokens: null };
+    const right = row.right || { kind: "empty", lineNo: null, text: "", tokens: null };
+
+    if (left.kind === "ctx" && right.kind === "ctx") {
+      flushChange();
+      leftItems.push({ type: "line", height: rowHeight, cell: left });
+      rightItems.push({ type: "line", height: rowHeight, cell: right });
+      gutterItems.push({ type: "ctx", height: rowHeight });
+      cursorY += rowHeight;
+      continue;
+    }
+
+    if (left.kind !== "empty") pendingDels.push(left);
+    if (right.kind !== "empty") pendingAdds.push(right);
+  }
+  flushChange();
+
+  return {
+    leftItems,
+    rightItems,
+    gutterItems,
+    hunkBands,
+    waves,
+    totalHeight: cursorY,
+  };
 }

@@ -5,6 +5,10 @@ import {
   MAX_VIEWER_DIFF_LINES,
   DEFAULT_SBS_PAGE_ROWS,
   MAX_RENDER_TOKENS_PER_LINE,
+  DIFF_ROW_HEIGHT,
+  DIFF_HUNK_HEIGHT,
+  DIFF_WAVE_GUTTER_WIDTH,
+  DIFF_WAVE_MAX_CENTER_OFFSET_ROWS,
   parseCommitFiles,
   getFileExt,
   expandCodeTabs,
@@ -14,11 +18,19 @@ import {
   buildSideBySideRows,
   buildUnifiedRows,
   computeDiffColumnWidths,
+  computeHorizontalWheelDelta,
+  computeHorizontalScrollbarMetrics,
+  computeScrollXFromTrackClick,
   resolveGitFileIcon,
   computeViewerLoadedKey,
   formatGitTabTitle,
   paginateDiffRows,
   capRenderTokens,
+  buildWaveDiffLayout,
+  toNbspString,
+  prepareRenderLineData,
+  tokenizeDeferredRow,
+  tokenizeSideBySidePage,
 } from "../mods/git-history/diff-logic.js";
 
 describe("git-history diff-logic", () => {
@@ -337,8 +349,24 @@ describe("git-history diff-logic", () => {
     const sbs = buildSideBySideRows(patch, "file.js");
     const widths = computeDiffColumnWidths(sbs.rows, 8);
     assert.ok(widths.leftWidth >= 260);
-    assert.ok(widths.rightWidth >= Math.ceil("much longer added line here".length * 8) + 68);
+    assert.ok(widths.rightWidth >= Math.ceil("much longer added line here".length * 8) + 92);
     assert.ok(widths.unifiedWidth >= 300);
+
+    // Expands literal tabs and includes long hunk headers on the Left side
+    const tabbedRows = [
+      { kind: "hunk", header: "@@ -1,2 +1,2 @@ function veryLongHunkSignatureForHorizontalScrollCheck()" },
+      { kind: "pair", left: { kind: "del", text: "\t\tconst a = 1;" }, right: { kind: "add", text: "    const b = 2;" } },
+    ];
+    const tabbedWidths = computeDiffColumnWidths(tabbedRows, 8);
+    assert.ok(
+      tabbedWidths.leftWidth >= Math.ceil(tabbedRows[0].header.length * 8) + 92,
+      "leftWidth should cover hunk header width"
+    );
+    const shortHeaderTabbedRows = [
+      { kind: "pair", left: { kind: "del", text: "\t\t\t\t\t\tret" }, right: { kind: "add", text: "ret" } },
+    ];
+    const tabExpanded = computeDiffColumnWidths(shortHeaderTabbedRows, 8);
+    assert.equal(tabExpanded.leftWidth, Math.ceil((6 * 4 + 3) * 8) + 92);
 
     const emptyWidths = computeDiffColumnWidths([]);
     assert.deepEqual(emptyWidths, { leftWidth: 260, rightWidth: 260, unifiedWidth: 300 });
@@ -445,5 +473,367 @@ describe("git-history diff-logic", () => {
     const small = [["keyword", "const"], ["plain", " x = 1"]];
     assert.deepEqual(capRenderTokens(small, MAX_RENDER_TOKENS_PER_LINE), small);
     assert.equal(capRenderTokens(null), null);
+  });
+
+  test("buildWaveDiffLayout produces height-synced compact columns, gutterItems, and wave connectors across add/del/mod chunks", () => {
+    assert.equal(DIFF_ROW_HEIGHT, 24);
+    assert.equal(DIFF_HUNK_HEIGHT, 28);
+    assert.equal(DIFF_WAVE_GUTTER_WIDTH, 40);
+    assert.equal(DIFF_WAVE_MAX_CENTER_OFFSET_ROWS, 2);
+
+    const empty = buildWaveDiffLayout([]);
+    assert.deepEqual(empty, {
+      leftItems: [],
+      rightItems: [],
+      gutterItems: [],
+      hunkBands: [],
+      waves: [],
+      totalHeight: 0,
+    });
+
+    const patch = [
+      "@@ -1,10 +1,11 @@",
+      " ctx1",
+      "-del1",
+      "-del2",
+      "+add1",
+      "+add2",
+      "+add3",
+      "+add4",
+      "+add5",
+      " ctx2",
+      "+pureAdd1",
+      "+pureAdd2",
+      " ctx3",
+      "-pureDel1",
+      " ctx4",
+    ].join("\n");
+
+    const sbs = buildSideBySideRows(patch, "demo.js");
+    const wave = buildWaveDiffLayout(sbs.rows);
+
+    const leftSum = wave.leftItems.reduce((acc, it) => acc + it.height, 0);
+    const rightSum = wave.rightItems.reduce((acc, it) => acc + it.height, 0);
+    const gutterSum = wave.gutterItems.reduce((acc, it) => acc + it.height, 0);
+    assert.equal(leftSum, wave.totalHeight);
+    assert.equal(rightSum, wave.totalHeight);
+    assert.equal(gutterSum, wave.totalHeight);
+    assert.equal(wave.hunkBands.length, 1);
+    assert.deepEqual(wave.hunkBands[0], { y: 0, height: 28 });
+
+    // No empty cell line boxes should exist — spacers hold zero line numbers
+    assert.ok(wave.leftItems.filter((it) => it.type === "line").every((it) => it.cell.kind !== "empty"));
+    assert.ok(wave.rightItems.filter((it) => it.type === "line").every((it) => it.cell.kind !== "empty"));
+
+    // 3 change blocks: mod (2 -> 5), pure add (0 -> 2), pure del (1 -> 0)
+    assert.equal(wave.waves.length, 3);
+
+    // Block 1 (after hunk 28 + ctx1 24 = 52): blockH = 5*24 = 120; Left centered offset = 36
+    assert.deepEqual(wave.waves[0], {
+      kind: "mod",
+      leftTop: 52 + 36,
+      leftBot: 52 + 36 + 48,
+      rightTop: 52,
+      rightBot: 52 + 120,
+    });
+    assert.deepEqual(wave.gutterItems[2], {
+      type: "wave",
+      height: 120,
+      kind: "mod",
+      leftTop: 36,
+      leftBot: 36 + 48,
+      rightTop: 0,
+      rightBot: 120,
+    });
+
+    // Block 2 (after 52 + 120 + ctx2 24 = 196): pure addition 0 -> 2 (blockH = 48, pinched apex at +24)
+    assert.deepEqual(wave.waves[1], {
+      kind: "add",
+      leftTop: 196 + 24,
+      leftBot: 196 + 24,
+      rightTop: 196,
+      rightBot: 196 + 48,
+    });
+    assert.deepEqual(wave.gutterItems[4], {
+      type: "wave",
+      height: 48,
+      kind: "add",
+      leftTop: 24,
+      leftBot: 24,
+      rightTop: 0,
+      rightBot: 48,
+    });
+    const addSpacer = wave.leftItems.find((it) => it.type === "spacer" && it.markerKind === "add");
+    assert.equal(addSpacer.markerOffsetY, 24);
+
+    // Block 3 (after 196 + 48 + ctx3 24 = 268): pure deletion 1 -> 0 (blockH = 24, pinched apex at +12)
+    assert.deepEqual(wave.waves[2], {
+      kind: "del",
+      leftTop: 268,
+      leftBot: 268 + 24,
+      rightTop: 268 + 12,
+      rightBot: 268 + 12,
+    });
+    assert.deepEqual(wave.gutterItems[6], {
+      type: "wave",
+      height: 24,
+      kind: "del",
+      leftTop: 0,
+      leftBot: 24,
+      rightTop: 12,
+      rightBot: 12,
+    });
+  });
+
+  test("buildWaveDiffLayout caps centering offset on giant single-sided insertions so wave starts stay near the top", () => {
+    const adds = Array.from({ length: 120 }, (_, i) => `+addedLine${i}`);
+    const giantPatch = ["@@ -1,1 +1,121 @@", " anchor", ...adds].join("\n");
+    const sbs = buildSideBySideRows(giantPatch, "big.js");
+    const wave = buildWaveDiffLayout(sbs.rows);
+
+    const leftSum = wave.leftItems.reduce((acc, it) => acc + it.height, 0);
+    const rightSum = wave.rightItems.reduce((acc, it) => acc + it.height, 0);
+    const gutterSum = wave.gutterItems.reduce((acc, it) => acc + it.height, 0);
+    assert.equal(leftSum, wave.totalHeight);
+    assert.equal(rightSum, wave.totalHeight);
+    assert.equal(gutterSum, wave.totalHeight);
+    assert.equal(wave.waves.length, 1);
+
+    // Chunk starts at y = 28 (hunk) + 24 (anchor) = 52; max offset is 2 * 24 = 48
+    assert.equal(wave.waves[0].kind, "add");
+    assert.equal(wave.waves[0].leftTop, 52 + 48);
+    assert.equal(wave.waves[0].leftBot, 52 + 48);
+    assert.equal(wave.waves[0].rightTop, 52);
+    assert.equal(wave.waves[0].rightBot, 52 + 120 * 24);
+    assert.deepEqual(wave.gutterItems[2], {
+      type: "wave",
+      height: 120 * 24,
+      kind: "add",
+      leftTop: 48,
+      leftBot: 48,
+      rightTop: 0,
+      rightBot: 120 * 24,
+    });
+  });
+
+  test("buildWaveDiffLayout produces zero-curvature local spans for equal-count 1:1 modifications", () => {
+    const patch = ["@@ -1,3 +1,3 @@", " ctx1", "-oldLine", "+newLine", " ctx2"].join("\n");
+    const sbs = buildSideBySideRows(patch, "eq.js");
+    const wave = buildWaveDiffLayout(sbs.rows);
+    const waveSegment = wave.gutterItems.find((it) => it.type === "wave");
+    assert.deepEqual(waveSegment, {
+      type: "wave",
+      height: 24,
+      kind: "mod",
+      leftTop: 0,
+      leftBot: 24,
+      rightTop: 0,
+      rightBot: 24,
+    });
+  });
+
+  test("computeHorizontalWheelDelta distinguishes plain vertical wheel from Shift+Wheel and horizontal trackpad swipes", () => {
+    // Plain vertical mouse wheel never triggers horizontal scroll
+    assert.deepEqual(
+      computeHorizontalWheelDelta({ delta: { x: 0, y: -48 }, modifiers: { shift: false } }),
+      { handled: false, deltaX: 0 }
+    );
+    assert.deepEqual(
+      computeHorizontalWheelDelta({ delta: { x: 4, y: 48 }, modifiers: { shift: false } }),
+      { handled: false, deltaX: 0 }
+    );
+
+    // Shift + Wheel (with delta.y on Linux/Wayland or delta.x when swapped by OS)
+    assert.deepEqual(
+      computeHorizontalWheelDelta({ delta: { x: 0, y: -48 }, modifiers: { shift: true } }),
+      { handled: true, deltaX: 48 }
+    );
+    assert.deepEqual(
+      computeHorizontalWheelDelta({ delta: { x: 0, y: 48 }, modifiers: { shift: true } }),
+      { handled: true, deltaX: -48 }
+    );
+    assert.deepEqual(
+      computeHorizontalWheelDelta({ delta: { x: -36, y: 0 }, modifiers: { shift: true } }),
+      { handled: true, deltaX: 36 }
+    );
+    assert.deepEqual(
+      computeHorizontalWheelDelta({ delta: { x: 0, y: 0 }, modifiers: { shift: true } }),
+      { handled: true, deltaX: 0 }
+    );
+
+    // Explicit horizontal touchpad swipe
+    assert.deepEqual(
+      computeHorizontalWheelDelta({ delta: { x: -30, y: 2 }, modifiers: { shift: false } }),
+      { handled: true, deltaX: 30 }
+    );
+  });
+
+  test("computeHorizontalScrollbarMetrics and computeScrollXFromTrackClick clamp and map thumb geometry accurately", () => {
+    assert.equal(computeHorizontalScrollbarMetrics(400, 450, 50, 442).visible, false);
+    assert.equal(computeHorizontalScrollbarMetrics(800, 0, 0, 0).visible, false);
+
+    const m = computeHorizontalScrollbarMetrics(1000, 500, 250, 500);
+    assert.equal(m.visible, true);
+    assert.equal(m.maxScroll, 500);
+    assert.equal(m.scrollX, 250);
+    assert.equal(m.thumbW, 250);
+    assert.equal(m.travelW, 250);
+    assert.equal(m.thumbX, 125);
+
+    // Clamps overflown scrollX
+    const clamped = computeHorizontalScrollbarMetrics(1000, 500, 9999, 500);
+    assert.equal(clamped.scrollX, 500);
+    assert.equal(clamped.thumbX, 250);
+
+    // Clicking start, middle, and far end of track
+    assert.equal(computeScrollXFromTrackClick(0, 1000, 500, 500), 0);
+    assert.equal(computeScrollXFromTrackClick(250, 1000, 500, 500), 250);
+    assert.equal(computeScrollXFromTrackClick(500, 1000, 500, 500), 500);
+  });
+
+  test("toNbspString and getDiffSyntaxPalette cache cleanly across identical themes and invalidate on theme changes", () => {
+    assert.equal(toNbspString("const  x = 1;"), "const\u00a0\u00a0x\u00a0=\u00a01;");
+    assert.equal(toNbspString("plainTextWithoutSpaces"), "plainTextWithoutSpaces");
+    assert.equal(toNbspString(""), "");
+
+    const themeA = {
+      foreground: "#cdd6f4",
+      dim: "#6c7086",
+      muted: "#a6adc8",
+      accent: "#89b4fa",
+      done: "#a6e3a1",
+      ansi1: "#f38ba8",
+      ansi2: "#a6e3a1",
+      ansi3: "#f9e2af",
+      ansi4: "#89b4fa",
+      ansi5: "#cba6f7",
+      ansi6: "#94e2d5",
+    };
+    const pal1 = getDiffSyntaxPalette(themeA);
+    const pal2 = getDiffSyntaxPalette({ ...themeA });
+    assert.equal(pal1._isSyntaxPalette, true);
+    assert.equal(pal1, pal2);
+    assert.equal(diffSyntaxTokenColor("keyword", pal1), "#cba6f7");
+
+    const pal3 = getDiffSyntaxPalette({ ...themeA, ansi5: "#ff00aa" });
+    assert.notEqual(pal3, pal1);
+    assert.equal(diffSyntaxTokenColor("keyword", pal3), "#ff00aa");
+  });
+
+  test("prepareRenderLineData converts tokens into NBSP spans and merges adjacent identical colors", () => {
+    const pal = getDiffSyntaxPalette({
+      foreground: "#eee",
+      dim: "#666",
+      muted: "#999",
+      accent: "#48f",
+      done: "#2c6",
+      ansi1: "#f44",
+      ansi2: "#2c6",
+      ansi3: "#ec3",
+      ansi4: "#48f",
+      ansi5: "#c6f",
+      ansi6: "#3cc",
+    });
+
+    const singlePlain = prepareRenderLineData(null, "\ta + b", pal, "#eee");
+    assert.deepEqual(singlePlain, {
+      kind: "single",
+      color: "#eee",
+      text: "\u00a0\u00a0\u00a0\u00a0a\u00a0+\u00a0b",
+    });
+
+    const mergedAdjacent = prepareRenderLineData(
+      [
+        ["keyword", "const"],
+        ["plain", " "],
+        ["plain", "value"],
+        ["operator", " = "],
+        ["number", "42"],
+      ],
+      "const value = 42",
+      pal,
+      "#eee"
+    );
+    assert.equal(mergedAdjacent.kind, "multi");
+    assert.deepEqual(mergedAdjacent.spans, [
+      [pal.keyword, "const"],
+      [pal.plain, "\u00a0value"],
+      [pal.operator, "\u00a0=\u00a0"],
+      [pal.number, "42"],
+    ]);
+
+    const collapsedSameColor = prepareRenderLineData(
+      [
+        ["plain", "foo"],
+        ["variable", " bar"],
+      ],
+      "foo bar",
+      { ...pal, variable: pal.plain },
+      "#eee"
+    );
+    assert.deepEqual(collapsedSameColor, {
+      kind: "single",
+      color: "#eee",
+      text: "foo\u00a0bar",
+    });
+  });
+
+  test("deferTokens skips eager tokenization until tokenizeDeferredRow or tokenizeSideBySidePage runs", () => {
+    const patch = [
+      "@@ -1,2 +1,3 @@",
+      " const a = 1;",
+      "-const b = 2;",
+      "+const b = 3;",
+      "+const c = 4;",
+    ].join("\n");
+
+    const deferredSbs = buildSideBySideRows(patch, "demo.js", { deferTokens: true });
+    assert.equal(deferredSbs.rows[0].kind, "hunk");
+    assert.equal(deferredSbs.rows[1].left.tokens, null);
+    assert.equal(deferredSbs.rows[1].right.tokens, null);
+    assert.equal(deferredSbs.rows[2].left.tokens, null);
+    assert.equal(deferredSbs.rows[2].right.tokens, null);
+    assert.equal(deferredSbs.rows[3].left.kind, "empty");
+    assert.equal(deferredSbs.rows[3].left.tokens, null);
+    assert.equal(deferredSbs.rows[3].right.tokens, null);
+
+    // Tokenize only row index 2..3 (page slice simulation)
+    tokenizeSideBySidePage(deferredSbs.rows.slice(2, 3), "js");
+    assert.equal(deferredSbs.rows[1].left.tokens, null);
+    assert.ok(Array.isArray(deferredSbs.rows[2].left.tokens) && deferredSbs.rows[2].left.tokens.length > 0);
+    assert.ok(Array.isArray(deferredSbs.rows[2].right.tokens) && deferredSbs.rows[2].right.tokens.length > 0);
+    assert.equal(deferredSbs.rows[3].right.tokens, null);
+
+    const deferredUni = buildUnifiedRows(patch, "demo.js", { deferTokens: true });
+    const uniCodeRow = deferredUni.rows.find((r) => r.kind === "add");
+    assert.equal(uniCodeRow.tokens, null);
+    tokenizeDeferredRow(uniCodeRow, "js");
+    assert.ok(Array.isArray(uniCodeRow.tokens) && uniCodeRow.tokens.length > 0);
+    // Calling again is a fast idempotent no-op preserving the exact array reference
+    const firstTokensRef = uniCodeRow.tokens;
+    tokenizeDeferredRow(uniCodeRow, "js");
+    assert.equal(uniCodeRow.tokens, firstTokensRef);
+  });
+
+  test("computeDiffColumnWidths counts untabbed and tabbed lines identically via expandedLineCols", () => {
+    const widths = computeDiffColumnWidths(
+      [
+        { kind: "pair", left: { text: "short" }, right: { text: "\t\tindented" } },
+      ],
+      7.6
+    );
+    // left: 5 cols * 7.6 = 38 + 92 = 130 -> min 260
+    assert.equal(widths.leftWidth, 260);
+    // right: "\t\tindented" expands to 8 + 8 = 16 cols -> ceil(16 * 7.6) + 92 = 122 + 92 = 214 -> min 260
+    assert.equal(widths.rightWidth, 260);
+
+    const wide = computeDiffColumnWidths(
+      [
+        { kind: "pair", left: { text: "x".repeat(40) }, right: { text: "\t" + "y".repeat(38) } },
+      ],
+      7.6
+    );
+    assert.equal(wide.leftWidth, Math.ceil(40 * 7.6) + 92);
+    assert.equal(wide.rightWidth, Math.ceil(42 * 7.6) + 92);
   });
 });
