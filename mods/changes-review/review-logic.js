@@ -7,6 +7,7 @@ import {
   advanceMarkdownState,
   tokenizeMarkdownLine,
 } from "./markdown-syntax.js";
+import { getDiffMarkdownPlan } from "./markdown-view-logic.js";
 
 export const DIFF_KEYWORDS = new Set([
   "abstract", "and", "as", "assert", "async", "await", "break", "case", "catch", "class",
@@ -1816,4 +1817,220 @@ export async function collectServiceWorkingSnapshot(service, on, includeCommits 
     service.branch = service.branch || "HEAD";
     return { service, files: [], commits: [], branch: service.branch, headHash: "", rawCount: 0, touched: false, error: e };
   }
+}
+
+function normalizeMarkdownRelPath(p) {
+  return String(p || "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/^\/+/, "");
+}
+
+function joinRepoFilePath(repoRoot, relPath) {
+  const rawRoot = String(repoRoot || "");
+  const cleanRoot = rawRoot === "/" ? "/" : rawRoot.replace(/[\\/]+$/, "");
+  const cleanRel = normalizeMarkdownRelPath(relPath);
+  if (!cleanRoot) return cleanRel;
+  if (!cleanRel) return cleanRoot;
+  return cleanRoot === "/" ? `/${cleanRel}` : `${cleanRoot}/${cleanRel}`;
+}
+
+/**
+ * Resolve how a Markdown file snapshot should be loaded for the changes-review viewer
+ * (working-tree file read vs lock-free `git show` for commits and deleted files).
+ */
+export function resolveReviewMarkdownSourceSpec(file, opts = {}) {
+  const rawStatus = String(file?.status || "M").trim().toUpperCase();
+  const plan = getDiffMarkdownPlan(rawStatus);
+  if (!file || typeof file !== "object") {
+    return {
+      kind: "unavailable",
+      mode: plan.mode,
+      isDeleted: plan.isDeleted,
+      notice: plan.notice,
+      targetPath: "",
+      error: "No file selected.",
+    };
+  }
+
+  const repoRoot = String(file.repoRoot || "").trim();
+  const filePath = normalizeMarkdownRelPath(file.path || file.relFile || "");
+  const oldPath = normalizeMarkdownRelPath(file.oldPath || opts?.oldPath || "");
+  const targetPath = plan.isDeleted ? (oldPath || filePath) : filePath;
+
+  if (!repoRoot || !targetPath) {
+    return {
+      kind: "unavailable",
+      mode: plan.mode,
+      isDeleted: plan.isDeleted,
+      notice: plan.notice,
+      targetPath,
+      error: "File location is unavailable.",
+    };
+  }
+
+  if (file.binary === true) {
+    return {
+      kind: "unavailable",
+      mode: plan.mode,
+      isDeleted: plan.isDeleted,
+      notice: plan.notice,
+      targetPath,
+      error: "Binary file — Markdown preview is unavailable.",
+    };
+  }
+
+  const readFlags = Array.isArray(opts?.readFlags) && opts.readFlags.length > 0
+    ? opts.readFlags
+    : READ_GIT_FLAGS;
+  const on = opts?.on ?? null;
+  const rawCommitHash = String(opts?.commitHash || "").trim();
+  const mode = opts?.viewMode === "working"
+    ? "working"
+    : (opts?.viewMode === "commit" ? "commit" : (rawCommitHash ? "commit" : "working"));
+  const commitHash = mode === "commit" ? rawCommitHash : "";
+
+  if (mode === "commit") {
+    if (!commitHash) {
+      return {
+        kind: "unavailable",
+        mode: plan.mode,
+        isDeleted: plan.isDeleted,
+        notice: plan.notice,
+        targetPath,
+        error: "No commit selected for Markdown preview.",
+      };
+    }
+    const refSpec = plan.isDeleted ? `${commitHash}^:${targetPath}` : `${commitHash}:${targetPath}`;
+    return {
+      kind: "git",
+      mode: plan.mode,
+      isDeleted: plan.isDeleted,
+      notice: plan.notice,
+      cwd: repoRoot,
+      on,
+      refSpec,
+      targetPath,
+      args: [...readFlags, "show", refSpec],
+      unavailableMessage: plan.isDeleted
+        ? "Previous version is unavailable (commit is a root commit or lacks a parent)."
+        : "Markdown snapshot at this commit is unavailable.",
+    };
+  }
+
+  if (plan.isDeleted) {
+    if (file.fresh === true || file.hasHead === false) {
+      return {
+        kind: "unavailable",
+        mode: plan.mode,
+        isDeleted: true,
+        notice: plan.notice,
+        targetPath,
+        error: "Previous version is unavailable (file is untracked or repository has no HEAD commit).",
+      };
+    }
+    const refSpec = `HEAD:${targetPath}`;
+    return {
+      kind: "git",
+      mode: plan.mode,
+      isDeleted: true,
+      notice: plan.notice,
+      cwd: repoRoot,
+      on,
+      refSpec,
+      targetPath,
+      args: [...readFlags, "show", refSpec],
+      unavailableMessage: "Previous version is unavailable (file is untracked or not present in HEAD).",
+    };
+  }
+
+  return {
+    kind: "file",
+    mode: plan.mode,
+    isDeleted: false,
+    notice: plan.notice,
+    cwd: repoRoot,
+    on,
+    absPath: joinRepoFilePath(repoRoot, filePath),
+    targetPath: filePath,
+    unavailableMessage: "Cannot preview this Markdown file (unavailable, too large, or unreadable).",
+  };
+}
+
+/** Build a stable per-file+mode identity key so file/commit switches reset Markdown preview cleanly. */
+export function computeViewerMarkdownFileId(file, viewMode = "working", commitHash = "") {
+  if (!file || !file.key) return "";
+  const mode = viewMode === "commit" ? "commit" : "working";
+  const hash = mode === "commit" ? String(commitHash || "").trim() : "";
+  return `${file.key}::${mode}::${hash}`;
+}
+
+/** Compute a revision token for Markdown snapshot caching and unique GPUI TextView element IDs. */
+export function computeReviewMarkdownLoadToken(
+  file,
+  { viewMode = "working", commitHash = "", requestSeq = 0, reloadNonce = 0 } = {},
+) {
+  const rNonce = Number(reloadNonce) || 0;
+  if (!file || typeof file !== "object") return `0|r${rNonce}`;
+  const status = String(file.status || "M").trim().toUpperCase();
+  const oldPath = normalizeMarkdownRelPath(file.oldPath || "");
+  const mode = viewMode === "commit" || (viewMode !== "working" && commitHash) ? "commit" : "working";
+  if (mode === "commit") {
+    return `${status}|${oldPath}|r${rNonce}`;
+  }
+  const sig = String(file.sig || "");
+  const mtimeMs = Number(file.mtimeMs) || 0;
+  const needsSeqFallback = !mtimeMs && !/\d/.test(sig);
+  const seqPart = needsSeqFallback ? `|q${Number(requestSeq) || 0}` : "";
+  return `${status}|${oldPath}|${file.fresh ? 1 : 0}|${sig}|${mtimeMs}|${Number(file.add) || 0}|${Number(file.del) || 0}${seqPart}|r${rNonce}`;
+}
+
+/** Build a bounded-cache key scoped by repo, commit/working mode, file paths, status, and load token. */
+export function buildReviewMarkdownCacheKey(
+  file,
+  { viewMode = "working", commitHash = "", loadToken = "" } = {},
+) {
+  if (!file || typeof file !== "object") return "";
+  const repo = normPathStr(file.repoRoot || "");
+  const mode = viewMode === "commit" || (viewMode !== "working" && commitHash) ? "commit" : "working";
+  const hash = mode === "commit" ? String(commitHash || "").trim() : "";
+  const path = normalizeMarkdownRelPath(file.path || file.relFile || "");
+  const oldPath = normalizeMarkdownRelPath(file.oldPath || "");
+  const status = String(file.status || "M").trim().toUpperCase();
+  return `${repo}|${mode}|${hash}|${path}|${oldPath}|${status}|${String(loadToken || "")}`;
+}
+
+/** Guard raw Markdown content against null reads and binary NUL bytes. */
+export function validateMarkdownTextContent(text, unavailableMessage = "Cannot preview this Markdown file.") {
+  if (typeof text !== "string") {
+    return { ok: false, error: unavailableMessage };
+  }
+  if (text.includes("\0")) {
+    return { ok: false, error: "Binary file — Markdown preview is unavailable." };
+  }
+  return { ok: true, text };
+}
+
+/** Translate `git show` stderr failures into concise, user-readable messages. */
+export function formatGitShowMarkdownError(stderr, spec = {}) {
+  const msg = String(stderr || "").trim();
+  const lower = msg.toLowerCase();
+  if (spec?.isDeleted) {
+    if (
+      spec.refSpec?.includes("^:") &&
+      (lower.includes("bad revision") || lower.includes("unknown revision") || lower.includes("ambiguous argument") || lower.includes("invalid object name"))
+    ) {
+      return "Previous version is unavailable (commit is a root commit or lacks a parent).";
+    }
+    if (
+      lower.includes("exists on disk, but not in") ||
+      lower.includes("does not exist in") ||
+      lower.includes("not in 'head'") ||
+      lower.includes("invalid object name 'head'")
+    ) {
+      return "Previous version is unavailable (file is untracked or not present in HEAD).";
+    }
+  }
+  const firstLine = msg ? msg.split(/\r?\n/)[0] : "";
+  if (spec?.unavailableMessage) {
+    return firstLine ? `${spec.unavailableMessage} (${firstLine})` : spec.unavailableMessage;
+  }
+  return firstLine || "Markdown snapshot is unavailable.";
 }

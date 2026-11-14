@@ -5,7 +5,7 @@ status: active
 title: Changes Review Mod (mods/changes-review)
 parent: module-mods
 references: [module-layouts, module-shared, spec-lifecycle]
-covers: [git-diff-viewer, inline-review-comments, commit-history-inspection, agent-feedback-dispatch, multi-repo-discovery, service-filter-pills, cross-service-review, multi-repo-commits, per-service-branch-badges, per-tab-review-checklist, lead-terminal-dispatch]
+covers: [git-diff-viewer, inline-review-comments, commit-history-inspection, agent-feedback-dispatch, multi-repo-discovery, service-filter-pills, cross-service-review, multi-repo-commits, per-service-branch-badges, per-tab-review-checklist, lead-terminal-dispatch, markdown-rendered-preview]
 tags: [mod, git, code-review, agent-feedback, multi-repo, mesh, checklist]
 ---
 
@@ -18,10 +18,12 @@ The `submodule-mod-changes-review` provides interactive source control inspectio
 - **Owns:**
   - Manifest file: `mods/changes-review/mod.json` (`{ "place": "none", "title": "Changes Review" }`).
   - Dual-mode component: `mods/changes-review/main.js` (`renderPanel` for `#changes` sidebar, `renderViewer` for `role: "viewer"` Review tab in `#main`).
-  - Pure diff, syntax lexer, file-type icon, session/tab/baseline resolution, fingerprint/invalidation, next-target selection, & watch filter helpers: `mods/changes-review/review-logic.js`.
+  - Pure diff, syntax lexer, file-type icon, session/tab/baseline resolution, fingerprint/invalidation, next-target selection, Markdown source/cache planning, & watch filter helpers: `mods/changes-review/review-logic.js`.
   - Synced shared modules (`[[module-shared]]`):
     - `mods/changes-review/code-wrap.js` (`computeWrapColumns`, `wrapPlainText`, `wrapStyledSpans`).
     - `mods/changes-review/markdown-syntax.js` (`isMarkdownExt`, `createMarkdownState`, `advanceMarkdownState`, `tokenizeMarkdownLine` — YAML frontmatter and fenced code block state tracking across diff hunks via `resetMdStateForLine`).
+    - `mods/changes-review/markdown-view-logic.js` (`isMarkdownFile`, `resolveRelativeMarkdownPath`, `getDiffMarkdownPlan`).
+    - `mods/changes-review/markdown-view.js` (`createMarkdownRenderCache`, `renderMarkdownToggleButton`, `renderMarkdownViewer`).
     - `mods/changes-review/dropdown-logic.js` & `mods/changes-review/dropdown.js` (`renderDropdownTrigger` for `#commit-selector-btn`, `renderDropdownPopover` for `#commit-dropdown-floating` with adaptive sizing via `computeDropdownMetrics`).
   - Icon assets: `mods/changes-review/changes.svg`, `mods/changes-review/icons/*.svg`, and `mods/changes-review/icons/file-types/*.svg` (22 vector file-type icons).
   - Type definitions and compiler configuration: `gpui-kit.d.ts`, `jsconfig.json`.
@@ -38,7 +40,7 @@ The `submodule-mod-changes-review` provides interactive source control inspectio
     - Reads and updates `mesh.flows[sessionTabId]` (`reviewedFiles` per-file approval map storing `{ reviewed: true, fp, reviewedAt }`, `repoHeads` persisted per-repo `HEAD` map for cross-reload commit invalidation, `sessionRepos` attribution, and `sessionBaseline` session snapshot, preserving all sibling fields such as `leadTerminal`, `ticket`, `derivedTitle`, `manualTitle`).
 - **Allowed deps:**
   - `gpui-kit`: `View`, `div`, `svg`.
-  - `gpui-base`: `v_flex`, `h_flex`, `v_virtual_list`, `VirtualListScrollHandle`, `InputState`, `Input`, `TextareaState`, `Textarea`, `Scrollbar`, `ScrollHandle`.
+  - `gpui-base`: `v_flex`, `h_flex`, `v_virtual_list`, `VirtualListScrollHandle`, `InputState`, `Input`, `TextareaState`, `Textarea`, `TextView` (via `markdown-view.js`), `Scrollbar`, `ScrollHandle`.
   - `herdr`: `props`, `run`, `spaces`, `panes`, `focused`, `agents`, `terminals`, `exec`, `readTextFile`, `watchFolder`, `theme`, `settings`, `notify`, `hc`, `layout`, `shared`, `setShared`, `window`, `appHome`.
   - `fs/promises`, `path`: Local directory discovery, file statting (`size:mtimeMs`), and session baseline persistence under `${appHome()}/mesh/sessions/`.
 - **Forbidden:**
@@ -81,6 +83,10 @@ Docked Sidebar (#changes, role !== "viewer")          Main Review Tab (#review-t
    - **Organic service pill status (`getServiceReviewStatus`):** Service pills (`#service-pill-*`) do NOT use a manual service-approval button; status is derived organically from `mesh.reviewNotes` (`"has_notes"` `✎` when any session note belongs to `serviceId`), else `"approved"` (`✓`) ONLY when dirty working files exist for `serviceId` and every working file in that service is reviewed, else `"pending"` (`○`).
    - **Automatic check invalidation (`computeFileReviewFingerprint`, `reconcileReviewedFiles`, `headHash`, `buildFileDescriptor`):** `buildFileDescriptor` preserves `sig` and `mtimeMs` on file descriptors so `computeFileReviewFingerprint` (`status|add|del|fresh|binary|sig|mtimeMs`) detects re-edits reliably. On working refresh, `loadServiceWorkingSnapshot` returns `headHash`, persists per-repo `HEAD` hashes (`repoHeads` inside `mesh.flows[sessionTabId]`), detects `HEAD` transitions (`lastRepoHeads` / persisted `repoHeads`) and newer commits modifying reviewed files via `collectCommitInvalidations`, and `reconcileReviewedFiles` automatically clears un-fingerprinted legacy checks plus stale `working::` checks (when a file leaves the working tree, is committed, or changes fingerprint `fp !== curFp`) and stale `commit:<hash>::` checks superseded by newer commits (`committedSet` or `commitMs > reviewedAt`).
 4. **Comment Composition & Synchronization (`mesh.reviewNotes`):** Inline comments added, updated, or deleted in the Review tab write directly to `shared("mesh.reviewNotes")[getSessionNotesKey(spaceId, sourceTabId)]` (reflected automatically as `"has_notes"` on `#service-pill-*`). `#changes` renders the synchronized note list (`Review (N)`), supports `jumpToComment`, individual deletion (`removeComment`), `Clear all`, and Markdown dispatch (`Send to agent` via `findActiveAgent()` resolved against `sessionTabId`).
+5. **On-Demand Markdown Rendered Preview (`#diff-markdown-toggle`, `resolveReviewMarkdownSourceSpec`, `renderMarkdownViewer`):**
+   - **Default Diff Mode & Toggle Button:** Diff view remains the default whenever opening a Review tab, switching to another file (via `#changes-list`, `←`/`→`, `Approve` advancing, relative link navigation, or `jumpToComment` targeting a line comment), switching between working tree and commits, or closing the viewer; toggle state (`viewerMarkdownRendered`) is preserved only when reloading/refreshing the same file in the same mode. `#diff-file-review-bar` shows `renderMarkdownToggleButton` (`id: "diff-markdown-toggle"`) alongside `#diff-reload-btn` and `#diff-viewed-btn` ONLY when `isMarkdownFile(openFile.path || openFile.displayPath)` is true.
+   - **Zero Idle Allocation & Lazy Snapshot Loading:** When toggled OFF, zero extra file or git reads, zero `prepareMarkdownForRender` calls, and zero `TextView.markdown` elements are allocated. When toggled ON, `loadViewerMarkdownNow` consults `resolveReviewMarkdownSourceSpec` (which consumes `getDiffMarkdownPlan(status)`): working-tree non-deleted files read asynchronously via `readTextFile`; working-tree deleted files (`status === "D"`) run lock-free `git show HEAD:<oldPath || path>` with the deleted-file notice banner (or show a clear unavailable error when untracked / missing from `HEAD`); commit-mode non-deleted files run lock-free `git show <commitHash>:<path>`; and commit-mode deleted files run lock-free `git show <commitHash>^:<oldPath || path>` with the deleted-file notice banner and readable root-commit/missing-parent handling. All loaded content checks for binary NUL bytes (`validateMarkdownTextContent`) and memoizes raw snapshots and prepared Markdown in bounded 16-entry LRU caches (`viewerMarkdownRawCache` + `createMarkdownRenderCache(16)`) keyed by repo/commit/file/status/loadToken, invalidating stale entries on explicit manual reload (`#diff-reload-btn`) and guarding async callbacks against stale `viewerMarkdownLoadGen`, switched files, or closed viewers (`_viewerClosed`).
+   - **Body & Review Compatibility:** When rendered mode is active, `renderMarkdownViewer` replaces `v_virtual_list("changes-diff-lines")` with unique `id`/`scrollId` per file+revision (`monoFont`, `noticeBanner`, `loading`, `error`, relative diff-file link navigation), clears/hides the active inline line-comment composer (`activeComment`) so `TextView.markdown` does not collide with diff line commenting, and keeps `Approve` / `Approved ✓`, file count pill, and existing review note counts intact.
 
 ### Review Dispatch Sequence
 
@@ -110,7 +116,7 @@ Docked Sidebar (#changes, role !== "viewer")          Main Review Tab (#review-t
 5. **Zero `localStorage` & Non-Reentrant Shared Updates:**
    Never call `localStorage`, `cx.notify()`, or `setShared()` synchronously inside `render()`. Defer refreshes, `mesh.spaceAgentTabs` updates, `viewerLoadedKey` diff fetches, and cross-mode syncs via `cx.timer.after(0, ...)`. Keep `mesh.services` deduplicated via `sig` and merge `mesh.flows[sessionTabId]` mutations onto the latest snapshot.
 6. **Stale-Context Cancellation & Cleanup:**
-   Async flows (`refresh`, `loadViewerDiffNow` via monotonic `viewerLoadGen`, watchers) validate context/generation across awaits, and `close()` cancels all active tasks (`renderRefreshTask`, `watchDebounceTask`, `agentTabSyncTask`, `sharedSyncTask`, `viewerLoadTask`, `diffResizeTask`, `pollTask`) and releases `input`, `commentInput`, `serviceFilterScroll`, `commitDropdownScroll`, and `diffScroll`.
+   Async flows (`refresh`, `loadViewerDiffNow` via monotonic `viewerLoadGen`, `loadViewerMarkdownNow` via monotonic `viewerMarkdownLoadGen` and `_viewerClosed`, watchers) validate context/generation across awaits, and `close()` cancels all active tasks (`renderRefreshTask`, `watchDebounceTask`, `agentTabSyncTask`, `sharedSyncTask`, `viewerLoadTask`, `diffResizeTask`, `pollTask`), resets and clears bounded Markdown caches, and releases `input`, `commentInput`, `serviceFilterScroll`, `commitDropdownScroll`, and `diffScroll`.
 
 ## Multi-Repo & Mesh Implementation
 

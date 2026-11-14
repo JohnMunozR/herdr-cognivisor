@@ -24,6 +24,22 @@ const SHARED_TARGETS = [
     ],
   },
   {
+    source: "shared/markdown-view-logic.js",
+    targets: [
+      "mods/files-search/markdown-view-logic.js",
+      "mods/changes-review/markdown-view-logic.js",
+      "mods/git-history/markdown-view-logic.js",
+    ],
+  },
+  {
+    source: "shared/markdown-view.js",
+    targets: [
+      "mods/files-search/markdown-view.js",
+      "mods/changes-review/markdown-view.js",
+      "mods/git-history/markdown-view.js",
+    ],
+  },
+  {
     source: "shared/dropdown-logic.js",
     targets: [
       "mods/changes-review/dropdown-logic.js",

@@ -23,6 +23,7 @@ import {
   computeScrollXFromTrackClick,
   resolveGitFileIcon,
   computeViewerLoadedKey,
+  resolveHistoryMarkdownBlobSpec,
   formatGitTabTitle,
   paginateDiffRows,
   capRenderTokens,
@@ -935,5 +936,110 @@ describe("git-history diff-logic", () => {
     }
     assert.deepEqual(flatLeft, wave.leftItems);
     assert.deepEqual(flatRight, wave.rightItems);
+  });
+
+  test("resolveHistoryMarkdownBlobSpec resolves M/A/R/C, deleted with/without parent, activeDiff shape, and missing inputs", () => {
+    const commit = { hash: "abc1234def5678", parents: ["9876fed54321"] };
+
+    // Modified file
+    assert.deepEqual(
+      resolveHistoryMarkdownBlobSpec(commit, { path: "docs/README.md", status: "M" }),
+      {
+        ok: true,
+        mode: "after",
+        isDeleted: false,
+        rev: "abc1234def5678",
+        path: "docs/README.md",
+        blobSpec: "abc1234def5678:docs/README.md",
+        notice: "",
+        unavailableReason: "",
+      }
+    );
+
+    // Added file on a root commit (no parents)
+    assert.deepEqual(
+      resolveHistoryMarkdownBlobSpec({ hash: "root111", parents: [] }, { path: "GUIDE.mdx", status: "A" }),
+      {
+        ok: true,
+        mode: "after",
+        isDeleted: false,
+        rev: "root111",
+        path: "GUIDE.mdx",
+        blobSpec: "root111:GUIDE.mdx",
+        notice: "",
+        unavailableReason: "",
+      }
+    );
+
+    // Renamed and copied files point at target commit + new path
+    const renamed = resolveHistoryMarkdownBlobSpec(commit, {
+      path: "docs/new-name.md",
+      oldPath: "docs/old-name.md",
+      status: "R",
+    });
+    assert.equal(renamed.ok, true);
+    assert.equal(renamed.blobSpec, "abc1234def5678:docs/new-name.md");
+    assert.equal(renamed.notice, "");
+
+    const copied = resolveHistoryMarkdownBlobSpec(commit, {
+      path: "docs/copy.md",
+      oldPath: "docs/orig.md",
+      status: "C",
+    });
+    assert.equal(copied.ok, true);
+    assert.equal(copied.blobSpec, "abc1234def5678:docs/copy.md");
+
+    // Deleted file with parent uses parents[0] and oldPath || path with notice
+    const delWithPath = resolveHistoryMarkdownBlobSpec(commit, { path: "docs/removed.md", status: "D" });
+    assert.equal(delWithPath.ok, true);
+    assert.equal(delWithPath.mode, "before");
+    assert.equal(delWithPath.isDeleted, true);
+    assert.equal(delWithPath.rev, "9876fed54321");
+    assert.equal(delWithPath.path, "docs/removed.md");
+    assert.equal(delWithPath.blobSpec, "9876fed54321:docs/removed.md");
+    assert.ok(delWithPath.notice.length > 0);
+    assert.equal(delWithPath.unavailableReason, "");
+
+    const delWithOldPath = resolveHistoryMarkdownBlobSpec(commit, {
+      path: "docs/new.md",
+      oldPath: "docs/legacy.md",
+      status: "D",
+    });
+    assert.equal(delWithOldPath.ok, true);
+    assert.equal(delWithOldPath.blobSpec, "9876fed54321:docs/legacy.md");
+
+    // Viewer activeDiff payload shape ({ commitHash, parentHashes })
+    const viewerDiffShape = resolveHistoryMarkdownBlobSpec(
+      { commitHash: "c999", parentHashes: ["p888"] },
+      { path: "SPEC.md", status: "D" }
+    );
+    assert.equal(viewerDiffShape.ok, true);
+    assert.equal(viewerDiffShape.blobSpec, "p888:SPEC.md");
+
+    // Deleted file without parent commit
+    const delNoParent = resolveHistoryMarkdownBlobSpec({ hash: "root111", parents: [] }, {
+      path: "docs/removed.md",
+      status: "D",
+    });
+    assert.equal(delNoParent.ok, false);
+    assert.equal(delNoParent.isDeleted, true);
+    assert.equal(delNoParent.blobSpec, null);
+    assert.ok(delNoParent.notice.length > 0);
+    assert.ok(delNoParent.unavailableReason.length > 0);
+
+    // Missing inputs
+    for (const [c, f] of [
+      [null, { path: "README.md", status: "M" }],
+      [null, { path: "README.md", status: "D" }],
+      [{ hash: "" }, { path: "README.md", status: "M" }],
+      [commit, null],
+      [commit, { path: "", status: "M" }],
+      [commit, { path: "   ", status: "D" }],
+    ]) {
+      const bad = resolveHistoryMarkdownBlobSpec(c, f);
+      assert.equal(bad.ok, false);
+      assert.equal(bad.blobSpec, null);
+      assert.ok(bad.unavailableReason.length > 0);
+    }
   });
 });

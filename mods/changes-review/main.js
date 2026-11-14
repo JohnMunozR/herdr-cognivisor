@@ -39,9 +39,17 @@ import {
   computeFileReviewFingerprint,
   parseReviewedFileRecord,
   reconcileReviewedFiles,
+  resolveReviewMarkdownSourceSpec,
+  computeViewerMarkdownFileId,
+  computeReviewMarkdownLoadToken,
+  buildReviewMarkdownCacheKey,
+  validateMarkdownTextContent,
+  formatGitShowMarkdownError,
 } from "./review-logic.js";
 import { computeWrapColumns, countWrappedLines, wrapPlainText, wrapStyledSpans } from "./code-wrap.js";
 import { renderDropdownTrigger, renderDropdownPopover } from "./dropdown.js";
+import { isMarkdownFile, resolveRelativeMarkdownPath } from "./markdown-view-logic.js";
+import { createMarkdownRenderCache, renderMarkdownToggleButton, renderMarkdownViewer } from "./markdown-view.js";
 
 const reviewWrapCache = new WeakMap();
 const REVIEW_ROW_HEIGHT = 20;
@@ -496,6 +504,7 @@ function buildFileDescriptor(f) {
   return {
     key: f.key,
     path: f.path,
+    ...(f.oldPath ? { oldPath: f.oldPath } : {}),
     displayPath: f.displayPath || f.path,
     repoRoot: f.repoRoot || "",
     serviceId: f.serviceId || ".",
@@ -638,6 +647,20 @@ export default class ChangesReview extends View {
     this.viewerLoadedKey = "";
     this.viewerScheduledKey = "";
     this.viewerLoading = false;
+    this._viewerClosed = false;
+    this.viewerMarkdownRendered = false;
+    this.viewerMarkdownFileId = "";
+    this.viewerMarkdownLoadedKey = "";
+    this.viewerMarkdownLoadedToken = "";
+    this.viewerMarkdownLoading = false;
+    this.viewerMarkdownError = "";
+    this.viewerMarkdownNotice = "";
+    this.viewerMarkdownPrepared = null;
+    this.viewerMarkdownLoadGen = 0;
+    this.viewerMarkdownRawCache = new Map();
+    this.viewerMarkdownRenderCache = createMarkdownRenderCache(16);
+    this.viewerMarkdownReloadNonces = new Map();
+    this.viewerMarkdownLastKeyByFileId = new Map();
     this.lastRequestSeq = 0;
     this.lastHandledSeq = 0;
     this.panelNote = null;
@@ -694,6 +717,8 @@ export default class ChangesReview extends View {
   }
 
   close() {
+    this._viewerClosed = true;
+    this.resetViewerMarkdownState(true);
     try { this.renderRefreshTask?.cancel?.(); } catch {}
     this.renderRefreshTask = null;
     try { this.watchDebounceTask?.cancel?.(); } catch {}
@@ -2442,7 +2467,240 @@ export default class ChangesReview extends View {
     });
   }
 
+  getMarkdownReloadNonce(fileId) {
+    if (!fileId || !this.viewerMarkdownReloadNonces) return 0;
+    return this.viewerMarkdownReloadNonces.get(fileId) || 0;
+  }
+
+  invalidateViewerMarkdownCacheForFile(fileId) {
+    if (!fileId) return;
+    const prevKey = this.viewerMarkdownLastKeyByFileId?.get(fileId);
+    if (prevKey) {
+      this.viewerMarkdownRawCache?.delete(prevKey);
+      this.viewerMarkdownLastKeyByFileId?.delete(fileId);
+    }
+    if (this.viewerMarkdownReloadNonces) {
+      const nextNonce = (this.viewerMarkdownReloadNonces.get(fileId) || 0) + 1;
+      if (!this.viewerMarkdownReloadNonces.has(fileId) && this.viewerMarkdownReloadNonces.size >= 32) {
+        const oldest = this.viewerMarkdownReloadNonces.keys().next().value;
+        if (oldest !== undefined) this.viewerMarkdownReloadNonces.delete(oldest);
+      }
+      this.viewerMarkdownReloadNonces.set(fileId, nextNonce);
+    }
+  }
+
+  getMarkdownRawCacheEntry(key) {
+    if (!key || !this.viewerMarkdownRawCache?.has(key)) return null;
+    const hit = this.viewerMarkdownRawCache.get(key);
+    this.viewerMarkdownRawCache.delete(key);
+    this.viewerMarkdownRawCache.set(key, hit);
+    return hit;
+  }
+
+  setMarkdownRawCacheEntry(key, value) {
+    if (!key || !this.viewerMarkdownRawCache) return;
+    if (this.viewerMarkdownRawCache.has(key)) {
+      this.viewerMarkdownRawCache.delete(key);
+    } else if (this.viewerMarkdownRawCache.size >= 16) {
+      const oldest = this.viewerMarkdownRawCache.keys().next().value;
+      if (oldest !== undefined) this.viewerMarkdownRawCache.delete(oldest);
+    }
+    this.viewerMarkdownRawCache.set(key, value);
+  }
+
+  resetViewerMarkdownState(clearCaches = false) {
+    this.viewerMarkdownRendered = false;
+    this.viewerMarkdownFileId = "";
+    this.viewerMarkdownLoadedKey = "";
+    this.viewerMarkdownLoadedToken = "";
+    this.viewerMarkdownLoading = false;
+    this.viewerMarkdownError = "";
+    this.viewerMarkdownNotice = "";
+    this.viewerMarkdownPrepared = null;
+    this.viewerMarkdownLoadGen = (this.viewerMarkdownLoadGen || 0) + 1;
+    if (clearCaches) {
+      this.viewerMarkdownRawCache?.clear?.();
+      this.viewerMarkdownRenderCache?.clear?.();
+      this.viewerMarkdownReloadNonces?.clear?.();
+      this.viewerMarkdownLastKeyByFileId?.clear?.();
+    }
+  }
+
+  toggleViewerMarkdown(diff, cx) {
+    if (this._viewerClosed) return;
+    const ctx = this.getSessionContext();
+    const activeDiff = diff || readActiveDiff(ctx.spaceId);
+    const files = activeDiff?.files || [];
+    const openFile = activeDiff?.openFile || files.find((f) => f.key === activeDiff?.openFileKey) || null;
+    const openFilePath = openFile?.path || openFile?.displayPath || "";
+    if (!openFile || !isMarkdownFile(openFilePath)) return;
+
+    const viewMode = activeDiff?.viewMode || "working";
+    const commitHash = viewMode === "commit" ? (activeDiff?.selectedCommit?.hash || "") : "";
+    const fileId = computeViewerMarkdownFileId(openFile, viewMode, commitHash);
+    const isCurrentlyActive = Boolean(this.viewerMarkdownRendered && this.viewerMarkdownFileId === fileId);
+
+    if (isCurrentlyActive) {
+      this.viewerMarkdownRendered = false;
+      this.viewerMarkdownLoading = false;
+      this.viewerMarkdownLoadGen = (this.viewerMarkdownLoadGen || 0) + 1;
+      cx?.notify();
+      return;
+    }
+
+    this.viewerMarkdownRendered = true;
+    this.viewerMarkdownFileId = fileId;
+    if (this.activeComment) {
+      this.activeComment = null;
+      this.commentText = "";
+      this.typingComment = false;
+      try { this.commentInput?.set_value?.(""); } catch {}
+    }
+    this.loadViewerMarkdownNow(activeDiff, cx);
+  }
+
+  isMarkdownLoadStillCurrent(spaceId, fileId, gen) {
+    if (this._viewerClosed || gen !== this.viewerMarkdownLoadGen) return false;
+    if (!this.viewerMarkdownRendered || this.viewerMarkdownFileId !== fileId) return false;
+    const curDiff = readActiveDiff(spaceId);
+    const curOpen = curDiff?.openFile || (curDiff?.files || []).find((f) => f.key === curDiff?.openFileKey) || null;
+    const curMode = curDiff?.viewMode || "working";
+    const curHash = curMode === "commit" ? (curDiff?.selectedCommit?.hash || "") : "";
+    return computeViewerMarkdownFileId(curOpen, curMode, curHash) === fileId;
+  }
+
+  async loadViewerMarkdownNow(diff, cx, opts = {}) {
+    if (this._viewerClosed) return;
+    const ctx = this.getSessionContext();
+    const latestDiff = diff || readActiveDiff(ctx.spaceId);
+    const files = latestDiff?.files || [];
+    const openFile = latestDiff?.openFile || files.find((f) => f.key === latestDiff?.openFileKey) || null;
+    const viewMode = latestDiff?.viewMode || "working";
+    const commitHash = viewMode === "commit" ? (latestDiff?.selectedCommit?.hash || "") : "";
+    const filePath = openFile?.path || openFile?.displayPath || "";
+
+    if (!openFile || !isMarkdownFile(filePath)) {
+      this.resetViewerMarkdownState(false);
+      cx?.notify();
+      return;
+    }
+
+    const fileId = computeViewerMarkdownFileId(openFile, viewMode, commitHash);
+    if (!this.viewerMarkdownRendered || this.viewerMarkdownFileId !== fileId) {
+      return;
+    }
+
+    if (opts.forceReload) {
+      this.invalidateViewerMarkdownCacheForFile(fileId);
+    }
+
+    const reloadNonce = this.getMarkdownReloadNonce(fileId);
+    const loadToken = computeReviewMarkdownLoadToken(openFile, {
+      viewMode,
+      commitHash,
+      requestSeq: latestDiff?.requestSeq || 0,
+      reloadNonce,
+    });
+    const cacheKey = buildReviewMarkdownCacheKey(openFile, {
+      viewMode,
+      commitHash,
+      loadToken,
+    });
+
+    if (this.viewerMarkdownLastKeyByFileId) {
+      if (!this.viewerMarkdownLastKeyByFileId.has(fileId) && this.viewerMarkdownLastKeyByFileId.size >= 32) {
+        const oldest = this.viewerMarkdownLastKeyByFileId.keys().next().value;
+        if (oldest !== undefined) this.viewerMarkdownLastKeyByFileId.delete(oldest);
+      }
+      this.viewerMarkdownLastKeyByFileId.set(fileId, cacheKey);
+    }
+
+    const cached = !opts.bypassCache ? this.getMarkdownRawCacheEntry(cacheKey) : null;
+    if (cached) {
+      this.viewerMarkdownLoadGen = (this.viewerMarkdownLoadGen || 0) + 1;
+      this.viewerMarkdownLoading = false;
+      this.viewerMarkdownLoadedKey = cacheKey;
+      this.viewerMarkdownLoadedToken = loadToken;
+      this.viewerMarkdownNotice = cached.notice || "";
+      this.viewerMarkdownError = "";
+      this.viewerMarkdownPrepared = this.viewerMarkdownRenderCache.getOrPrepare(cacheKey, cached.text, { filePath });
+      cx?.notify();
+      return;
+    }
+
+    const spec = resolveReviewMarkdownSourceSpec(openFile, {
+      viewMode,
+      commitHash,
+      on: latestDiff?.on ?? null,
+    });
+
+    if (spec.kind === "unavailable") {
+      this.viewerMarkdownLoadGen = (this.viewerMarkdownLoadGen || 0) + 1;
+      this.viewerMarkdownLoading = false;
+      this.viewerMarkdownLoadedKey = cacheKey;
+      this.viewerMarkdownLoadedToken = loadToken;
+      this.viewerMarkdownNotice = spec.notice || "";
+      this.viewerMarkdownError = spec.error || spec.unavailableMessage || "Markdown preview is unavailable.";
+      this.viewerMarkdownPrepared = null;
+      cx?.notify();
+      return;
+    }
+
+    const gen = (this.viewerMarkdownLoadGen || 0) + 1;
+    this.viewerMarkdownLoadGen = gen;
+    this.viewerMarkdownLoading = true;
+    this.viewerMarkdownError = "";
+    this.viewerMarkdownNotice = spec.notice || "";
+    this.viewerMarkdownPrepared = null;
+    this.viewerMarkdownLoadedKey = cacheKey;
+    this.viewerMarkdownLoadedToken = loadToken;
+    cx?.notify();
+
+    try {
+      let rawText = null;
+      if (spec.kind === "file") {
+        rawText = await readTextFile(spec.absPath, { on: spec.on }).catch(() => null);
+        if (!this.isMarkdownLoadStillCurrent(ctx.spaceId, fileId, gen)) return;
+      } else if (spec.kind === "git") {
+        const res = await exec("git", spec.args, { cwd: spec.cwd, on: spec.on }).catch((e) => ({
+          code: -1,
+          stdout: "",
+          stderr: String(e?.message || e || ""),
+        }));
+        if (!this.isMarkdownLoadStillCurrent(ctx.spaceId, fileId, gen)) return;
+        if (!res || res.code !== 0) {
+          this.viewerMarkdownError = formatGitShowMarkdownError(res?.stderr, spec);
+          this.viewerMarkdownPrepared = null;
+          return;
+        }
+        rawText = typeof res.stdout === "string" ? res.stdout : String(res.stdout ?? "");
+      }
+
+      const checked = validateMarkdownTextContent(rawText, spec.unavailableMessage);
+      if (!checked.ok) {
+        this.viewerMarkdownError = checked.error;
+        this.viewerMarkdownPrepared = null;
+        return;
+      }
+
+      this.setMarkdownRawCacheEntry(cacheKey, { text: checked.text, notice: spec.notice || "" });
+      this.viewerMarkdownPrepared = this.viewerMarkdownRenderCache.getOrPrepare(cacheKey, checked.text, { filePath });
+      this.viewerMarkdownError = "";
+      this.viewerMarkdownNotice = spec.notice || "";
+    } catch (e) {
+      if (!this.isMarkdownLoadStillCurrent(ctx.spaceId, fileId, gen)) return;
+      this.viewerMarkdownError = String(e?.message || e || spec.unavailableMessage || "Cannot preview Markdown file.");
+      this.viewerMarkdownPrepared = null;
+    } finally {
+      if (!this._viewerClosed && gen === this.viewerMarkdownLoadGen) {
+        this.viewerMarkdownLoading = false;
+        cx?.notify();
+      }
+    }
+  }
+
   async loadViewerDiffNow(diff, cx, opts = {}) {
+    if (this._viewerClosed) return;
     if (this.viewerLoadTask) {
       try { this.viewerLoadTask.cancel(); } catch {}
       this.viewerLoadTask = null;
@@ -2460,6 +2718,21 @@ export default class ChangesReview extends View {
     this.open = openFile ? openFile.key : null;
     this.viewerNote = null;
 
+    const viewMode = diff?.viewMode || "working";
+    const commitHash = viewMode === "commit" ? (diff?.selectedCommit?.hash || "") : "";
+    const openFilePath = openFile?.path || openFile?.displayPath || "";
+    const isMdFile = Boolean(openFile && isMarkdownFile(openFilePath));
+    const nextFileId = isMdFile ? computeViewerMarkdownFileId(openFile, viewMode, commitHash) : "";
+    const seq = diff?.requestSeq || 0;
+    const isCommentJump = Boolean(diff?.openCommentLine != null && seq && seq !== this.lastHandledSeq);
+
+    if (!openFile || !isMdFile || opts.resetMarkdown || nextFileId !== this.viewerMarkdownFileId || isCommentJump) {
+      this.resetViewerMarkdownState(false);
+    }
+    if (opts.forceReload && nextFileId) {
+      this.invalidateViewerMarkdownCacheForFile(nextFileId);
+    }
+
     if (prevOpenKey && prevOpenKey !== this.open && this.activeComment && this.activeComment.fileKey !== this.open) {
       this.activeComment = null;
       this.commentText = "";
@@ -2471,6 +2744,10 @@ export default class ChangesReview extends View {
       this.viewerLoading = false;
       cx?.notify();
       return;
+    }
+
+    if (isMdFile && this.viewerMarkdownRendered && this.viewerMarkdownFileId === nextFileId) {
+      this.loadViewerMarkdownNow(diff, cx, { bypassCache: Boolean(opts.forceReload) });
     }
 
     const isExpanded = Boolean(this.expandedFiles?.has(openFile.key));
@@ -2485,10 +2762,9 @@ export default class ChangesReview extends View {
         diff?.on ?? null,
         isExpanded,
       );
-      if (gen !== this.viewerLoadGen) return;
+      if (this._viewerClosed || gen !== this.viewerLoadGen) return;
       this.setLines(lines, openFile.path);
 
-      const seq = diff?.requestSeq || 0;
       const shouldConsumeDirectives = Boolean(seq && seq !== this.lastHandledSeq) || Boolean(opts.forceScrollTop);
       if (seq && seq !== this.lastHandledSeq) {
         this.lastHandledSeq = seq;
@@ -2515,11 +2791,11 @@ export default class ChangesReview extends View {
         );
       }
     } catch (e) {
-      if (gen !== this.viewerLoadGen) return;
+      if (this._viewerClosed || gen !== this.viewerLoadGen) return;
       this.setLines([]);
       this.viewerNote = `Cannot preview this diff (too large or unreadable): ${e.message || e}`;
     } finally {
-      if (gen === this.viewerLoadGen) {
+      if (!this._viewerClosed && gen === this.viewerLoadGen) {
         this.viewerLoading = false;
         cx?.notify();
       }
@@ -2545,7 +2821,7 @@ export default class ChangesReview extends View {
     if (revTab) {
       run("tab.rename", { id: revTab.tabId, name: formatReviewTabTitle(nextFile) });
     }
-    this.loadViewerDiffNow(payload, cx, { forceScrollTop: true });
+    this.loadViewerDiffNow(payload, cx, { forceScrollTop: true, resetMarkdown: true });
     return payload;
   }
 
@@ -2941,6 +3217,15 @@ export default class ChangesReview extends View {
     const openKey = openFile?.key || diff?.openFileKey || null;
     const viewMode = diff?.viewMode || "working";
     const selectedCommit = diff?.selectedCommit || null;
+    const commitHash = viewMode === "commit" ? (selectedCommit?.hash || "") : "";
+    const openFilePath = openFile?.path || openFile?.displayPath || "";
+    const isMdFile = Boolean(openFile && isMarkdownFile(openFilePath));
+    const currentMdFileId = isMdFile ? computeViewerMarkdownFileId(openFile, viewMode, commitHash) : "";
+    const markdownActive = Boolean(
+      isMdFile &&
+      this.viewerMarkdownRendered &&
+      this.viewerMarkdownFileId === currentMdFileId
+    );
 
     const flows = readFlows();
     const flow = ctx.sourceTabId ? (flows[ctx.sourceTabId] || {}) : {};
@@ -3034,13 +3319,26 @@ export default class ChangesReview extends View {
         ))
         .child(
           h_flex().flex_none().flex_wrap().gap(5).items_center()
+            .when(isMdFile, (bar) => bar.child(
+              renderMarkdownToggleButton({
+                id: "diff-markdown-toggle",
+                active: markdownActive,
+                compact: compactViewer,
+                height: 24,
+                rounded: 5,
+                icon: "mods/changes-review/icons/file-types/markdown.svg",
+                tooltip: markdownActive ? "Switch back to diff view" : "Render formatted Markdown",
+                t,
+                onClick: (_e, cx) => this.toggleViewerMarkdown(diff, cx),
+              })
+            ))
             .child(
               h_flex().id("diff-reload-btn").h(24).w(24).items_center().justify_center().rounded(5)
                 .border_1().border_color(t.border).bg(t.background)
                 .text_size(12).text_color(t.muted).cursor_pointer()
                 .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                .tooltip("Reload diff")
-                .on_click((_e, cx) => this.loadViewerDiffNow(diff, cx))
+                .tooltip(markdownActive ? "Reload Markdown & diff" : "Reload diff")
+                .on_click((_e, cx) => this.loadViewerDiffNow(diff, cx, { forceReload: true }))
                 .child("↻")
             )
             .child(
@@ -3094,7 +3392,7 @@ export default class ChangesReview extends View {
         }
       })
       .on_key_down((e, cx) => {
-        if (e.key === "escape" && (this.typingComment || this.activeComment)) {
+        if (!markdownActive && e.key === "escape" && (this.typingComment || this.activeComment)) {
           this.cancelActiveComment(cx);
           this.handle.focus();
           cx.stop_propagation();
@@ -3116,71 +3414,99 @@ export default class ChangesReview extends View {
           .child(renderFileInfo())
           .child(renderReviewControls())
       ))
-      .when(Boolean(this.viewerNote), (el) => el.child(
+      .when(!markdownActive && Boolean(this.viewerNote), (el) => el.child(
         div().flex_none().px(12).py(6).border_b(1).border_color(t.border).text_size(11).text_color(del).child(this.viewerNote)
       ))
       .child(
-        (() => {
-          const wrapCols = this.getReviewWrapCols();
-          const rowHeights = this.computeDiffRowHeights(commentMap, wrapCols);
-          return v_flex().flex_1().min_h(0).w_full()
-            .on_size_change((size, cx) => {
-              const w = Math.round(size?.width || 0);
-              if (w > 0 && Math.abs(w - (this.diffViewportWidth || 0)) > 4) {
-                this.scheduleDiffResizeReflow(w, cx);
-              }
+        markdownActive
+          ? renderMarkdownViewer({
+              id: `changes-md-view::${currentMdFileId}::${this.viewerMarkdownLoadedToken || "0"}`,
+              scrollId: `changes-md-scroll::${currentMdFileId}::${this.viewerMarkdownLoadedToken || "0"}`,
+              prepared: this.viewerMarkdownPrepared,
+              filePath: openFilePath,
+              loading: this.viewerMarkdownLoading,
+              error: this.viewerMarkdownError,
+              noticeBanner: this.viewerMarkdownNotice,
+              emptyText: this.viewerMarkdownNotice
+                ? `${this.viewerMarkdownNotice} (Empty Markdown file)`
+                : "Empty Markdown file",
+              monoFont: mono,
+              t,
+              onRelativeLink: (href, linkCx) => {
+                const targetRel = resolveRelativeMarkdownPath(openFilePath, href);
+                if (!targetRel) return;
+                const normTarget = targetRel.replace(/^\/+/, "");
+                const targetFile = files.find((f) => {
+                  if (!f || f.serviceId !== openFile?.serviceId) return false;
+                  const p = String(f.path || "").replace(/\\/g, "/").replace(/^\/+/, "");
+                  return p === normTarget;
+                });
+                if (targetFile) {
+                  this.openViewerFile(targetFile, diff, ctx, linkCx || cx);
+                }
+              },
             })
-            .child(
-              div().size_full().relative().font_family(mono).text_size(11.5)
-                .when(this.rows.length > 0, (el) => el
-                  .child(
-                    v_virtual_list(
-                      "changes-diff-lines",
-                      this.rows.length,
-                      rowHeights,
-                      (index) => `${openKey || ""}::${index}`,
-                      (range) => {
-                        const out = [];
-                        for (let i = range.start; i < range.end; i++) {
-                          out.push(this.diffRow(this.rows[i], t, dt, commentMap, openKey, wrapCols));
-                        }
-                        return out;
-                      }
+          : (() => {
+              const wrapCols = this.getReviewWrapCols();
+              const rowHeights = this.computeDiffRowHeights(commentMap, wrapCols);
+              return v_flex().flex_1().min_h(0).w_full()
+                .on_size_change((size, cx) => {
+                  const w = Math.round(size?.width || 0);
+                  if (w > 0 && Math.abs(w - (this.diffViewportWidth || 0)) > 4) {
+                    this.scheduleDiffResizeReflow(w, cx);
+                  }
+                })
+                .child(
+                  div().size_full().relative().font_family(mono).text_size(11.5)
+                    .when(this.rows.length > 0, (el) => el
+                      .child(
+                        v_virtual_list(
+                          "changes-diff-lines",
+                          this.rows.length,
+                          rowHeights,
+                          (index) => `${openKey || ""}::${index}`,
+                          (range) => {
+                            const out = [];
+                            for (let i = range.start; i < range.end; i++) {
+                              out.push(this.diffRow(this.rows[i], t, dt, commentMap, openKey, wrapCols));
+                            }
+                            return out;
+                          }
+                        )
+                          .size_full()
+                          .track_scroll(this.diffScroll)
+                          .on_item_click((itemKey, cx) => {
+                            const keyStr = String(itemKey || "");
+                            const sep = keyStr.lastIndexOf("::");
+                            const idx = Number(sep >= 0 ? keyStr.slice(sep + 2) : keyStr);
+                            if (!Number.isInteger(idx) || idx < 0 || idx >= this.rows.length) return;
+                            const rowObj = this.rows[idx];
+                            if (!rowObj) return;
+                            const activeKey = readActiveDiff(this.getSessionContext().spaceId)?.openFileKey || openKey;
+                            if (rowObj.kind === "@") {
+                              this.toggleExpand(activeKey, cx);
+                            } else if (rowObj.number !== undefined) {
+                              this.startComment(activeKey, rowObj.number, rowObj.text, cx);
+                            }
+                          })
+                      )
+                      .child(Scrollbar.vertical("changes-diff-lines").viewport_from_layout().absolute().inset_0())
                     )
-                      .size_full()
-                      .track_scroll(this.diffScroll)
-                      .on_item_click((itemKey, cx) => {
-                        const keyStr = String(itemKey || "");
-                        const sep = keyStr.lastIndexOf("::");
-                        const idx = Number(sep >= 0 ? keyStr.slice(sep + 2) : keyStr);
-                        if (!Number.isInteger(idx) || idx < 0 || idx >= this.rows.length) return;
-                        const rowObj = this.rows[idx];
-                        if (!rowObj) return;
-                        const activeKey = readActiveDiff(this.getSessionContext().spaceId)?.openFileKey || openKey;
-                        if (rowObj.kind === "@") {
-                          this.toggleExpand(activeKey, cx);
-                        } else if (rowObj.number !== undefined) {
-                          this.startComment(activeKey, rowObj.number, rowObj.text, cx);
-                        }
-                      })
-                  )
-                  .child(Scrollbar.vertical("changes-diff-lines").viewport_from_layout().absolute().inset_0())
-                )
-                .when(!openFile, (e) => e.child(
-                  h_flex().absolute().inset_0().items_center().justify_center()
-                    .child(div().text_size(12).text_color(t.dim).child(
-                      files.length === 0 && viewMode === "working"
-                        ? "No changes in this session yet"
-                        : "Select a file from the Changes panel to review its diff"
+                    .when(!openFile, (e) => e.child(
+                      h_flex().absolute().inset_0().items_center().justify_center()
+                        .child(div().text_size(12).text_color(t.dim).child(
+                          files.length === 0 && viewMode === "working"
+                            ? "No changes in this session yet"
+                            : "Select a file from the Changes panel to review its diff"
+                        ))
                     ))
-                ))
-                .when(Boolean(openFile) && this.viewerLoading && this.rows.length === 0, (e) => e.child(
-                  div().absolute().top(12).left(14).text_size(11.5).text_color(t.dim).child("Loading diff…")
-                ))
-            );
-        })()
+                    .when(Boolean(openFile) && this.viewerLoading && this.rows.length === 0, (e) => e.child(
+                      div().absolute().top(12).left(14).text_size(11.5).text_color(t.dim).child("Loading diff…")
+                    ))
+                );
+            })()
       )
-      .when(Boolean(this.activeComment && this.activeComment.fileKey === openKey), (el) =>
+      .when(!markdownActive && Boolean(this.activeComment && this.activeComment.fileKey === openKey), (el) =>
         el.child(this.renderCommentComposer(t, commentMap, openKey))
       );
   }

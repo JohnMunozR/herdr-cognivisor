@@ -24,7 +24,17 @@ import {
   formatFileTabTitle,
   pruneOpenFileTabs,
   findMatchingOpenFileTab,
+  resolveViewerMarkdownToggleOnLoad,
+  selectViewerMarkdownRawText,
+  buildViewerMarkdownCacheKey,
+  buildViewerMarkdownViewIds,
+  resolveRelativeMarkdownTarget,
+  getPreviewMarkdownTargetPath,
+  shouldResetPreviewMarkdown,
+  shouldLoadFullMarkdownPreview,
+  buildPreviewMarkdownViewIds,
 } from "../mods/files-search/search-logic.js";
+import { isMarkdownFile } from "../mods/files-search/markdown-view-logic.js";
 
 describe("files-search search-logic", () => {
   test("prepareSearchQuery and scoreIndexEntry rank folders with trailing slash higher than files", () => {
@@ -543,5 +553,113 @@ describe("files-search search-logic", () => {
     );
     assert.equal(winHit?.tabId, "tab-win");
     assert.equal(findMatchingOpenFileTab(null, ["tab-1"], ["tab-1"], "/repo", "a.ts"), null);
+  });
+
+  test("resolveViewerMarkdownToggleOnLoad defaults false on new/switched targets and preserves on same-file reload", () => {
+    // Initial open starts raw (false)
+    assert.equal(resolveViewerMarkdownToggleOnLoad("", "/repo/README.md", false), false);
+    assert.equal(resolveViewerMarkdownToggleOnLoad(null, "/repo/README.md", true), false);
+
+    // Explicit reload of the same Markdown file preserves toggle state
+    assert.equal(resolveViewerMarkdownToggleOnLoad("/repo/README.md", "/repo/README.md", true), true);
+    assert.equal(resolveViewerMarkdownToggleOnLoad("/repo/README.md", "/repo/README.md", false), false);
+    assert.equal(
+      resolveViewerMarkdownToggleOnLoad("C:\\Repo\\docs\\SPEC.md", "C:/repo/docs/spec.md", true, true),
+      true
+    );
+
+    // Switching to another file resets toggle to raw (false)
+    assert.equal(resolveViewerMarkdownToggleOnLoad("/repo/README.md", "/repo/SPEC.md", true), false);
+    assert.equal(resolveViewerMarkdownToggleOnLoad("/repo/README.md", "/repo/src/main.js", true), false);
+    assert.equal(resolveViewerMarkdownToggleOnLoad("/repo/src/main.js", "/repo/src/main.js", true), false);
+  });
+
+  test("selectViewerMarkdownRawText retains raw text only for valid non-binary Markdown files", () => {
+    assert.equal(selectViewerMarkdownRawText("/repo/README.md", "# Title\n"), "# Title\n");
+    assert.equal(selectViewerMarkdownRawText("docs/guide.MDX", "# MDX"), "# MDX");
+    assert.equal(selectViewerMarkdownRawText("/repo/empty.md", ""), "");
+
+    // Non-Markdown, errors, null, or binary content must clear retained text to null
+    assert.equal(selectViewerMarkdownRawText("/repo/main.js", "console.log(1);"), null);
+    assert.equal(selectViewerMarkdownRawText("/repo/README.md", "# Title", true), null);
+    assert.equal(selectViewerMarkdownRawText("/repo/README.md", null, false), null);
+    assert.equal(selectViewerMarkdownRawText("/repo/README.md", "abc\0def", false), null);
+    assert.equal(isMarkdownFile("/repo/README.md"), true);
+    assert.equal(isMarkdownFile("/repo/main.js"), false);
+  });
+
+  test("buildViewerMarkdownCacheKey and buildViewerMarkdownViewIds scope keys and scroll IDs per target and loadSeq", () => {
+    assert.equal(buildViewerMarkdownCacheKey("/repo/README.md", 3), "/repo/README.md|3");
+    assert.equal(buildViewerMarkdownCacheKey("", 1), "");
+
+    const idsA1 = buildViewerMarkdownViewIds("fv-1", "/repo/README.md", 1);
+    const idsA1Again = buildViewerMarkdownViewIds("fv-1", "/repo/README.md", 1);
+    const idsA2 = buildViewerMarkdownViewIds("fv-1", "/repo/README.md", 2);
+    const idsB1 = buildViewerMarkdownViewIds("fv-1", "/repo/SPEC.md", 1);
+    const idsOtherTab = buildViewerMarkdownViewIds("fv-2", "/repo/README.md", 1);
+
+    assert.deepEqual(idsA1, idsA1Again);
+    assert.notEqual(idsA1.id, idsA1.scrollId);
+    assert.notEqual(idsA1.scrollId, idsA2.scrollId);
+    assert.notEqual(idsA1.scrollId, idsB1.scrollId);
+    assert.notEqual(idsA1.scrollId, idsOtherTab.scrollId);
+  });
+
+  test("resolveRelativeMarkdownTarget resolves different relative files and rejects same-file, anchor, external, and unsafe links", () => {
+    assert.equal(
+      resolveRelativeMarkdownTarget("/repo/mods/files-search/SPEC.md", "../changes-review/SPEC.md#overview"),
+      "/repo/mods/changes-review/SPEC.md"
+    );
+    assert.equal(
+      resolveRelativeMarkdownTarget("mods/files-search/SPEC.md", "./main.js#L10"),
+      "mods/files-search/main.js"
+    );
+
+    // Same-file relative links, anchors, external URLs, and invalid escapes must return null
+    assert.equal(resolveRelativeMarkdownTarget("/repo/README.md", "./README.md#install"), null);
+    assert.equal(
+      resolveRelativeMarkdownTarget("C:\\repo\\README.md", "./readme.md", true),
+      null
+    );
+    assert.equal(resolveRelativeMarkdownTarget("/repo/README.md", "#section"), null);
+    assert.equal(resolveRelativeMarkdownTarget("/repo/README.md", "https://example.com/docs"), null);
+    assert.equal(resolveRelativeMarkdownTarget("README.md", "../../secret.md"), null);
+  });
+
+  test("shouldResetPreviewMarkdown resets on path change, dir selection, or close while preserving same-file hits", () => {
+    const fileItemA = { kind: "file", path: "docs/README.md" };
+    const textHitA1 = { kind: "text", path: "docs/README.md", line: 10 };
+    const textHitA2 = { kind: "text", path: "docs/README.md", line: 85 };
+    const fileItemB = { kind: "file", path: "docs/SPEC.md" };
+    const dirItem = { kind: "dir", path: "docs" };
+
+    assert.equal(getPreviewMarkdownTargetPath(dirItem), null);
+    assert.equal(getPreviewMarkdownTargetPath(fileItemA), "docs/README.md");
+
+    assert.equal(shouldResetPreviewMarkdown(null, fileItemA), true);
+    assert.equal(shouldResetPreviewMarkdown(fileItemA, textHitA1), false);
+    assert.equal(shouldResetPreviewMarkdown(textHitA1, textHitA2), false);
+    assert.equal(shouldResetPreviewMarkdown(fileItemA, fileItemB), true);
+    assert.equal(shouldResetPreviewMarkdown(fileItemA, dirItem), true);
+    assert.equal(shouldResetPreviewMarkdown(fileItemA, null), true);
+    assert.equal(shouldResetPreviewMarkdown(null, null), false);
+  });
+
+  test("shouldLoadFullMarkdownPreview and buildPreviewMarkdownViewIds distinguish complete chunks from partial/mid-file previews", () => {
+    // Full file already present from line 1 with no remaining chunks -> zero extra read
+    assert.equal(shouldLoadFullMarkdownPreview(1, false), false);
+    assert.equal(shouldLoadFullMarkdownPreview(0, false), false);
+
+    // Mid-file text search hit or truncated >120 line file -> lazy fetch from line 1 required
+    assert.equal(shouldLoadFullMarkdownPreview(1, true), true);
+    assert.equal(shouldLoadFullMarkdownPreview(25, false), true);
+    assert.equal(shouldLoadFullMarkdownPreview(25, true), true);
+    assert.equal(shouldLoadFullMarkdownPreview(NaN, false), true);
+
+    const chunkIds = buildPreviewMarkdownViewIds("docs/README.md", 1, "chunk-24");
+    const fullIds = buildPreviewMarkdownViewIds("docs/README.md", 1, "full");
+    const otherFileIds = buildPreviewMarkdownViewIds("docs/SPEC.md", 1, "chunk-24");
+    assert.notEqual(chunkIds.scrollId, fullIds.scrollId);
+    assert.notEqual(chunkIds.scrollId, otherFileIds.scrollId);
   });
 });

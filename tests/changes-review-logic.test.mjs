@@ -39,6 +39,12 @@ import {
   parseCommitLogOutput,
   mergeBusCandidateServices,
   collectServiceWorkingSnapshot,
+  resolveReviewMarkdownSourceSpec,
+  computeViewerMarkdownFileId,
+  computeReviewMarkdownLoadToken,
+  buildReviewMarkdownCacheKey,
+  validateMarkdownTextContent,
+  formatGitShowMarkdownError,
 } from "../mods/changes-review/review-logic.js";
 import {
   statFileEntry as filesSearchStatFileEntry,
@@ -949,5 +955,154 @@ describe("changes-review review-logic", () => {
     assert.deepEqual(mdDiffRows[16].tokens, [
       ["plain", "This and or is outside any unclosed fence from earlier hunks."],
     ]);
+  });
+
+  test("resolveReviewMarkdownSourceSpec resolves working tree, commit, renamed R, deleted D, untracked ??, and lock-free git flags", () => {
+    // 1. Working tree modified/added/untracked/renamed -> fast readTextFile path with no deleted notice
+    const workingMod = resolveReviewMarkdownSourceSpec(
+      { repoRoot: "/ws/repo/", path: "docs/README.md", status: "M", hasHead: true },
+      { viewMode: "working" },
+    );
+    assert.equal(workingMod.kind, "file");
+    assert.equal(workingMod.mode, "after");
+    assert.equal(workingMod.isDeleted, false);
+    assert.equal(workingMod.notice, "");
+    assert.equal(workingMod.absPath, "/ws/repo/docs/README.md");
+
+    const workingUntracked = resolveReviewMarkdownSourceSpec(
+      { repoRoot: "/ws/repo", path: "notes/TODO.mdx", status: "??", fresh: true, hasHead: false },
+    );
+    assert.equal(workingUntracked.kind, "file");
+    assert.equal(workingUntracked.isDeleted, false);
+    assert.equal(workingUntracked.absPath, "/ws/repo/notes/TODO.mdx");
+
+    const workingRenamed = resolveReviewMarkdownSourceSpec(
+      { repoRoot: "/ws/repo", path: "docs/new-guide.md", oldPath: "docs/old-guide.md", status: "R", hasHead: true },
+      { viewMode: "working" },
+    );
+    assert.equal(workingRenamed.kind, "file");
+    assert.equal(workingRenamed.isDeleted, false);
+    assert.equal(workingRenamed.notice, "");
+    assert.equal(workingRenamed.absPath, "/ws/repo/docs/new-guide.md");
+
+    // 2. Working tree deleted -> lock-free git show HEAD:<oldPath || path> with notice banner
+    const workingDeleted = resolveReviewMarkdownSourceSpec(
+      { repoRoot: "/ws/repo", path: "docs/removed.md", oldPath: "docs/prev-removed.md", status: "D", hasHead: true },
+      { viewMode: "working", on: "dev@host" },
+    );
+    assert.equal(workingDeleted.kind, "git");
+    assert.equal(workingDeleted.mode, "before");
+    assert.equal(workingDeleted.isDeleted, true);
+    assert.equal(workingDeleted.notice, "Deleted in this change — showing previous version");
+    assert.equal(workingDeleted.refSpec, "HEAD:docs/prev-removed.md");
+    assert.equal(workingDeleted.on, "dev@host");
+    assert.deepEqual(workingDeleted.args, [...READ_GIT_FLAGS, "show", "HEAD:docs/prev-removed.md"]);
+
+    const workingDeletedFallbackPath = resolveReviewMarkdownSourceSpec(
+      { repoRoot: "/ws/repo", path: "CHANGELOG.md", status: "D" },
+    );
+    assert.equal(workingDeletedFallbackPath.kind, "git");
+    assert.equal(workingDeletedFallbackPath.refSpec, "HEAD:CHANGELOG.md");
+
+    // Working tree deleted when untracked / repo has no HEAD -> clear unavailable spec
+    const workingDeletedNoHead = resolveReviewMarkdownSourceSpec(
+      { repoRoot: "/ws/repo", path: "draft.md", status: "D", hasHead: false },
+    );
+    assert.equal(workingDeletedNoHead.kind, "unavailable");
+    assert.equal(workingDeletedNoHead.isDeleted, true);
+    assert.match(workingDeletedNoHead.error, /untracked|HEAD/i);
+
+    // 3. Commit mode non-deleted (M, R) -> lock-free git show <hash>:<path>
+    const commitHash = "845bbd44c7b586209dacee3c495946a6116b3edf";
+    const commitRenamed = resolveReviewMarkdownSourceSpec(
+      { repoRoot: "/ws/repo", path: "docs/renamed.md", oldPath: "docs/before.md", status: "R" },
+      { viewMode: "commit", commitHash },
+    );
+    assert.equal(commitRenamed.kind, "git");
+    assert.equal(commitRenamed.mode, "after");
+    assert.equal(commitRenamed.isDeleted, false);
+    assert.equal(commitRenamed.notice, "");
+    assert.equal(commitRenamed.refSpec, `${commitHash}:docs/renamed.md`);
+    assert.deepEqual(commitRenamed.args, [...READ_GIT_FLAGS, "show", `${commitHash}:docs/renamed.md`]);
+
+    // 4. Commit mode deleted -> lock-free git show <hash>^:<oldPath || path> with deleted notice
+    const commitDeleted = resolveReviewMarkdownSourceSpec(
+      { repoRoot: "/ws/repo", path: "docs/old.md", status: "D" },
+      { commitHash },
+    );
+    assert.equal(commitDeleted.kind, "git");
+    assert.equal(commitDeleted.mode, "before");
+    assert.equal(commitDeleted.isDeleted, true);
+    assert.equal(commitDeleted.notice, "Deleted in this change — showing previous version");
+    assert.equal(commitDeleted.refSpec, `${commitHash}^:docs/old.md`);
+    assert.deepEqual(commitDeleted.args, [...READ_GIT_FLAGS, "show", `${commitHash}^:docs/old.md`]);
+
+    const commitDeletedWithOldPath = resolveReviewMarkdownSourceSpec(
+      { repoRoot: "/ws/repo", path: "docs/new.md", oldPath: "docs/orig.md", status: "D" },
+      { viewMode: "commit", commitHash },
+    );
+    assert.equal(commitDeletedWithOldPath.refSpec, `${commitHash}^:docs/orig.md`);
+
+    // 5. Guards: binary flag, missing commit hash in commit mode, missing file
+    assert.equal(
+      resolveReviewMarkdownSourceSpec({ repoRoot: "/ws/repo", path: "docs/bin.md", status: "M", binary: true }).kind,
+      "unavailable",
+    );
+    assert.equal(
+      resolveReviewMarkdownSourceSpec({ repoRoot: "/ws/repo", path: "docs/a.md", status: "M" }, { viewMode: "commit", commitHash: "" }).kind,
+      "unavailable",
+    );
+    assert.equal(resolveReviewMarkdownSourceSpec(null).kind, "unavailable");
+  });
+
+  test("Markdown cache keying, binary NUL guard, and git-show error formatting handle edge cases", () => {
+    const file = {
+      key: "svc::docs/guide.md",
+      repoRoot: "/ws/repo",
+      path: "docs/guide.md",
+      status: "M",
+      fresh: false,
+      sig: "120:1700000000000",
+      mtimeMs: 1700000000000,
+      add: 4,
+      del: 1,
+    };
+
+    const workingId = computeViewerMarkdownFileId(file, "working", "");
+    const commitId = computeViewerMarkdownFileId(file, "commit", "abc123");
+    assert.notEqual(workingId, commitId);
+    assert.equal(computeViewerMarkdownFileId(null), "");
+
+    const tok0 = computeReviewMarkdownLoadToken(file, { viewMode: "working", reloadNonce: 0 });
+    const tok1 = computeReviewMarkdownLoadToken(file, { viewMode: "working", reloadNonce: 1 });
+    const tokEdited = computeReviewMarkdownLoadToken(
+      { ...file, sig: "140:1700000005000", mtimeMs: 1700000005000 },
+      { viewMode: "working", reloadNonce: 0 },
+    );
+    assert.notEqual(tok0, tok1);
+    assert.notEqual(tok0, tokEdited);
+
+    const k0 = buildReviewMarkdownCacheKey(file, { viewMode: "working", loadToken: tok0 });
+    const k1 = buildReviewMarkdownCacheKey(file, { viewMode: "working", loadToken: tok1 });
+    const kCommit = buildReviewMarkdownCacheKey(file, { viewMode: "commit", commitHash: "abc123", loadToken: "M||r0" });
+    assert.notEqual(k0, k1);
+    assert.notEqual(k0, kCommit);
+
+    // Binary content NUL byte guard
+    assert.deepEqual(validateMarkdownTextContent("# Hello\n"), { ok: true, text: "# Hello\n" });
+    const binRes = validateMarkdownTextContent("abc\0def");
+    assert.equal(binRes.ok, false);
+    assert.match(binRes.error, /binary/i);
+    assert.equal(validateMarkdownTextContent(null, "Missing file").error, "Missing file");
+
+    // Git show error translations (root commit parent missing vs missing from HEAD)
+    assert.match(
+      formatGitShowMarkdownError("fatal: bad revision 'abc^:docs/old.md'", { isDeleted: true, refSpec: "abc^:docs/old.md" }),
+      /root commit|parent/i,
+    );
+    assert.match(
+      formatGitShowMarkdownError("fatal: path 'docs/new.md' exists on disk, but not in 'HEAD'", { isDeleted: true, refSpec: "HEAD:docs/new.md" }),
+      /HEAD|untracked/i,
+    );
   });
 });

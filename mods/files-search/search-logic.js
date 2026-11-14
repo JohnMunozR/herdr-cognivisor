@@ -1,5 +1,6 @@
 // Pure helper logic for files-search: fuzzy scoring, directory-aware query ranking, text-search parsing, git header parsing, and syntax highlighting.
 import { isMarkdownExt, tokenizeMarkdownLine } from "./markdown-syntax.js";
+import { isMarkdownFile, resolveRelativeMarkdownPath } from "./markdown-view-logic.js";
 
 export const MAX_FILE_RESULTS = 50;
 export const MAX_TEXT_RESULTS = 35;
@@ -1237,4 +1238,109 @@ export function findMatchingOpenFileTab(openTabsMap, spaceTabIds, filePaneTabIds
     }
   }
   return null;
+}
+
+function hashPathShort(value) {
+  const s = String(value || "");
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    hash ^= s.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+/**
+ * Determine whether the File Viewer Markdown toggle should stay active on file load.
+ * Defaults to false when opening or switching targets; preserves toggle state when reloading the same file.
+ */
+export function resolveViewerMarkdownToggleOnLoad(prevTargetPath, nextTargetPath, prevRendered = false, isWin = false) {
+  const nextKey = buildFileViewerKey("", nextTargetPath, isWin);
+  if (!nextKey || !isMarkdownFile(nextTargetPath)) return false;
+  const prevKey = buildFileViewerKey("", prevTargetPath, isWin);
+  return Boolean(prevKey && prevKey === nextKey && prevRendered);
+}
+
+/**
+ * Retain raw text in viewer state only when the loaded target is a valid non-binary Markdown file.
+ */
+export function selectViewerMarkdownRawText(targetPath, text, hasError = false) {
+  if (hasError || typeof text !== "string" || text.includes("\0")) return null;
+  return isMarkdownFile(targetPath) ? text : null;
+}
+
+/**
+ * Build cache key `${targetPath}|${viewerLoadSeq}` for the viewer's bounded Markdown preparation cache.
+ */
+export function buildViewerMarkdownCacheKey(targetPath, loadSeq = 0) {
+  const cleanPath = String(targetPath || "").trim();
+  if (!cleanPath) return "";
+  const seq = Number.isFinite(Number(loadSeq)) ? Math.max(0, Math.floor(Number(loadSeq))) : 0;
+  return `${cleanPath}|${seq}`;
+}
+
+/**
+ * Derive stable GPUI element and scroll IDs scoped to viewer instance, target path, and load version.
+ */
+export function buildViewerMarkdownViewIds(viewerId, targetPath, loadSeq = 0) {
+  const vId = String(viewerId || "viewer");
+  const seq = Number.isFinite(Number(loadSeq)) ? Math.max(0, Math.floor(Number(loadSeq))) : 0;
+  const pathHash = hashPathShort(targetPath);
+  return {
+    id: `viewer-md-text-${vId}-${pathHash}-${seq}`,
+    scrollId: `viewer-md-scroll-${vId}-${pathHash}-${seq}`,
+  };
+}
+
+/**
+ * Resolve a relative Markdown href against the current viewer file path when it targets a different file.
+ */
+export function resolveRelativeMarkdownTarget(currentTargetPath, href, isWin = false) {
+  const resolved = resolveRelativeMarkdownPath(currentTargetPath, href);
+  if (!resolved) return null;
+  const curKey = buildFileViewerKey("", currentTargetPath, isWin);
+  const nextKey = buildFileViewerKey("", resolved, isWin);
+  if (!nextKey || (curKey && curKey === nextKey)) return null;
+  return resolved;
+}
+
+/**
+ * Extract the previewable file path from a Search Everywhere result item (excluding directories).
+ */
+export function getPreviewMarkdownTargetPath(item) {
+  if (!item || item.kind === "dir" || typeof item.path !== "string") return null;
+  const clean = item.path.trim();
+  return clean || null;
+}
+
+/**
+ * Return true when changing the highlighted Search Everywhere item must reset rendered Markdown state.
+ */
+export function shouldResetPreviewMarkdown(prevItem, nextItem) {
+  const prevPath = getPreviewMarkdownTargetPath(prevItem);
+  const nextPath = getPreviewMarkdownTargetPath(nextItem);
+  if (!nextPath) return Boolean(prevPath);
+  return prevPath !== nextPath;
+}
+
+/**
+ * Return true when toggling rendered Markdown preview in Search Everywhere requires fetching from line 1.
+ */
+export function shouldLoadFullMarkdownPreview(startLine = 1, hasMore = false) {
+  if (hasMore) return true;
+  const start = Number(startLine);
+  if (!Number.isFinite(start)) return true;
+  return start > 1;
+}
+
+/**
+ * Derive stable GPUI element and scroll IDs for the Search Everywhere Markdown preview surface.
+ */
+export function buildPreviewMarkdownViewIds(targetPath, seq = 0, sourceTag = "chunk") {
+  const s = Number.isFinite(Number(seq)) ? Math.max(0, Math.floor(Number(seq))) : 0;
+  const pathHash = hashPathShort(targetPath);
+  return {
+    id: `preview-md-text-${pathHash}-${s}-${sourceTag}`,
+    scrollId: `preview-md-scroll-${pathHash}-${s}-${sourceTag}`,
+  };
 }

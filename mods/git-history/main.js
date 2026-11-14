@@ -58,11 +58,18 @@ import {
   tokenizeSideBySidePage,
   resolveGitFileIcon,
   computeViewerLoadedKey,
+  resolveHistoryMarkdownBlobSpec,
   formatGitTabTitle,
   expandCodeTabs,
   paginateDiffRows,
 } from "./diff-logic.js";
 import { computeWrapColumns, wrapPlainText } from "./code-wrap.js";
+import { DEFAULT_MARKDOWN_MAX_CHARS, isMarkdownFile } from "./markdown-view-logic.js";
+import {
+  createMarkdownRenderCache,
+  renderMarkdownToggleButton,
+  renderMarkdownViewer,
+} from "./markdown-view.js";
 import {
   READ_GIT,
   DISCOVER_SKIP_DIRS,
@@ -87,6 +94,7 @@ const REPO_CACHE_TTL_MS = 60000;
 const SEARCH_DEBOUNCE_MS = 60;
 const MAX_COMMIT_FILES_CACHE = 32;
 const MAX_VIEWER_PATCH_CACHE = 24;
+const MAX_VIEWER_MARKDOWN_CACHE = 16;
 const GIT_EXEC_TIMEOUT_MS = 15000;
 const EXPANDED_VIEWER_DIFF_LINES = 4000;
 const GIT_LOG_FORMAT = "%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s%x1e";
@@ -551,6 +559,16 @@ function makeCommitFileKey(commit, file) {
   return `${h}::${p}`;
 }
 
+function makeViewerFileIdentity(diff, openFile) {
+  if (!diff || !openFile) return "";
+  const repoRoot = normPathStr(diff?.repoRoot || openFile?.repoRoot);
+  const on = diff?.on ?? "";
+  const commitHash = diff?.commitHash || "";
+  const fileKey = openFile?.key || openFile?.path || "";
+  if (!commitHash || !fileKey) return "";
+  return `${repoRoot}|${on}|${commitHash}|${fileKey}`;
+}
+
 function buildFileDescriptor(repo, commit, file) {
   if (!file) return null;
   const key = makeCommitFileKey(commit, file);
@@ -705,6 +723,19 @@ export default class GitHistory extends View {
     this._lastSbsWrapSig = "";
     this._lastUniWrapSig = "";
     this.open = null;
+    this.closed = false;
+
+    // Viewer Markdown preview state
+    this.viewerMarkdownRendered = false;
+    this.viewerMarkdownLoading = false;
+    this.viewerMarkdownError = "";
+    this.viewerMarkdownNotice = "";
+    this.viewerMarkdownPrepared = null;
+    this.viewerMarkdownKey = "";
+    this.viewerMarkdownFileIdentity = "";
+    this.viewerMarkdownGen = 0;
+    this.viewerMarkdownBlobCache = new Map();
+    this.markdownRenderCache = this.isViewer ? createMarkdownRenderCache(MAX_VIEWER_MARKDOWN_CACHE) : null;
 
     // Watchers & timers
     this.watchedGitDirs = new Map();
@@ -774,12 +805,28 @@ export default class GitHistory extends View {
     }
   }
 
+  closeViewer() {
+    this.viewerLoadGen += 1;
+    this.viewerMarkdownGen += 1;
+    this.viewerMarkdownRendered = false;
+    this.viewerMarkdownLoading = false;
+    this.viewerMarkdownError = "";
+    this.viewerMarkdownNotice = "";
+    this.viewerMarkdownPrepared = null;
+    this.viewerMarkdownKey = "";
+    this.viewerMarkdownFileIdentity = "";
+    this.viewerMarkdownBlobCache?.clear?.();
+    this.markdownRenderCache?.clear?.();
+    this.viewerPatchCache?.clear?.();
+  }
+
   close() {
+    this.closed = true;
     this.hostCx = null;
     this.repoDiscoverGen += 1;
     this.logGen += 1;
     this.commitFilesGen += 1;
-    this.viewerLoadGen += 1;
+    this.closeViewer();
 
     if (this.viewerHostId) {
       viewerHostsById.delete(this.viewerHostId);
@@ -1628,6 +1675,173 @@ export default class GitHistory extends View {
     return `${repoRoot}|${on}|${commitHash}|${openFile?.key || openFile?.path || ""}|${isExpanded ? 1 : 0}`;
   }
 
+  makeViewerMarkdownCacheKey(diff, openFile, spec) {
+    const repoRoot = normPathStr(diff?.repoRoot || openFile?.repoRoot);
+    const on = diff?.on ?? "";
+    const blobPart = spec?.blobSpec || `${diff?.commitHash || ""}:${openFile?.key || openFile?.path || ""}`;
+    return `${repoRoot}|${on}|${blobPart}`;
+  }
+
+  resetViewerMarkdownState(nextIdentity = "") {
+    this.viewerMarkdownGen += 1;
+    this.viewerMarkdownRendered = false;
+    this.viewerMarkdownLoading = false;
+    this.viewerMarkdownError = "";
+    this.viewerMarkdownNotice = "";
+    this.viewerMarkdownPrepared = null;
+    this.viewerMarkdownKey = "";
+    this.viewerMarkdownFileIdentity = nextIdentity;
+  }
+
+  invalidateViewerMarkdownCache(diff, openFile) {
+    if (!openFile || !isMarkdownFile(openFile.path || openFile)) return;
+    const spec = resolveHistoryMarkdownBlobSpec(diff, openFile);
+    const cacheKey = this.makeViewerMarkdownCacheKey(diff, openFile, spec);
+    this.viewerMarkdownBlobCache?.delete?.(cacheKey);
+    this.markdownRenderCache?.clear?.();
+  }
+
+  async loadViewerMarkdownNow(diff, openFile, cx, opts = {}) {
+    const gen = ++this.viewerMarkdownGen;
+    if (this.closed || !openFile) return;
+
+    const spec = resolveHistoryMarkdownBlobSpec(diff, openFile);
+    const fileIdentity = makeViewerFileIdentity(diff, openFile);
+    const cacheKey = this.makeViewerMarkdownCacheKey(diff, openFile, spec);
+    this.viewerMarkdownNotice = spec.notice || "";
+    this.viewerMarkdownKey = cacheKey;
+    this.viewerMarkdownFileIdentity = fileIdentity;
+
+    const failImmediate = (msg) => {
+      this.viewerMarkdownLoading = false;
+      this.viewerMarkdownPrepared = null;
+      this.viewerMarkdownError = msg;
+      cx?.notify();
+    };
+    const prepareCached = (rawText) => {
+      const renderCache =
+        this.markdownRenderCache ||
+        (this.markdownRenderCache = createMarkdownRenderCache(MAX_VIEWER_MARKDOWN_CACHE));
+      return renderCache.getOrPrepare(
+        `${cacheKey}|${DEFAULT_MARKDOWN_MAX_CHARS}`,
+        rawText,
+        { filePath: spec.path }
+      );
+    };
+    const cacheAndFail = (msg) => {
+      lruSet(
+        this.viewerMarkdownBlobCache,
+        cacheKey,
+        { rawText: "", error: msg, notice: spec.notice || "", path: spec.path },
+        MAX_VIEWER_MARKDOWN_CACHE
+      );
+      this.viewerMarkdownPrepared = null;
+      this.viewerMarkdownError = msg;
+    };
+
+    if (!spec.ok) {
+      failImmediate(spec.unavailableReason || "Markdown preview unavailable");
+      return;
+    }
+    if (openFile.binary) {
+      failImmediate("Binary file cannot be rendered as Markdown");
+      return;
+    }
+
+    const repoRoot = diff?.repoRoot || openFile?.repoRoot;
+    const on = diff?.on ?? null;
+    if (!repoRoot) {
+      failImmediate("Repository root unavailable for Markdown preview");
+      return;
+    }
+
+    if (opts.forceReload) {
+      this.viewerMarkdownBlobCache.delete(cacheKey);
+      this.markdownRenderCache?.clear?.();
+    } else {
+      const cached = lruGet(this.viewerMarkdownBlobCache, cacheKey);
+      if (cached) {
+        if (cached.error) {
+          this.viewerMarkdownPrepared = null;
+          this.viewerMarkdownError = cached.error;
+        } else {
+          this.viewerMarkdownPrepared = prepareCached(cached.rawText);
+          this.viewerMarkdownError = "";
+        }
+        this.viewerMarkdownNotice = cached.notice ?? spec.notice ?? "";
+        this.viewerMarkdownLoading = false;
+        cx?.notify();
+        return;
+      }
+    }
+
+    this.viewerMarkdownLoading = true;
+    this.viewerMarkdownError = "";
+    this.viewerMarkdownPrepared = null;
+    cx?.notify();
+
+    try {
+      const res = await exec("git", [...READ_GIT, "show", "--no-textconv", spec.blobSpec], {
+        cwd: repoRoot,
+        on,
+        timeout: GIT_EXEC_TIMEOUT_MS,
+      });
+      if (this.closed || gen !== this.viewerMarkdownGen || !this.viewerMarkdownRendered) return;
+      if (this.viewerMarkdownFileIdentity !== fileIdentity) return;
+      const latestDiff = readActiveDiff(this.getSessionContext().spaceId);
+      if (latestDiff) {
+        const latestOpen =
+          latestDiff.openFile || (latestDiff.files || []).find((f) => f.key === latestDiff.openFileKey) || null;
+        if (makeViewerFileIdentity(latestDiff, latestOpen) !== fileIdentity) return;
+      }
+
+      if (!res || res.code !== 0) {
+        cacheAndFail((res?.stderr || "").trim() || `Cannot read ${spec.path} from commit`);
+        return;
+      }
+
+      const rawText = typeof res.stdout === "string" ? res.stdout : "";
+      if (rawText.includes("\0")) {
+        cacheAndFail("Binary file cannot be rendered as Markdown");
+        return;
+      }
+
+      lruSet(
+        this.viewerMarkdownBlobCache,
+        cacheKey,
+        { rawText, error: "", notice: spec.notice || "", path: spec.path },
+        MAX_VIEWER_MARKDOWN_CACHE
+      );
+      this.viewerMarkdownPrepared = prepareCached(rawText);
+      this.viewerMarkdownError = "";
+    } catch (e) {
+      if (this.closed || gen !== this.viewerMarkdownGen || !this.viewerMarkdownRendered) return;
+      if (this.viewerMarkdownFileIdentity !== fileIdentity) return;
+      cacheAndFail(`Cannot load Markdown: ${e?.message || e}`);
+    } finally {
+      if (!this.closed && gen === this.viewerMarkdownGen) {
+        this.viewerMarkdownLoading = false;
+        cx?.notify();
+      }
+    }
+  }
+
+  toggleViewerMarkdown(diff, openFile, cx) {
+    if (!openFile || !isMarkdownFile(openFile.path || openFile)) return;
+    if (this.viewerMarkdownRendered) {
+      this.viewerMarkdownGen += 1;
+      this.viewerMarkdownRendered = false;
+      this.viewerMarkdownLoading = false;
+      this.buildActiveDiffModeData();
+      cx?.notify();
+      this.notifyViewerChildren(cx, "all");
+      return;
+    }
+    this.viewerMarkdownRendered = true;
+    this.viewerMarkdownFileIdentity = makeViewerFileIdentity(diff, openFile);
+    this.loadViewerMarkdownNow(diff, openFile, cx);
+  }
+
   notifyViewerChildren(cx, targets = "all") {
     if (!this.isViewerMode()) return;
     const primaryCx = cx || this.hostCx;
@@ -1803,6 +2017,25 @@ export default class GitHistory extends View {
     const openFile = diff?.openFile || files.find((f) => f.key === diff?.openFileKey) || null;
     this.open = openFile ? openFile.key : null;
     this.viewerError = null;
+
+    const prevMarkdownIdentity = this.viewerMarkdownFileIdentity;
+    const nextFileIdentity = makeViewerFileIdentity(diff, openFile);
+    const keepMarkdown = Boolean(
+      opts.forceReload &&
+        this.viewerMarkdownRendered &&
+        openFile &&
+        isMarkdownFile(openFile.path || openFile) &&
+        nextFileIdentity &&
+        nextFileIdentity === prevMarkdownIdentity
+    );
+    if (!keepMarkdown) {
+      this.resetViewerMarkdownState(nextFileIdentity);
+      if (opts.forceReload && openFile) {
+        this.invalidateViewerMarkdownCache(diff, openFile);
+      }
+    } else {
+      this.loadViewerMarkdownNow(diff, openFile, cx, { forceReload: true });
+    }
 
     if (!openFile) {
       this.loadedPatchSource = null;
@@ -2055,6 +2288,11 @@ export default class GitHistory extends View {
 
   setViewerDiffMode(mode, diff, cx) {
     if (mode !== "side-by-side" && mode !== "unified") return;
+    if (this.viewerMarkdownRendered) {
+      this.viewerMarkdownGen += 1;
+      this.viewerMarkdownRendered = false;
+      this.viewerMarkdownLoading = false;
+    }
     this._userSetDiffMode = true;
     this.diffMode = mode;
     this.buildActiveDiffModeData();
@@ -2629,6 +2867,14 @@ export default class GitHistory extends View {
     const beforeLabel = openFile?.status === "A" || parents.length === 0 ? "empty" : parentLabel;
     const compactViewer = (this.viewerWidth || 960) < 700;
     const relTime = diff?.commitTimestamp ? formatRelativeTime(diff.commitTimestamp) : "";
+    const isMdFile = Boolean(openFile && isMarkdownFile(openFile.path || openFile));
+    const fileIdentity = makeViewerFileIdentity(diff, openFile);
+    const isMarkdownActive = Boolean(
+      isMdFile &&
+        this.viewerMarkdownRendered &&
+        fileIdentity &&
+        fileIdentity === this.viewerMarkdownFileIdentity
+    );
 
     return v_flex()
       .id("git-diff-tab-viewer")
@@ -2650,9 +2896,10 @@ export default class GitHistory extends View {
         if (Math.abs(w - prevW) > 12) {
           const compactChanged = (prevW < 700) !== (w < 700);
           const unmeasured =
-            this.diffMode === "unified"
+            !this.viewerMarkdownRendered &&
+            (this.diffMode === "unified"
               ? !this.unifiedViewportW
-              : (!this.leftViewportW || !this.rightViewportW);
+              : (!this.leftViewportW || !this.rightViewportW));
           this.viewerWidth = w;
           if (compactChanged || unmeasured) {
             cx.notify();
@@ -2829,7 +3076,7 @@ export default class GitHistory extends View {
                     )
                 )
               )
-              .when(Boolean(openFile) && !openFile?.binary && !this.isBinaryDiff, (b) =>
+              .when(Boolean(openFile) && !openFile?.binary && !this.isBinaryDiff && !isMarkdownActive, (b) =>
                 b.child(
                   h_flex()
                     .id("git-diff-expand")
@@ -2866,10 +3113,10 @@ export default class GitHistory extends View {
                       .items_center()
                       .cursor_pointer()
                       .text_size(11)
-                      .when(this.diffMode === "side-by-side", (el) =>
+                      .when(!isMarkdownActive && this.diffMode === "side-by-side", (el) =>
                         el.bg(t.selected).text_color(t.foreground).font_medium()
                       )
-                      .when(this.diffMode !== "side-by-side", (el) =>
+                      .when(isMarkdownActive || this.diffMode !== "side-by-side", (el) =>
                         el.text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
                       )
                       .on_click((_e, cx) => this.setViewerDiffMode("side-by-side", diff, cx))
@@ -2884,15 +3131,30 @@ export default class GitHistory extends View {
                       .items_center()
                       .cursor_pointer()
                       .text_size(11)
-                      .when(this.diffMode === "unified", (el) =>
+                      .when(!isMarkdownActive && this.diffMode === "unified", (el) =>
                         el.bg(t.selected).text_color(t.foreground).font_medium()
                       )
-                      .when(this.diffMode !== "unified", (el) =>
+                      .when(isMarkdownActive || this.diffMode !== "unified", (el) =>
                         el.text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
                       )
                       .on_click((_e, cx) => this.setViewerDiffMode("unified", diff, cx))
                       .child("Unified")
                   )
+              )
+              .when(isMdFile, (b) =>
+                b.child(
+                  renderMarkdownToggleButton({
+                    id: "git-markdown-toggle",
+                    active: isMarkdownActive,
+                    compact: compactViewer,
+                    height: 24,
+                    rounded: 5,
+                    icon: "mods/git-history/icons/file-types/markdown.svg",
+                    tooltip: isMarkdownActive ? "Back to commit diff view" : "Render formatted Markdown snapshot",
+                    t,
+                    onClick: (_e, cx) => this.toggleViewerMarkdown(diff, openFile, cx),
+                  })
+                )
               )
               .child(
                 h_flex()
@@ -2909,7 +3171,7 @@ export default class GitHistory extends View {
                   .text_color(t.muted)
                   .cursor_pointer()
                   .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                  .tooltip("Reload diff")
+                  .tooltip(isMarkdownActive ? "Reload Markdown preview & diff" : "Reload diff")
                   .on_click((_e, cx) => this.loadViewerDiffNow(diff, cx, { preserveLocalDiffMode: true, forceReload: true }))
                   .child("↻")
               )
@@ -2953,7 +3215,7 @@ export default class GitHistory extends View {
             )
         )
       )
-      .when(Boolean(this.viewerError), (el) =>
+      .when(Boolean(this.viewerError) && !isMarkdownActive, (el) =>
         el.child(
           div()
             .flex_none()
@@ -2966,7 +3228,7 @@ export default class GitHistory extends View {
             .child(this.viewerError)
         )
       )
-      .when(this.diffTruncated, (el) =>
+      .when(this.diffTruncated && !isMarkdownActive, (el) =>
         el.child(
           div()
             .flex_none()
@@ -3000,7 +3262,22 @@ export default class GitHistory extends View {
             )
         )
       )
-      .when(Boolean(openFile) && this.viewerLoading && this.sbsRows.length === 0 && this.uniRows.length === 0, (el) =>
+      .when(Boolean(openFile) && isMarkdownActive, (el) =>
+        el.child(
+          renderMarkdownViewer({
+            id: `git-md-view-${fileIdentity}`,
+            scrollId: `git-md-scroll-${fileIdentity}`,
+            prepared: this.viewerMarkdownPrepared,
+            filePath: openFile.status === "D" && openFile.oldPath ? openFile.oldPath : (openFile.path || ""),
+            loading: this.viewerMarkdownLoading,
+            error: this.viewerMarkdownError,
+            noticeBanner: this.viewerMarkdownNotice,
+            monoFont: mono,
+            t,
+          })
+        )
+      )
+      .when(Boolean(openFile) && !isMarkdownActive && this.viewerLoading && this.sbsRows.length === 0 && this.uniRows.length === 0, (el) =>
         el.child(
           h_flex()
             .flex_1()
@@ -3010,7 +3287,7 @@ export default class GitHistory extends View {
             .child(div().text_size(12).text_color(t.dim).child("Loading diff…"))
         )
       )
-      .when(Boolean(openFile) && !this.viewerLoading && (this.isBinaryDiff || openFile.binary), (el) =>
+      .when(Boolean(openFile) && !isMarkdownActive && !this.viewerLoading && (this.isBinaryDiff || openFile.binary), (el) =>
         el.child(
           v_flex()
             .flex_1()
@@ -3030,6 +3307,7 @@ export default class GitHistory extends View {
       )
       .when(
         Boolean(openFile) &&
+          !isMarkdownActive &&
           !this.isBinaryDiff &&
           !openFile.binary &&
           this.diffMode === "side-by-side" &&
@@ -3206,6 +3484,7 @@ export default class GitHistory extends View {
       )
       .when(
         Boolean(openFile) &&
+          !isMarkdownActive &&
           !this.isBinaryDiff &&
           !openFile.binary &&
           this.diffMode === "unified" &&

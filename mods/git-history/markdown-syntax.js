@@ -85,7 +85,7 @@ function normalizeFenceLang(raw) {
   return FENCE_LANG_ALIASES[lower] || lower;
 }
 
-function isFrontmatterDelimiter(text) {
+export function isFrontmatterDelimiter(text) {
   const len = text.length;
   let i = 0;
   while (i < len && isHorizWs(text[i])) i++;
@@ -99,7 +99,7 @@ function isFrontmatterDelimiter(text) {
   return true;
 }
 
-function parseFenceOpen(text) {
+export function parseFenceOpen(text) {
   const len = text.length;
   let wsEnd = 0;
   while (wsEnd < len && isHorizWs(text[wsEnd])) wsEnd++;
@@ -144,7 +144,7 @@ function parseFenceOpen(text) {
   };
 }
 
-function parseFenceClose(text, activeFence) {
+export function parseFenceClose(text, activeFence) {
   const len = text.length;
   const fenceChar = activeFence[0];
   const minLen = activeFence.length;

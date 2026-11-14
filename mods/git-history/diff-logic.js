@@ -6,6 +6,7 @@ import {
   advanceMarkdownState,
   tokenizeMarkdownLine,
 } from "./markdown-syntax.js";
+import { getDiffMarkdownPlan } from "./markdown-view-logic.js";
 
 export const MAX_DIFF_SYNTAX_LINE_CHARS = 500;
 export const MAX_VIEWER_DIFF_LINES = 1500;
@@ -1879,6 +1880,94 @@ export function computeViewerLoadedKey(diff) {
   const fileKey = diff.openFileKey || diff.openFile?.path || "";
   if (!diff.commitHash || !fileKey) return "empty";
   return `${diff.requestSeq || 0}::${diff.repoRoot || ""}::${diff.commitHash}::${fileKey}::${diff.expanded ? 1 : 0}`;
+}
+
+/**
+ * Resolves the read-only git object spec (`rev:path`), preview notice, or
+ * unavailability reason for rendering a commit file as Markdown.
+ */
+export function resolveHistoryMarkdownBlobSpec(commit, file) {
+  const plan = getDiffMarkdownPlan(typeof file === "string" ? "M" : file?.status);
+  const rawPath = typeof file === "string" ? file : (typeof file?.path === "string" ? file.path : "");
+  const rawOldPath = typeof file === "string" ? "" : (typeof file?.oldPath === "string" ? file.oldPath : "");
+  const filePath = rawPath.trim() ? rawPath : "";
+  const oldPath = rawOldPath.trim() ? rawOldPath : "";
+  const targetPath = plan.isDeleted ? (oldPath || filePath) : filePath;
+
+  if (!targetPath) {
+    return {
+      ok: false,
+      mode: plan.mode,
+      isDeleted: plan.isDeleted,
+      rev: "",
+      path: "",
+      blobSpec: null,
+      notice: plan.notice,
+      unavailableReason: "Missing file path for Markdown preview",
+    };
+  }
+
+  const commitHash =
+    typeof commit?.hash === "string"
+      ? commit.hash.trim()
+      : typeof commit?.commitHash === "string"
+        ? commit.commitHash.trim()
+        : "";
+  const rawParents = Array.isArray(commit?.parents)
+    ? commit.parents
+    : Array.isArray(commit?.parentHashes)
+      ? commit.parentHashes
+      : [];
+  const firstParent = rawParents.find((p) => typeof p === "string" && p.trim())?.trim() || "";
+
+  if (plan.isDeleted) {
+    if (!firstParent) {
+      return {
+        ok: false,
+        mode: plan.mode,
+        isDeleted: true,
+        rev: "",
+        path: targetPath,
+        blobSpec: null,
+        notice: plan.notice,
+        unavailableReason: "Deleted file has no parent commit snapshot to preview",
+      };
+    }
+    return {
+      ok: true,
+      mode: plan.mode,
+      isDeleted: true,
+      rev: firstParent,
+      path: targetPath,
+      blobSpec: `${firstParent}:${targetPath}`,
+      notice: plan.notice,
+      unavailableReason: "",
+    };
+  }
+
+  if (!commitHash) {
+    return {
+      ok: false,
+      mode: plan.mode,
+      isDeleted: false,
+      rev: "",
+      path: targetPath,
+      blobSpec: null,
+      notice: "",
+      unavailableReason: "Missing commit hash for Markdown preview",
+    };
+  }
+
+  return {
+    ok: true,
+    mode: plan.mode,
+    isDeleted: false,
+    rev: commitHash,
+    path: targetPath,
+    blobSpec: `${commitHash}:${targetPath}`,
+    notice: "",
+    unavailableReason: "",
+  };
 }
 
 export function formatGitTabTitle(commit, file) {

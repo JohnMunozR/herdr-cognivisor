@@ -1,7 +1,8 @@
 // FilesSearch: File browser with search button + floating IntelliJ-style Search Everywhere dialog.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, Input, InputState, Scrollbar, VirtualListScrollHandle, v_virtual_list } from "gpui-base";
-import { readdir, exists } from "fs/promises";
+import * as fsPromises from "fs/promises";
+const { readdir, exists } = fsPromises;
 import { join } from "path";
 import {
   spaces, panes, focused, agents, terminals, hc, exec, appHome, readTextFile, watchFolder,
@@ -61,7 +62,21 @@ import {
   formatFileTabTitle,
   pruneOpenFileTabs,
   findMatchingOpenFileTab,
+  resolveViewerMarkdownToggleOnLoad,
+  selectViewerMarkdownRawText,
+  buildViewerMarkdownCacheKey,
+  buildViewerMarkdownViewIds,
+  resolveRelativeMarkdownTarget,
+  shouldResetPreviewMarkdown,
+  shouldLoadFullMarkdownPreview,
+  buildPreviewMarkdownViewIds,
 } from "./search-logic.js";
+import { isMarkdownFile } from "./markdown-view-logic.js";
+import {
+  createMarkdownRenderCache,
+  renderMarkdownToggleButton,
+  renderMarkdownViewer,
+} from "./markdown-view.js";
 import { computeWrapColumns, wrapStyledSpans } from "./code-wrap.js";
 import {
   isMarkdownExt,
@@ -2710,6 +2725,13 @@ export default class FilesSearch extends View {
     this.previewError = null;
     this.previewScroll = 0;
     this.previewCache = new Map();
+    this.previewMarkdownRendered = false;
+    this.previewMarkdownSeq = 0;
+    this.previewMarkdownLoading = false;
+    this.previewMarkdownError = null;
+    this.previewMarkdownFullText = null;
+    this.previewMarkdownFullPath = null;
+    this.previewMarkdownCache = createMarkdownRenderCache(12);
 
     // Resize state (remembers user size preference)
     const savedSize = shared("files-search.customSize");
@@ -2789,6 +2811,8 @@ export default class FilesSearch extends View {
     this.pending?.clear();
     this.pendingTokens?.clear();
     this.visibleRowByKey = null;
+    this.resetPreviewMarkdownState({ clearCache: true });
+    this.previewMarkdownCache = null;
     try { this.treeScrollHandle?.release(); } catch {}
     this.treeScrollHandle = null;
     try { this.input?.release(); } catch {}
@@ -2807,6 +2831,9 @@ export default class FilesSearch extends View {
     this.textSearchTask = null;
     this.previewDebounceTask?.cancel();
     this.previewDebounceTask = null;
+    this.resetPreviewMarkdownState({ clearCache: true });
+    this.previewItem = null;
+    this._currentPreviewKey = null;
     closeOverlay(props().overlay);
   }
 
@@ -2894,11 +2921,176 @@ export default class FilesSearch extends View {
     cx.notify();
   }
 
+  resetPreviewMarkdownState({ clearCache = false } = {}) {
+    this.previewMarkdownRendered = false;
+    this.previewMarkdownSeq = (this.previewMarkdownSeq || 0) + 1;
+    this.previewMarkdownLoading = false;
+    this.previewMarkdownError = null;
+    this.previewMarkdownFullText = null;
+    this.previewMarkdownFullPath = null;
+    if (clearCache) {
+      this.previewMarkdownCache?.clear();
+    }
+  }
+
+  togglePreviewMarkdown(item, cx) {
+    if (!item || item.kind === "dir" || !isMarkdownFile(item.path) || this.previewError) return;
+    if (this.previewLoading && this.previewLines.length === 0) return;
+
+    const nextRendered = !this.previewMarkdownRendered;
+    this.previewMarkdownRendered = nextRendered;
+
+    if (!nextRendered) {
+      this.previewMarkdownSeq = (this.previewMarkdownSeq || 0) + 1;
+      this.previewMarkdownLoading = false;
+      this.previewMarkdownError = null;
+      cx.notify();
+      return;
+    }
+
+    this.previewMarkdownError = null;
+    if (
+      this.previewMarkdownFullPath === item.path &&
+      typeof this.previewMarkdownFullText === "string"
+    ) {
+      this.previewMarkdownLoading = false;
+      cx.notify();
+      return;
+    }
+
+    if (!shouldLoadFullMarkdownPreview(this.previewStartLine, this.previewHasMore)) {
+      this.previewMarkdownLoading = false;
+      cx.notify();
+      return;
+    }
+
+    this.loadPreviewMarkdownFull(item, cx, { notifyOnStart: true });
+  }
+
+  loadPreviewMarkdownFull(item, cx, { notifyOnStart = true } = {}) {
+    if (this._overlayClosed || !item || item.kind === "dir" || !isMarkdownFile(item.path)) return;
+    const root = this.searchRoot;
+    const on = this.searchOn ?? null;
+    const targetPath = item.path;
+    const fullPath = resolveViewerFilePath(root, targetPath);
+    if (!fullPath) {
+      this.previewMarkdownError = "Cannot resolve Markdown file path";
+      this.previewMarkdownLoading = false;
+      if (notifyOnStart) cx.notify();
+      return;
+    }
+
+    const mdSeq = ++this.previewMarkdownSeq;
+    const reqSeq = this.previewReqSeq;
+    this.previewMarkdownLoading = true;
+    this.previewMarkdownError = null;
+    if (notifyOnStart) cx.notify();
+
+    cx.spawn(async innerCx => {
+      try {
+        const text = await readTextFile(fullPath, { on });
+        if (
+          this._overlayClosed ||
+          mdSeq !== this.previewMarkdownSeq ||
+          reqSeq !== this.previewReqSeq ||
+          this.previewItem?.path !== targetPath ||
+          !this.previewMarkdownRendered
+        ) {
+          return;
+        }
+        if (text === null || typeof text !== "string") {
+          this.previewMarkdownError = "File not found or unreadable";
+          return;
+        }
+        if (text.includes("\0")) {
+          this.previewMarkdownError = "Binary file · no text preview";
+          return;
+        }
+        this.previewMarkdownFullPath = targetPath;
+        this.previewMarkdownFullText = text;
+        this.previewMarkdownError = null;
+      } catch {
+        if (
+          !this._overlayClosed &&
+          mdSeq === this.previewMarkdownSeq &&
+          reqSeq === this.previewReqSeq &&
+          this.previewItem?.path === targetPath
+        ) {
+          this.previewMarkdownError = "Cannot preview this Markdown file";
+        }
+      } finally {
+        if (
+          !this._overlayClosed &&
+          mdSeq === this.previewMarkdownSeq &&
+          reqSeq === this.previewReqSeq &&
+          this.previewItem?.path === targetPath
+        ) {
+          this.previewMarkdownLoading = false;
+          innerCx.notify();
+        }
+      }
+    });
+  }
+
+  renderPreviewMarkdown(t, item) {
+    const isLoading = Boolean(this.previewMarkdownLoading || (this.previewLoading && this.previewLines.length === 0));
+    const hasFullSnapshot = Boolean(
+      this.previewMarkdownFullPath === item.path && typeof this.previewMarkdownFullText === "string"
+    );
+    const needsFullFetch = !hasFullSnapshot && shouldLoadFullMarkdownPreview(this.previewStartLine, this.previewHasMore);
+    const sourceTag = hasFullSnapshot ? "full" : `chunk-${this.previewLines.length}`;
+    const mdIds = buildPreviewMarkdownViewIds(item.path, this.previewMarkdownSeq, sourceTag);
+    const monoFont = settings()?.font_family || "monospace";
+
+    if (this.previewMarkdownError) {
+      return renderMarkdownViewer({
+        id: mdIds.id,
+        scrollId: mdIds.scrollId,
+        error: this.previewMarkdownError,
+        monoFont,
+        paddingX: 14,
+        paddingY: 10,
+        t,
+      });
+    }
+
+    if (isLoading || needsFullFetch) {
+      return renderMarkdownViewer({
+        id: mdIds.id,
+        scrollId: mdIds.scrollId,
+        loading: true,
+        monoFont,
+        paddingX: 14,
+        paddingY: 10,
+        t,
+      });
+    }
+
+    const rawText = hasFullSnapshot ? this.previewMarkdownFullText : this.previewLines.join("\n");
+    const cacheKey = hasFullSnapshot ? `full:${item.path}` : `chunk:${item.path}:${this.previewLines.length}`;
+    if (!this.previewMarkdownCache) {
+      this.previewMarkdownCache = createMarkdownRenderCache(12);
+    }
+    const prepared = this.previewMarkdownCache.getOrPrepare(cacheKey, rawText, { filePath: item.path });
+
+    return renderMarkdownViewer({
+      id: mdIds.id,
+      scrollId: mdIds.scrollId,
+      prepared,
+      filePath: item.path,
+      monoFont,
+      paddingX: 14,
+      paddingY: 10,
+      t,
+    });
+  }
+
   schedulePreview(item, cx, immediate = false) {
     if (!item) {
       this.previewDebounceTask?.cancel();
       this.previewDebounceTask = null;
       this.previewReqSeq++;
+      this.resetPreviewMarkdownState();
       this.previewItem = null;
       this.previewIsDir = false;
       this.previewDirEntries = [];
@@ -2918,6 +3110,9 @@ export default class FilesSearch extends View {
       (this.previewLines.length > 0 || this.previewDirEntries.length > 0 || this.previewError || this.previewIsDir)
     ) {
       return;
+    }
+    if (shouldResetPreviewMarkdown(this.previewItem, item)) {
+      this.resetPreviewMarkdownState();
     }
     this._currentPreviewKey = itemKey;
     this.previewItem = item;
@@ -2946,6 +3141,15 @@ export default class FilesSearch extends View {
       this.previewError = null;
       this.previewLoading = false;
       this.previewLoadingMore = false;
+      if (
+        this.previewMarkdownRendered &&
+        !this.previewIsDir &&
+        isMarkdownFile(item.path) &&
+        this.previewMarkdownFullPath !== item.path &&
+        shouldLoadFullMarkdownPreview(this.previewStartLine, this.previewHasMore)
+      ) {
+        this.loadPreviewMarkdownFull(item, cx, { notifyOnStart: immediate });
+      }
       return;
     }
 
@@ -3029,6 +3233,14 @@ export default class FilesSearch extends View {
             hasMore: this.previewHasMore,
             scroll: this.previewScroll,
           });
+          if (
+            this.previewMarkdownRendered &&
+            isMarkdownFile(targetPath) &&
+            this.previewMarkdownFullPath !== targetPath &&
+            shouldLoadFullMarkdownPreview(this.previewStartLine, this.previewHasMore)
+          ) {
+            this.loadPreviewMarkdownFull(item, cx, { notifyOnStart: false });
+          }
         } catch {
           if (reqSeq === this.previewReqSeq) {
             this.previewError = isDir ? "Cannot list this folder" : "Cannot preview this file";
@@ -3915,88 +4127,93 @@ export default class FilesSearch extends View {
         );
     }
 
-    const previewCols = computeWrapColumns({
-      viewportWidth: previewW,
-      gutterWidth: 53,
-      rightPadding: 20,
-      fontSize: 11.5,
-      minCols: 12,
-    });
-    const maxScroll = Math.max(0, this.previewLines.length - VISIBLE_ROWS);
-    this.previewScroll = Math.max(0, Math.min(this.previewScroll, maxScroll));
-
+    const isMd = isMarkdownFile(item.path);
+    const showRenderedMd = Boolean(isMd && this.previewMarkdownRendered && !this.previewError);
     const monoFont = settings()?.font_family || "monospace";
-    const syntaxPal = getSyntaxPalette(t);
-    const targetGutterColor = syntaxPal.type;
-    const dimGutterColor = syntaxPal.comment;
     const visibleLines = [];
-    const startIdx = this.previewScroll;
-    const endIdx = Math.min(this.previewLines.length, startIdx + VISIBLE_ROWS);
-    let renderedVisualRows = 0;
 
-    let mdState = null;
-    if (isMarkdownExt(ext)) {
-      mdState = createMarkdownState();
-      const baseLine = Math.max(0, (this.previewStartLine || 1) - 1);
-      mdState.lineIndex = baseLine;
-      if (baseLine > 0) mdState.frontmatterClosed = true;
-      for (let i = 0; i < startIdx; i++) {
-        advanceMarkdownState(this.previewLines[i] ?? "", mdState);
-      }
-    }
+    if (!showRenderedMd) {
+      const previewCols = computeWrapColumns({
+        viewportWidth: previewW,
+        gutterWidth: 53,
+        rightPadding: 20,
+        fontSize: 11.5,
+        minCols: 12,
+      });
+      const maxScroll = Math.max(0, this.previewLines.length - VISIBLE_ROWS);
+      this.previewScroll = Math.max(0, Math.min(this.previewScroll, maxScroll));
 
-    for (let i = startIdx; i < endIdx && renderedVisualRows < VISIBLE_ROWS; i++) {
-      const lineNum = (this.previewStartLine || 1) + i;
-      const isTarget = lineNum === targetLine;
-      const gutterLineColor = isTarget ? targetGutterColor : dimGutterColor;
-      const lineContent = this.previewLines[i] ?? "";
-      const wrappedSegments = this.renderWrappedSyntaxSegments(
-        t,
-        lineContent,
-        ext,
-        isTarget ? item.matchedQuery : null,
-        isTarget,
-        previewCols,
-        monoFont,
-        true,
-        mdState
-      );
-      if (mdState) {
-        advanceMarkdownState(lineContent, mdState);
+      const syntaxPal = getSyntaxPalette(t);
+      const targetGutterColor = syntaxPal.type;
+      const dimGutterColor = syntaxPal.comment;
+      const startIdx = this.previewScroll;
+      const endIdx = Math.min(this.previewLines.length, startIdx + VISIBLE_ROWS);
+      let renderedVisualRows = 0;
+
+      let mdState = null;
+      if (isMarkdownExt(ext)) {
+        mdState = createMarkdownState();
+        const baseLine = Math.max(0, (this.previewStartLine || 1) - 1);
+        mdState.lineIndex = baseLine;
+        if (baseLine > 0) mdState.frontmatterClosed = true;
+        for (let i = 0; i < startIdx; i++) {
+          advanceMarkdownState(this.previewLines[i] ?? "", mdState);
+        }
       }
 
-      for (let s = 0; s < wrappedSegments.length && renderedVisualRows < VISIBLE_ROWS; s++) {
-        const isFirstSeg = s === 0;
-        renderedVisualRows += 1;
-        visibleLines.push(
-          h_flex()
-            .w_full()
-            .h(LINE_H)
-            .flex_none()
-            .items_center()
-            .pl(4)
-            .pr(16)
-            .gap(8)
-            .cursor_pointer()
-            .hover(st => st.bg(t.hover))
-            .on_click(() => this.selectResult({ ...item, line: lineNum }, cx))
-            .when(isTarget, el => el.bg(t.selected).border_l(3).border_color(t.accent))
-            .when(!isTarget, el => el.border_l(3).border_color(t.background))
-            // Line Number Gutter (blank on wrapped continuation rows)
-            .child(
-              div()
-                .w(38)
-                .flex_none()
-                .text_right()
-                .text_size(11)
-                .font_family(monoFont)
-                .text_color(gutterLineColor)
-                .when(isTarget, el => el.font_semibold())
-                .child(isFirstSeg ? String(lineNum) : "\u00a0")
-            )
-            // Soft-wrapped Line Content
-            .child(wrappedSegments[s])
+      for (let i = startIdx; i < endIdx && renderedVisualRows < VISIBLE_ROWS; i++) {
+        const lineNum = (this.previewStartLine || 1) + i;
+        const isTarget = lineNum === targetLine;
+        const gutterLineColor = isTarget ? targetGutterColor : dimGutterColor;
+        const lineContent = this.previewLines[i] ?? "";
+        const wrappedSegments = this.renderWrappedSyntaxSegments(
+          t,
+          lineContent,
+          ext,
+          isTarget ? item.matchedQuery : null,
+          isTarget,
+          previewCols,
+          monoFont,
+          true,
+          mdState
         );
+        if (mdState) {
+          advanceMarkdownState(lineContent, mdState);
+        }
+
+        for (let s = 0; s < wrappedSegments.length && renderedVisualRows < VISIBLE_ROWS; s++) {
+          const isFirstSeg = s === 0;
+          renderedVisualRows += 1;
+          visibleLines.push(
+            h_flex()
+              .w_full()
+              .h(LINE_H)
+              .flex_none()
+              .items_center()
+              .pl(4)
+              .pr(16)
+              .gap(8)
+              .cursor_pointer()
+              .hover(st => st.bg(t.hover))
+              .on_click(() => this.selectResult({ ...item, line: lineNum }, cx))
+              .when(isTarget, el => el.bg(t.selected).border_l(3).border_color(t.accent))
+              .when(!isTarget, el => el.border_l(3).border_color(t.background))
+              // Line Number Gutter (blank on wrapped continuation rows)
+              .child(
+                div()
+                  .w(38)
+                  .flex_none()
+                  .text_right()
+                  .text_size(11)
+                  .font_family(monoFont)
+                  .text_color(gutterLineColor)
+                  .when(isTarget, el => el.font_semibold())
+                  .child(isFirstSeg ? String(lineNum) : "\u00a0")
+              )
+              // Soft-wrapped Line Content
+              .child(wrappedSegments[s])
+          );
+        }
       }
     }
 
@@ -4040,7 +4257,7 @@ export default class FilesSearch extends View {
                 .border_1()
                 .border_color(t.accent)
                 .text_size(11)
-                .font_family(settings()?.font_family || "monospace")
+                .font_family(monoFont)
                 .font_semibold()
                 .text_color(t.ansi3)
                 .child(`line ${targetLine}`)
@@ -4054,7 +4271,7 @@ export default class FilesSearch extends View {
                 .child(`${this.previewLines.length}${this.previewHasMore ? "+" : ""} lines`)
             )
           )
-          .when(Boolean(this.previewLoadingMore), el =>
+          .when(!showRenderedMd && Boolean(this.previewLoadingMore), el =>
             el.child(
               div()
                 .px(5)
@@ -4065,6 +4282,22 @@ export default class FilesSearch extends View {
                 .font_medium()
                 .text_color(t.ansi4)
                 .child("loading more…")
+            )
+          )
+          .when(isMd && !this.previewError, el =>
+            el.child(
+              renderMarkdownToggleButton({
+                id: "preview-markdown-toggle",
+                active: Boolean(this.previewMarkdownRendered),
+                compact: true,
+                disabled: Boolean(this.previewLoading && this.previewLines.length === 0),
+                height: 22,
+                px: 7,
+                rounded: 4,
+                icon: "mods/files-search/icons/file-types/markdown.svg",
+                t,
+                onClick: (_e, cx) => this.togglePreviewMarkdown(item, cx),
+              })
             )
           )
           .child(
@@ -4089,13 +4322,14 @@ export default class FilesSearch extends View {
           .flex_1()
           .min_h(0)
           .overflow_hidden()
-          .when(this.previewLoading && this.previewLines.length === 0, el =>
+          .when(showRenderedMd, el => el.child(this.renderPreviewMarkdown(t, item)))
+          .when(!showRenderedMd && this.previewLoading && this.previewLines.length === 0, el =>
             el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child("Loading preview…"))
           )
-          .when(!this.previewLoading && Boolean(this.previewError) && this.previewLines.length === 0, el =>
+          .when(!showRenderedMd && !this.previewLoading && Boolean(this.previewError) && this.previewLines.length === 0, el =>
             el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child(this.previewError))
           )
-          .when(this.previewLines.length > 0, el =>
+          .when(!showRenderedMd && this.previewLines.length > 0, el =>
             el
               .on_scroll_wheel((e, cx) => {
                 const dx = Math.abs(e.delta?.x || 0);
@@ -4124,7 +4358,7 @@ export default class FilesSearch extends View {
                   .children(visibleLines)
               )
           )
-          .when(!this.previewLoading && !this.previewError && this.previewLines.length === 0, el =>
+          .when(!showRenderedMd && !this.previewLoading && !this.previewError && this.previewLines.length === 0, el =>
             el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child("Empty file"))
           )
       );
@@ -4699,6 +4933,12 @@ export default class FilesSearch extends View {
 
     this.viewerCode = null;
     this.viewerSyntaxSig = null;
+    this.viewerRawText = null;
+    this.viewerMarkdownRendered = false;
+    this.viewerMarkdownCache = createMarkdownRenderCache(12);
+    this.viewerLoadedTargetPath = null;
+    this.viewerContentSeq = 0;
+    this.viewerNavSeq = 0;
     this.viewerLoading = Boolean(this.viewerTargetPath);
     this.viewerError = this.viewerTargetPath ? null : "No file path specified";
     this.viewerTabId = null;
@@ -4907,6 +5147,152 @@ export default class FilesSearch extends View {
     if (dirty) cx.notify();
   }
 
+  applyViewerText(targetPath, text, reqSeq, { forceRecreate = false } = {}) {
+    const isWin = !this.viewerOn && window()?.platform === "windows";
+    this.viewerMarkdownRendered = resolveViewerMarkdownToggleOnLoad(
+      this.viewerLoadedTargetPath,
+      targetPath,
+      this.viewerMarkdownRendered,
+      isWin
+    );
+    this.viewerLoadedTargetPath = targetPath;
+    this.viewerContentSeq = reqSeq;
+
+    if (text === null) {
+      this.viewerCode?.release();
+      this.viewerCode = null;
+      this.viewerRawText = null;
+      this.viewerError = "This file is no longer available";
+      return;
+    }
+    if (text.includes("\0")) {
+      this.viewerCode?.release();
+      this.viewerCode = null;
+      this.viewerRawText = null;
+      this.viewerError = "Binary file · no text preview";
+      return;
+    }
+
+    this.viewerError = null;
+    this.viewerRawText = selectViewerMarkdownRawText(targetPath, text, false);
+
+    const value = text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text;
+    const t = theme();
+    const syntaxCfg = getEditorSyntaxConfig(t);
+    const fontFamily = settings()?.font_family;
+    const syntaxSig = `${JSON.stringify(syntaxCfg)}|${fontFamily || ""}`;
+
+    if (!forceRecreate && this.viewerCode && this.viewerSyntaxSig === syntaxSig) {
+      if (this.viewerCode.value() !== value) {
+        this.viewerCode.set_value(value);
+      }
+    } else {
+      this.viewerCode?.release();
+      this.viewerCode = EditorState.new({
+        language: resolveEditorLanguage(targetPath),
+        readonly: true,
+        soft_wrap: true,
+        line_numbers: true,
+        folding: true,
+        value,
+        font_family: fontFamily,
+        font_size: 12.5,
+        syntax: syntaxCfg,
+      });
+      this.viewerSyntaxSig = syntaxSig;
+    }
+  }
+
+  switchViewerTarget(resolvedPath, prefetchedText, cx) {
+    if (this._viewerClosed || !resolvedPath) return;
+    const isWin = !this.viewerOn && window()?.platform === "windows";
+    let relPath = resolvedPath;
+    if (this.viewerRoot && isSameOrChildPath(resolvedPath, this.viewerRoot, isWin)) {
+      if (this.viewerRoot === "/") {
+        relPath = resolvedPath.slice(1) || resolvedPath;
+      } else if (resolvedPath.length > this.viewerRoot.length) {
+        relPath = resolvedPath.slice(this.viewerRoot.length + 1);
+      }
+    }
+    const displayPath = (this.viewerRoot && isSameOrChildPath(resolvedPath, this.viewerRoot, isWin) && relPath)
+      ? relPath
+      : resolvedPath;
+    const svc = resolveServiceForFile(this.viewerRoot, relPath, resolvedPath, isWin);
+
+    const allSpaces = spaces() || [];
+    const ownerSpace = (this.viewerSpaceId ? allSpaces.find(s => s.id === this.viewerSpaceId) : null)
+      || allSpaces.find(s => (s.tabs || []).some(t => t.id === this.viewerTabId))
+      || null;
+    const existingTitles = new Set(
+      (ownerSpace?.tabs || [])
+        .filter(t => t?.id && t.id !== this.viewerTabId && t?.name)
+        .map(t => t.name)
+    );
+    const nextTitle = formatFileTabTitle(resolvedPath, svc.serviceName, existingTitles);
+
+    this.viewerPath = relPath;
+    this.viewerAbsPath = resolvedPath;
+    this.viewerTargetPath = resolvedPath;
+    this.viewerDisplayPath = displayPath;
+    this.viewerLine = null;
+    this.viewerServiceId = svc.serviceId;
+    this.viewerServiceName = svc.serviceName;
+    this.viewerTabTitle = nextTitle;
+
+    try {
+      if (this.viewerTabId && nextTitle) {
+        run("tab.rename", { id: this.viewerTabId, name: nextTitle });
+      }
+    } catch {}
+
+    const reqSeq = ++this.viewerLoadSeq;
+    this.viewerLoading = false;
+    this.applyViewerText(resolvedPath, prefetchedText, reqSeq, { forceRecreate: true });
+    this.viewerHasLoadedOnce = true;
+    this.scheduleViewerSync(cx, 0);
+    cx.notify();
+  }
+
+  openViewerRelativeLink(href, cx) {
+    if (this._viewerClosed || !this.viewerTargetPath || typeof href !== "string") return;
+    const isWin = !this.viewerOn && window()?.platform === "windows";
+    const resolvedPath = resolveRelativeMarkdownTarget(this.viewerTargetPath, href, isWin);
+    if (!resolvedPath) return;
+
+    const navSeq = ++this.viewerNavSeq;
+    const originPath = this.viewerTargetPath;
+    const originLoadSeq = this.viewerLoadSeq;
+    const on = this.viewerOn ?? null;
+    const spawnCx = typeof cx?.spawn === "function" ? cx : null;
+    if (!spawnCx) return;
+
+    spawnCx.spawn(async innerCx => {
+      try {
+        if (!on && typeof fsPromises.stat === "function") {
+          const st = await fsPromises.stat(resolvedPath).catch(() => null);
+          if (!st || (typeof st.isDirectory === "function" && st.isDirectory())) {
+            return;
+          }
+        }
+        const text = await readTextFile(resolvedPath, { on }).catch(() => null);
+        if (
+          this._viewerClosed ||
+          navSeq !== this.viewerNavSeq ||
+          this.viewerTargetPath !== originPath ||
+          this.viewerLoadSeq !== originLoadSeq
+        ) {
+          return;
+        }
+        if (typeof text !== "string" || text.includes("\0")) {
+          return;
+        }
+        this.switchViewerTarget(resolvedPath, text, innerCx);
+      } catch {
+        // Ignore missing or unreadable relative link targets without clobbering current viewer state.
+      }
+    });
+  }
+
   loadViewerFile(cx, { silent = false, forceRecreate = false } = {}) {
     if (this._viewerClosed || !this.viewerTargetPath) return;
     const reqSeq = ++this.viewerLoadSeq;
@@ -4923,48 +5309,13 @@ export default class FilesSearch extends View {
       try {
         const text = await readTextFile(targetPath, { on });
         if (this._viewerClosed || reqSeq !== this.viewerLoadSeq) return;
-        if (text === null) {
-          this.viewerCode?.release();
-          this.viewerCode = null;
-          this.viewerError = "This file is no longer available";
-          return;
-        }
-        if (text.includes("\0")) {
-          this.viewerCode?.release();
-          this.viewerCode = null;
-          this.viewerError = "Binary file · no text preview";
-          return;
-        }
-        const value = text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text;
-        const t = theme();
-        const syntaxCfg = getEditorSyntaxConfig(t);
-        const fontFamily = settings()?.font_family;
-        const syntaxSig = `${JSON.stringify(syntaxCfg)}|${fontFamily || ""}`;
-        this.viewerError = null;
-
-        if (!forceRecreate && this.viewerCode && this.viewerSyntaxSig === syntaxSig) {
-          if (this.viewerCode.value() !== value) {
-            this.viewerCode.set_value(value);
-          }
-        } else {
-          this.viewerCode?.release();
-          this.viewerCode = EditorState.new({
-            language: resolveEditorLanguage(targetPath),
-            readonly: true,
-            soft_wrap: true,
-            line_numbers: true,
-            folding: true,
-            value,
-            font_family: fontFamily,
-            font_size: 12.5,
-            syntax: syntaxCfg,
-          });
-          this.viewerSyntaxSig = syntaxSig;
-        }
+        this.applyViewerText(targetPath, text, reqSeq, { forceRecreate });
       } catch {
         if (!this._viewerClosed && reqSeq === this.viewerLoadSeq) {
           this.viewerCode?.release();
           this.viewerCode = null;
+          this.viewerRawText = null;
+          this.viewerContentSeq = reqSeq;
           this.viewerError = "Cannot open this file (binary, too large, or unreadable)";
         }
       } finally {
@@ -4980,13 +5331,42 @@ export default class FilesSearch extends View {
   closeViewer() {
     this._viewerClosed = true;
     this.viewerLoadSeq = (this.viewerLoadSeq || 0) + 1;
+    this.viewerNavSeq = (this.viewerNavSeq || 0) + 1;
     try { this.viewerSyncTask?.cancel(); } catch {}
     this.viewerSyncTask = null;
     try { this.viewerCode?.release(); } catch {}
     this.viewerCode = null;
+    this.viewerTargetPath = "";
+    this.viewerLoadedTargetPath = null;
+    this.viewerRawText = null;
+    this.viewerMarkdownRendered = false;
+    this.viewerMarkdownCache?.clear();
+    this.viewerMarkdownCache = null;
     if (this.viewerTabId && ACTIVE_VIEWER_CLAIMS.get(this.viewerTabId) === this.viewerId) {
       ACTIVE_VIEWER_CLAIMS.delete(this.viewerTabId);
     }
+  }
+
+  renderViewerMarkdown(t) {
+    const cacheKey = buildViewerMarkdownCacheKey(this.viewerTargetPath, this.viewerContentSeq);
+    if (!this.viewerMarkdownCache) {
+      this.viewerMarkdownCache = createMarkdownRenderCache(12);
+    }
+    const prepared = this.viewerMarkdownCache.getOrPrepare(cacheKey, this.viewerRawText, {
+      filePath: this.viewerTargetPath,
+    });
+    const mdIds = buildViewerMarkdownViewIds(this.viewerId, this.viewerTargetPath, this.viewerContentSeq);
+    const monoFont = settings()?.font_family || "monospace";
+
+    return renderMarkdownViewer({
+      id: mdIds.id,
+      scrollId: mdIds.scrollId,
+      prepared,
+      filePath: this.viewerTargetPath,
+      monoFont,
+      t,
+      onRelativeLink: (href, linkCx) => this.openViewerRelativeLink(href, linkCx),
+    });
   }
 
   renderViewer(cx) {
@@ -5003,10 +5383,18 @@ export default class FilesSearch extends View {
     );
     const currentSyntaxSig = `${JSON.stringify(getEditorSyntaxConfig(t))}|${settings()?.font_family || ""}`;
     const needsSyntaxUpdate = Boolean(this.viewerCode && this.viewerSyntaxSig && this.viewerSyntaxSig !== currentSyntaxSig);
+    const isMd = isMarkdownFile(this.viewerTargetPath);
+    const showRenderedMd = Boolean(
+      isMd &&
+      this.viewerMarkdownRendered &&
+      !this.viewerError &&
+      typeof this.viewerRawText === "string"
+    );
 
     if (
       !this.viewerTabId ||
       !sharedEntry ||
+      sharedEntry.absPath !== this.viewerTargetPath ||
       hasNewSharedUpdate ||
       needsSyntaxUpdate ||
       (this.viewerSeenActiveState && isActiveNow !== this.viewerWasActive)
@@ -5100,6 +5488,24 @@ export default class FilesSearch extends View {
                 .child(`Ln ${activeLine}`)
             )
           )
+          .when(isMd, el =>
+            el.child(
+              renderMarkdownToggleButton({
+                id: "viewer-markdown-toggle",
+                active: Boolean(this.viewerMarkdownRendered),
+                disabled: Boolean(this.viewerError || (this.viewerLoading && typeof this.viewerRawText !== "string")),
+                height: 26,
+                rounded: 6,
+                icon: "mods/files-search/icons/file-types/markdown.svg",
+                t,
+                onClick: (_e, cx) => {
+                  if (this.viewerError || typeof this.viewerRawText !== "string") return;
+                  this.viewerMarkdownRendered = !this.viewerMarkdownRendered;
+                  cx.notify();
+                },
+              })
+            )
+          )
           .child(
             h_flex()
               .id("viewer-reload")
@@ -5124,9 +5530,11 @@ export default class FilesSearch extends View {
           )
       )
       .child(
-        this.viewerCode
-          ? Editor.new(this.viewerCode).flex_1().min_h(0).w_full().min_w(0)
-          : this.viewerError
+        showRenderedMd
+          ? this.renderViewerMarkdown(t)
+          : this.viewerCode
+            ? Editor.new(this.viewerCode).flex_1().min_h(0).w_full().min_w(0)
+            : this.viewerError
             ? v_flex()
                 .flex_1()
                 .min_h(0)
