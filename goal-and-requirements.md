@@ -3,7 +3,7 @@ id: goal-and-requirements
 type: goal-and-requirements
 status: active
 title: Herdr Mesh — Goal and Requirements
-covers: [multi-service-agent-ide, organic-tab-auto-naming, cross-repo-changes-review, workspace-files-search, session-scoped-repo-attribution, unified-layout]
+covers: [multi-service-agent-ide, organic-tab-auto-naming, cross-repo-changes-review, workspace-files-search, git-history-comparison, session-scoped-repo-attribution, unified-layout]
 tags: [root, requirements, herdr, microservices, agent-ide]
 ---
 
@@ -48,8 +48,8 @@ Herdr Mesh is designed for software engineers, tech leads, and autonomous AI cod
 ## Capabilities
 
 - **Unified Multi-Service Layout (`[[module-layouts]]`):**
-  - Top tab bar (`mesh-tabs`) with automatic Jira/prompt naming, double-click inline rename, `Files`/`Review` toggles, and `mesh.spacePanels` persistence.
-  - Expandable `#panel-body` stack hosting `files` (`files-search`) and `changes` (`changes-review`).
+  - Top tab bar (`mesh-tabs`) with automatic Jira/prompt naming, double-click inline rename, `Files`/`Review`/`Git` toggles, and `mesh.spacePanels` persistence.
+  - Expandable `#panel-body` stack hosting `files` (`files-search`), `changes` (`changes-review`), and `git` (`git-history`).
   - Bottom telemetry bar (`mesh-status`) summarizing host, session service/dirty counts, branch, agents, and palette hint.
 - **Microservice Code Review (`[[submodule-mod-changes-review]]`):**
   - Per-service branch visibility, working-tree/commit diffs, expandable context (`git diff -U99999`), and inline notes.
@@ -57,8 +57,11 @@ Herdr Mesh is designed for software engineers, tech leads, and autonomous AI cod
   - Direct review feedback dispatch to `leadTerminal` and multi-repo commit execution.
 - **Workspace Search Everywhere & Multi-Repo Tree (`[[submodule-mod-files-search]]`):**
   - Multi-tab floating overlay (`All`, `Files`, `Text`) with ripgrep streaming, fixed-string fallback on invalid regex, clamped multi-pane preview, and docked session-scoped multi-repo file tree.
+- **Git History & Before/After Commit Comparison (`[[submodule-mod-git-history]]`):**
+  - Docked `#git` panel across all workspace repositories (clean and dirty) with branch/search filters, a GitKraken-style topological commit graph, and per-commit modified file inspection.
+  - Single reusable `#main` comparison tab (`role: "viewer"`) rendering **Side-by-Side (`Before | After`)** and **Unified** commit diffs with in-place commit/file switching, lock-free read-only Git execution, and zero duplicate tabs.
 - **Shared State Orchestration (`[[architecture]]`):**
-  - Reactive `shared()` / `setShared()` bus using namespaced keys (`mesh.*`, `files-search.*`, `changes-review.*`) with zero `localStorage`.
+  - Reactive `shared()` / `setShared()` bus using namespaced keys (`mesh.*`, `files-search.*`, `changes-review.*`, `git-history.*`) with zero `localStorage`.
 
 ## Non-Goals
 

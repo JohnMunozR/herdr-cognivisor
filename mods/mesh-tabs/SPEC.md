@@ -5,7 +5,7 @@ status: active
 title: Mesh Tabs Mod (mods/mesh-tabs)
 parent: module-mods
 references: [module-layouts]
-covers: [two-panel-switcher, space-panel-persistence, organic-tab-auto-naming, inline-tab-rename]
+covers: [three-panel-switcher, space-panel-persistence, organic-tab-auto-naming, inline-tab-rename]
 tags: [mod, tabs, navigation, auto-naming]
 ---
 
@@ -13,7 +13,7 @@ tags: [mod, tabs, navigation, auto-naming]
 
 The `submodule-mod-mesh-tabs` implements the top 42px workspace tab strip (`#tabs`) for `layouts/mesh.json` (`[[module-layouts]]`, `[[module-mods]]`). Cloned and evolved from Herdr's core `tabs` view, it preserves native Herdr window dragging, macOS traffic-light padding, Windows/Linux window buttons, tab selection/drag-reordering, right-click tab context menus, and `+` new-menu creation while adding three workspace capabilities:
 
-1. **Two-Panel Switcher:** Top-right toggle buttons for `#panel-body` stack children (`files` -> `Files`, `changes` -> `Review`).
+1. **Three-Panel Switcher:** Top-right toggle buttons for `#panel-body` stack children (`files` -> `Files`, `changes` -> `Review`, `git` -> `Git`).
 2. **Space Panel Persistence (`mesh.spacePanels`):** Zero-`localStorage` per-space panel memory stored on Herdr's persisted reactive bus (`shared("mesh.spacePanels")`).
 3. **Organic Tab Auto-Naming & Inline Rename:** Non-blocking, cooldown-throttled (`8000ms`) detection of generic/unnamed agent tabs using `hc get` / `hc read` and lock-free `git rev-parse --abbrev-ref HEAD` to derive concise Jira-key + prompt/branch titles via `run("tab.rename")`, plus double-click inline `Input` renaming (`Enter` saves with `manualTitle: true`, `Esc` cancels).
 
@@ -22,16 +22,16 @@ The `submodule-mod-mesh-tabs` implements the top 42px workspace tab strip (`#tab
 - **Owns:**
   - Manifest: `mods/mesh-tabs/mod.json` (`{ "place": "none", "title": "Mesh Tabs" }`).
   - View implementation: `mods/mesh-tabs/main.js` (`MeshTabs` view).
-  - Pure tab-naming & lead-pane helpers: `mods/mesh-tabs/tab-logic.js`.
-  - Self-contained SVG icon assets: `mods/mesh-tabs/icons/*.svg` (`files.svg`, `changes.svg`, `close.svg`, `spinner.svg`, `win-min.svg`, `win-max.svg`, `win-restore.svg`, `win-close.svg`).
+  - Pure tab-naming, panel-target, viewer-tab classification, & lead-pane helpers: `mods/mesh-tabs/tab-logic.js`.
+  - Self-contained SVG icon assets: `mods/mesh-tabs/icons/*.svg` (`files.svg`, `changes.svg`, `git.svg`, `close.svg`, `spinner.svg`, `win-min.svg`, `win-max.svg`, `win-restore.svg`, `win-close.svg`).
 - **Public surface:**
   - Registered mod identifier: `mesh-tabs`.
   - Layout slot: `#tabs` (`42px`, `window_drag: true`) in `layouts/mesh.json`.
   - Shared state channels:
-    - Reads/writes `mesh.spacePanels`: `Record<spaceId, "files" | "changes" | null>`.
+    - Reads/writes `mesh.spacePanels`: `Record<spaceId, "files" | "changes" | "git" | null>`.
     - Reads/writes `mesh.flows`: `Record<tabId, MeshFlowTabState>` (`ticket`, `derivedTitle`, `autoNamed`, `manualTitle`, `leadTerminal`, `reviewedServices`, `sessionRepos`, `updatedAt`).
-    - Reads `mesh.openFileTabs`: `Record<tabId, OpenFileTabMeta>` to display semantic file-type icons and path tooltips on non-terminal `files-search` tabs alongside `changes-review` review tab icons and quick one-click close buttons.
-    - Enables `#panel-body` module toggles (`["files", "changes"]`).
+    - Reads `mesh.openFileTabs`: `Record<tabId, OpenFileTabMeta>` to display semantic file-type icons and path tooltips on non-terminal `files-search` tabs alongside `changes-review` (`changes.svg`) and `git-history` (`git.svg`) viewer tab icons (via `classifyViewerTab` with accent tint) and quick one-click close buttons.
+    - Enables `#panel-body` module toggles (`["files", "changes", "git"]`).
   - Herdr command invocations: `tab.select`, `tab.move`, `tab.close`, `tab.rename`, `tab.next`, `tab.prev`, `layout.select`, `layout.show`, `layout.hide`, `window.minimize`, `window.maximize`, `window.close`.
 - **Allowed deps:**
   - `gpui-kit`: `View`, `div`, `svg`, `image`.
@@ -49,7 +49,7 @@ The `submodule-mod-mesh-tabs` implements the top 42px workspace tab strip (`#tab
 
 ```text
 +---------------------------------------------------------------------------------------------------+
-| [lightsPad] [icon Title ● x] [icon PROJ-412 · Checkout ⟳] [+]              | Files Review [− □ x] |
+| [lightsPad] [icon Title ● x] [icon PROJ-412 · Checkout ⟳] [+]         | Files Review Git [− □ x] |
 +---------------------------------------------------------------------------------------------------+
                   │                                                            │
                   ├─ Double-click -> Input.new(renameInput)                    ├─ Toggle -> layout.select + show/hide #panel

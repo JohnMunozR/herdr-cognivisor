@@ -7,6 +7,8 @@ import {
 import {
   findNode,
   asPlainObject,
+  resolveSpacePanelTarget,
+  classifyViewerTab,
   isGenericName,
   isGenericTab,
   findLeadPane,
@@ -25,6 +27,7 @@ const READ_GIT = [
 const PANEL_DEFS = [
   { id: "files", label: "Files", icon: "mods/mesh-tabs/icons/files.svg" },
   { id: "changes", label: "Review", icon: "mods/mesh-tabs/icons/changes.svg" },
+  { id: "git", label: "Git", icon: "mods/mesh-tabs/icons/git.svg" },
 ];
 
 const PROBE_COOLDOWN_MS = 8000;
@@ -157,7 +160,7 @@ export default class MeshTabs extends View {
       this.editingTabId = null;
       if (!(first && !(space.id in panels))) {
         const stored = panels[space.id] ?? null;
-        const want = enabled.includes(stored) ? stored : null;
+        const want = resolveSpacePanelTarget(stored, enabled);
         if (want !== now) {
           this.pending = { want, until: Date.now() + 1000 };
           try { this.pendingPanelSyncTask?.cancel(); } catch {}
@@ -361,17 +364,10 @@ export default class MeshTabs extends View {
         tabPanes.find((p) => p.program?.agent)?.program ??
         tabPanes[0]?.program;
       const openFileEntry = openFileTabs[c.id] || null;
-      const isFilesTab = tabPanes.some((p) => p.mod === "files-search") || Boolean(openFileEntry);
-      const isReviewTab = tabPanes.some((p) => p.mod === "changes-review");
-      const isViewerTab = isFilesTab || isReviewTab;
+      const { isViewerTab, modIconPath, usesAccentTint } = classifyViewerTab(tabPanes, openFileEntry);
       const displayName = /^tb\d+$/.test(c.name) ? (program?.name ?? "Terminal") : c.name;
       const isEditing = this.editingTabId === c.id;
-      const modIconPath = isReviewTab
-        ? "mods/mesh-tabs/icons/changes.svg"
-        : isFilesTab
-          ? (openFileEntry?.iconPath || "mods/mesh-tabs/icons/files.svg")
-          : null;
-      const modIconColor = isReviewTab
+      const modIconColor = usesAccentTint
         ? (c.active ? (t.accent || t.foreground) : t.muted)
         : (openFileEntry?.iconColor || (c.active ? t.foreground : t.muted));
 

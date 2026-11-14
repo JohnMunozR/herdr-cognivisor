@@ -2,6 +2,8 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import {
   findNode,
+  resolveSpacePanelTarget,
+  classifyViewerTab,
   isGenericName,
   isGenericTab,
   findLeadPane,
@@ -86,5 +88,59 @@ describe("mesh-tabs tab-logic", () => {
     assert.equal(cleanBranchSlug("feat/PROJ-412-oauth-refresh-flow", "PROJ-412"), "oauth refresh flow");
     assert.equal(cleanBranchSlug("main", null), "");
     assert.equal(cleanBranchSlug("develop", null), "");
+  });
+
+  test("classifyViewerTab detects git-history, changes-review, files-search, and terminal tabs", () => {
+    const gitTab = classifyViewerTab([{ id: "p1", mod: "git-history" }], null);
+    assert.deepEqual(gitTab, {
+      isFilesTab: false,
+      isReviewTab: false,
+      isGitTab: true,
+      isViewerTab: true,
+      modIconPath: "mods/mesh-tabs/icons/git.svg",
+      usesAccentTint: true,
+    });
+
+    const reviewTab = classifyViewerTab([{ id: "p2", mod: "changes-review" }], null);
+    assert.deepEqual(reviewTab, {
+      isFilesTab: false,
+      isReviewTab: true,
+      isGitTab: false,
+      isViewerTab: true,
+      modIconPath: "mods/mesh-tabs/icons/changes.svg",
+      usesAccentTint: true,
+    });
+
+    const filesTab = classifyViewerTab(
+      [{ id: "p3", mod: "files-search" }],
+      { iconPath: "mods/files-search/icons/file-types/javascript.svg" },
+    );
+    assert.deepEqual(filesTab, {
+      isFilesTab: true,
+      isReviewTab: false,
+      isGitTab: false,
+      isViewerTab: true,
+      modIconPath: "mods/files-search/icons/file-types/javascript.svg",
+      usesAccentTint: false,
+    });
+
+    const termTab = classifyViewerTab([{ id: "p4", terminal: "t1" }], null);
+    assert.deepEqual(termTab, {
+      isFilesTab: false,
+      isReviewTab: false,
+      isGitTab: false,
+      isViewerTab: false,
+      modIconPath: null,
+      usesAccentTint: false,
+    });
+  });
+
+  test("resolveSpacePanelTarget supports files, changes, and git panels via mesh.spacePanels", () => {
+    const enabled = ["files", "changes", "git"];
+    assert.equal(resolveSpacePanelTarget("files", enabled), "files");
+    assert.equal(resolveSpacePanelTarget("changes", enabled), "changes");
+    assert.equal(resolveSpacePanelTarget("git", enabled), "git");
+    assert.equal(resolveSpacePanelTarget("unknown", enabled), null);
+    assert.equal(resolveSpacePanelTarget(null, enabled), null);
   });
 });

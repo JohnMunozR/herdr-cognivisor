@@ -160,6 +160,13 @@
                       "content": {
                         "mod": "changes-review"
                       }
+                    },
+                    {
+                      "id": "git",
+                      "type": "block",
+                      "content": {
+                        "mod": "git-history"
+                      }
                     }
                   ]
                 }

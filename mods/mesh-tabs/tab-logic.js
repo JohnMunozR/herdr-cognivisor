@@ -19,6 +19,34 @@ export function asPlainObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
+export function resolveSpacePanelTarget(storedPanelId, enabledPanels) {
+  if (!storedPanelId || !Array.isArray(enabledPanels)) return null;
+  return enabledPanels.includes(storedPanelId) ? storedPanelId : null;
+}
+
+export function classifyViewerTab(tabPanes, openFileEntry = null) {
+  const list = Array.isArray(tabPanes) ? tabPanes : [];
+  const isFilesTab = list.some((p) => p?.mod === "files-search") || Boolean(openFileEntry);
+  const isReviewTab = list.some((p) => p?.mod === "changes-review");
+  const isGitTab = list.some((p) => p?.mod === "git-history");
+  const isViewerTab = isFilesTab || isReviewTab || isGitTab;
+  const modIconPath = isReviewTab
+    ? "mods/mesh-tabs/icons/changes.svg"
+    : isGitTab
+      ? "mods/mesh-tabs/icons/git.svg"
+      : isFilesTab
+        ? (openFileEntry?.iconPath || "mods/mesh-tabs/icons/files.svg")
+        : null;
+  return {
+    isFilesTab,
+    isReviewTab,
+    isGitTab,
+    isViewerTab,
+    modIconPath,
+    usesAccentTint: isReviewTab || isGitTab,
+  };
+}
+
 export function isGenericName(name, program) {
   const s = String(name || "").trim();
   if (!s) return true;

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # herdr-mesh: installer for the Herdr Multi-Repo Agent IDE mesh layout package
-# Integrates the mesh layout and 4 active mods (files-search, changes-review, mesh-tabs, mesh-status).
+# Integrates the mesh layout and 5 active mods (files-search, changes-review, git-history, mesh-tabs, mesh-status).
 #
 # Usage:
 #   ./install.sh [--home DIR] [--app-bin PATH]
@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-MODS=(files-search changes-review mesh-tabs mesh-status)
+MODS=(files-search changes-review git-history mesh-tabs mesh-status)
 LEGACY_MODS=(mesh-flow mesh-test mesh-ship)
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -75,7 +75,7 @@ if [ "$mode" = "uninstall" ]; then
     say "Removed cached state $layouts_dir/.state/mesh.json"
   fi
 
-  # 3. Clean up keys.json (files-search, changes-review, and mesh-* bindings)
+  # 3. Clean up keys.json (files-search, changes-review, git-history, and mesh-* bindings)
   if [ -f "$keys_file" ] && command -v python3 >/dev/null 2>&1; then
     KEYS_FILE="$keys_file" python3 -c '
 import json, os, re
@@ -87,7 +87,7 @@ try:
             keys = json.load(f)
         changed = False
         if isinstance(keys, dict):
-            pattern = re.compile(r"(files-search|changes-review|mesh-[a-z0-9-]+)")
+            pattern = re.compile(r"(files-search|changes-review|git-history|mesh-[a-z0-9-]+)")
             for sec in ("global", "window"):
                 section = keys.get(sec)
                 if isinstance(section, dict):

@@ -34,7 +34,7 @@ The root UI topology is defined by `layouts/mesh.json` (`[[module-layouts]]`), p
 | - Agents     |                                                   |  [stack active]   | (Collapsible) |
 | - Footer     |    $ claude "Implement PROJ-412..."               |  - files-search   |               |
 |              |                                                   |  - changes-review |               |
-|              |    +-------------------------------------------+  |                   |               |
+|              |    +-------------------------------------------+  |  - git-history    |               |
 |              |    | files-search-win (Ctrl+P / Alt+F)         |  |                   |               |
 |              |    +-------------------------------------------+  |                   |               |
 +--------------+---------------------------------------------------+-------------------+---------------+
@@ -45,11 +45,12 @@ The root UI topology is defined by `layouts/mesh.json` (`[[module-layouts]]`), p
 ### Zone Breakdown
 
 - **`#sidebar`:** Hosts workspace spaces, remote machines, agent roster, and preferences (`workspace-chrome`, `spaces`, `agents`).
-- **`#tabs` (`42px`, `mesh-tabs`):** Workspace tab strip with organic auto-naming (Jira key + prompt/branch summary), double-click inline rename, drag reorder, `mesh.spacePanels` per-space panel memory, and drawer toggles (`files`, `changes`).
-- **`#main`:** Primary terminal workspace hosting feature agents (`claude`, `gemini`, `codex`, `opencode`, `pi`, `antigravity`).
+- **`#tabs` (`42px`, `mesh-tabs`):** Workspace tab strip with organic auto-naming (Jira key + prompt/branch summary), double-click inline rename, drag reorder, `mesh.spacePanels` per-space panel memory, and drawer toggles (`files`, `changes`, `git`).
+- **`#main`:** Primary terminal workspace hosting feature agents (`claude`, `gemini`, `codex`, `opencode`, `pi`, `antigravity`) and reusable single-tab `role: "viewer"` tabs (`files-search`, `changes-review`, `git-history`).
 - **`#panel` / `#panel-body`:** Collapsible mutually exclusive stack hosting:
   - `#files` (`[[submodule-mod-files-search]]`): Session-scoped multi-repo file tree with git status decorators and Search Everywhere overlay (`files-search-win`).
   - `#changes` (`[[submodule-mod-changes-review]]`): Per-service branches, diffs, inline review notes, and `reviewedServices` checklist (`Approve Service ✓`).
+  - `#git` (`[[submodule-mod-git-history]]`): All-repo (clean + dirty) commit graph, branch/text filters, and modified files driving a reusable `#main` Before/After comparison tab.
 - **`#status` (`28px`, `mesh-status`):** Bottom telemetry bar displaying active host, service/dirty counts, active branch, agent summary, and palette shortcut.
 
 ---
@@ -66,6 +67,7 @@ herdr-mesh/
     ├── SPEC.md
     ├── files-search/      <- [[submodule-mod-files-search]]: Search Everywhere, indexer engine (`indexer.js`, `search-logic.js`)
     ├── changes-review/    <- [[submodule-mod-changes-review]]: Per-service diff review & checklist (`review-logic.js`)
+    ├── git-history/       <- [[submodule-mod-git-history]]: Topological commit graph & Before/After diff viewer (`graph-logic.js`, `diff-logic.js`, `repo-logic.js`)
     ├── mesh-tabs/         <- [[submodule-mod-mesh-tabs]]: Tab strip, auto-naming, `mesh.spacePanels` (`tab-logic.js`)
     └── mesh-status/       <- [[submodule-mod-mesh-status]]: Telemetry status bar
 ```
@@ -100,13 +102,16 @@ Communication between mods occurs exclusively over Herdr's persisted reactive bu
 
 | Bus Key | Producer | Consumer | Payload Format | Description |
 |---|---|---|---|---|
-| `mesh.services` | `files-search`, `changes-review` | `files-search`, `changes-review`, `mesh-status` | `{ tabId, workspaceRoot, on, services, candidates, sig, ts }` | Session-attributed touched repositories and candidate cache metadata. |
-| `mesh.activeService` | `changes-review`, `files-search` | `changes-review`, `files-search` | `{ workspaceRoot, serviceId, ts }` | Synchronized active service filter (`"all"` or specific `serviceId`). |
+| `mesh.services` | `files-search`, `changes-review` | `files-search`, `changes-review`, `git-history`, `mesh-status` | `{ tabId, workspaceRoot, on, services, candidates, sig, ts }` | Session-attributed touched repositories and candidate cache metadata. |
+| `mesh.activeService` | `changes-review`, `files-search`, `git-history` | `changes-review`, `files-search`, `git-history` | `{ workspaceRoot, serviceId, ts }` | Synchronized active service filter (`"all"` or specific `serviceId`; `git-history` updates only for repos present in `mesh.services`). |
 | `mesh.flows` | `mesh-tabs`, `changes-review` | `mesh-tabs`, `changes-review`, `files-search` | `Record<tabId, { tabId?, ticket?, derivedTitle?, autoNamed?, manualTitle?, leadTerminal?, reviewedServices?, sessionRepos?, updatedAt }>` | Tab-scoped metadata: naming state, `leadTerminal`, per-service checklist, and attributed session repos. |
-| `mesh.spacePanels` | `mesh-tabs` | `mesh-tabs` | `Record<spaceId, "files" \| "changes" \| null>` | Persisted active `#panel-body` selection per space (replaces `localStorage`). |
+| `mesh.spacePanels` | `mesh-tabs` | `mesh-tabs` | `Record<spaceId, "files" \| "changes" \| "git" \| null>` | Persisted active `#panel-body` selection per space (replaces `localStorage`). |
+| `mesh.spaceAgentTabs` | `files-search`, `changes-review`, `git-history` | `files-search`, `changes-review`, `git-history` | `Record<spaceId, tabId>` | Preserves each space's active terminal-bearing tab ID while non-terminal `role: "viewer"` tabs are focused. |
 | `files-search.select` | `files-search` | `files-search` | `{ root: string, path: string, line: number\|null, ts: number }` | Triggers tree expansion and file preview jump from Search Everywhere. |
 | `files-search.customSize` | `files-search` | `files-search` | `{ w: number, h: number }` | Persisted custom dimensions for Search Everywhere overlay. |
 | `changes-review.focus` | `changes-review` | `changes-review` | `{ path: string, line?: number }` | Jumps to a modified line in the diff viewer. |
+| `git-history.activeDiff` | `git-history` | `git-history` | `Record<spaceId, GitDiffViewerState>` | Coordinates the space's single `#main` `git-history` comparison tab (`commitHash`, `openFileKey`, `files`, `diffMode`, `expanded`, `requestSeq`, `ts`). |
+| `git-history.selectedRepo` | `git-history` | `git-history` | `Record<spaceId, { repoRoot: string, ts: number }>` | Persists the selected repository (clean or dirty) per space in `#git`. |
 
 All bus keys outside mod-private namespaces MUST carry the `mesh.*` prefix.
 
@@ -115,7 +120,7 @@ All bus keys outside mod-private namespaces MUST carry the `mesh.*` prefix.
 ## Invariants
 
 1. **Lock-Free Git Invariant:**
-   All read-only Git executions (`git rev-parse`, `git status`, `git diff`, `git ls-files`, `git log`, `git grep`, `git for-each-ref`, `git rev-list`) invoked by any mod MUST include:
+   All read-only Git executions (`git rev-parse`, `git status`, `git diff`, `git diff-tree`, `git show`, `git ls-files`, `git log`, `git grep`, `git for-each-ref`, `git rev-list`) invoked by any mod MUST include:
    ```bash
    --no-optional-locks -c core.fsmonitor=false -c diff.autoRefreshIndex=false
    ```
