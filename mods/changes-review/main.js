@@ -1,7 +1,8 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, Scrollbar, ScrollHandle } from "gpui-base";
-import { readdir, exists, readFile, writeFile, mkdir } from "fs/promises";
-import { join, dirname } from "path";
+import * as fsPromises from "fs/promises";
+import { readdir, exists } from "fs/promises";
+import { join } from "path";
 import {
   spaces, panes, focused, agents, terminals, exec, readTextFile, watchFolder,
   theme, settings, notify, hc, run, layout, props, shared, setShared, window, appHome,
@@ -29,121 +30,101 @@ import {
   sortServicesDirtyFirst,
   filterSessionCommits,
   filterSessionWorkingEntries,
+  normalizeGitStatusMark,
+  statFileEntry,
+  normalizeSessionBaseline,
+  readDiskSessionBaseline,
+  writeDiskSessionBaseline,
+  extractResumeKeyFromTranscript,
+  filterUnbaselinedRepoEntries,
+  resolveWorkspaceRoot,
 } from "./review-logic.js";
 
 function readPlainObject(val) {
   return val && typeof val === "object" && !Array.isArray(val) ? val : {};
 }
 
-function safeTabId(tabId) {
-  return String(tabId || "").replace(/[^a-zA-Z0-9._-]/g, "_");
-}
-
-function fnv1aHex(str) {
-  let hash = 0x811c9dc5;
-  const s = String(str || "");
-  for (let i = 0; i < s.length; i++) {
-    hash ^= s.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0).toString(16).padStart(8, "0");
-}
-
-function getMeshSessionsBase() {
+function getSafeAppHome() {
   try {
-    const base = typeof appHome === "function" ? appHome() : "";
-    return base ? join(base, "mesh", "sessions") : "";
+    return typeof appHome === "function" ? appHome() : "";
   } catch {
     return "";
   }
 }
 
-async function readJsonFileSafe(filePath) {
-  if (!filePath) return null;
-  try {
-    const raw = await readFile(filePath, "utf8");
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-async function writeJsonFileSafe(filePath, data) {
-  if (!filePath) return;
-  try {
-    await mkdir(dirname(filePath), { recursive: true });
-    await writeFile(filePath, JSON.stringify(data), "utf8");
-  } catch {}
-}
-
-function extractResumeKeyFromTranscript(text, workspaceRoot) {
-  const s = String(text || "");
-  if (!s) return "";
-  const lines = s.split(/\r?\n/);
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    const cmdMatch = line.match(/(?:^|\s)(?:\/resume|(?:claude|codex)\s+(?:--)?resume)(?:\s+([a-zA-Z0-9._:/-]+))?/);
-    if (cmdMatch) {
-      const id = cmdMatch[1] ? cmdMatch[1].trim() : "";
-      return id ? `resume:${id}` : `resume:${normPathStr(workspaceRoot || "")}`;
-    }
-  }
-  return "";
-}
-
-function isValidBaseline(baseline) {
-  return Boolean(baseline && typeof baseline === "object" && typeof baseline.startedAt === "number" && baseline.startedAt > 0);
-}
-
-function mergeSessionBaselineIntoFlow(tabId, baseline) {
-  if (!tabId || !isValidBaseline(baseline)) return;
+function mergeSessionBaselineIntoFlow(tabId, baseline, sessionRepos = null) {
+  if (!tabId) return;
+  const normalized = normalizeSessionBaseline(baseline);
+  if (!normalized) return;
   const flows = readPlainObject(shared("mesh.flows"));
   const cur = flows[tabId] && typeof flows[tabId] === "object" ? flows[tabId] : {};
-  if (cur.sessionBaseline && cur.sessionBaseline.startedAt === baseline.startedAt) return;
+  const curReposCount = Object.keys(cur.sessionBaseline?.repos || {}).length;
+  const nextReposCount = Object.keys(normalized.repos || {}).length;
+  const prevRepos = Array.isArray(cur.sessionRepos) ? cur.sessionRepos.map((r) => normPathStr(r)) : [];
+  const nextRepos = Array.isArray(sessionRepos) ? sessionRepos.map((r) => normPathStr(r)).filter(Boolean) : null;
+  const reposChanged = Boolean(nextRepos && (prevRepos.length !== nextRepos.length || prevRepos.some((r, idx) => r !== nextRepos[idx])));
+  const baselineChanged =
+    !cur.sessionBaseline ||
+    cur.sessionBaseline.startedAt !== normalized.startedAt ||
+    cur.sessionStartedAt !== normalized.startedAt ||
+    curReposCount !== nextReposCount;
+  if (!baselineChanged && !reposChanged) return;
   setShared("mesh.flows", {
     ...flows,
-    [tabId]: { ...cur, sessionBaseline: baseline, updatedAt: Date.now() },
+    [tabId]: {
+      ...cur,
+      sessionBaseline: normalized,
+      sessionStartedAt: normalized.startedAt,
+      ...(nextRepos ? { sessionRepos: nextRepos } : {}),
+      updatedAt: Date.now(),
+    },
   });
 }
 
 async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTermAddrs, workspaceRoot) {
-  if (!sessionTabId) return null;
-  const flows = readPlainObject(shared("mesh.flows"));
-  const existing = flows[sessionTabId]?.sessionBaseline;
-  if (isValidBaseline(existing)) return existing;
+  if (!sessionTabId) return { baseline: null, isFresh: false, dirtyChanged: false, primaryBranch: "" };
+  const normWs = normPathStr(workspaceRoot || "");
+  const primaryService = (serviceResults || []).find((r) => normPathStr(r.service?.root) === normWs)
+    || (serviceResults || []).find((r) => r.branch)
+    || null;
+  const primaryBranch = String(primaryService?.branch || "").trim();
+  const candidateBranches = Array.from(
+    new Set((serviceResults || []).map((r) => String(r.branch || r.service?.branch || "").trim()).filter(Boolean))
+  );
 
-  const sessionsBase = getMeshSessionsBase();
-  const tabFilePath = sessionsBase ? join(sessionsBase, "tabs", `${safeTabId(sessionTabId)}.json`) : "";
-  if (tabFilePath) {
-    const diskTab = await readJsonFileSafe(tabFilePath);
-    const diskBaseline = isValidBaseline(diskTab?.sessionBaseline) ? diskTab.sessionBaseline : (isValidBaseline(diskTab) ? diskTab : null);
-    if (diskBaseline) {
-      mergeSessionBaselineIntoFlow(sessionTabId, diskBaseline);
-      return diskBaseline;
+  const flows = readPlainObject(shared("mesh.flows"));
+  const rawExisting = flows[sessionTabId]?.sessionBaseline;
+  const existing = normalizeSessionBaseline(rawExisting);
+  if (existing && (!normWs || !existing.workspaceRoot || existing.workspaceRoot === normWs)) {
+    return { baseline: existing, isFresh: false, dirtyChanged: false, primaryBranch };
+  }
+
+  const appHomeDir = getSafeAppHome();
+  if (appHomeDir) {
+    const fromTab = await readDiskSessionBaseline(appHomeDir, sessionTabId, workspaceRoot, candidateBranches, false, fsPromises);
+    if (fromTab) {
+      return { baseline: fromTab, isFresh: false, dirtyChanged: false, primaryBranch };
     }
   }
 
   let resumeKey = "";
-  if (sessionsBase && Array.isArray(tabTermAddrs) && tabTermAddrs.length > 0) {
+  if (appHomeDir && Array.isArray(tabTermAddrs) && tabTermAddrs.length > 0) {
     const reads = await Promise.all(
-      tabTermAddrs.slice(0, 2).map((addr) => hc(["read", "--lines", "120", addr]).catch(() => ""))
+      tabTermAddrs.slice(0, 2).map((addr) => hc(["read", "--lines", "100", addr]).catch(() => ""))
     );
     const transcript = reads.filter(Boolean).join("\n");
     resumeKey = extractResumeKeyFromTranscript(transcript, workspaceRoot);
     if (resumeKey) {
-      const candidateBranches = Array.from(new Set((serviceResults || []).map((r) => String(r.branch || r.service?.branch || "").trim()).filter(Boolean)));
-      const resumeHashes = [fnv1aHex(resumeKey), ...candidateBranches.map((br) => fnv1aHex(`${normPathStr(workspaceRoot || "")}::${br}`)), fnv1aHex(`${normPathStr(workspaceRoot || "")}::`)];
-      for (const h of resumeHashes) {
-        const resumePath = join(sessionsBase, "resume", `${h}.json`);
-        const diskResume = await readJsonFileSafe(resumePath);
-        const resumeBaseline = isValidBaseline(diskResume?.sessionBaseline) ? diskResume.sessionBaseline : (isValidBaseline(diskResume) ? diskResume : null);
-        if (resumeBaseline) {
-          mergeSessionBaselineIntoFlow(sessionTabId, resumeBaseline);
-          await writeJsonFileSafe(tabFilePath, { tabId: sessionTabId, sessionBaseline: resumeBaseline });
-          return resumeBaseline;
-        }
+      const fromResume = await readDiskSessionBaseline(
+        appHomeDir,
+        sessionTabId,
+        workspaceRoot,
+        candidateBranches,
+        { resumeKey, hasResumeCommand: true },
+        fsPromises
+      );
+      if (fromResume) {
+        return { baseline: fromResume, isFresh: false, dirtyChanged: true, primaryBranch, resumeKey };
       }
     }
   }
@@ -158,23 +139,14 @@ async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTer
       const rel = f.relFile ?? f.path ?? "";
       if (!rel) continue;
       dirtyFiles[rel] = {
-        status: f.status || "M",
-        sig: f.sig || "",
-        mtimeMs: Number(f.mtimeMs || 0),
+        status: String(f.status || "M"),
+        sig: String(f.sig || ""),
       };
     }
     repos[normRoot] = { dirtyFiles };
   }
-  const baseline = { startedAt, repos };
-  mergeSessionBaselineIntoFlow(sessionTabId, baseline);
-  if (tabFilePath) {
-    await writeJsonFileSafe(tabFilePath, { tabId: sessionTabId, sessionBaseline: baseline });
-  }
-  if (sessionsBase && resumeKey) {
-    const resumePath = join(sessionsBase, "resume", `${fnv1aHex(resumeKey)}.json`);
-    await writeJsonFileSafe(resumePath, { resumeKey, sessionBaseline: baseline });
-  }
-  return baseline;
+  const baseline = { version: 1, startedAt, workspaceRoot: normWs, repos };
+  return { baseline, isFresh: true, dirtyChanged: true, primaryBranch, resumeKey };
 }
 
 function location() {
@@ -194,20 +166,13 @@ function location() {
     null;
   const on = pane?.machine || space?.machine || null;
   const isWin = !on && window()?.platform === "windows";
-
-  let workspaceRoot = null;
-  if (space?.folder) {
-    workspaceRoot = space.folder;
-    if (pane?.cwd) {
-      const normSpace = normCmpStr(space.folder, isWin);
-      const normPane = normCmpStr(pane.cwd, isWin);
-      if (normPane !== normSpace && !normPane.startsWith(normSpace + "/")) {
-        workspaceRoot = pane.cwd;
-      }
-    }
-  } else {
-    workspaceRoot = pane?.cwd || null;
-  }
+  const workspaceRoot = resolveWorkspaceRoot({
+    spaceFolder: space?.folder,
+    paneCwd: pane?.cwd,
+    on,
+    isWindows: isWin,
+    appHomeDir: getSafeAppHome(),
+  });
 
   return { cwd: workspaceRoot, paneCwd: pane?.cwd || null, on, spaceId: space?.id ?? null, tabId: sessionTabId };
 }
@@ -494,74 +459,6 @@ function repoMatchesTranscript(service, files, transcript) {
   return false;
 }
 
-async function attributeSessionRepos(tabId, touchedResults, tabPaneCwds, tabTermAddrs, transcriptCache = null) {
-  if (!tabId || !Array.isArray(touchedResults) || touchedResults.length === 0) return [];
-  const flows = shared("mesh.flows");
-  const flowObj = flows && typeof flows === "object" ? flows[tabId] : null;
-  const prevSessionRepos = new Set(
-    Array.isArray(flowObj?.sessionRepos)
-      ? flowObj.sessionRepos.map((r) => normPathStr(r))
-      : []
-  );
-
-  const normCwds = (tabPaneCwds || []).map((c) => normPathStr(c)).filter(Boolean);
-  const needTranscript = [];
-  for (const res of touchedResults) {
-    const normRoot = normPathStr(res.service?.root);
-    if (!normRoot) continue;
-    const inPrev = prevSessionRepos.has(normRoot);
-    const inPaneCwd = normCwds.some((c) => c === normRoot || c.startsWith(normRoot + "/"));
-    if (!inPrev && !inPaneCwd) needTranscript.push(res);
-  }
-
-  let transcript = "";
-  if (needTranscript.length > 0 && (tabTermAddrs || []).length > 0) {
-    const now = Date.now();
-    const unattrSig = needTranscript.map((r) => r.service?.root || "").sort().join("|") + "::" + (tabTermAddrs || []).join(",");
-    const canReuse = transcriptCache && transcriptCache.sig === unattrSig && (now - transcriptCache.ts) < TRANSCRIPT_THROTTLE_MS;
-    if (canReuse) {
-      transcript = transcriptCache.text;
-    } else {
-      const reads = await Promise.all(
-        (tabTermAddrs || []).map((addr) =>
-          hc(["read", "--lines", "250", addr]).catch(() => "")
-        )
-      );
-      transcript = reads.filter(Boolean).join("\n").replace(/\\/g, "/");
-      if (transcriptCache) {
-        transcriptCache.sig = unattrSig;
-        transcriptCache.ts = now;
-        transcriptCache.text = transcript;
-      }
-    }
-  }
-
-  const attributed = [];
-  const nextSessionRepos = new Set(prevSessionRepos);
-
-  for (const res of touchedResults) {
-    const normRoot = normPathStr(res.service?.root);
-    if (!normRoot) continue;
-    const inPrev = prevSessionRepos.has(normRoot);
-    const inPaneCwd = normCwds.some((c) => c === normRoot || c.startsWith(normRoot + "/"));
-    const inTranscript = !inPrev && !inPaneCwd && repoMatchesTranscript(res.service, res.files, transcript);
-
-    if (inPrev || inPaneCwd || inTranscript) {
-      attributed.push(res);
-      nextSessionRepos.add(normRoot);
-    }
-  }
-
-  if (nextSessionRepos.size !== prevSessionRepos.size) {
-    const allFlows = flows && typeof flows === "object" ? { ...flows } : {};
-    const cur = allFlows[tabId] && typeof allFlows[tabId] === "object" ? allFlows[tabId] : {};
-    allFlows[tabId] = { ...cur, sessionRepos: [...nextSessionRepos], updatedAt: Date.now() };
-    setShared("mesh.flows", allFlows);
-  }
-
-  return attributed;
-}
-
 async function repoAheadCount(root, branch, on) {
   if (!branch || BASE_BRANCHES.has(branch)) return 0;
   const refs = await exec(
@@ -678,19 +575,11 @@ async function loadServiceWorkingSnapshot(service, on, includeCommits = true) {
     const files = await Promise.all(
       fileEntries.map(async ({ xy, path }) => {
         const fresh = xy === "??";
-        const conflict = xy.includes("U") || xy === "AA" || xy === "DD";
-        const s = conflict ? "U" : xy.includes("D") ? "D" : fresh || xy.includes("A") ? "A" : "M";
+        const s = normalizeGitStatusMark(xy);
         const lineStat = stats[path] ?? { add: 0, del: 0 };
-        let sig = s === "D" ? "deleted" : "";
-        let mtimeMs = 0;
-        if (!on && s !== "D") {
-          try {
-            const content = await readFile(join(service.root, path), "utf8");
-            sig = `${content.length}:${fnv1aHex(String(content))}`;
-          } catch {
-            sig = "deleted";
-          }
-        }
+        const { sig, mtimeMs } = s === "D"
+          ? { sig: "deleted", mtimeMs: 0 }
+          : await statFileEntry(join(service.root, path), s, on, fsPromises);
         return {
           key: `${service.id}::${path}`,
           serviceId: service.id,
@@ -2104,18 +1993,11 @@ export default class ChangesReview extends View {
 
     this.loading = true;
     const isWindows = this.isWindows;
-    const activeTabIds = new Set((activeSpace?.tabs || []).map((t) => t.id));
     const allPanesList = panes() || [];
-    const extraCwds = Array.from(
-      new Set(
-        allPanesList
-          .filter((p) => p?.cwd && activeTabIds.has(p.tab))
-          .map((p) => p.cwd),
-      ),
-    );
-    const tabPaneCwds = sessionTabId
-      ? Array.from(new Set(allPanesList.filter((p) => p.tab === sessionTabId && p.cwd).map((p) => p.cwd)))
+    const extraCwds = sessionTabId
+      ? Array.from(new Set(allPanesList.filter((p) => p?.cwd && p.tab === sessionTabId).map((p) => p.cwd)))
       : [];
+    const tabPaneCwds = extraCwds;
     const tabFlowObj = sessionTabId && shared("mesh.flows")?.[sessionTabId];
     const tabTermAddrs = sessionTabId
       ? Array.from(
@@ -2161,18 +2043,80 @@ export default class ChangesReview extends View {
 
         if (key() !== context) return;
 
-        const sessionBaseline = sessionTabId
+        const baselineInit = sessionTabId
           ? await resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTermAddrs, workspaceRoot)
-          : null;
+          : { baseline: null, isFresh: false, dirtyChanged: false, primaryBranch: "" };
         if (key() !== context) return;
 
-        if (sessionBaseline) {
+        const sessionBaseline = baselineInit.baseline;
+        let baselineDirtyChanged = Boolean(baselineInit.dirtyChanged);
+        let touchedResults = [];
+
+        if (sessionTabId && sessionBaseline) {
           const startedAt = sessionBaseline.startedAt || 0;
+          const flowsNow = readPlainObject(shared("mesh.flows"));
+          const curFlowNow = readPlainObject(flowsNow[sessionTabId]);
+          const prevSessionRepos = new Set(
+            Array.isArray(curFlowNow.sessionRepos) ? curFlowNow.sessionRepos.map((r) => normPathStr(r)).filter(Boolean) : []
+          );
+          const normPaneCwds = tabPaneCwds.map((c) => normPathStr(c)).filter(Boolean);
+
+          const unbaselinedNeedTranscript = [];
+          if (!baselineInit.isFresh) {
+            for (const res of serviceResults) {
+              const normRoot = normPathStr(res.service?.root);
+              if (!normRoot || sessionBaseline.repos?.[normRoot]) continue;
+              const inPaneCwd = normPaneCwds.some((c) => c === normRoot || c.startsWith(normRoot + "/"));
+              if (!prevSessionRepos.has(normRoot) && !inPaneCwd && (res.files || []).some((f) => !Number(f?.mtimeMs || 0))) {
+                unbaselinedNeedTranscript.push(res);
+              }
+            }
+          }
+          let unbaselinedTranscript = "";
+          if (unbaselinedNeedTranscript.length > 0 && tabTermAddrs.length > 0) {
+            const unattrSig = "unbaselined::" + unbaselinedNeedTranscript.map((r) => r.service?.root || "").sort().join("|") + "::" + tabTermAddrs.join(",");
+            const nowTs = Date.now();
+            if (this.lastTranscriptScan && this.lastTranscriptScan.sig === unattrSig && (nowTs - this.lastTranscriptScan.ts) < TRANSCRIPT_THROTTLE_MS) {
+              unbaselinedTranscript = this.lastTranscriptScan.text;
+            } else {
+              const reads = await Promise.all(
+                tabTermAddrs.map((addr) => hc(["read", "--lines", "150", addr]).catch(() => ""))
+              );
+              if (key() !== context) return;
+              unbaselinedTranscript = reads.filter(Boolean).join("\n").replace(/\\/g, "/");
+              this.lastTranscriptScan = { sig: unattrSig, ts: nowTs, text: unbaselinedTranscript };
+            }
+          }
+
           for (const res of serviceResults) {
             const normRoot = normPathStr(res.service?.root);
             const baselineRepo = normRoot ? (sessionBaseline.repos?.[normRoot] || null) : null;
-            const sessionFiles = filterSessionWorkingEntries(res.files, baselineRepo, startedAt);
+            if (baselineInit.isFresh) {
+              res.files = [];
+              res.commits = [];
+              if (res.service) res.service.workingCount = 0;
+              res.touched = false;
+              continue;
+            }
             const sessionCommits = filterSessionCommits(res.commits, startedAt);
+            let sessionFiles = [];
+            if (baselineRepo) {
+              sessionFiles = filterSessionWorkingEntries(res.files, baselineRepo, startedAt);
+            } else {
+              const inPaneCwd = normRoot && normPaneCwds.some((c) => c === normRoot || c.startsWith(normRoot + "/"));
+              const isAttributed = Boolean(
+                normRoot && (prevSessionRepos.has(normRoot) || inPaneCwd || repoMatchesTranscript(res.service, res.files, unbaselinedTranscript))
+              );
+              const unbaselinedRes = filterUnbaselinedRepoEntries(res.files, startedAt, {
+                isAttributed,
+                hasSessionCommits: sessionCommits.length > 0,
+              });
+              sessionFiles = unbaselinedRes.sessionFiles;
+              if (normRoot) {
+                sessionBaseline.repos[normRoot] = { dirtyFiles: unbaselinedRes.backfillDirtyFiles };
+                baselineDirtyChanged = true;
+              }
+            }
             res.files = sessionFiles;
             res.commits = sessionCommits;
             if (res.service) {
@@ -2180,13 +2124,24 @@ export default class ChangesReview extends View {
             }
             res.touched = sessionFiles.length > 0 || sessionCommits.length > 0;
           }
-        }
 
-        const rawTouched = serviceResults.filter((r) => r.touched);
-        const touchedResults = (sessionTabId && !usingBusServices && !sessionBaseline)
-          ? await attributeSessionRepos(sessionTabId, rawTouched, tabPaneCwds, tabTermAddrs, this.lastTranscriptScan)
-          : rawTouched;
-        if (key() !== context) return;
+          touchedResults = serviceResults.filter((r) => r.touched);
+          const sessionRepos = touchedResults.map((r) => normPathStr(r.service?.root)).filter(Boolean);
+          mergeSessionBaselineIntoFlow(sessionTabId, sessionBaseline, sessionRepos);
+          const appHomeDir = getSafeAppHome();
+          if (appHomeDir && baselineDirtyChanged) {
+            await writeDiskSessionBaseline(
+              appHomeDir,
+              sessionTabId,
+              workspaceRoot,
+              baselineInit.primaryBranch,
+              sessionBaseline,
+              baselineInit.resumeKey || "",
+              fsPromises
+            );
+            if (key() !== context) return;
+          }
+        }
         const services = touchedResults.map((r) => r.service);
 
         this.workspaceRoot = workspaceRoot;
@@ -2208,14 +2163,17 @@ export default class ChangesReview extends View {
         }
 
         const existingBus = shared("mesh.services");
-        const nextCandidates = existingBus?.candidates || candidateServices.map((s) => ({
-          id: s.id,
-          name: s.name,
-          relPath: s.relPath || "",
-          root: s.root,
-          isSibling: Boolean(s.isSibling),
-          branch: s.branch || "",
-        }));
+        const sameBusWorkspace = Boolean(existingBus && normPathStr(existingBus.workspaceRoot) === normWs);
+        const nextCandidates = (sameBusWorkspace && Array.isArray(existingBus.candidates))
+          ? existingBus.candidates
+          : candidateServices.map((s) => ({
+              id: s.id,
+              name: s.name,
+              relPath: s.relPath || "",
+              root: s.root,
+              isSibling: Boolean(s.isSibling),
+              branch: s.branch || "",
+            }));
         const servicesSig = (sessionTabId || "") + "::" + normWs + "::" + nextCandidates.length + "::" + services.map((s) => `${normPathStr(s.root)}@${s.branch || ""}:${s.workingCount || 0}:${s.aheadCount || 0}`).join(",");
         const existingBusSig = existingBus && normPathStr(existingBus.workspaceRoot) === normWs && (existingBus.tabId || null) === (sessionTabId || null)
           ? (existingBus.sig || ((sessionTabId || "") + "::" + normWs + "::" + (existingBus.candidates?.length ?? -1) + "::" + (existingBus.services || []).map((s) => `${normPathStr(s.root)}@${s.branch || ""}:${s.workingCount || 0}:${s.aheadCount || 0}`).join(",")))

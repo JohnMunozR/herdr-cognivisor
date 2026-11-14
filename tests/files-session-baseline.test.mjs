@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  normalizeGitStatusMark,
   normalizeSessionBaseline,
   readDiskSessionBaseline,
   writeDiskSessionBaseline,
@@ -12,6 +13,8 @@ import {
   computeFileSig,
   statFileEntry,
   filterSessionDirtyEntries,
+  isHomeDirectoryRoot,
+  resolveWorkspaceRoot,
 } from "../mods/files-search/session-baseline.js";
 
 describe("files-search session-baseline", () => {
@@ -168,8 +171,103 @@ describe("files-search session-baseline", () => {
       // Different branch does NOT match resume/<hash>.json
       const wrongBranch = await readDiskSessionBaseline(appHomeDir, "tab:999", workspaceRoot, "main", true);
       assert.equal(wrongBranch, null);
+
+      // Same tabId on a DIFFERENT workspaceRoot MUST NOT inherit stale baseline
+      const wrongWorkspaceTab = await readDiskSessionBaseline(appHomeDir, "tab:123", "/home/dev/projects/other-repo", branch, false);
+      assert.equal(wrongWorkspaceTab, null);
     } finally {
       await rm(appHomeDir, { recursive: true, force: true });
     }
+  });
+
+  it("ignores /resume inside paths or help banners and handles no-stat QuickJS binary/dir fallbacks", async () => {
+    assert.equal(terminalHasResumeCommand("ls ~/.config/herdr-app/mesh/sessions/resume\n"), false);
+    assert.equal(terminalHasResumeCommand("Type /resume to continue your previous conversation"), false);
+    assert.equal(terminalHasResumeCommand("  /resume   Resume a previous session\n"), false);
+    assert.equal(terminalHasResumeCommand("\x1b[32m❯\x1b[0m /resume my-prev-session\n"), true);
+    assert.equal(terminalHasResumeCommand("user@host:~/proj$ antigravity --resume\n"), true);
+
+    assert.equal(normalizeGitStatusMark("??"), "A");
+    assert.equal(normalizeGitStatusMark("AD"), "D");
+    assert.equal(normalizeGitStatusMark("UD"), "U");
+
+    const noStatBinaryFs = {
+      exists: async (p) => !p.endsWith("missing.bin"),
+      readFile: async (p) => {
+        if (p.endsWith(".agent")) {
+          const err = new Error("EISDIR");
+          err.code = "EISDIR";
+          throw err;
+        }
+        return new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0xff, 0x00]);
+      },
+    };
+    const binStat = await statFileEntry("/repo/mypass.zip", "A", null, noStatBinaryFs);
+    assert.match(binStat.sig, /^6:b[0-9a-f]{8}$/);
+    assert.equal(binStat.mtimeMs, 0);
+
+    const dirStat = await statFileEntry("/repo/.agent", "A", null, noStatBinaryFs);
+    assert.equal(dirStat.sig, "dir:A");
+    assert.equal(dirStat.mtimeMs, 0);
+
+    const missingStat = await statFileEntry("/repo/missing.bin", "D", null, noStatBinaryFs);
+    assert.equal(missingStat.sig, "deleted");
+  });
+
+  it("resolveWorkspaceRoot skips $HOME anchoring when pane.cwd is a deeper project folder", () => {
+    const appHomeDir = "/home/nmr/.config/herdr-app";
+    assert.equal(isHomeDirectoryRoot("/home/nmr", null, appHomeDir), true);
+    assert.equal(isHomeDirectoryRoot("/home/nmr/Projects", null, appHomeDir), false);
+    assert.equal(isHomeDirectoryRoot("C:\\Users\\dev", null, "C:\\Users\\dev\\AppData\\Roaming\\herdr-app", true), true);
+
+    assert.equal(
+      resolveWorkspaceRoot({
+        spaceFolder: "/home/nmr",
+        paneCwd: "/home/nmr/Projects/herdr-mesh",
+        appHomeDir,
+      }),
+      "/home/nmr/Projects/herdr-mesh",
+    );
+    assert.equal(
+      resolveWorkspaceRoot({
+        spaceFolder: "/home/nmr",
+        paneCwd: null,
+        appHomeDir,
+      }),
+      "/home/nmr",
+    );
+    assert.equal(
+      resolveWorkspaceRoot({
+        spaceFolder: "/home/nmr/Projects",
+        paneCwd: "/home/nmr/Projects/herdr-mesh",
+        appHomeDir,
+      }),
+      "/home/nmr/Projects",
+    );
+    assert.equal(
+      resolveWorkspaceRoot({
+        spaceFolder: "/home/nmr/Projects/herdr-mesh",
+        paneCwd: "/home/nmr/Projects/herdr-mesh/mods",
+        appHomeDir,
+      }),
+      "/home/nmr/Projects/herdr-mesh",
+    );
+    assert.equal(
+      resolveWorkspaceRoot({
+        spaceFolder: "/home/nmr/Projects/herdr-mesh",
+        paneCwd: "/home/nmr/Projects/other-repo",
+        appHomeDir,
+      }),
+      "/home/nmr/Projects/other-repo",
+    );
+    assert.equal(
+      resolveWorkspaceRoot({
+        spaceFolder: "C:/Users/dev",
+        paneCwd: "C:/Users/dev/Projects/app",
+        isWindows: true,
+        appHomeDir: "C:/Users/dev/AppData/Roaming/herdr-app",
+      }),
+      "C:/Users/dev/Projects/app",
+    );
   });
 });

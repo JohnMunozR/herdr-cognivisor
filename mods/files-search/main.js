@@ -75,12 +75,14 @@ import {
   runStagedCascade,
 } from "./tree-logic.js";
 import {
+  normalizeGitStatusMark,
   normalizeSessionBaseline,
   readDiskSessionBaseline,
   writeDiskSessionBaseline,
   terminalHasResumeCommand,
   statFileEntry,
   filterSessionDirtyEntries,
+  resolveWorkspaceRoot,
 } from "./session-baseline.js";
 
 function asPlainObject(v) {
@@ -155,7 +157,7 @@ function location() {
   const isFileViewerTab = tabId => Boolean(
     tabId && (
       openFileTabs[tabId] ||
-      (spacePanes.some(p => p.tab === tabId && p.mod === "files-search") && !tabHasTerminal(tabId))
+      (spacePanes.some(p => p.tab === tabId && (p.mod === "files-search" || p.mod === "changes-review")) && !tabHasTerminal(tabId))
     )
   );
   const isNonTerminalActive = Boolean(
@@ -185,9 +187,17 @@ function location() {
   const on = f?.pane === null && f?.terminal
     ? (f.terminal.includes("/") ? f.terminal.split("/")[0] : null)
     : space?.machine ?? null;
+  const isWin = !on && window()?.platform === "windows";
   const spaceFolder = space?.folder;
   const paneCwd = activePane?.cwd || (!activePane?.cwd ? fallbackPane?.cwd : null) || null;
-  let cwd = paneCwd || f?.cwd || spaceFolder;
+  let cwd = resolveWorkspaceRoot({
+    spaceFolder,
+    paneCwd,
+    fallbackCwd: f?.cwd || null,
+    on,
+    isWindows: isWin,
+    appHomeDir: getSafeAppHome(),
+  });
   if (!cwd && activeTab && openFileTabs[activeTab.id]?.root) {
     cwd = openFileTabs[activeTab.id].root;
   }
@@ -1534,11 +1544,10 @@ export default class FilesSearch extends View {
     const activeSpace = spaces().find(s => s.active);
     const activeTab = (activeSpace?.tabs || []).find(t => t.active) || null;
     const activeTabId = loc.tabId || activeTab?.id || null;
-    const activeTabIds = new Set((activeSpace?.tabs || []).map(t => t.id));
     const allPanesList = panes() || [];
-    const extraCwds = Array.from(
-      new Set(allPanesList.filter(p => p?.cwd && activeTabIds.has(p.tab)).map(p => p.cwd))
-    );
+    const extraCwds = activeTabId
+      ? Array.from(new Set(allPanesList.filter(p => p?.cwd && p.tab === activeTabId).map(p => p.cwd)))
+      : [];
     const tabPaneCwds = activeTabId
       ? Array.from(new Set(allPanesList.filter(p => p.tab === activeTabId && p.cwd).map(p => p.cwd)))
       : [];
@@ -1652,7 +1661,11 @@ export default class FilesSearch extends View {
             || null;
           const primaryBranch = primaryStatus?.branch || "";
 
-          let sessionBaseline = normalizeSessionBaseline(tabFlowObj?.sessionBaseline);
+          const freshFlowObj = asPlainObject(shared("mesh.flows"))[activeTabId];
+          let sessionBaseline = normalizeSessionBaseline(freshFlowObj?.sessionBaseline);
+          if (sessionBaseline && sessionBaseline.workspaceRoot && normCwd && sessionBaseline.workspaceRoot !== normCwd) {
+            sessionBaseline = null;
+          }
           let isFreshBaseline = false;
           let baselineDirtyChanged = false;
 
@@ -1663,7 +1676,7 @@ export default class FilesSearch extends View {
           }
           if (!sessionBaseline && appHomeDir && (tabTermAddrs || []).length > 0) {
             const reads = await Promise.all(
-              (tabTermAddrs || []).map(addr => hc(["read", "--lines", "250", addr]).catch(() => ""))
+              (tabTermAddrs || []).map(addr => hc(["read", "--lines", "100", addr]).catch(() => ""))
             );
             if (!this.current(context)) return;
             const transcript = reads.filter(Boolean).join("\n");
@@ -1690,16 +1703,40 @@ export default class FilesSearch extends View {
               serviceAhead[service.id] = ahead || 0;
               serviceBranches[service.id] = branch || "";
 
-              const parsedRaw = [];
+              const dirEntries = [];
+              const expandedItems = [];
               for (const entry of fileEntries.slice(0, TOTAL)) {
                 const xy = entry.slice(0, 2);
                 const rawRel = entry.slice(3);
                 const relFile = rawRel.replace(/\/+$/, "");
                 if (!relFile) continue;
-                const fullPath = `${service.root}/${relFile}`;
-                const mark = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
-                parsedRaw.push({ relFile, fullPath, status: mark, mark });
+                if (xy === "??" && rawRel.endsWith("/")) {
+                  dirEntries.push(relFile);
+                } else {
+                  expandedItems.push({ xy, relFile });
+                }
               }
+              if (dirEntries.length > 0 && expandedItems.length < TOTAL) {
+                const ls = await exec(
+                  "git",
+                  ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "ls-files", "--others", "--exclude-standard", "-z", "--", ...dirEntries],
+                  { cwd: service.root, on }
+                ).catch(() => null);
+                if (ls?.code === 0 && ls.stdout) {
+                  for (const expandedPath of ls.stdout.split("\0").filter(Boolean)) {
+                    const cleanExp = expandedPath.replace(/\/+$/, "");
+                    if (!cleanExp) continue;
+                    expandedItems.push({ xy: "??", relFile: cleanExp });
+                    if (expandedItems.length >= TOTAL) break;
+                  }
+                }
+              }
+
+              const parsedRaw = expandedItems.map(({ xy, relFile }) => {
+                const fullPath = `${service.root}/${relFile}`;
+                const mark = normalizeGitStatusMark(xy);
+                return { relFile, fullPath, status: mark, mark };
+              });
 
               const [parsedEntries, logRes] = await Promise.all([
                 Promise.all(
@@ -1804,46 +1841,11 @@ export default class FilesSearch extends View {
             if (!this.current(context)) return;
           }
         } else {
-          for (const { service, branch, fileEntries, ahead } of statusResults) {
+          for (const { service, branch, ahead } of statusResults) {
             serviceAhead[service.id] = ahead || 0;
             serviceBranches[service.id] = branch || "";
-            if (!fileEntries.length) continue;
-            const parsedEntries = [];
-            for (const entry of fileEntries.slice(0, TOTAL)) {
-              const xy = entry.slice(0, 2);
-              const rawRel = entry.slice(3);
-              const relFile = rawRel.replace(/\/+$/, "");
-              if (!relFile) continue;
-              const fullPath = `${service.root}/${relFile}`;
-              const mark = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
-              parsedEntries.push({ relFile, fullPath, status: xy, mark });
-            }
-            if (parsedEntries.length > 0) {
-              recordDirtyMarksAndCounts(
-                cwd,
-                isWindows,
-                normCwd,
-                service,
-                parsedEntries,
-                marks,
-                dirCounts,
-                serviceCounts,
-                serviceFiles
-              );
-            }
           }
-          enrichedServices = candidateServices
-            .map(s => {
-              const normRoot = normPathStr(s.root);
-              const existing = prevByRoot.get(normRoot);
-              return {
-                ...s,
-                branch: serviceBranches[s.id] || existing?.branch || s.branch || "",
-                workingCount: serviceCounts[s.id] ?? 0,
-                aheadCount: serviceAhead[s.id] ?? existing?.aheadCount ?? 0,
-              };
-            })
-            .filter(s => (s.workingCount || 0) > 0 || (s.aheadCount || 0) > 0);
+          enrichedServices = [];
         }
 
         this.services = enrichedServices;

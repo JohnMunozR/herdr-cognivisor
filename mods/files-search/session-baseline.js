@@ -11,6 +11,43 @@ function normRelPath(p) {
   return String(p || "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
 }
 
+export function isHomeDirectoryRoot(folderPath, on = null, appHomeDir = "", isWindows = false) {
+  const norm = normPath(folderPath);
+  if (!norm) return false;
+  if (norm === "~" || norm === "/root") return true;
+  if (/^\/(?:home|Users)\/[^/]+$/.test(norm)) return true;
+  if (/^[a-zA-Z]:\/Users\/[^/]+$/i.test(norm)) return true;
+  if (!on && appHomeDir) {
+    const normApp = normPath(appHomeDir);
+    const cmpFolder = isWindows ? norm.toLowerCase() : norm;
+    const cmpApp = isWindows ? normApp.toLowerCase() : normApp;
+    if (normApp && cmpApp !== cmpFolder && cmpApp.startsWith(cmpFolder + "/")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function resolveWorkspaceRoot({ spaceFolder, paneCwd, fallbackCwd = null, on = null, isWindows = false, appHomeDir = "" } = {}) {
+  const activeCwd = paneCwd || fallbackCwd || null;
+  if (spaceFolder) {
+    if (activeCwd) {
+      if (isHomeDirectoryRoot(spaceFolder, on, appHomeDir, isWindows)) {
+        return activeCwd;
+      }
+      const normSpace = normPath(spaceFolder);
+      const normActive = normPath(activeCwd);
+      const cmpSpace = isWindows ? normSpace.toLowerCase() : normSpace;
+      const cmpActive = isWindows ? normActive.toLowerCase() : normActive;
+      if (cmpActive !== cmpSpace && !cmpActive.startsWith(cmpSpace + "/")) {
+        return activeCwd;
+      }
+    }
+    return spaceFolder;
+  }
+  return activeCwd;
+}
+
 function fnv1aHex(str) {
   let hash = 0x811c9dc5;
   for (let i = 0; i < str.length; i++) {
@@ -18,6 +55,39 @@ function fnv1aHex(str) {
     hash = Math.imul(hash, 0x01000193);
   }
   return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function fnv1aBytes(buf) {
+  let hash = 0x811c9dc5;
+  if (typeof buf === "string") {
+    for (let i = 0; i < buf.length; i++) {
+      const code = buf.charCodeAt(i);
+      hash ^= code & 0xff;
+      hash = Math.imul(hash, 0x01000193);
+      if (code > 0xff) {
+        hash ^= (code >>> 8) & 0xff;
+        hash = Math.imul(hash, 0x01000193);
+      }
+    }
+    return { len: buf.length, hex: (hash >>> 0).toString(16).padStart(8, "0") };
+  }
+  const view = buf instanceof ArrayBuffer
+    ? new Uint8Array(buf)
+    : (ArrayBuffer.isView(buf) ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength) : buf);
+  const len = Number(view?.length) || 0;
+  for (let i = 0; i < len; i++) {
+    hash ^= (view[i] & 0xff);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return { len, hex: (hash >>> 0).toString(16).padStart(8, "0") };
+}
+
+export function normalizeGitStatusMark(xy) {
+  const s = String(xy || "");
+  if (s.includes("U") || s === "AA" || s === "DD") return "U";
+  if (s.includes("D")) return "D";
+  if (s === "??" || s.includes("A")) return "A";
+  return "M";
 }
 
 function safeTabId(tabId) {
@@ -68,10 +138,19 @@ async function readBaselineJsonFile(filePath) {
   try {
     const text = await readFile(filePath, "utf8");
     const parsed = JSON.parse(text);
-    return normalizeSessionBaseline(parsed);
+    const payload = parsed && typeof parsed === "object" && !Array.isArray(parsed) && parsed.sessionBaseline && typeof parsed.sessionBaseline === "object"
+      ? parsed.sessionBaseline
+      : parsed;
+    return normalizeSessionBaseline(payload);
   } catch {
     return null;
   }
+}
+
+function matchesWorkspaceRoot(baseline, workspaceRoot) {
+  const normWs = normPath(workspaceRoot);
+  if (!normWs || !baseline?.workspaceRoot) return true;
+  return baseline.workspaceRoot === normWs;
 }
 
 export async function readDiskSessionBaseline(appHomeDir, tabId, workspaceRoot, branch, hasResumeCommand = false) {
@@ -80,7 +159,7 @@ export async function readDiskSessionBaseline(appHomeDir, tabId, workspaceRoot, 
   if (tabId) {
     const tabPath = join(baseDir, "tabs", `${safeTabId(tabId)}.json`);
     const fromTab = await readBaselineJsonFile(tabPath);
-    if (fromTab) return fromTab;
+    if (fromTab && matchesWorkspaceRoot(fromTab, workspaceRoot)) return fromTab;
   }
   const shouldCheckResume = typeof hasResumeCommand === "object" && hasResumeCommand !== null
     ? Boolean(hasResumeCommand.hasResumeCommand)
@@ -88,14 +167,16 @@ export async function readDiskSessionBaseline(appHomeDir, tabId, workspaceRoot, 
   if (shouldCheckResume && workspaceRoot) {
     const resumePath = join(baseDir, "resume", `${resumeKeyHash(workspaceRoot, branch)}.json`);
     const fromResume = await readBaselineJsonFile(resumePath);
-    if (fromResume) return fromResume;
+    if (fromResume && matchesWorkspaceRoot(fromResume, workspaceRoot)) return fromResume;
   }
   return null;
 }
 
 export async function writeDiskSessionBaseline(appHomeDir, tabId, workspaceRoot, branch, data) {
   if (!appHomeDir || !data) return false;
-  const normalized = normalizeSessionBaseline(data);
+  const normalized = normalizeSessionBaseline(
+    workspaceRoot && !data.workspaceRoot ? { ...data, workspaceRoot } : data
+  );
   if (!normalized) return false;
   const json = JSON.stringify(normalized);
   const baseDir = join(String(appHomeDir), "mesh", "sessions");
@@ -123,40 +204,68 @@ export async function writeDiskSessionBaseline(appHomeDir, tabId, workspaceRoot,
   return wrote;
 }
 
-export function terminalHasResumeCommand(transcriptText) {
-  return typeof transcriptText === "string" && /\/resume\b/i.test(transcriptText);
+function stripAnsiEscapes(text) {
+  return String(text || "")
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
 }
 
-export async function statFileEntry(fullPath, status, on = null) {
+const RESUME_CMD_LINE_RE =
+  /^(?:(?:[^\n]{0,60}?[$%>❯›•]\s+)|Running\s+)?(?:\/resume(?:\s+([a-zA-Z0-9_][a-zA-Z0-9._:/-]*))?|(?:claude|codex|gemini|opencode|antigravity)\s+(?:--)?resume(?:\s+([a-zA-Z0-9_][a-zA-Z0-9._:/-]*))?)\s*$/i;
+
+export function terminalHasResumeCommand(transcriptText) {
+  if (typeof transcriptText !== "string" || !transcriptText) return false;
+  const clean = stripAnsiEscapes(transcriptText);
+  const lines = clean.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    if (RESUME_CMD_LINE_RE.test(line)) return true;
+  }
+  return false;
+}
+
+export async function statFileEntry(fullPath, status, on = null, fsDeps = fsPromises) {
   if (on) return { sig: String(status || ""), mtimeMs: 0 };
   if (!fullPath) return { sig: "deleted", mtimeMs: 0 };
-  if (typeof fsPromises.stat === "function") {
+  const api = fsDeps || fsPromises;
+  if (typeof api.stat === "function") {
     try {
-      const st = await fsPromises.stat(fullPath);
+      const st = await api.stat(fullPath);
+      if (typeof st?.isDirectory === "function" && st.isDirectory()) {
+        return { sig: `dir:${String(status || "")}`, mtimeMs: 0 };
+      }
       const mtimeMs = Number.isFinite(st.mtimeMs) ? st.mtimeMs : 0;
       return { sig: `${st.size}:${Math.trunc(mtimeMs)}`, mtimeMs };
     } catch (err) {
       if (err && err.code === "ENOENT") return { sig: "deleted", mtimeMs: 0 };
-      return { sig: String(status || ""), mtimeMs: 0 };
+      // fall through when stat is unsupported or fails transiently
     }
   }
-  if (typeof fsPromises.exists === "function") {
+  if (typeof api.exists === "function") {
     try {
-      const ok = await fsPromises.exists(fullPath);
+      const ok = await api.exists(fullPath);
       if (!ok) return { sig: "deleted", mtimeMs: 0 };
-      if (typeof readFile === "function") {
-        const buf = await readFile(fullPath);
-        return { sig: `${buf.length}:${fnv1aHex(String(buf))}`, mtimeMs: 0 };
-      }
     } catch {
       // fall through
+    }
+  }
+  const reader = typeof api.readFile === "function" ? api.readFile : readFile;
+  if (typeof reader === "function") {
+    try {
+      const buf = await reader(fullPath);
+      const { len, hex } = fnv1aBytes(buf);
+      return { sig: `${len}:b${hex}`, mtimeMs: 0 };
+    } catch (err) {
+      if (err && err.code === "ENOENT") return { sig: "deleted", mtimeMs: 0 };
+      return { sig: `dir:${String(status || "")}`, mtimeMs: 0 };
     }
   }
   return { sig: String(status || ""), mtimeMs: 0 };
 }
 
-export async function computeFileSig(fullPath, status, on = null) {
-  const res = await statFileEntry(fullPath, status, on);
+export async function computeFileSig(fullPath, status, on = null, fsDeps = fsPromises) {
+  const res = await statFileEntry(fullPath, status, on, fsDeps);
   return res.sig;
 }
 

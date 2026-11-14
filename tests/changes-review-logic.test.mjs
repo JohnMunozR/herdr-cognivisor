@@ -25,7 +25,20 @@ import {
   pickNextDirtyService,
   filterSessionCommits,
   filterSessionWorkingEntries,
+  normalizeGitStatusMark,
+  statFileEntry,
+  readDiskSessionBaseline,
+  writeDiskSessionBaseline,
+  extractResumeKeyFromTranscript,
+  filterUnbaselinedRepoEntries,
+  isHomeDirectoryRoot,
+  resolveWorkspaceRoot,
 } from "../mods/changes-review/review-logic.js";
+import {
+  statFileEntry as filesSearchStatFileEntry,
+  normalizeGitStatusMark as filesSearchNormalizeStatus,
+  resolveWorkspaceRoot as filesSearchResolveWorkspaceRoot,
+} from "../mods/files-search/session-baseline.js";
 
 describe("changes-review review-logic", () => {
   test("getFileExt resolves extensionless Dockerfiles, Makefiles, dotfiles, and standard extensions", () => {
@@ -409,5 +422,178 @@ describe("changes-review review-logic", () => {
       filterSessionWorkingEntries(fallbackEntries, null, startedAt).map((e) => e.relFile),
       ["fresh.js", "remote-no-stat.js"],
     );
+  });
+
+  test("statFileEntry and normalizeGitStatusMark match files-search identically across stat, no-stat QuickJS, binary, dir, and SSH", async () => {
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "herdr-parity-"));
+    try {
+      const textFile = path.join(dir, "main.ts");
+      await fs.writeFile(textFile, "export const saludo = 'hola ñ';\n", "utf8");
+      const binFile = path.join(dir, "mypass.zip");
+      await fs.writeFile(binFile, new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0xfe, 0xed]));
+      const subDir = path.join(dir, ".agent");
+      await fs.mkdir(subDir);
+
+      // 1. Standard Node stat mode
+      assert.deepEqual(
+        await statFileEntry(textFile, "M", null),
+        await filesSearchStatFileEntry(textFile, "M", null),
+      );
+      assert.deepEqual(
+        await statFileEntry(binFile, "A", null),
+        await filesSearchStatFileEntry(binFile, "A", null),
+      );
+      assert.deepEqual(
+        await statFileEntry(subDir, "A", null),
+        await filesSearchStatFileEntry(subDir, "A", null),
+      );
+
+      // 2. QuickJS no-stat fallback mode (exists + raw readFile Uint8Array)
+      const noStatFs = {
+        exists: async (p) => {
+          try { await fs.access(p); return true; } catch { return false; }
+        },
+        readFile: (p) => fs.readFile(p),
+      };
+      const crText = await statFileEntry(textFile, "M", null, noStatFs);
+      const fsText = await filesSearchStatFileEntry(textFile, "M", null, noStatFs);
+      assert.deepEqual(crText, fsText);
+      assert.match(crText.sig, /^\d+:b[0-9a-f]{8}$/);
+
+      const crBin = await statFileEntry(binFile, "A", null, noStatFs);
+      const fsBin = await filesSearchStatFileEntry(binFile, "A", null, noStatFs);
+      assert.deepEqual(crBin, fsBin);
+      assert.equal(crBin.sig.startsWith("6:b"), true);
+
+      const crDir = await statFileEntry(subDir, "A", null, noStatFs);
+      const fsDir = await filesSearchStatFileEntry(subDir, "A", null, noStatFs);
+      assert.deepEqual(crDir, fsDir);
+      assert.equal(crDir.sig, "dir:A");
+
+      const crMissing = await statFileEntry(path.join(dir, "nope.txt"), "D", null, noStatFs);
+      const fsMissing = await filesSearchStatFileEntry(path.join(dir, "nope.txt"), "D", null, noStatFs);
+      assert.deepEqual(crMissing, fsMissing);
+      assert.equal(crMissing.sig, "deleted");
+
+      // 3. SSH remote mode
+      assert.deepEqual(
+        await statFileEntry(textFile, "M", "dev@host"),
+        await filesSearchStatFileEntry(textFile, "M", "dev@host"),
+      );
+
+      // 4. Git status normalization parity
+      for (const xy of ["??", " M", "M ", "MM", "A ", "AD", "UD", "UU", "AA", "DD", " D"]) {
+        assert.equal(normalizeGitStatusMark(xy), filesSearchNormalizeStatus(xy), `mismatch for ${xy}`);
+      }
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveSessionAgentTabId does not steal prior tab baseline when a brand-new tab has no panes yet", () => {
+    const space = {
+      id: "sp-1",
+      tabs: [
+        { id: "tab-old", active: false },
+        { id: "tab-new", active: true },
+      ],
+    };
+    const panesBeforeSpawn = [
+      { id: "p-1", tab: "tab-old", terminal: "term-1" },
+    ];
+    assert.equal(
+      resolveSessionAgentTabId(space, panesBeforeSpawn, { "sp-1": "tab-old" }),
+      "tab-new",
+    );
+
+    // Non-terminal File Viewer tab DOES preserve stored agent tab
+    const spaceViewingFile = {
+      id: "sp-1",
+      tabs: [
+        { id: "tab-old", active: false },
+        { id: "tab-file-viewer", active: true },
+      ],
+    };
+    const panesWithViewer = [
+      { id: "p-1", tab: "tab-old", terminal: "term-1" },
+      { id: "p-2", tab: "tab-file-viewer", terminal: null, mod: "files-search" },
+    ];
+    assert.equal(
+      resolveSessionAgentTabId(spaceViewingFile, panesWithViewer, { "sp-1": "tab-old" }),
+      "tab-old",
+    );
+  });
+
+  test("filterUnbaselinedRepoEntries blocks un-attributed mtimeMs=0 sibling leaks and backfills baseline", () => {
+    const entries = [
+      { relFile: "manifest.json", status: "M", sig: "100:b1234567", mtimeMs: 0 },
+      { relFile: ".agent/SKILL.md", status: "A", sig: "200:babcdef0", mtimeMs: 0 },
+    ];
+
+    // Un-attributed sibling repo (e.g. mypass/scaffold) with mtimeMs=0 -> 0 session changes, backfilled
+    const unattr = filterUnbaselinedRepoEntries(entries, 1700000000000, { isAttributed: false, hasSessionCommits: false });
+    assert.equal(unattr.sessionFiles.length, 0);
+    assert.deepEqual(Object.keys(unattr.backfillDirtyFiles).sort(), [".agent/SKILL.md", "manifest.json"]);
+
+    // Attributed repo (active-tab pane cwd / transcript / sessionRepos) -> surfaces entries
+    const attr = filterUnbaselinedRepoEntries(entries, 1700000000000, { isAttributed: true, hasSessionCommits: false });
+    assert.equal(attr.sessionFiles.length, 2);
+  });
+
+  test("extractResumeKeyFromTranscript and readDiskSessionBaseline prevent false /resume & cross-workspace collisions", async () => {
+    assert.equal(extractResumeKeyFromTranscript("/home/nmr/.config/herdr-app/mesh/sessions/resume", "/ws"), "");
+    assert.equal(extractResumeKeyFromTranscript("Use /resume to restore a session\n  /resume   Resume chat", "/ws"), "");
+    assert.equal(extractResumeKeyFromTranscript("\x1b[36m❯\x1b[0m /resume sess-42", "/ws"), "resume:sess-42");
+    assert.equal(extractResumeKeyFromTranscript("user@dev:~/herdr-mesh$ claude --resume", "/ws"), "resume:/ws");
+
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const appHomeDir = await fs.mkdtemp(path.join(os.tmpdir(), "herdr-cr-baseline-"));
+    try {
+      const ws = "/home/nmr/Projects/herdr-mesh";
+      const baseline = {
+        version: 1,
+        startedAt: 1700000000000,
+        workspaceRoot: ws,
+        repos: {
+          "/home/nmr/Projects/mypass": { dirtyFiles: { "manifest.json": { status: "M", sig: "10:b01020304" } } },
+        },
+      };
+      await writeDiskSessionBaseline(appHomeDir, "tab-1", ws, "main", baseline);
+
+      const loadedSameWs = await readDiskSessionBaseline(appHomeDir, "tab-1", ws, ["main"], false);
+      assert.deepEqual(loadedSameWs, baseline);
+
+      const loadedWrongWs = await readDiskSessionBaseline(appHomeDir, "tab-1", "/home/nmr/Projects/other", ["main"], false);
+      assert.equal(loadedWrongWs, null);
+    } finally {
+      await fs.rm(appHomeDir, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveWorkspaceRoot defers to paneCwd when spaceFolder is $HOME and matches files-search", () => {
+    const appHomeDir = "/home/nmr/.config/herdr-app";
+    const cases = [
+      { spaceFolder: "/home/nmr", paneCwd: "/home/nmr/Projects/herdr-mesh", appHomeDir },
+      { spaceFolder: "/home/nmr", paneCwd: "/home/nmr", appHomeDir },
+      { spaceFolder: "/home/nmr", paneCwd: null, appHomeDir },
+      { spaceFolder: "/home/nmr/Projects", paneCwd: "/home/nmr/Projects/herdr-mesh", appHomeDir },
+      { spaceFolder: "/home/nmr/Projects/herdr-mesh", paneCwd: "/home/nmr/Projects/herdr-mesh/mods", appHomeDir },
+      { spaceFolder: "/home/nmr/Projects/herdr-mesh", paneCwd: "/tmp/scratch", appHomeDir },
+      { spaceFolder: "C:\\Users\\nmr", paneCwd: "C:\\Users\\nmr\\work\\app", isWindows: true, appHomeDir: "C:\\Users\\nmr\\AppData\\Roaming\\herdr-app" },
+    ];
+    for (const c of cases) {
+      assert.equal(resolveWorkspaceRoot(c), filesSearchResolveWorkspaceRoot(c));
+    }
+    assert.equal(isHomeDirectoryRoot("/home/nmr", null, appHomeDir), true);
+    assert.equal(resolveWorkspaceRoot(cases[0]), "/home/nmr/Projects/herdr-mesh");
+    assert.equal(resolveWorkspaceRoot(cases[3]), "/home/nmr/Projects");
+    assert.equal(resolveWorkspaceRoot(cases[4]), "/home/nmr/Projects/herdr-mesh");
+    assert.equal(resolveWorkspaceRoot(cases[5]), "/tmp/scratch");
+    assert.equal(resolveWorkspaceRoot(cases[6]), "C:\\Users\\nmr\\work\\app");
   });
 });

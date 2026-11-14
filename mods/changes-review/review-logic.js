@@ -1,4 +1,6 @@
-// Pure helper logic for changes-review: diff row parsing, linear syntax lexer, path normalization, watch filtering, and check command discovery.
+// Pure helper logic for changes-review: diff row parsing, linear syntax lexer, path normalization, watch filtering, and session baseline helpers.
+import * as fsPromises from "fs/promises";
+import { join } from "path";
 
 export const DIFF_KEYWORDS = new Set([
   "abstract", "and", "as", "assert", "async", "await", "break", "case", "catch", "class",
@@ -993,13 +995,22 @@ export function resolveSessionAgentTabId(space, allPanes, storedAgentTabs) {
   const activeTab = tabs.find((t) => t && t.active) || null;
   if (activeTab && hasTerminal(activeTab.id)) return activeTab.id;
 
-  const storedId = storedAgentTabs && space?.id ? storedAgentTabs[space.id] : null;
-  if (storedId && tabs.some((t) => t && t.id === storedId) && hasTerminal(storedId)) {
-    return storedId;
-  }
+  const activePanes = activeTab ? panesList.filter((p) => p && p.tab === activeTab.id) : [];
+  const isViewerOnlyTab = Boolean(
+    activeTab &&
+    activePanes.length > 0 &&
+    activePanes.every((p) => !p.terminal && (p.mod === "changes-review" || p.mod === "files-search"))
+  );
 
-  const firstTerminalTab = tabs.find((t) => t && hasTerminal(t.id));
-  if (firstTerminalTab) return firstTerminalTab.id;
+  if (!activeTab || isViewerOnlyTab) {
+    const storedId = storedAgentTabs && space?.id ? storedAgentTabs[space.id] : null;
+    if (storedId && tabs.some((t) => t && t.id === storedId) && hasTerminal(storedId)) {
+      return storedId;
+    }
+
+    const firstTerminalTab = tabs.find((t) => t && hasTerminal(t.id));
+    if (firstTerminalTab) return firstTerminalTab.id;
+  }
 
   return activeTab?.id || null;
 }
@@ -1091,4 +1102,330 @@ export function filterSessionWorkingEntries(entries, baselineRepo, sessionStarte
     }
     return true;
   });
+}
+
+function normBaselineRoot(p) {
+  return String(p || "").replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function normBaselineRel(p) {
+  return String(p || "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+}
+
+export function isHomeDirectoryRoot(folderPath, on = null, appHomeDir = "", isWindows = false) {
+  const norm = normBaselineRoot(folderPath);
+  if (!norm) return false;
+  if (norm === "~" || norm === "/root") return true;
+  if (/^\/(?:home|Users)\/[^/]+$/.test(norm)) return true;
+  if (/^[a-zA-Z]:\/Users\/[^/]+$/i.test(norm)) return true;
+  if (!on && appHomeDir) {
+    const normApp = normBaselineRoot(appHomeDir);
+    const cmpFolder = isWindows ? norm.toLowerCase() : norm;
+    const cmpApp = isWindows ? normApp.toLowerCase() : normApp;
+    if (normApp && cmpApp !== cmpFolder && cmpApp.startsWith(cmpFolder + "/")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function resolveWorkspaceRoot({ spaceFolder, paneCwd, fallbackCwd = null, on = null, isWindows = false, appHomeDir = "" } = {}) {
+  const activeCwd = paneCwd || fallbackCwd || null;
+  if (spaceFolder) {
+    if (activeCwd) {
+      if (isHomeDirectoryRoot(spaceFolder, on, appHomeDir, isWindows)) {
+        return activeCwd;
+      }
+      const normSpace = normBaselineRoot(spaceFolder);
+      const normActive = normBaselineRoot(activeCwd);
+      const cmpSpace = isWindows ? normSpace.toLowerCase() : normSpace;
+      const cmpActive = isWindows ? normActive.toLowerCase() : normActive;
+      if (cmpActive !== cmpSpace && !cmpActive.startsWith(cmpSpace + "/")) {
+        return activeCwd;
+      }
+    }
+    return spaceFolder;
+  }
+  return activeCwd;
+}
+
+function fnv1aHexStr(str) {
+  let hash = 0x811c9dc5;
+  const s = String(str || "");
+  for (let i = 0; i < s.length; i++) {
+    hash ^= s.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function fnv1aBytes(buf) {
+  let hash = 0x811c9dc5;
+  if (typeof buf === "string") {
+    for (let i = 0; i < buf.length; i++) {
+      const code = buf.charCodeAt(i);
+      hash ^= code & 0xff;
+      hash = Math.imul(hash, 0x01000193);
+      if (code > 0xff) {
+        hash ^= (code >>> 8) & 0xff;
+        hash = Math.imul(hash, 0x01000193);
+      }
+    }
+    return { len: buf.length, hex: (hash >>> 0).toString(16).padStart(8, "0") };
+  }
+  const view = buf instanceof ArrayBuffer
+    ? new Uint8Array(buf)
+    : (ArrayBuffer.isView(buf) ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength) : buf);
+  const len = Number(view?.length) || 0;
+  for (let i = 0; i < len; i++) {
+    hash ^= (view[i] & 0xff);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return { len, hex: (hash >>> 0).toString(16).padStart(8, "0") };
+}
+
+function safeBaselineTabId(tabId) {
+  return String(tabId || "")
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/^_+|_+$/g, "") || "tab";
+}
+
+function resumeKeyHash(workspaceRoot, branch) {
+  const normRoot = normBaselineRoot(workspaceRoot);
+  const normBranch = String(branch || "").trim();
+  return fnv1aHexStr(`${normRoot}::${normBranch}`);
+}
+
+export function normalizeGitStatusMark(xy) {
+  const s = String(xy || "");
+  if (s.includes("U") || s === "AA" || s === "DD") return "U";
+  if (s.includes("D")) return "D";
+  if (s === "??" || s.includes("A")) return "A";
+  return "M";
+}
+
+export async function statFileEntry(fullPath, status, on = null, fsDeps = fsPromises) {
+  if (on) return { sig: String(status || ""), mtimeMs: 0 };
+  if (!fullPath) return { sig: "deleted", mtimeMs: 0 };
+  const api = fsDeps || fsPromises;
+  if (typeof api.stat === "function") {
+    try {
+      const st = await api.stat(fullPath);
+      if (typeof st?.isDirectory === "function" && st.isDirectory()) {
+        return { sig: `dir:${String(status || "")}`, mtimeMs: 0 };
+      }
+      const mtimeMs = Number.isFinite(st.mtimeMs) ? st.mtimeMs : 0;
+      return { sig: `${st.size}:${Math.trunc(mtimeMs)}`, mtimeMs };
+    } catch (err) {
+      if (err && err.code === "ENOENT") return { sig: "deleted", mtimeMs: 0 };
+    }
+  }
+  if (typeof api.exists === "function") {
+    try {
+      const ok = await api.exists(fullPath);
+      if (!ok) return { sig: "deleted", mtimeMs: 0 };
+    } catch {
+      // fall through
+    }
+  }
+  const reader = typeof api.readFile === "function" ? api.readFile : fsPromises.readFile;
+  if (typeof reader === "function") {
+    try {
+      const buf = await reader(fullPath);
+      const { len, hex } = fnv1aBytes(buf);
+      return { sig: `${len}:b${hex}`, mtimeMs: 0 };
+    } catch (err) {
+      if (err && err.code === "ENOENT") return { sig: "deleted", mtimeMs: 0 };
+      return { sig: `dir:${String(status || "")}`, mtimeMs: 0 };
+    }
+  }
+  return { sig: String(status || ""), mtimeMs: 0 };
+}
+
+export function normalizeSessionBaseline(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const payload = raw.sessionBaseline && typeof raw.sessionBaseline === "object" && !Array.isArray(raw.sessionBaseline)
+    ? raw.sessionBaseline
+    : raw;
+  const startedAtNum = Number(payload.startedAt);
+  if (!Number.isFinite(startedAtNum) || startedAtNum <= 0) return null;
+  const workspaceRoot = normBaselineRoot(payload.workspaceRoot || "");
+  const repos = {};
+  const rawRepos = payload.repos && typeof payload.repos === "object" && !Array.isArray(payload.repos) ? payload.repos : {};
+  for (const [repoKey, repoVal] of Object.entries(rawRepos)) {
+    const normRoot = normBaselineRoot(repoKey);
+    if (!normRoot || !repoVal || typeof repoVal !== "object" || Array.isArray(repoVal)) continue;
+    const dirtyFiles = {};
+    const rawDirty = repoVal.dirtyFiles && typeof repoVal.dirtyFiles === "object" && !Array.isArray(repoVal.dirtyFiles)
+      ? repoVal.dirtyFiles
+      : {};
+    for (const [relFile, entryVal] of Object.entries(rawDirty)) {
+      const cleanRel = normBaselineRel(relFile);
+      if (!cleanRel || !entryVal || typeof entryVal !== "object" || Array.isArray(entryVal)) continue;
+      dirtyFiles[cleanRel] = {
+        status: String(entryVal.status || ""),
+        sig: String(entryVal.sig || ""),
+      };
+    }
+    repos[normRoot] = { dirtyFiles };
+  }
+  return {
+    version: 1,
+    startedAt: startedAtNum,
+    workspaceRoot,
+    repos,
+  };
+}
+
+function baselineMatchesWorkspace(baseline, workspaceRoot) {
+  const normWs = normBaselineRoot(workspaceRoot);
+  if (!normWs || !baseline?.workspaceRoot) return true;
+  return baseline.workspaceRoot === normWs;
+}
+
+async function readBaselineJsonFile(filePath, fsDeps = fsPromises) {
+  if (!filePath) return null;
+  const reader = typeof fsDeps?.readFile === "function" ? fsDeps.readFile : fsPromises.readFile;
+  try {
+    const text = await reader(filePath, "utf8");
+    const parsed = JSON.parse(text);
+    return normalizeSessionBaseline(parsed);
+  } catch {
+    return null;
+  }
+}
+
+export async function readDiskSessionBaseline(appHomeDir, tabId, workspaceRoot, branchesOrBranch, resumeArg = false, fsDeps = fsPromises) {
+  if (!appHomeDir) return null;
+  const baseDir = join(String(appHomeDir), "mesh", "sessions");
+  if (tabId) {
+    const tabPath = join(baseDir, "tabs", `${safeBaselineTabId(tabId)}.json`);
+    const fromTab = await readBaselineJsonFile(tabPath, fsDeps);
+    if (fromTab && baselineMatchesWorkspace(fromTab, workspaceRoot)) return fromTab;
+  }
+  const resumeKey = typeof resumeArg === "object" && resumeArg !== null
+    ? String(resumeArg.resumeKey || "")
+    : (typeof resumeArg === "string" ? resumeArg : "");
+  const shouldCheckResume = typeof resumeArg === "object" && resumeArg !== null
+    ? Boolean(resumeArg.hasResumeCommand || resumeArg.resumeKey)
+    : Boolean(resumeArg);
+  if (shouldCheckResume && (workspaceRoot || resumeKey)) {
+    const branchList = Array.isArray(branchesOrBranch)
+      ? Array.from(new Set(branchesOrBranch.map((b) => String(b || "").trim()).filter(Boolean)))
+      : (String(branchesOrBranch || "").trim() ? [String(branchesOrBranch || "").trim()] : []);
+    const hashes = [];
+    if (resumeKey) hashes.push(fnv1aHexStr(resumeKey));
+    if (workspaceRoot) {
+      for (const br of branchList) {
+        hashes.push(resumeKeyHash(workspaceRoot, br));
+      }
+      if (branchList.length === 0) {
+        hashes.push(resumeKeyHash(workspaceRoot, ""));
+      }
+    }
+    for (const h of Array.from(new Set(hashes))) {
+      const resumePath = join(baseDir, "resume", `${h}.json`);
+      const fromResume = await readBaselineJsonFile(resumePath, fsDeps);
+      if (fromResume && baselineMatchesWorkspace(fromResume, workspaceRoot)) return fromResume;
+    }
+  }
+  return null;
+}
+
+export async function writeDiskSessionBaseline(appHomeDir, tabId, workspaceRoot, branch, data, resumeKey = "", fsDeps = fsPromises) {
+  if (!appHomeDir || !data) return false;
+  const normalized = normalizeSessionBaseline(
+    workspaceRoot && !data.workspaceRoot ? { ...data, workspaceRoot } : data
+  );
+  if (!normalized) return false;
+  const json = JSON.stringify(normalized);
+  const baseDir = join(String(appHomeDir), "mesh", "sessions");
+  const mk = typeof fsDeps?.mkdir === "function" ? fsDeps.mkdir : fsPromises.mkdir;
+  const wr = typeof fsDeps?.writeFile === "function" ? fsDeps.writeFile : fsPromises.writeFile;
+  let wrote = false;
+  if (tabId) {
+    try {
+      const tabsDir = join(baseDir, "tabs");
+      await mk(tabsDir, { recursive: true });
+      await wr(join(tabsDir, `${safeBaselineTabId(tabId)}.json`), json, "utf8");
+      wrote = true;
+    } catch {
+      // non-fatal
+    }
+  }
+  if (workspaceRoot || resumeKey) {
+    try {
+      const resumeDir = join(baseDir, "resume");
+      await mk(resumeDir, { recursive: true });
+      const h = resumeKey ? fnv1aHexStr(resumeKey) : resumeKeyHash(workspaceRoot, branch);
+      await wr(join(resumeDir, `${h}.json`), json, "utf8");
+      wrote = true;
+    } catch {
+      // non-fatal
+    }
+  }
+  return wrote;
+}
+
+function stripAnsiEscapes(text) {
+  return String(text || "")
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
+}
+
+const RESUME_CMD_LINE_RE =
+  /^(?:(?:[^\n]{0,60}?[$%>❯›•]\s+)|Running\s+)?(?:\/resume(?:\s+([a-zA-Z0-9_][a-zA-Z0-9._:/-]*))?|(?:claude|codex|gemini|opencode|antigravity)\s+(?:--)?resume(?:\s+([a-zA-Z0-9_][a-zA-Z0-9._:/-]*))?)\s*$/i;
+
+export function extractResumeKeyFromTranscript(text, workspaceRoot) {
+  const s = stripAnsiEscapes(text);
+  if (!s) return "";
+  const lines = s.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const cmdMatch = line.match(RESUME_CMD_LINE_RE);
+    if (cmdMatch) {
+      const id = (cmdMatch[1] || cmdMatch[2] || "").trim();
+      return id ? `resume:${id}` : `resume:${normBaselineRoot(workspaceRoot || "")}`;
+    }
+  }
+  return "";
+}
+
+export function filterUnbaselinedRepoEntries(entries, sessionStartedAt, opts = {}) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return { sessionFiles: [], backfillDirtyFiles: {} };
+  }
+  const startedAtMs = Number(sessionStartedAt || 0);
+  const hasAnyMtime = entries.some((e) => Number(e?.mtimeMs || 0) > 0);
+  const { isAttributed = false, hasSessionCommits = false } = opts || {};
+
+  if (hasAnyMtime) {
+    const sessionFiles = filterSessionWorkingEntries(entries, null, startedAtMs);
+    const backfillDirtyFiles = {};
+    for (const item of entries) {
+      const rel = item?.relFile ?? item?.path ?? "";
+      if (!rel) continue;
+      const mtimeMs = Number(item?.mtimeMs || 0);
+      if (mtimeMs > 0 && startedAtMs > 0 && mtimeMs < startedAtMs) {
+        backfillDirtyFiles[rel] = { status: String(item.status || ""), sig: String(item.sig || "") };
+      }
+    }
+    return { sessionFiles, backfillDirtyFiles };
+  }
+
+  if (isAttributed || hasSessionCommits) {
+    return {
+      sessionFiles: filterSessionWorkingEntries(entries, null, startedAtMs),
+      backfillDirtyFiles: {},
+    };
+  }
+
+  const backfillDirtyFiles = {};
+  for (const item of entries) {
+    const rel = item?.relFile ?? item?.path ?? "";
+    if (!rel) continue;
+    backfillDirtyFiles[rel] = { status: String(item.status || ""), sig: String(item.sig || "") };
+  }
+  return { sessionFiles: [], backfillDirtyFiles };
 }
