@@ -117,6 +117,7 @@ export function parseBranchesOutput(stdout) {
     const name = (parts[1] || "").trim();
     if (!name) continue;
     const fullName = (parts[2] || "").trim() || name;
+    if (fullName.endsWith("/HEAD")) continue;
     const shortHash = (parts[3] || "").trim();
     const kind = fullName.startsWith("refs/remotes/") ? "remote" : "local";
     branches.push({

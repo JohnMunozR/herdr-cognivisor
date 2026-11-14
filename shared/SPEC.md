@@ -2,29 +2,45 @@
 id: module-shared
 type: module-design
 status: active
-title: Shared Pure Utilities Module (shared/)
+title: Shared Reusable Components & Pure Engines Module (shared/)
 parent: architecture
 references: [submodule-mod-files-search, submodule-mod-changes-review, submodule-mod-git-history]
-covers: [soft-line-wrapping, column-budget-reflow]
-tags: [shared, pure-logic, wrapping, sync]
+covers: [soft-line-wrapping, column-budget-reflow, dropdown-geometry, reusable-gpui-dropdown, markdown-syntax-tokenization]
+tags: [shared, pure-logic, ui-adapters, wrapping, dropdown, markdown, sync]
 ---
 
 ## Responsibility
 
-The `module-shared` directory holds the canonical source of truth for pure JavaScript helpers shared across multiple `herdr-mesh` mods without violating Herdr's per-mod bundling and `herdr-app check` sandboxing rules (which disallow relative `../` imports across `mods/*/` directories).
+The `module-shared` directory holds the canonical source of truth for reusable pure JavaScript engines and shared GPUI UI adapters consumed across multiple `herdr-mesh` mods without violating Herdr's per-mod bundling and `herdr-app check` sandboxing rules (which disallow relative `../` imports across `mods/*/` directories).
+
+Developers and AI agents MUST inspect `shared/` first before creating any new wrapper, dropdown popover, syntax tokenizer, or reusable GPUI widget inside an individual mod, and extend or reuse these canonical components via `scripts/sync-shared.mjs` and `install.sh`.
 
 ## Boundary
 
 - **Owns:**
-  - `shared/code-wrap.js`: Pure dependency-free soft line-wrapping module (`DEFAULT_TAB_SIZE`, `computeWrapColumns`, `codeUnitEndForColumns`, `expandTabsFromColumn`, `expandTabs`, `computeWrapRanges`, `countWrappedLines`, `wrapPlainText`, `wrapStyledSpans`).
-  - Synced intra-mod runtime copies at `mods/files-search/code-wrap.js`, `mods/changes-review/code-wrap.js`, and `mods/git-history/code-wrap.js`, maintained identically via `scripts/sync-shared.mjs` (`npm run sync:shared` / `npm run check:shared`, enforced automatically in `npm test` and synced during `install.sh`).
-- **Allowed deps:** Zero external or host imports (`node`, `gpui-kit`, `gpui-base`, and `herdr` free so it executes identically under both Node tests and QuickJS inside GPUI).
+  - **Zero-Dependency Pure Logic & Engines** (executable identically under Node `--test` and QuickJS inside GPUI):
+    - `shared/code-wrap.js`: Pure soft line-wrapping engine (`DEFAULT_TAB_SIZE`, `computeWrapColumns`, `codeUnitEndForColumns`, `expandTabsFromColumn`, `expandTabs`, `computeWrapRanges`, `countWrappedLines`, `wrapPlainText`, `wrapStyledSpans`) synced to `mods/{files-search,changes-review,git-history}/code-wrap.js`.
+    - `shared/dropdown-logic.js`: Pure popover geometry, scroll-gating, and reopen-guard calculator (`DEFAULT_REOPEN_GUARD_MS`, `clampDropdownNumber`, `computeDropdownMetrics` returning `{ width, contentHeight, bodyHeight, shouldScroll }`, `shouldSuppressDropdownReopen`) synced to `mods/{changes-review,git-history}/dropdown-logic.js`.
+    - `shared/markdown-syntax.js`: Single-pass `O(n)` Markdown syntax tokenizer (`isMarkdownExt`, `createMarkdownState`, `getMarkdownStateTag`, `advanceMarkdownState`, `tokenizeMarkdownLine`) supporting YAML frontmatter (`---` on line 0 through closing `---`), fenced code blocks (` ```lang ` / `~~~lang` with `fallbackCodeTokenizer` delegation and lossless tab restoration), ATX headings (`#`–`######`), horizontal rules, blockquotes, lists and task checkboxes, inline code spans, HTML comments, autolinks, images, links, and escaped punctuation without regex backtracking, synced to `mods/{files-search,changes-review,git-history}/markdown-syntax.js`.
+  - **Shared GPUI UI Adapters** (thin declarative GPUI builders paired with sibling pure `*-logic.js` modules):
+    - `shared/dropdown.js`: Reusable GPUI dropdown trigger (`renderDropdownTrigger`) and adaptive shrink-wrapping overlay popover (`renderDropdownPopover`) importing `computeDropdownMetrics` from `./dropdown-logic.js`, synced to `mods/{changes-review,git-history}/dropdown.js`.
+  - Sync parity enforcement: Maintained identically across consuming `mods/*/` directories via `scripts/sync-shared.mjs` (`SHARED_TARGETS`, `npm run sync:shared` / `npm run check:shared`, executed automatically in `npm test`) and synced during `install.sh`.
+- **Allowed deps:**
+  - **Zero-dependency pure engines (`code-wrap.js`, `dropdown-logic.js`, `markdown-syntax.js`):** Zero external or host imports (`node`, `gpui-kit`, `gpui-base`, and `herdr` free).
+  - **Shared GPUI UI adapters (`dropdown.js`):** `gpui-kit` (`div`, `svg`), `gpui-base` (`v_flex`, `h_flex`), and sibling intra-mod pure logic modules (`./dropdown-logic.js`); zero `localStorage`, DOM APIs, or hardcoded hex colors.
 - **Forbidden:**
   - Directly importing `shared/*.js` across `../` boundaries from inside `mods/*/`.
-  - Allowing any synced mod copy (`mods/*/code-wrap.js`) to drift from canonical `shared/code-wrap.js`.
+  - Importing `gpui-kit`, `gpui-base`, or `herdr` inside zero-dependency pure logic engines (`code-wrap.js`, `dropdown-logic.js`, `markdown-syntax.js`).
+  - Allowing any synced mod copy (`mods/{files-search,changes-review,git-history}/{code-wrap,markdown-syntax,dropdown-logic,dropdown}.js`) to drift from canonical `shared/*.js`.
+  - Duplicating shared wrappers, dropdown popovers, or Markdown/syntax tokenizers inside individual mods instead of registering and reusing them through `shared/`.
 
 ## Invariants
 
-1. **Zero Line-Number Inflation:** Wrapping splits long logical lines into visual continuation sub-rows without emitting extra logical line numbers in any consuming viewer (`files-search`, `changes-review`, `git-history`).
-2. **Lossless Surrogate-Safe Splitting:** `wrapPlainText` and `wrapStyledSpans` never split UTF-16 surrogate pairs, never drop or reorder characters, preserve syntax token spans/colors/attributes across continuation sub-rows, and maintain an exact `O(1)` fast path when line length fits `maxCols`.
-3. **Byte-for-Byte Sync Parity:** `node scripts/sync-shared.mjs --check` and `tests/shared-code-wrap.test.mjs` fail whenever `mods/{files-search,changes-review,git-history}/code-wrap.js` diverge from `shared/code-wrap.js`.
+1. **Zero Line-Number Inflation & Lossless Surrogate-Safe Wrapping (`code-wrap.js`):**
+   Wrapping splits long logical lines into visual continuation sub-rows without emitting extra logical line numbers in any consuming viewer (`files-search`, `changes-review`, `git-history`). `wrapPlainText` and `wrapStyledSpans` never split UTF-16 surrogate pairs, never drop or reorder characters, preserve syntax token spans/colors/attributes across continuation sub-rows, and maintain an `O(1)` fast path when line length fits `maxCols`.
+2. **Adaptive Dropdown Sizing Without Empty Overflow Scrollboxes (`dropdown-logic.js` + `dropdown.js`):**
+   `renderDropdownPopover` computes exact dimensions via `computeDropdownMetrics` so short menus shrink-wrap cleanly to content height and attach `.h(metrics.bodyHeight).overflow_y_scrollbar().track_scroll(...)` ONLY when `metrics.shouldScroll === true`, preventing empty scrollboxes and zero-allocation overhead when menus are closed (`.when(isOpen, ...)`).
+3. **Single-Pass O(n) Backtracking-Free Markdown Tokenization (`markdown-syntax.js`):**
+   `tokenizeMarkdownLine` and `advanceMarkdownState` scan linearly in `O(n)` time without catastrophic backtracking regexes, preserve exact character concatenation losslessly across all tokens, and keep prose calm while accurately tracking multi-line YAML frontmatter and fenced code block state across virtualized windows and diff hunks.
+4. **Byte-for-Byte Sync Parity (`scripts/sync-shared.mjs` & `install.sh`):**
+   `node scripts/sync-shared.mjs --check`, `tests/shared-code-wrap.test.mjs`, `tests/shared-dropdown.test.mjs`, and `tests/shared-markdown-syntax.test.mjs` fail whenever any target copy in `mods/*/` diverges from canonical `shared/*.js`, and `install.sh` copies each applicable `shared/*.js` file into `$HERDR_APP_HOME/mods/$mod/`.

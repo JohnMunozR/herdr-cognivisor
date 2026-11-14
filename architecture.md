@@ -4,7 +4,7 @@ type: architecture-design
 status: active
 title: Herdr Mesh — Top-level Architecture
 parent: goal-and-requirements
-references: [module-layouts, module-mods, spec-lifecycle]
+references: [module-layouts, module-mods, module-shared, spec-lifecycle]
 covers: [layout-topology, mod-lifecycle, shared-state-bus, multi-repo-discovery, lock-free-git, session-scoped-repo-attribution, zero-localstorage]
 tags: [architecture, herdr, gpui-kit, layout, mods]
 ---
@@ -49,7 +49,7 @@ The root UI topology is defined by `layouts/mesh.json` (`[[module-layouts]]`), p
 - **`#main`:** Primary terminal workspace hosting feature agents (`claude`, `gemini`, `codex`, `opencode`, `pi`, `antigravity`) and reusable single-tab `role: "viewer"` tabs (`files-search`, `changes-review`, `git-history`).
 - **`#panel` / `#panel-body`:** Collapsible mutually exclusive stack hosting:
   - `#files` (`[[submodule-mod-files-search]]`): Session-scoped multi-repo file tree with git status decorators and Search Everywhere overlay (`files-search-win`).
-  - `#changes` (`[[submodule-mod-changes-review]]`): Per-service branches, diffs, inline review notes, and `reviewedServices` checklist (`Approve Service ✓`).
+  - `#changes` (`[[submodule-mod-changes-review]]`): Per-service branches, diffs, inline review notes, per-file `Approve` / `Approved ✓` review tracking with automatic fingerprint/commit invalidation, and organic service pill status (`pending | has_notes | approved`).
   - `#git` (`[[submodule-mod-git-history]]`): All-repo (clean + dirty) commit graph, branch/text filters, and modified files driving a reusable `#main` Before/After comparison tab.
 - **`#status` (`28px`, `mesh-status`):** Bottom telemetry bar displaying active host, service/dirty counts, active branch, agent summary, and palette shortcut.
 
@@ -62,13 +62,13 @@ herdr-mesh/
 ├── package.json           <- Zero-dependency test runner entrypoint (`npm test`)
 ├── tests/                 <- Native `node --test` unit/regression suites (`*.test.mjs` + `helpers/herdr-mock.mjs`)
 ├── layouts/               <- [[module-layouts]]: Layout recipe (layouts/mesh.json) & SPEC.md
-├── shared/                <- [[module-shared]]: Canonical pure helpers (`code-wrap.js`) & `scripts/sync-shared.mjs`
+├── shared/                <- [[module-shared]]: Canonical pure engines (`code-wrap.js`, `dropdown-logic.js`, `markdown-syntax.js`), UI adapters (`dropdown.js`), & `scripts/sync-shared.mjs`
 ├── openspec/specs/        <- [[spec-lifecycle]]: Agent Workspace domain specification
 └── mods/                  <- [[module-mods]]: Independent GPUI-kit mod extensions
     ├── SPEC.md
-    ├── files-search/      <- [[submodule-mod-files-search]]: Search Everywhere, indexer engine (`indexer.js`, `search-logic.js`, `code-wrap.js`)
-    ├── changes-review/    <- [[submodule-mod-changes-review]]: Per-service diff review & checklist (`review-logic.js`, `code-wrap.js`)
-    ├── git-history/       <- [[submodule-mod-git-history]]: Topological commit graph & Before/After diff viewer (`graph-logic.js`, `diff-logic.js`, `repo-logic.js`, `code-wrap.js`)
+    ├── files-search/      <- [[submodule-mod-files-search]]: Search Everywhere, indexer engine (`indexer.js`, `search-logic.js`, `tree-logic.js`, `session-baseline.js`, `code-wrap.js`, `markdown-syntax.js`)
+    ├── changes-review/    <- [[submodule-mod-changes-review]]: Per-service diff review & file approval (`review-logic.js`, `code-wrap.js`, `markdown-syntax.js`, `dropdown-logic.js`, `dropdown.js`)
+    ├── git-history/       <- [[submodule-mod-git-history]]: Topological commit graph & Before/After diff viewer (`graph-logic.js`, `diff-logic.js`, `repo-logic.js`, `code-wrap.js`, `markdown-syntax.js`, `dropdown-logic.js`, `dropdown.js`)
     ├── mesh-tabs/         <- [[submodule-mod-mesh-tabs]]: Tab strip, auto-naming, `mesh.spacePanels` (`tab-logic.js`)
     └── mesh-status/       <- [[submodule-mod-mesh-status]]: Telemetry status bar
 ```
@@ -92,8 +92,9 @@ herdr-mesh/
    - Prevents path collisions across microservices for file selection, hunk expansion (`git diff -U99999`), and inline review comments.
 5. **Tab-Scoped Lead Agent & Review Dispatch (`findActiveAgent`):**
    - Resolves target agent with `mesh.flows[tabId].leadTerminal` first, then focused agent, tab primary agent, and global `agents()[0]` fallback.
-6. **Microservice Checklist & Batch Commits:**
-   - Tracks per-service review status (`pending | has_notes | approved`) in `mesh.flows[tabId].reviewedServices`; `Approve Service ✓` marks reviewed and advances to the next unreviewed dirty microservice.
+6. **Per-File Review Tracking, Automatic Invalidation & Organic Service Status:**
+   - Tracks per-file review records (`{ reviewed: true, fp, reviewedAt }`) in `mesh.flows[tabId].reviewedFiles` using `computeFileReviewFingerprint` (`buildFileDescriptor` preserving `sig`/`mtimeMs`), automatically invalidating stale checks via `reconcileReviewedFiles` when working files change or leave the tree, when `headHash` transitions, or when newer commits touch reviewed files.
+   - Service pill status (`pending | has_notes | approved`) is derived organically from `mesh.reviewNotes` (`"has_notes"`) and `reviewedFiles` (`"approved"` only when dirty working files exist and all of them are reviewed), while the Review tab's non-checkbox `Approve` / `Approved ✓` button advances to the next unreviewed file.
 
 ---
 
@@ -105,7 +106,7 @@ Communication between mods occurs exclusively over Herdr's persisted reactive bu
 |---|---|---|---|---|
 | `mesh.services` | `files-search`, `changes-review` | `files-search`, `changes-review`, `git-history`, `mesh-status` | `{ tabId, workspaceRoot, on, services, candidates, sig, ts }` | Session-attributed touched repositories and candidate cache metadata. |
 | `mesh.activeService` | `changes-review`, `files-search`, `git-history` | `changes-review`, `files-search`, `git-history` | `{ workspaceRoot, serviceId, ts }` | Synchronized active service filter (`"all"` or specific `serviceId`; `git-history` updates only for repos present in `mesh.services`). |
-| `mesh.flows` | `mesh-tabs`, `changes-review` | `mesh-tabs`, `changes-review`, `files-search` | `Record<tabId, { tabId?, ticket?, derivedTitle?, autoNamed?, manualTitle?, leadTerminal?, reviewedServices?, sessionRepos?, updatedAt }>` | Tab-scoped metadata: naming state, `leadTerminal`, per-service checklist, and attributed session repos. |
+| `mesh.flows` | `mesh-tabs`, `changes-review` | `mesh-tabs`, `changes-review`, `files-search` | `Record<tabId, { tabId?, ticket?, derivedTitle?, autoNamed?, manualTitle?, leadTerminal?, reviewedFiles?, sessionRepos?, sessionBaseline?, updatedAt }>` | Tab-scoped metadata: naming state, `leadTerminal`, per-file review checklist (`reviewedFiles`), session baseline, and attributed session repos. |
 | `mesh.spacePanels` | `mesh-tabs` | `mesh-tabs` | `Record<spaceId, "files" \| "changes" \| "git" \| null>` | Persisted active `#panel-body` selection per space (replaces `localStorage`). |
 | `mesh.spaceAgentTabs` | `files-search`, `changes-review`, `git-history` | `files-search`, `changes-review`, `git-history` | `Record<spaceId, tabId>` | Preserves each space's active terminal-bearing tab ID while non-terminal `role: "viewer"` tabs are focused. |
 | `files-search.select` | `files-search` | `files-search` | `{ root: string, path: string, line: number\|null, ts: number }` | Triggers tree expansion and file preview jump from Search Everywhere. |
@@ -135,3 +136,7 @@ All bus keys outside mod-private namespaces MUST carry the `mesh.*` prefix.
    Every structural change to directories, layouts, interfaces, or bus keys MUST be reflected in the owning `SPEC.md` and `openspec/specs/` before or alongside code changes.
 6. **Pure Logic Decoupling & Mandatory Unit Tests:**
    Testable business logic (indexing, watch filtering, query scoring, Git/diff parsing, tab naming) MUST reside in zero-UI intra-mod helper modules (`indexer.js`, `*-logic.js`) covered by native `node --test` suites under `tests/*.test.mjs` (`npm test`) whenever developed or fixed.
+7. **Shared Reusable Components & `shared/` Registry (`[[module-shared]]`):**
+   Developers and AI agents MUST inspect `shared/` first and extend/reuse canonical shared engines (`code-wrap.js`, `dropdown-logic.js`, `markdown-syntax.js`) and GPUI UI adapters (`dropdown.js`) registered in `scripts/sync-shared.mjs` and `install.sh` rather than duplicating widgets, wrappers, dropdowns, or syntax tokenizers inside individual mods.
+8. **Performance & Rendering Optimization Invariant:**
+   Scrollable lists and diff panes MUST use `v_virtual_list` + `VirtualListScrollHandle` with precomputed/memoized row heights; closed overlays, dropdown menus, and hidden panels MUST produce zero per-frame UI allocations; floating popovers MUST size adaptively via `computeDropdownMetrics` without empty overflow scrollboxes; scanners and syntax tokenizers MUST run single-pass `O(n)` without catastrophic backtracking regexes; caches MUST be bounded (`WeakMap` or capped LRU maps); resize reflows MUST coalesce through `16ms` timers (`timer.after(16, ...)`); and background Git refreshes MUST combine lock-free flags with `git show-ref --head` signature skipping.

@@ -15,6 +15,28 @@ const SHARED_TARGETS = [
       "mods/git-history/code-wrap.js",
     ],
   },
+  {
+    source: "shared/markdown-syntax.js",
+    targets: [
+      "mods/files-search/markdown-syntax.js",
+      "mods/changes-review/markdown-syntax.js",
+      "mods/git-history/markdown-syntax.js",
+    ],
+  },
+  {
+    source: "shared/dropdown-logic.js",
+    targets: [
+      "mods/changes-review/dropdown-logic.js",
+      "mods/git-history/dropdown-logic.js",
+    ],
+  },
+  {
+    source: "shared/dropdown.js",
+    targets: [
+      "mods/changes-review/dropdown.js",
+      "mods/git-history/dropdown.js",
+    ],
+  },
 ];
 
 const checkOnly = process.argv.includes("--check");

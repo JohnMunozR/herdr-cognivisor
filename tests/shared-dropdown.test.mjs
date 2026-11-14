@@ -1,0 +1,183 @@
+import { test, describe } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  DEFAULT_REOPEN_GUARD_MS,
+  clampDropdownNumber,
+  computeDropdownMetrics,
+  shouldSuppressDropdownReopen,
+} from "../shared/dropdown-logic.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = resolve(__dirname, "..");
+
+describe("shared dropdown engine & git-history sync parity", () => {
+  test("mods/git-history/dropdown-logic.js and dropdown.js stay byte-identical to shared/", () => {
+    for (const file of ["dropdown-logic.js", "dropdown.js"]) {
+      const canonical = readFileSync(resolve(ROOT, "shared", file), "utf8");
+      const modCopy = readFileSync(resolve(ROOT, "mods/git-history", file), "utf8");
+      assert.equal(modCopy, canonical, `mods/git-history/${file} must match shared/${file} verbatim`);
+    }
+  });
+
+  test("clampDropdownNumber clamps numbers cleanly and handles non-finite or reversed bounds", () => {
+    assert.equal(clampDropdownNumber(200, 170, 340), 200);
+    assert.equal(clampDropdownNumber(100, 170, 340), 170);
+    assert.equal(clampDropdownNumber(500, 170, 340), 340);
+    assert.equal(clampDropdownNumber(Number.NaN, 170, 340), 170);
+    assert.equal(clampDropdownNumber(undefined, 170, 340), 170);
+    assert.equal(clampDropdownNumber(220, 200, 150), 200);
+  });
+
+  test("computeDropdownMetrics shrink-wraps empty and single-item lists without enabling scroll", () => {
+    const emptyMetrics = computeDropdownMetrics({
+      items: [],
+      panelWidth: 420,
+      minWidth: 180,
+      maxWidth: 340,
+      maxHeight: 320,
+    });
+    assert.deepEqual(emptyMetrics, {
+      width: 180,
+      contentHeight: 41,
+      bodyHeight: 41,
+      shouldScroll: false,
+    });
+
+    const singleItem = computeDropdownMetrics({
+      items: [{ type: "option", label: "All Branches", rightText: "--all" }],
+      panelWidth: 420,
+      minWidth: 180,
+      maxWidth: 340,
+      maxHeight: 320,
+    });
+    assert.equal(singleItem.shouldScroll, false);
+    assert.equal(singleItem.contentHeight, 41);
+    assert.equal(singleItem.bodyHeight, 41);
+    assert.equal(singleItem.width, 180);
+
+    const twoItems = computeDropdownMetrics({
+      items: [
+        { type: "option", label: "All Branches", rightText: "--all" },
+        { type: "divider" },
+        { type: "section", label: "Local branches" },
+        { type: "option", label: "main", dotColor: "#61afef", rightText: "885a77d" },
+      ],
+      panelWidth: 420,
+      minWidth: 180,
+      maxWidth: 340,
+      maxHeight: 320,
+    });
+    // rows: 31 + 9 + 26 + 31 = 97; gaps: 3 * 1 = 3; padding: 5 * 2 = 10 => 110
+    assert.equal(twoItems.contentHeight, 110);
+    assert.equal(twoItems.bodyHeight, 110);
+    assert.equal(twoItems.shouldScroll, false);
+    assert.ok(twoItems.width >= 180 && twoItems.width <= 240);
+  });
+
+  test("computeDropdownMetrics sizes moderate lists with subline, badge, and meta cleanly", () => {
+    const items = [
+      {
+        type: "option",
+        label: "auth-service",
+        subline: "feature/oauth2-pkce-refresh",
+        sublineBadge: "ahead",
+        badge: "12",
+        dotColor: "#ffaa00",
+        height: 42,
+      },
+      {
+        type: "option",
+        label: "api-gateway",
+        meta: "(clean)",
+        subline: "main",
+        dotColor: "#00cc66",
+        height: 42,
+      },
+      { type: "empty", label: "No other services" },
+    ];
+    const metrics = computeDropdownMetrics({
+      items,
+      panelWidth: 420,
+      minWidth: 180,
+      maxWidth: 340,
+      maxHeight: 320,
+    });
+    // rows: 42 + 42 + 31 = 115; gaps: 2 * 1 = 2; padding: 5 * 2 = 10 => 127
+    assert.equal(metrics.contentHeight, 127);
+    assert.equal(metrics.bodyHeight, 127);
+    assert.equal(metrics.shouldScroll, false);
+    assert.ok(metrics.width > 180 && metrics.width <= 340, `expected dynamic width in (180, 340], got ${metrics.width}`);
+  });
+
+  test("computeDropdownMetrics activates scroll and caps bodyHeight at maxHeight for long lists", () => {
+    const items = [
+      { type: "option", label: "All Branches", rightText: "--all" },
+      { type: "divider" },
+      { type: "section", label: "Local branches" },
+    ];
+    for (let i = 0; i < 20; i += 1) {
+      items.push({
+        type: "option",
+        label: `feature/branch-item-${i}`,
+        rightText: "885a77d",
+      });
+    }
+    const metrics = computeDropdownMetrics({
+      items,
+      panelWidth: 420,
+      minWidth: 180,
+      maxWidth: 340,
+      maxHeight: 320,
+    });
+    // rows: 31 + 9 + 26 + 20 * 31 = 686; gaps: 22 * 1 = 22; padding: 10 => 718
+    assert.equal(metrics.contentHeight, 718);
+    assert.equal(metrics.shouldScroll, true);
+    assert.equal(metrics.bodyHeight, 320);
+    assert.ok(metrics.width >= 180 && metrics.width <= 340);
+  });
+
+  test("computeDropdownMetrics clamps width safely on narrow panels", () => {
+    const longBranchItems = [
+      {
+        type: "option",
+        label: "origin/feature/very-long-cross-service-branch-name-that-exceeds-panel",
+        rightText: "885a77d",
+        height: 26,
+      },
+    ];
+
+    const narrow = computeDropdownMetrics({
+      items: longBranchItems,
+      panelWidth: 240,
+      minWidth: 170,
+      maxWidth: 340,
+      marginX: 20,
+    });
+    assert.equal(narrow.width, 220);
+    assert.equal(narrow.shouldScroll, false);
+
+    const ultraNarrow = computeDropdownMetrics({
+      items: longBranchItems,
+      panelWidth: 150,
+      minWidth: 170,
+      maxWidth: 340,
+      marginX: 20,
+    });
+    assert.equal(ultraNarrow.width, 170);
+  });
+
+  test("shouldSuppressDropdownReopen prevents same-click backdrop dismiss + trigger reopen races", () => {
+    const t0 = 1700000000000;
+    assert.equal(shouldSuppressDropdownReopen(t0, t0), true);
+    assert.equal(shouldSuppressDropdownReopen(t0, t0 + 12), true);
+    assert.equal(shouldSuppressDropdownReopen(t0, t0 + DEFAULT_REOPEN_GUARD_MS - 1), true);
+    assert.equal(shouldSuppressDropdownReopen(t0, t0 + DEFAULT_REOPEN_GUARD_MS), false);
+    assert.equal(shouldSuppressDropdownReopen(t0, t0 + 250), false);
+    assert.equal(shouldSuppressDropdownReopen(undefined, t0), false);
+    assert.equal(shouldSuppressDropdownReopen(0, t0), false);
+    assert.equal(shouldSuppressDropdownReopen(t0, t0 - 5), false);
+  });
+});

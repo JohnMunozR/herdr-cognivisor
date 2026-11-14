@@ -74,6 +74,7 @@ import {
   shouldIgnoreGitWatchEvent,
   resolveSessionAgentTabId,
 } from "./repo-logic.js";
+import { renderDropdownTrigger, renderDropdownPopover } from "./dropdown.js";
 
 const ROW_HEIGHT = 30;
 const FILE_ROW_HEIGHT = 26;
@@ -89,7 +90,7 @@ const MAX_VIEWER_PATCH_CACHE = 24;
 const GIT_EXEC_TIMEOUT_MS = 15000;
 const EXPANDED_VIEWER_DIFF_LINES = 4000;
 const GIT_LOG_FORMAT = "%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s%x1e";
-const GIT_BRANCH_FORMAT = "%(HEAD)%x1f%(refname:short)%x1f%(refname)%x1f%(objectname:short)";
+const GIT_BRANCH_FORMAT = "%(HEAD)%09%(refname:short)%09%(refname)%09%(objectname:short)";
 
 const viewerHostsById = new Map();
 let nextViewerHostId = 1;
@@ -675,6 +676,8 @@ export default class GitHistory extends View {
     this._cachedFilterState = null;
     this._cachedRowMapState = null;
     this._cachedBranchState = null;
+    this._cachedRepoMenu = null;
+    this._cachedBranchMenu = null;
 
     // Viewer state
     this.diffMode = "side-by-side"; // "side-by-side" | "unified"
@@ -3490,6 +3493,119 @@ export default class GitHistory extends View {
       );
   }
 
+  getRepoMenuItems(t) {
+    const selectedRoot = normPathStr(this.selectedRepo?.root);
+    const themeSig = cachedThemeBundleSig;
+    if (
+      this._cachedRepoMenu &&
+      this._cachedRepoMenu.repos === this.repos &&
+      this._cachedRepoMenu.selectedRoot === selectedRoot &&
+      this._cachedRepoMenu.themeSig === themeSig
+    ) {
+      return this._cachedRepoMenu.items;
+    }
+
+    const items =
+      this.repos.length === 0
+        ? [{ type: "empty", id: "git-repo-empty", label: "No repositories found" }]
+        : this.repos.map((r) => ({
+            type: "option",
+            id: `git-repo-opt-${r.id || r.root}`,
+            label: r.name,
+            fontMedium: normPathStr(r.root) === selectedRoot,
+            subline: r.branch || undefined,
+            height: r.branch ? 42 : 31,
+            selected: normPathStr(r.root) === selectedRoot,
+            dotColor: r.isDirty ? (t.working || t.accent || t.foreground) : (t.done || t.ansi2 || t.muted),
+            badge: (r.dirtyCount || 0) > 0 ? String(r.dirtyCount) : undefined,
+            onSelect: (_e, cx) => this.selectRepo(r, cx),
+          }));
+
+    this._cachedRepoMenu = { repos: this.repos, selectedRoot, themeSig, items };
+    return items;
+  }
+
+  getBranchMenuItems(t) {
+    const themeSig = cachedThemeBundleSig;
+    if (
+      this._cachedBranchMenu &&
+      this._cachedBranchMenu.branches === this.branches &&
+      this._cachedBranchMenu.selectedBranch === this.selectedBranch &&
+      this._cachedBranchMenu.themeSig === themeSig
+    ) {
+      return this._cachedBranchMenu.items;
+    }
+
+    if (!this._cachedBranchState || this._cachedBranchState.branches !== this.branches) {
+      const localBranches = [];
+      const remoteBranches = [];
+      for (const b of this.branches || []) {
+        if (b.kind === "local") localBranches.push(b);
+        else if (b.kind === "remote") remoteBranches.push(b);
+      }
+      this._cachedBranchState = { branches: this.branches, localBranches, remoteBranches };
+    }
+    const { localBranches, remoteBranches } = this._cachedBranchState;
+
+    const items = [
+      {
+        type: "option",
+        id: "git-branch-opt-all",
+        label: "All Branches",
+        fontMedium: this.selectedBranch === "__all__",
+        rightText: "--all",
+        rightMono: false,
+        selected: this.selectedBranch === "__all__",
+        onSelect: (_e, cx) => this.selectBranch("__all__", cx),
+      },
+    ];
+
+    if (localBranches.length > 0) {
+      items.push({ type: "divider", id: "git-branch-div-local" });
+      items.push({ type: "section", id: "git-branch-sec-local", label: "Local branches" });
+      for (const br of localBranches) {
+        items.push({
+          type: "option",
+          id: `git-branch-local-${br.name}`,
+          dotColor: br.isCurrent ? (t.accent || t.foreground) : undefined,
+          label: br.name,
+          labelColor: br.isCurrent ? (t.accent || t.foreground) : t.foreground,
+          fontMedium: this.selectedBranch === br.name,
+          rightText: br.shortHash,
+          rightMono: true,
+          selected: this.selectedBranch === br.name,
+          onSelect: (_e, cx) => this.selectBranch(br.name, cx),
+        });
+      }
+    }
+
+    if (remoteBranches.length > 0) {
+      items.push({ type: "divider", id: "git-branch-div-remote" });
+      items.push({ type: "section", id: "git-branch-sec-remote", label: "Remote branches" });
+      for (const br of remoteBranches) {
+        items.push({
+          type: "option",
+          id: `git-branch-remote-${br.name}`,
+          label: br.name,
+          labelColor: t.muted,
+          fontMedium: this.selectedBranch === br.name,
+          rightText: br.shortHash,
+          rightMono: true,
+          selected: this.selectedBranch === br.name,
+          onSelect: (_e, cx) => this.selectBranch(br.name, cx),
+        });
+      }
+    }
+
+    this._cachedBranchMenu = {
+      branches: this.branches,
+      selectedBranch: this.selectedBranch,
+      themeSig,
+      items,
+    };
+    return items;
+  }
+
   renderPanel(cx) {
     const visible = isGitPanelVisible();
     const bus = shared("mesh.services");
@@ -3578,16 +3694,6 @@ export default class GitHistory extends View {
 
     const activeRepo = this.selectedRepo;
     const branchDisplay = this.selectedBranch === "__all__" ? "All Branches" : this.selectedBranch;
-    if (!this._cachedBranchState || this._cachedBranchState.branches !== this.branches) {
-      const localBranches = [];
-      const remoteBranches = [];
-      for (const b of this.branches || []) {
-        if (b.kind === "local") localBranches.push(b);
-        else if (b.kind === "remote") remoteBranches.push(b);
-      }
-      this._cachedBranchState = { branches: this.branches, localBranches, remoteBranches };
-    }
-    const { localBranches, remoteBranches } = this._cachedBranchState;
 
     return v_flex()
       .id("git-history")
@@ -3608,7 +3714,7 @@ export default class GitHistory extends View {
         if (w > 0 && Math.abs(w - prevW) > 12) {
           const compactChanged = (prevW < 380) !== (w < 380);
           this.panelWidth = w;
-          if (compactChanged) {
+          if (compactChanged || this.showRepoMenu || this.showBranchMenu) {
             cx.notify();
           }
         }
@@ -3643,70 +3749,39 @@ export default class GitHistory extends View {
               .items_center()
               .child(svg("mods/git-history/icons/git-branch.svg").size(13).flex_none().text_color(t.muted))
               .child(
-                h_flex()
-                  .id("git-repo-btn")
-                  .h(24)
-                  .px(7)
-                  .gap(5)
-                  .min_w(0)
-                  .max_w(160)
-                  .items_center()
-                  .rounded(5)
-                  .border_1()
-                  .border_color(this.showRepoMenu ? (t.accent || t.border) : t.border)
-                  .bg(this.showRepoMenu ? t.selected : t.background)
-                  .cursor_pointer()
-                  .hover((s) => s.bg(t.hover))
-                  .on_click((_e, cx) => {
+                renderDropdownTrigger({
+                  id: "git-repo-btn",
+                  isOpen: this.showRepoMenu,
+                  label: activeRepo ? activeRepo.name : "No repo",
+                  labelColor: t.foreground,
+                  fontMedium: true,
+                  dotColor: activeRepo?.isDirty ? (t.working || t.accent || t.foreground) : undefined,
+                  chevronIcon: "mods/git-history/icons/chevron-down.svg",
+                  maxW: 160,
+                  t,
+                  onClick: (_e, cx) => {
                     this.showRepoMenu = !this.showRepoMenu;
                     this.showBranchMenu = false;
                     cx.notify();
-                  })
-                  .child(
-                    div()
-                      .flex_1()
-                      .min_w(0)
-                      .truncate()
-                      .text_size(11)
-                      .font_medium()
-                      .text_color(t.foreground)
-                      .child(activeRepo ? activeRepo.name : "No repo")
-                  )
-                  .when(Boolean(activeRepo?.isDirty), (b) =>
-                    b.child(div().w(6).h(6).rounded_full().flex_none().bg(t.working || t.accent || t.foreground))
-                  )
-                  .child(svg("mods/git-history/icons/chevron-down.svg").size(9).flex_none().text_color(t.dim))
+                  },
+                })
               )
               .child(
-                h_flex()
-                  .id("git-branch-btn")
-                  .h(24)
-                  .px(7)
-                  .gap(5)
-                  .min_w(0)
-                  .max_w(140)
-                  .items_center()
-                  .rounded(5)
-                  .border_1()
-                  .border_color(this.showBranchMenu ? (t.accent || t.border) : t.border)
-                  .bg(this.showBranchMenu ? t.selected : t.background)
-                  .cursor_pointer()
-                  .hover((s) => s.bg(t.hover))
-                  .on_click((_e, cx) => {
+                renderDropdownTrigger({
+                  id: "git-branch-btn",
+                  isOpen: this.showBranchMenu,
+                  label: branchDisplay,
+                  labelColor: this.selectedBranch === "__all__" ? t.muted : t.foreground,
+                  fontMedium: false,
+                  chevronIcon: "mods/git-history/icons/chevron-down.svg",
+                  maxW: 140,
+                  t,
+                  onClick: (_e, cx) => {
                     this.showBranchMenu = !this.showBranchMenu;
                     this.showRepoMenu = false;
                     cx.notify();
-                  })
-                  .child(
-                    div()
-                      .flex_1()
-                      .min_w(0)
-                      .truncate()
-                      .text_size(11)
-                      .text_color(this.selectedBranch === "__all__" ? t.muted : t.foreground)
-                      .child(branchDisplay)
-                  )
-                  .child(svg("mods/git-history/icons/chevron-down.svg").size(9).flex_none().text_color(t.dim))
+                  },
+                })
               )
           )
           .child(
@@ -4034,178 +4109,56 @@ export default class GitHistory extends View {
           )
       )
       // Floating dropdowns
-      .when(this.showRepoMenu || this.showBranchMenu, (el) =>
+      .when(this.showRepoMenu, (el) =>
         el.child(
-          div()
-            .id("git-dropdown-overlay")
-            .absolute()
-            .inset_0()
-            .on_mouse_down("left", (_e, cx) => {
+          renderDropdownPopover({
+            overlayId: "git-dropdown-overlay",
+            menuId: "git-repo-dropdown",
+            triggerId: "git-repo-btn",
+            top: 38,
+            left: 10,
+            anchor: "left",
+            minWidth: 190,
+            maxWidth: 320,
+            maxHeight: 320,
+            panelWidth: this.panelWidth || 420,
+            marginX: 20,
+            items: this.getRepoMenuItems(t),
+            scrollHandle: this.repoDropdownScroll,
+            monoFont: mono,
+            t,
+            onClose: (_e, cx) => {
               this.showRepoMenu = false;
               this.showBranchMenu = false;
               cx.notify();
-            })
-            .when(this.showRepoMenu, (ov) =>
-              ov.child(
-                v_flex()
-                  .id("git-repo-dropdown")
-                  .absolute()
-                  .top(38)
-                  .left(10)
-                  .w(280)
-                  .max_h(300)
-                  .rounded(8)
-                  .bg(t.raised)
-                  .border_1()
-                  .border_color(t.border)
-                  .shadow_xl()
-                  .p(4)
-                  .gap(2)
-                  .overflow_y_scrollbar()
-                  .track_scroll(this.repoDropdownScroll)
-                  .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-                  .children(
-                    this.repos.map((r) => {
-                      const isCur = normPathStr(r.root) === normPathStr(activeRepo?.root);
-                      return h_flex()
-                        .id(`git-repo-opt-${r.id || r.root}`)
-                        .min_h(30)
-                        .px(8)
-                        .py(4)
-                        .gap(6)
-                        .items_center()
-                        .rounded(5)
-                        .cursor_pointer()
-                        .when(isCur, (s) => s.bg(t.selected))
-                        .hover((s) => s.bg(t.hover))
-                        .on_click((_e, cx) => this.selectRepo(r, cx))
-                        .child(
-                          div()
-                            .w(6)
-                            .h(6)
-                            .rounded_full()
-                            .flex_none()
-                            .bg(r.isDirty ? (t.working || t.accent || t.foreground) : (t.done || t.ansi2 || t.muted))
-                        )
-                        .child(
-                          v_flex()
-                            .flex_1()
-                            .min_w(0)
-                            .gap(1)
-                            .child(div().truncate().text_size(11.5).font_medium().text_color(t.foreground).child(r.name))
-                            .when(Boolean(r.branch), (b) =>
-                              b.child(div().truncate().text_size(9.5).text_color(t.dim).child(r.branch))
-                            )
-                        )
-                        .when((r.dirtyCount || 0) > 0, (b) =>
-                          b.child(
-                            div()
-                              .flex_none()
-                              .px(5)
-                              .py(0.5)
-                              .rounded(3)
-                              .bg(t.background)
-                              .text_size(9.5)
-                              .text_color(t.muted)
-                              .child(String(r.dirtyCount))
-                          )
-                        );
-                    })
-                  )
-              )
-            )
-            .when(this.showBranchMenu, (ov) =>
-              ov.child(
-                v_flex()
-                  .id("git-branch-dropdown")
-                  .absolute()
-                  .top(38)
-                  .left(90)
-                  .right(10)
-                  .max_w(300)
-                  .max_h(320)
-                  .rounded(8)
-                  .bg(t.raised)
-                  .border_1()
-                  .border_color(t.border)
-                  .shadow_xl()
-                  .p(4)
-                  .gap(2)
-                  .overflow_y_scrollbar()
-                  .track_scroll(this.branchDropdownScroll)
-                  .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-                  .child(
-                    h_flex()
-                      .id("git-branch-opt-all")
-                      .min_h(28)
-                      .px(8)
-                      .gap(6)
-                      .items_center()
-                      .rounded(5)
-                      .cursor_pointer()
-                      .when(this.selectedBranch === "__all__", (s) => s.bg(t.selected))
-                      .hover((s) => s.bg(t.hover))
-                      .on_click((_e, cx) => this.selectBranch("__all__", cx))
-                      .child(div().text_size(11.5).font_medium().text_color(t.foreground).child("All Branches"))
-                      .child(div().flex_1())
-                      .child(div().text_size(9.5).text_color(t.dim).child("--all"))
-                  )
-                  .when(localBranches.length > 0, (b) =>
-                    b
-                      .child(div().h(1).w_full().bg(t.border).my(2).flex_none())
-                      .child(div().px(8).py(2).text_size(9.5).font_semibold().text_color(t.dim).child("LOCAL"))
-                      .children(
-                        localBranches.map((br) => {
-                          const isCur = this.selectedBranch === br.name;
-                          return h_flex()
-                            .id(`git-branch-local-${br.name}`)
-                            .min_h(26)
-                            .px(8)
-                            .gap(6)
-                            .items_center()
-                            .rounded(5)
-                            .cursor_pointer()
-                            .when(isCur, (s) => s.bg(t.selected))
-                            .hover((s) => s.bg(t.hover))
-                            .on_click((_e, cx) => this.selectBranch(br.name, cx))
-                            .child(
-                              div()
-                                .flex_1()
-                                .min_w(0)
-                                .truncate()
-                                .text_size(11.5)
-                                .text_color(br.isCurrent ? (t.accent || t.foreground) : t.foreground)
-                                .child(br.isCurrent ? `● ${br.name}` : br.name)
-                            )
-                            .child(div().flex_none().font_family(mono).text_size(9.5).text_color(t.dim).child(br.shortHash));
-                        })
-                      )
-                  )
-                  .when(remoteBranches.length > 0, (b) =>
-                    b
-                      .child(div().h(1).w_full().bg(t.border).my(2).flex_none())
-                      .child(div().px(8).py(2).text_size(9.5).font_semibold().text_color(t.dim).child("REMOTE"))
-                      .children(
-                        remoteBranches.map((br) => {
-                          const isCur = this.selectedBranch === br.name;
-                          return h_flex()
-                            .id(`git-branch-remote-${br.name}`)
-                            .min_h(26)
-                            .px(8)
-                            .gap(6)
-                            .items_center()
-                            .rounded(5)
-                            .cursor_pointer()
-                            .when(isCur, (s) => s.bg(t.selected))
-                            .hover((s) => s.bg(t.hover))
-                            .on_click((_e, cx) => this.selectBranch(br.name, cx))
-                            .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(br.name))
-                            .child(div().flex_none().font_family(mono).text_size(9.5).text_color(t.dim).child(br.shortHash));
-                        })
-                      )
-                  )
-              )
-            )
+            },
+          })
+        )
+      )
+      .when(this.showBranchMenu, (el) =>
+        el.child(
+          renderDropdownPopover({
+            overlayId: "git-dropdown-overlay",
+            menuId: "git-branch-dropdown",
+            triggerId: "git-branch-btn",
+            top: 38,
+            right: 10,
+            anchor: "right",
+            minWidth: 180,
+            maxWidth: 340,
+            maxHeight: 320,
+            panelWidth: this.panelWidth || 420,
+            marginX: 20,
+            items: this.getBranchMenuItems(t),
+            scrollHandle: this.branchDropdownScroll,
+            monoFont: mono,
+            t,
+            onClose: (_e, cx) => {
+              this.showRepoMenu = false;
+              this.showBranchMenu = false;
+              cx.notify();
+            },
+          })
         )
       );
   }

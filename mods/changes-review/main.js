@@ -12,7 +12,6 @@ import {
   diffRows,
   diffSyntaxTokenColor,
   resolveDiffFileIcon,
-  expandCodeTabs,
   computeDiffContentWidth,
   normPathStr,
   normCmpStr,
@@ -20,18 +19,14 @@ import {
   isSupportedDirentList,
   direntIsDir,
   hasRelevantWatchChange,
-  parsePorcelainHeader,
   getParentDir,
   formatReviewTabTitle,
   getSessionNotesKey,
   resolveSessionAgentTabId,
   pickNextUnreviewedFile,
-  pickNextDirtyService,
   sortServicesDirtyFirst,
   filterSessionCommits,
   filterSessionWorkingEntries,
-  normalizeGitStatusMark,
-  statFileEntry,
   normalizeSessionBaseline,
   readDiskSessionBaseline,
   writeDiskSessionBaseline,
@@ -41,8 +36,12 @@ import {
   READ_GIT_FLAGS,
   mergeBusCandidateServices,
   collectServiceWorkingSnapshot,
+  computeFileReviewFingerprint,
+  parseReviewedFileRecord,
+  reconcileReviewedFiles,
 } from "./review-logic.js";
 import { computeWrapColumns, countWrappedLines, wrapPlainText, wrapStyledSpans } from "./code-wrap.js";
+import { renderDropdownTrigger, renderDropdownPopover } from "./dropdown.js";
 
 const reviewWrapCache = new WeakMap();
 const REVIEW_ROW_HEIGHT = 20;
@@ -508,6 +507,8 @@ function buildFileDescriptor(f) {
     binary: Boolean(f.binary),
     add: Number(f.add) || 0,
     del: Number(f.del) || 0,
+    sig: f.sig || "",
+    mtimeMs: Number(f.mtimeMs) || 0,
   };
 }
 
@@ -612,6 +613,9 @@ export default class ChangesReview extends View {
     this.busy = false;
     this.expandedFiles = new Set();
     this.localReviewedFiles = new Set();
+    this.localReviewedMeta = {};
+    this.lastRepoHeads = new Map();
+    this.commitFilesCache = new Map();
 
     // Multi-repository & Git inspection state
     this.workspaceRoot = null;
@@ -643,8 +647,10 @@ export default class ChangesReview extends View {
     this.needsRefreshOnShow = false;
 
     this.serviceFilterScroll = ScrollHandle.new();
+    this.commitDropdownScroll = ScrollHandle.new();
     this.diffScroll = VirtualListScrollHandle.new();
     this.diffResizeTask = null;
+    this._cachedCommitMenu = null;
 
     this.viewMode = "working"; // "working" | "commit"
     this.commits = [];
@@ -706,6 +712,7 @@ export default class ChangesReview extends View {
     try { this.input?.release(); } catch {}
     try { this.commentInput?.release(); } catch {}
     try { this.serviceFilterScroll?.release(); } catch {}
+    try { this.commitDropdownScroll?.release(); } catch {}
     try { this.diffScroll?.release(); } catch {}
   }
 
@@ -994,7 +1001,7 @@ export default class ChangesReview extends View {
         }),
         c.workspaceRoot,
       );
-    } else if (!hasNotes && currentStatus === "has_notes") {
+    } else if (!hasNotes && currentStatus && currentStatus !== "pending") {
       updateTabFlow(
         c.sourceTabId,
         (prev) => ({
@@ -1300,66 +1307,24 @@ export default class ChangesReview extends View {
     return sortServicesDirtyFirst(servicesList ?? this.services ?? []);
   }
 
-  getServiceReviewStatus(serviceId, flow, reviewsOverride = null) {
+  getServiceReviewStatus(serviceId, flow, reviewsOverride = null, workingFilesOverride = null) {
+    if (!serviceId) return "pending";
     const reviews = reviewsOverride ?? this.getSessionReviews();
     if (reviews.some((r) => r.serviceId === serviceId)) return "has_notes";
-    if (flow?.reviewedServices?.[serviceId]?.status === "approved") return "approved";
+    let workingFiles;
+    if (Array.isArray(workingFilesOverride)) {
+      workingFiles = workingFilesOverride;
+    } else if (this.isViewerMode()) {
+      const diff = readActiveDiff(this.getSessionContext().spaceId);
+      workingFiles = diff?.viewMode === "working" ? (diff?.allFiles || diff?.files || []) : [];
+    } else {
+      workingFiles = this.allWorkingFiles || [];
+    }
+    const svcFiles = workingFiles.filter((f) => f && f.serviceId === serviceId);
+    if (svcFiles.length > 0 && svcFiles.every((f) => this.isFileReviewed(f, flow, "working"))) {
+      return "approved";
+    }
     return "pending";
-  }
-
-  toggleServiceApproval(service, currentStatus, cx) {
-    if (!service) return;
-    if (currentStatus === "has_notes") {
-      notify({
-        title: "Review notes pending",
-        body: `Send or clear review notes for ${service.name} before approving.`,
-        level: "info",
-      });
-      return;
-    }
-
-    const ctx = this.getSessionContext();
-    if (!ctx.sourceTabId) {
-      notify({
-        title: "No active tab",
-        body: "Focus a workspace tab to record service review status.",
-        level: "warning",
-      });
-      return;
-    }
-
-    const nextStatus = currentStatus === "approved" ? "pending" : "approved";
-    const branch = service.branch || "";
-    const updatedFlow = updateTabFlow(
-      ctx.sourceTabId,
-      (prev) => ({
-        reviewedServices: {
-          ...(prev.reviewedServices || {}),
-          [service.id]: {
-            status: nextStatus,
-            branch,
-            updatedAt: Date.now(),
-          },
-        },
-      }),
-      ctx.workspaceRoot,
-    );
-
-    if (nextStatus === "approved") {
-      const sorted = this.getSortedServices();
-      const reviews = this.getSessionReviews(ctx);
-      const nextDirty = pickNextDirtyService(
-        sorted,
-        service.id,
-        (sId) => this.getServiceReviewStatus(sId, updatedFlow, reviews),
-      );
-      if (nextDirty) {
-        this.selectService(nextDirty.id, cx, { preferUnreviewed: true });
-        return;
-      }
-    }
-
-    cx.notify();
   }
 
   fileReviewScope(viewModeOverride = null, commitOverride = null) {
@@ -1381,32 +1346,68 @@ export default class ChangesReview extends View {
   isFileReviewed(file, flow, scopeOverride = null) {
     const rk = this.fileReviewKey(file, scopeOverride);
     if (!rk) return false;
+    const flowEntry = flow?.reviewedFiles?.[rk];
+    if (flowEntry !== undefined) {
+      return Boolean(parseReviewedFileRecord(flowEntry));
+    }
     if (flow?.tabId || this.getSessionContext().sourceTabId) {
-      return Boolean(flow?.reviewedFiles?.[rk]);
+      return false;
     }
     return Boolean(this.localReviewedFiles?.has(rk));
   }
 
-  toggleFileReviewed(file, cx, _advanceToNext = false, scopeOverride = null) {
-    const fileKey = typeof file === "string" ? file : file?.key;
-    const scope = scopeOverride ?? this.fileReviewScope();
-    const rk = this.fileReviewKey(file, scope);
-    if (!rk || !fileKey) return;
+  buildLocalReviewedSnapshot() {
+    const out = { ...(this.localReviewedMeta || {}) };
+    for (const rk of this.localReviewedFiles || []) {
+      if (!Object.prototype.hasOwnProperty.call(out, rk)) {
+        out[rk] = true;
+      }
+    }
+    return out;
+  }
 
-    const ctx = this.getSessionContext();
+  syncLocalReviewedFromMap(map) {
+    this.localReviewedFiles.clear();
+    this.localReviewedMeta = {};
+    for (const [rk, val] of Object.entries(map || {})) {
+      const rec = parseReviewedFileRecord(val);
+      if (rec) {
+        this.localReviewedFiles.add(rk);
+        this.localReviewedMeta[rk] = rec;
+      }
+    }
+  }
+
+  applyFileReviewToggle(fileObj, fileKey, scope, ctx) {
+    const rk = this.fileReviewKey(fileKey, scope);
+    if (!rk || !fileKey) return { nextReviewed: false, updatedFlow: null };
+
     const flows = readFlows();
     const curFlow = ctx.sourceTabId ? (flows[ctx.sourceTabId] || {}) : {};
-    const nextReviewed = !this.isFileReviewed(file, curFlow, scope);
+    const nextReviewed = !this.isFileReviewed(fileKey, curFlow, scope);
+    const record = nextReviewed
+      ? {
+          reviewed: true,
+          fp: computeFileReviewFingerprint(fileObj || { key: fileKey }),
+          reviewedAt: Date.now(),
+        }
+      : null;
 
-    if (nextReviewed) this.localReviewedFiles.add(rk);
-    else this.localReviewedFiles.delete(rk);
+    if (nextReviewed) {
+      this.localReviewedFiles.add(rk);
+      this.localReviewedMeta[rk] = record;
+    } else {
+      this.localReviewedFiles.delete(rk);
+      delete this.localReviewedMeta[rk];
+    }
 
+    let updatedFlow = curFlow;
     if (ctx.sourceTabId) {
-      updateTabFlow(
+      updatedFlow = updateTabFlow(
         ctx.sourceTabId,
         (prev) => {
           const nextMap = { ...(prev.reviewedFiles || {}) };
-          if (nextReviewed) nextMap[rk] = true;
+          if (nextReviewed) nextMap[rk] = record;
           else delete nextMap[rk];
           return { reviewedFiles: nextMap };
         },
@@ -1414,6 +1415,18 @@ export default class ChangesReview extends View {
       );
     }
 
+    return { nextReviewed, updatedFlow };
+  }
+
+  toggleFileReviewed(file, cx, _advanceToNext = false, scopeOverride = null) {
+    const fileKey = typeof file === "string" ? file : file?.key;
+    const scope = scopeOverride ?? this.fileReviewScope();
+    const rk = this.fileReviewKey(fileKey, scope);
+    if (!rk || !fileKey) return;
+
+    const fileObj = typeof file === "object" && file ? file : this.resolveFileDescriptor(fileKey);
+    const ctx = this.getSessionContext();
+    this.applyFileReviewToggle(fileObj, fileKey, scope, ctx);
     cx.notify();
   }
 
@@ -1423,6 +1436,11 @@ export default class ChangesReview extends View {
     for (const rk of [...this.localReviewedFiles]) {
       if (prefixes.some((p) => rk.startsWith(p))) {
         this.localReviewedFiles.delete(rk);
+      }
+    }
+    for (const rk of Object.keys(this.localReviewedMeta || {})) {
+      if (prefixes.some((p) => rk.startsWith(p))) {
+        delete this.localReviewedMeta[rk];
       }
     }
     const ctx = this.getSessionContext();
@@ -1783,6 +1801,9 @@ export default class ChangesReview extends View {
       this.closed = false;
       this.limited = false;
       this.expandedFiles.clear();
+      this.localReviewedFiles.clear();
+      this.localReviewedMeta = {};
+      this.lastRepoHeads.clear();
       this.viewMode = "working";
       this.showCommitMenu = false;
       this.selectedCommit = null;
@@ -1886,6 +1907,70 @@ export default class ChangesReview extends View {
         );
 
         if (key() !== context) return;
+
+        const erroredServiceIds = new Set();
+        const headTransitions = [];
+        const prevHeadsByServiceId = new Map();
+        const nextRepoHeads = [];
+        const persistedHeads = sessionTabId ? readPlainObject(readFlows()?.[sessionTabId]?.repoHeads) : {};
+
+        for (const res of serviceResults) {
+          const svcId = res.service?.id;
+          if (res.error) {
+            if (svcId) erroredServiceIds.add(svcId);
+            continue;
+          }
+          const normRoot = normPathStr(res.service?.root);
+          const newHead = String(res.headHash || "").trim();
+          const persistedPrevHead = normRoot && typeof persistedHeads[normRoot] === "string"
+            ? persistedHeads[normRoot]
+            : "";
+          const prevHead = normRoot ? (this.lastRepoHeads.get(normRoot) || persistedPrevHead) : "";
+          if (svcId) prevHeadsByServiceId.set(svcId, prevHead);
+          if (prevHead && newHead && prevHead !== newHead) {
+            headTransitions.push({ service: res.service, prevHead, newHead });
+          }
+          if (normRoot && newHead) {
+            nextRepoHeads.push([normRoot, newHead]);
+          }
+        }
+
+        const committedFileKeys = new Set();
+        if (headTransitions.length > 0) {
+          await Promise.all(
+            headTransitions.map(async ({ service, prevHead, newHead }) => {
+              let r = await exec(
+                "git",
+                [...READ, "diff", "--name-only", "--no-renames", prevHead, newHead],
+                { cwd: service.root, on },
+              ).catch(() => null);
+              if (!r || r.code !== 0) {
+                r = await exec(
+                  "git",
+                  [...READ, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "--no-renames", newHead],
+                  { cwd: service.root, on },
+                ).catch(() => null);
+              }
+              if (r && r.code === 0 && r.stdout) {
+                for (const line of r.stdout.split(/\r?\n/)) {
+                  const p = line.trim();
+                  if (p) committedFileKeys.add(`${service.id}::${p}`);
+                }
+              }
+            })
+          );
+          if (key() !== context) return;
+        }
+
+        const nextRepoHeadsObj = { ...persistedHeads };
+        let headsChanged = false;
+        for (const [normRoot, newHead] of nextRepoHeads) {
+          this.lastRepoHeads.set(normRoot, newHead);
+          if (nextRepoHeadsObj[normRoot] !== newHead) {
+            nextRepoHeadsObj[normRoot] = newHead;
+            headsChanged = true;
+          }
+        }
 
         const baselineInit = sessionTabId
           ? await resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTermAddrs, workspaceRoot)
@@ -2068,6 +2153,48 @@ export default class ChangesReview extends View {
         this.workingFiles = allFiles;
         this.workingFilesCount = allFiles.length;
 
+        const snapshotReviewedFiles = sessionTabId
+          ? (readFlows()?.[sessionTabId]?.reviewedFiles || {})
+          : this.buildLocalReviewedSnapshot();
+        const committedAfterByKey = await this.collectCommitInvalidations(
+          snapshotReviewedFiles,
+          allCommits,
+          prevHeadsByServiceId,
+          erroredServiceIds,
+          on,
+          committedFileKeys,
+        );
+        if (key() !== context) return;
+
+        const latestReviewedFiles = sessionTabId
+          ? (readFlows()?.[sessionTabId]?.reviewedFiles || {})
+          : this.buildLocalReviewedSnapshot();
+        const reconciled = reconcileReviewedFiles(latestReviewedFiles, {
+          workingFiles: allFiles,
+          committedFileKeys,
+          committedAfterByKey,
+          erroredServiceIds,
+          scopeMode: "working",
+        });
+
+        if (sessionTabId) {
+          if (reconciled.changed || headsChanged) {
+            updateTabFlow(
+              sessionTabId,
+              () => {
+                const patch = {};
+                if (reconciled.changed) patch.reviewedFiles = reconciled.nextMap;
+                if (headsChanged) patch.repoHeads = nextRepoHeadsObj;
+                return patch;
+              },
+              workspaceRoot,
+            );
+          }
+          this.syncLocalReviewedFromMap(reconciled.nextMap);
+        } else if (reconciled.changed) {
+          this.syncLocalReviewedFromMap(reconciled.nextMap);
+        }
+
         this.watch(services, cx);
         this.applyServiceFilter(null, { preferUnreviewed: false, syncReviewTab: false });
 
@@ -2092,8 +2219,13 @@ export default class ChangesReview extends View {
             if (!curDiff || curDiff.sourceTabId === sessionTabId) {
               const openFile = this.open ? (this.files.find((f) => f.key === this.open) || null) : null;
               const fileChanged = prevOpen !== this.open || (curDiff && curDiff.openFileKey !== this.open);
+              const openFpChanged = Boolean(
+                openFile &&
+                curDiff?.openFile &&
+                computeFileReviewFingerprint(curDiff.openFile) !== computeFileReviewFingerprint(openFile)
+              );
               const payload = this.buildActiveDiffPayload(openFile, {
-                bumpSeq: Boolean(fileChanged || force),
+                bumpSeq: Boolean(fileChanged || openFpChanged || force),
                 focusLine: fileChanged ? null : (curDiff?.focusLine ?? null),
                 openCommentLine: fileChanged ? null : (curDiff?.openCommentLine ?? null),
               });
@@ -2113,6 +2245,140 @@ export default class ChangesReview extends View {
     });
   }
 
+  async getCommitChangedFiles(commit, on) {
+    if (!commit?.hash || !commit?.repoRoot) return [];
+    const cacheKey = `${normPathStr(commit.repoRoot)}::${commit.hash}`;
+    if (this.commitFilesCache.has(cacheKey)) {
+      return this.commitFilesCache.get(cacheKey);
+    }
+    const r = await exec(
+      "git",
+      [...READ, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "--no-renames", commit.hash],
+      { cwd: commit.repoRoot, on },
+    ).catch(() => null);
+    const paths = r && r.code === 0 && r.stdout
+      ? r.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+      : [];
+    if (this.commitFilesCache.size > 250) {
+      this.commitFilesCache.clear();
+    }
+    this.commitFilesCache.set(cacheKey, paths);
+    return paths;
+  }
+
+  async collectCommitInvalidations(snapshotReviewedFiles, allCommits, prevHeadsByServiceId, erroredServiceIds, on, committedFileKeys) {
+    const committedAfterByKey = new Map();
+    const entries = Object.entries(snapshotReviewedFiles || {});
+    if (entries.length === 0 || !Array.isArray(allCommits) || allCommits.length === 0) {
+      return committedAfterByKey;
+    }
+
+    const commitReviewsBySvc = new Map();
+    const workingReviewedAtByKey = new Map();
+    const workingSvcsCold = new Set();
+
+    for (const [rk, rawVal] of entries) {
+      const rec = parseReviewedFileRecord(rawVal);
+      if (!rec) continue;
+      if (rk.startsWith("commit:")) {
+        const rest = rk.slice("commit:".length);
+        const hashSep = rest.indexOf("::");
+        if (hashSep <= 0) continue;
+        const cHash = rest.slice(0, hashSep);
+        const fileKey = rest.slice(hashSep + 2);
+        const svcSep = fileKey.indexOf("::");
+        const svcId = svcSep >= 0 ? fileKey.slice(0, svcSep) : "";
+        if (!svcId || erroredServiceIds.has(svcId)) continue;
+        if (!commitReviewsBySvc.has(svcId)) commitReviewsBySvc.set(svcId, []);
+        commitReviewsBySvc.get(svcId).push({ hash: cHash, reviewedAt: rec.reviewedAt || 0 });
+      } else if (rk.startsWith("working::")) {
+        const fileKey = rk.slice("working::".length);
+        const svcSep = fileKey.indexOf("::");
+        const svcId = svcSep >= 0 ? fileKey.slice(0, svcSep) : "";
+        if (!svcId || erroredServiceIds.has(svcId) || !rec.reviewedAt || prevHeadsByServiceId.get(svcId)) continue;
+        workingSvcsCold.add(svcId);
+        const prevTs = workingReviewedAtByKey.get(fileKey);
+        if (prevTs === undefined || rec.reviewedAt < prevTs) {
+          workingReviewedAtByKey.set(fileKey, rec.reviewedAt);
+        }
+      }
+    }
+
+    if (commitReviewsBySvc.size === 0 && workingSvcsCold.size === 0) {
+      return committedAfterByKey;
+    }
+
+    const commitsByService = new Map();
+    for (const c of allCommits) {
+      if (!c?.serviceId || !c?.hash) continue;
+      if (!commitReviewsBySvc.has(c.serviceId) && !workingSvcsCold.has(c.serviceId)) continue;
+      if (!commitsByService.has(c.serviceId)) commitsByService.set(c.serviceId, []);
+      commitsByService.get(c.serviceId).push(c);
+    }
+
+    const commitsToInspect = [];
+    for (const [svcId, svcCommits] of commitsByService.entries()) {
+      const commitReviews = commitReviewsBySvc.get(svcId) || [];
+      let minWorkingTs = Infinity;
+      if (workingSvcsCold.has(svcId)) {
+        for (const [fk, ts] of workingReviewedAtByKey.entries()) {
+          if (fk.startsWith(`${svcId}::`) && ts < minWorkingTs) {
+            minWorkingTs = ts;
+          }
+        }
+      }
+
+      const hashToIdx = new Map();
+      for (let i = 0; i < svcCommits.length; i++) {
+        if (svcCommits[i]?.hash && !hashToIdx.has(svcCommits[i].hash)) {
+          hashToIdx.set(svcCommits[i].hash, i);
+        }
+      }
+
+      for (let idx = 0; idx < svcCommits.length; idx++) {
+        const c = svcCommits[idx];
+        const commitMs = (Number(c.timestamp) || 0) * 1000;
+        const forCommitReview = commitReviews.some((entry) => {
+          if (entry.hash === c.hash) return false;
+          if (entry.reviewedAt > 0) return commitMs > entry.reviewedAt;
+          const entryIdx = hashToIdx.get(entry.hash);
+          return entryIdx !== undefined && idx < entryIdx;
+        });
+        const forWorkingReview = workingSvcsCold.has(svcId) && commitMs > minWorkingTs;
+        if (forCommitReview || forWorkingReview) {
+          commitsToInspect.push({ commit: c, commitMs, forCommitReview, forWorkingReview });
+        }
+      }
+    }
+
+    if (commitsToInspect.length === 0) return committedAfterByKey;
+
+    const inspected = await Promise.all(
+      commitsToInspect.map(async (item) => ({
+        ...item,
+        paths: await this.getCommitChangedFiles(item.commit, on),
+      }))
+    );
+
+    for (const { commit, commitMs, forCommitReview, forWorkingReview, paths } of inspected) {
+      for (const p of paths) {
+        const fk = `${commit.serviceId}::${p}`;
+        if (forCommitReview) {
+          const prevTs = committedAfterByKey.get(fk) || 0;
+          if (commitMs > prevTs) committedAfterByKey.set(fk, commitMs);
+        }
+        if (forWorkingReview) {
+          const reviewedAt = workingReviewedAtByKey.get(fk);
+          if (reviewedAt !== undefined && commitMs > reviewedAt) {
+            committedFileKeys.add(fk);
+          }
+        }
+      }
+    }
+
+    return committedAfterByKey;
+  }
+
   async fetchFileDiffLines(file, viewMode, selectedCommit, on, isExpanded) {
     if (!file || !file.repoRoot) return ["No file selected"];
     const root = file.repoRoot;
@@ -2126,7 +2392,6 @@ export default class ChangesReview extends View {
         else if (text.includes("\0")) lines = ["Binary file · no text diff"];
         else {
           const lineTotal = countLines(text);
-          file.add = lineTotal;
           lines = [`@@ -0,0 +1,${lineTotal} @@`, ...text.slice(0, 400000).replace(/\n$/, "").split("\n").slice(0, 450).map((l) => `+${l}`)];
         }
       } else {
@@ -2308,26 +2573,7 @@ export default class ChangesReview extends View {
     const rk = this.fileReviewKey(curFile, scope);
     if (!rk) return;
 
-    const flows = readFlows();
-    const curFlow = ctx.sourceTabId ? (flows[ctx.sourceTabId] || {}) : {};
-    const nextReviewed = !this.isFileReviewed(curFile, curFlow, scope);
-
-    if (nextReviewed) this.localReviewedFiles.add(rk);
-    else this.localReviewedFiles.delete(rk);
-
-    let updatedFlow = curFlow;
-    if (ctx.sourceTabId) {
-      updatedFlow = updateTabFlow(
-        ctx.sourceTabId,
-        (prev) => {
-          const nextMap = { ...(prev.reviewedFiles || {}) };
-          if (nextReviewed) nextMap[rk] = true;
-          else delete nextMap[rk];
-          return { reviewedFiles: nextMap };
-        },
-        ctx.workspaceRoot,
-      );
-    }
+    const { nextReviewed, updatedFlow } = this.applyFileReviewToggle(curFile, curFile.key, scope, ctx);
 
     if (nextReviewed) {
       const nextFile = pickNextUnreviewedFile(
@@ -2337,90 +2583,6 @@ export default class ChangesReview extends View {
       );
       if (nextFile) {
         this.openViewerFile(nextFile, diff, ctx, cx);
-        return;
-      }
-    }
-
-    cx.notify();
-  }
-
-  async toggleViewerServiceApproval(service, currentStatus, cx) {
-    if (!service) return;
-    if (currentStatus === "has_notes") {
-      notify({
-        title: "Review notes pending",
-        body: `Send or clear review notes for ${service.name} before approving.`,
-        level: "info",
-      });
-      return;
-    }
-
-    const ctx = this.getSessionContext();
-    if (!ctx.sourceTabId) {
-      notify({
-        title: "No active tab",
-        body: "Focus a workspace tab to record service review status.",
-        level: "warning",
-      });
-      return;
-    }
-
-    const diff = readActiveDiff(ctx.spaceId);
-    const nextStatus = currentStatus === "approved" ? "pending" : "approved";
-    const branch = service.branch || "";
-    const updatedFlow = updateTabFlow(
-      ctx.sourceTabId,
-      (prev) => ({
-        reviewedServices: {
-          ...(prev.reviewedServices || {}),
-          [service.id]: {
-            status: nextStatus,
-            branch,
-            updatedAt: Date.now(),
-          },
-        },
-      }),
-      ctx.workspaceRoot,
-    );
-
-    if (nextStatus === "approved") {
-      const sorted = this.getSortedServices(diff?.services || []);
-      const reviews = this.getSessionReviews(ctx);
-      const nextDirty = pickNextDirtyService(
-        sorted,
-        service.id,
-        (sId) => this.getServiceReviewStatus(sId, updatedFlow, reviews),
-      );
-      if (nextDirty) {
-        if (ctx.workspaceRoot) {
-          setShared("mesh.activeService", {
-            workspaceRoot: ctx.workspaceRoot,
-            serviceId: nextDirty.id,
-            ts: Date.now(),
-          });
-        }
-        let nextFiles = (diff?.allFiles || []).filter((f) => f.serviceId === nextDirty.id);
-        if (nextFiles.length === 0 && nextDirty.root) {
-          try {
-            const snap = await loadServiceWorkingSnapshot(nextDirty, diff?.on ?? null, false);
-            const baseline = updatedFlow?.sessionBaseline || null;
-            const normRoot = normPathStr(nextDirty.root);
-            const rawSnapFiles = baseline
-              ? filterSessionWorkingEntries(snap?.files || [], baseline.repos?.[normRoot] || null, baseline.startedAt || 0)
-              : (snap?.files || []);
-            nextFiles = rawSnapFiles.map(buildFileDescriptor);
-          } catch {}
-        }
-        const firstUnreviewed =
-          pickNextUnreviewedFile(nextFiles, null, (f) => this.isFileReviewed(f, updatedFlow, "working")) ||
-          nextFiles[0] ||
-          null;
-        this.openViewerFile(firstUnreviewed, diff, ctx, cx, {
-          viewMode: "working",
-          selectedCommit: null,
-          activeService: nextDirty.id,
-          files: nextFiles,
-        });
         return;
       }
     }
@@ -2798,15 +2960,6 @@ export default class ChangesReview extends View {
       }
     }
 
-    const focusedService =
-      (diff?.activeService && diff.activeService !== "all"
-        ? services.find((s) => s.id === diff.activeService)
-        : null) ||
-      (openFile?.serviceId ? services.find((s) => s.id === openFile.serviceId) : null) ||
-      (services.length === 1 ? services[0] : null);
-    const svcStatus = focusedService ? this.getServiceReviewStatus(focusedService.id, flow, sessionReviews) : null;
-    const svcApproved = svcStatus === "approved";
-    const svcHasNotes = svcStatus === "has_notes";
     const canStepFiles = files.length > 1;
     const openIcon = openFile ? resolveDiffFileIcon(openFile.path || openFile.displayPath, t) : null;
     const compactViewer = (this.viewerWidth || 900) < 680;
@@ -2894,14 +3047,14 @@ export default class ChangesReview extends View {
               h_flex()
                 .id("diff-viewed-btn")
                 .h(24)
-                .px(compactViewer ? 7 : 9)
-                .gap(5)
+                .px(compactViewer ? 8 : 10)
                 .flex_none()
                 .items_center()
+                .justify_center()
                 .rounded(5)
                 .border_1()
                 .cursor_pointer()
-                .tooltip(openFileReviewed ? "Unmark reviewed" : "Mark reviewed & advance to next unreviewed file")
+                .tooltip(openFileReviewed ? "Click to unapprove file" : "Approve file & advance to next unreviewed file")
                 .when(openFileReviewed, (btn) =>
                   btn
                     .bg(hexWithAlpha(passColor, "22"))
@@ -2911,60 +3064,19 @@ export default class ChangesReview extends View {
                 )
                 .when(!openFileReviewed, (btn) =>
                   btn
-                    .bg(t.background)
-                    .border_color(t.border)
-                    .text_color(t.foreground)
-                    .hover((s) => s.bg(t.hover))
+                    .bg(t.solid)
+                    .border_color(t.solid)
+                    .text_color(t.solid_foreground)
+                    .hover((s) => s.bg(hexWithAlpha(t.solid, "dd")))
                 )
                 .on_click((_e, cx) => this.toggleViewerFileReviewed(cx))
                 .child(
-                  h_flex().w(12).h(12).flex_none().items_center().justify_center().rounded(3).border_1()
-                    .when(openFileReviewed, (c) => c.bg(passColor).border_color(passColor).text_color(t.background))
-                    .when(!openFileReviewed, (c) => c.bg(t.background).border_color(t.border))
-                    .text_size(8.5).font_semibold()
-                    .child(openFileReviewed ? "✓" : "")
+                  div()
+                    .text_size(11)
+                    .font_medium()
+                    .child(openFileReviewed ? (compactViewer ? "Approved" : "Approved ✓") : "Approve")
                 )
-                .child(div().text_size(11).font_medium().child(compactViewer ? (openFileReviewed ? "Reviewed" : "Mark") : (openFileReviewed ? "Reviewed ✓" : "Mark reviewed")))
             )
-            .when(Boolean(focusedService) && viewMode !== "commit", (el) => el.child(
-              h_flex()
-                .id("diff-approve-service-btn")
-                .h(24)
-                .px(compactViewer ? 8 : 10)
-                .flex_none()
-                .items_center()
-                .rounded(5)
-                .text_size(11)
-                .font_medium()
-                .when(svcApproved, (btn) =>
-                  btn
-                    .bg(t.background)
-                    .border_1()
-                    .border_color(t.border)
-                    .text_color(t.muted)
-                    .cursor_pointer()
-                    .tooltip(`Unapprove ${focusedService.name}`)
-                    .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                    .on_click((_e, cx) => this.toggleViewerServiceApproval(focusedService, svcStatus, cx))
-                )
-                .when(svcHasNotes, (btn) =>
-                  btn
-                    .bg(t.background)
-                    .border_1()
-                    .border_color(t.border)
-                    .text_color(t.dim)
-                    .tooltip("Send or clear review notes before approving")
-                )
-                .when(!svcApproved && !svcHasNotes, (btn) =>
-                  btn
-                    .bg(t.solid)
-                    .text_color(t.solid_foreground)
-                    .cursor_pointer()
-                    .tooltip(`Approve ${focusedService.name} & advance to next dirty service`)
-                    .on_click((_e, cx) => this.toggleViewerServiceApproval(focusedService, svcStatus, cx))
-                )
-                .child(svcApproved ? "Unapprove" : compactViewer ? "Approve ✓" : "Approve Service ✓")
-            ))
         );
 
     return v_flex().id("review-tab-viewer").size_full().min_h(0).rounded(10).overflow_hidden().relative()
@@ -3073,6 +3185,83 @@ export default class ChangesReview extends View {
       );
   }
 
+  getCommitMenuItems(t) {
+    if (!this.showCommitMenu) return [];
+    const selectedHash = this.selectedCommit?.hash || "";
+    const servicesCount = this.services.length;
+    const themeSig = `${t?.accent || ""}|${t?.foreground || ""}|${t?.muted || ""}|${t?.dim || ""}|${t?.background || ""}`;
+    if (
+      this._cachedCommitMenu &&
+      this._cachedCommitMenu.viewMode === this.viewMode &&
+      this._cachedCommitMenu.selectedHash === selectedHash &&
+      this._cachedCommitMenu.workingFilesCount === this.workingFilesCount &&
+      this._cachedCommitMenu.servicesCount === servicesCount &&
+      this._cachedCommitMenu.commits === this.commits &&
+      this._cachedCommitMenu.themeSig === themeSig
+    ) {
+      return this._cachedCommitMenu.items;
+    }
+
+    const items = [
+      {
+        type: "option",
+        id: "select-working-tree",
+        icon: "mods/changes-review/icons/git-commit.svg",
+        iconSize: 13,
+        iconColor: this.viewMode === "working" ? (t.accent || t.foreground) : t.muted,
+        label: "Working Tree",
+        fontMedium: this.viewMode === "working",
+        meta: "Uncommitted",
+        metaColor: t.dim,
+        badge: this.workingFilesCount > 0 ? String(this.workingFilesCount) : undefined,
+        badgeBg: t.raised || t.background,
+        badgeColor: t.muted,
+        selected: this.viewMode === "working",
+        onSelect: (_e, cx) => this.switchMode("working", null, cx),
+      },
+    ];
+
+    if (this.commits.length > 0) {
+      items.push({ type: "divider", id: "commit-menu-divider" });
+      for (let i = 0; i < this.commits.length; i += 1) {
+        const c = this.commits[i];
+        const isSelected = this.viewMode === "commit" && selectedHash === c.hash;
+        items.push({
+          type: "option",
+          id: `commit-item-${c.serviceId || "repo"}-${c.hash || `${c.shortHash}-${i}`}`,
+          icon: "mods/changes-review/icons/git-commit.svg",
+          iconSize: 13,
+          iconColor: isSelected ? (t.accent || t.foreground) : t.muted,
+          label: c.subject || c.shortHash,
+          labelColor: t.foreground,
+          fontMedium: isSelected,
+          subline: [c.author, c.date].filter(Boolean).join(" · ") || undefined,
+          sublineColor: t.dim,
+          sublineBadge: servicesCount > 1 && c.serviceName ? c.serviceName : undefined,
+          sublineBadgeBg: t.raised || t.background,
+          sublineBadgeColor: t.muted,
+          rightText: c.shortHash,
+          rightMono: true,
+          rightColor: isSelected ? t.foreground : t.dim,
+          height: 42,
+          selected: isSelected,
+          onSelect: (_e, cx) => this.switchMode("commit", c, cx),
+        });
+      }
+    }
+
+    this._cachedCommitMenu = {
+      viewMode: this.viewMode,
+      selectedHash,
+      workingFilesCount: this.workingFilesCount,
+      servicesCount,
+      commits: this.commits,
+      themeSig,
+      items,
+    };
+    return items;
+  }
+
   renderPanel(cx) {
     const visible = isChangesVisible();
     const bus = shared("mesh.services");
@@ -3138,9 +3327,7 @@ export default class ChangesReview extends View {
     const flow = ctx.sourceTabId ? (flows[ctx.sourceTabId] || {}) : {};
     const sessionReviews = this.getSessionReviews(ctx);
     const sortedServices = this.getSortedServices();
-    const focusedService = this.activeService !== "all"
-      ? (this.services.find((s) => s.id === this.activeService) || null)
-      : (this.services.length === 1 ? this.services[0] : null);
+    const soleService = this.services.length === 1 ? (this.services[0] || null) : null;
 
     const targetRepos = this.getTargetRepos();
     const commitEnabled = Boolean(this.message.trim() && targetRepos.length > 0 && !this.busy && !this.loading);
@@ -3154,36 +3341,33 @@ export default class ChangesReview extends View {
     const allFilesReviewed = this.files.length > 0 && reviewedFilesCount === this.files.length;
     const compactPanel = (this.panelWidth || 420) < 380;
 
+    const commitSelectorLabel = this.viewMode === "working"
+      ? "Working Tree"
+      : this.selectedCommit
+        ? `${this.services.length > 1 && this.selectedCommit.serviceName ? `[${this.selectedCommit.serviceName}] ` : ""}${this.selectedCommit.shortHash}: ${this.selectedCommit.subject}`
+        : "Select commit";
+
     const renderCommitSelector = () =>
-      h_flex().id("commit-selector-btn").h(24).px(8).gap(6).items_center().rounded(5)
-        .when(compactPanel, (b) => b.w_full().min_w(0))
-        .when(!compactPanel, (b) => b.flex_1().min_w(80).max_w(210))
-        .bg(this.showCommitMenu ? t.selected : t.background).border_1().border_color(this.showCommitMenu ? t.accent : t.border)
-        .cursor_pointer().hover((s) => s.bg(t.hover))
-        .on_click((_e, cx) => {
+      renderDropdownTrigger({
+        id: "commit-selector-btn",
+        isOpen: this.showCommitMenu,
+        label: commitSelectorLabel,
+        labelColor: t.foreground,
+        fontMedium: true,
+        badge: this.viewMode === "working" && this.workingFilesCount > 0 ? String(this.workingFilesCount) : undefined,
+        leftIcon: "mods/changes-review/icons/git-commit.svg",
+        leftIconSize: 11,
+        leftIconColor: this.viewMode === "working" ? t.muted : (t.accent || t.foreground),
+        chevronIcon: "mods/changes-review/icons/chevron-down.svg",
+        maxW: compactPanel ? undefined : 210,
+        flex1: !compactPanel,
+        fullWidth: compactPanel,
+        t,
+        onClick: (_e, cx) => {
           this.showCommitMenu = !this.showCommitMenu;
           cx.notify();
-        })
-        .child(
-          svg("mods/changes-review/icons/git-commit.svg")
-            .size(11).flex_none()
-            .text_color(this.viewMode === "working" ? t.muted : t.accent || t.foreground)
-        )
-        .child(
-          div().flex_1().min_w(0).truncate().text_size(11).font_medium()
-            .text_color(t.foreground)
-            .child(
-              this.viewMode === "working"
-                ? "Working Tree"
-                : this.selectedCommit
-                  ? `${this.services.length > 1 && this.selectedCommit.serviceName ? `[${this.selectedCommit.serviceName}] ` : ""}${this.selectedCommit.shortHash}: ${this.selectedCommit.subject}`
-                  : "Select commit"
-            )
-        )
-        .when(this.viewMode === "working" && this.workingFilesCount > 0, (el) => el.child(
-          div().flex_none().px(4).py(0.5).rounded(3).bg(t.raised).text_size(9.5).text_color(t.muted).child(String(this.workingFilesCount))
-        ))
-        .child(svg("mods/changes-review/icons/chevron-down.svg").size(9).flex_none().text_color(t.dim));
+        },
+      });
 
     const renderPanelHeaderBadges = () =>
       h_flex().flex_none().gap(6).items_center()
@@ -3294,103 +3478,32 @@ export default class ChangesReview extends View {
         );
       })
 
-      // Microservice Review Bar (when a single service is selected, or sole repository)
-      .when(Boolean(focusedService), (el) => {
-        const svc = focusedService;
-        const svcStatus = this.getServiceReviewStatus(svc.id, flow, sessionReviews);
+      // Compact read-only branch bar when workspace contains a single repository
+      .when(Boolean(soleService), (el) => {
+        const svc = soleService;
         const branchLabel = svc.branch || "HEAD";
-        const statusText = svcStatus === "approved" ? "Approved ✓" : svcStatus === "has_notes" ? "Has notes" : "Pending";
-        const statusColor = svcStatus === "approved" ? passColor : svcStatus === "has_notes" ? noteColor : t.muted;
-        const isApproved = svcStatus === "approved";
-        const hasNotes = svcStatus === "has_notes";
-
         return el.child(
           h_flex()
             .id("microservice-review-bar")
-            .min_h(34)
+            .min_h(28)
             .flex_none()
-            .flex_wrap()
             .px(10)
-            .py(5)
+            .py(4)
             .gap(6)
             .items_center()
-            .justify_between()
             .border_b(1)
             .border_color(t.border)
             .bg(t.raised)
+            .child(svg("mods/changes-review/icons/git-branch.svg").size(11).flex_none().text_color(t.muted))
             .child(
-              h_flex()
+              div()
                 .flex_1()
-                .min_w(140)
-                .gap(6)
-                .items_center()
-                .child(svg("mods/changes-review/icons/git-branch.svg").size(11).flex_none().text_color(t.muted))
-                .child(
-                  div()
-                    .min_w(0)
-                    .truncate()
-                    .text_size(11)
-                    .font_medium()
-                    .text_color(t.foreground)
-                    .child(`${svc.name} · ${branchLabel}`),
-                )
-                .child(
-                  div()
-                    .flex_none()
-                    .px(5)
-                    .py(0.5)
-                    .rounded(4)
-                    .bg(svcStatus === "pending" ? t.background : hexWithAlpha(statusColor, "22"))
-                    .border_1()
-                    .border_color(svcStatus === "pending" ? t.border : hexWithAlpha(statusColor, "66"))
-                    .text_size(9.5)
-                    .font_medium()
-                    .text_color(statusColor)
-                    .child(statusText),
-                ),
-            )
-            .child(
-              h_flex()
-                .flex_none()
-                .gap(6)
-                .items_center()
-                .child(
-                  h_flex()
-                    .id("approve-service-btn")
-                    .h(22)
-                    .px(8)
-                    .flex_none()
-                    .items_center()
-                    .rounded(5)
-                    .text_size(10.5)
-                    .font_medium()
-                    .when(isApproved, (btn) =>
-                      btn
-                        .bg(t.background)
-                        .border_1()
-                        .border_color(t.border)
-                        .text_color(t.muted)
-                        .cursor_pointer()
-                        .hover((s) => s.bg(t.hover).text_color(t.foreground)),
-                    )
-                    .when(hasNotes, (btn) =>
-                      btn
-                        .bg(t.background)
-                        .border_1()
-                        .border_color(t.border)
-                        .text_color(t.dim)
-                        .cursor_pointer()
-                        .tooltip("Send or clear review notes before approving"),
-                    )
-                    .when(!isApproved && !hasNotes, (btn) =>
-                      btn
-                        .bg(t.solid)
-                        .text_color(t.solid_foreground)
-                        .cursor_pointer(),
-                    )
-                    .on_click((_e, cx) => this.toggleServiceApproval(svc, svcStatus, cx))
-                    .child(isApproved ? "Unapprove" : "Approve Service ✓"),
-                ),
+                .min_w(0)
+                .truncate()
+                .text_size(11)
+                .font_medium()
+                .text_color(t.foreground)
+                .child(`${svc.name} · ${branchLabel}`),
             ),
         );
       })
@@ -3554,59 +3667,27 @@ export default class ChangesReview extends View {
 
       // Floating commit dropdown overlay
       .when(this.showCommitMenu, (el) => el.child(
-        div().id("commit-menu-overlay").absolute().inset_0()
-          .on_mouse_down("left", (_e, cx) => {
+        renderDropdownPopover({
+          overlayId: "commit-menu-overlay",
+          menuId: "commit-dropdown-floating",
+          triggerId: "commit-selector-btn",
+          top: compactPanel ? 68 : 43,
+          left: 10,
+          anchor: "left",
+          minWidth: 220,
+          maxWidth: 360,
+          maxHeight: 320,
+          panelWidth: this.panelWidth || 420,
+          marginX: 20,
+          items: this.getCommitMenuItems(t),
+          scrollHandle: this.commitDropdownScroll,
+          monoFont: mono,
+          t,
+          onClose: (_e, cx) => {
             this.showCommitMenu = false;
             cx.notify();
-          })
-          .child(
-            v_flex().id("commit-dropdown-floating")
-              .absolute().top(compactPanel ? 68 : 43).left(10).right(10).max_w(360)
-              .when(this.commits.length > 6, (b) => b.h(320).overflow_y_scrollbar())
-              .rounded(8).bg(t.raised).border_1().border_color(t.border).shadow_xl().p(4).gap(2)
-              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-              .child(
-                h_flex().id("select-working-tree").min_h(28).py(3).flex_none().px(8).gap(7).items_center().rounded(5).cursor_pointer()
-                  .when(this.viewMode === "working", (s) => s.bg(t.selected))
-                  .hover((s) => s.bg(t.hover))
-                  .on_click((_e, cx) => this.switchMode("working", null, cx))
-                  .child(svg("mods/changes-review/icons/git-commit.svg").size(11).flex_none().text_color(this.viewMode === "working" ? t.accent || t.foreground : t.muted))
-                  .child(div().text_size(11).font_medium().child("Working Tree"))
-                  .child(div().text_size(10).text_color(t.dim).child("Uncommitted"))
-                  .child(div().flex_1())
-                  .when(this.workingFilesCount > 0, (b) => b.child(
-                    div().flex_none().px(4).py(0.5).rounded(3).bg(t.background).text_size(9).text_color(t.muted).child(String(this.workingFilesCount))
-                  ))
-              )
-              .when(this.commits.length > 0, (b) => b.child(div().h(1).w_full().bg(t.border).my(1).flex_none()))
-              .children(
-                this.commits.map((c) => {
-                  const isSelected = this.viewMode === "commit" && this.selectedCommit?.hash === c.hash;
-                  return h_flex().id(`commit-item-${c.shortHash}`).min_h(34).py(3.5).flex_none().px(8).gap(7).items_center().rounded(5).cursor_pointer()
-                    .when(isSelected, (s) => s.bg(t.selected))
-                    .hover((s) => s.bg(t.hover))
-                    .on_click((_e, cx) => this.switchMode("commit", c, cx))
-                    .child(svg("mods/changes-review/icons/git-commit.svg").size(11).flex_none().text_color(isSelected ? t.accent || t.foreground : t.muted))
-                    .child(
-                      v_flex().flex_1().min_w(0).gap(1.5)
-                        .child(
-                          h_flex().gap(6).items_center()
-                            .when(this.services.length > 1 && Boolean(c.serviceName), (b) => b.child(
-                              div().flex_none().px(3.5).py(0.5).rounded(3).bg(t.background).border_1().border_color(t.border).text_size(9).text_color(t.muted).child(c.serviceName)
-                            ))
-                            .child(div().flex_none().font_family(mono).text_size(10).font_medium().text_color(isSelected ? t.foreground : t.dim).child(c.shortHash))
-                            .child(div().flex_1().min_w(0).truncate().text_size(11).font_medium().text_color(t.foreground).child(c.subject))
-                        )
-                        .child(
-                          h_flex().gap(5).items_center().text_size(9).text_color(t.dim)
-                            .child(div().truncate().child(c.author))
-                            .child(div().child("·"))
-                            .child(div().flex_none().child(c.date))
-                        )
-                    );
-                })
-              )
-          )
+          },
+        })
       ));
   }
 }

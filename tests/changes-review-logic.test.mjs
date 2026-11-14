@@ -22,7 +22,9 @@ import {
   resolveSessionAgentTabId,
   pickNextUnreviewedFile,
   sortServicesDirtyFirst,
-  pickNextDirtyService,
+  computeFileReviewFingerprint,
+  parseReviewedFileRecord,
+  reconcileReviewedFiles,
   filterSessionCommits,
   filterSessionWorkingEntries,
   normalizeGitStatusMark,
@@ -331,7 +333,7 @@ describe("changes-review review-logic", () => {
     assert.equal(pickNextUnreviewedFile([], null, () => false), null);
   });
 
-  test("sortServicesDirtyFirst and pickNextDirtyService advance across dirty unapproved services", () => {
+  test("sortServicesDirtyFirst orders dirty services first and then alphabetically by name", () => {
     const sorted = sortServicesDirtyFirst([
       { id: "web", name: "web-client", workingCount: 0 },
       { id: "billing", name: "billing-api", workingCount: 2 },
@@ -339,39 +341,7 @@ describe("changes-review review-logic", () => {
       { id: "docs", name: "docs", workingCount: 0 },
     ]);
     assert.deepEqual(sorted.map((s) => s.id), ["auth", "billing", "docs", "web"]);
-
-    const statuses = {
-      auth: "approved",
-      billing: "pending",
-      web: "pending",
-    };
-    assert.equal(
-      pickNextDirtyService(sorted, "auth", (id) => statuses[id])?.id,
-      "billing",
-    );
-
-    // Wraps to earlier dirty service when current is at the end
-    const statusesWrap = {
-      auth: "pending",
-      billing: "approved",
-      web: "pending",
-    };
-    assert.equal(
-      pickNextDirtyService(sorted, "billing", (id) => statusesWrap[id])?.id,
-      "auth",
-    );
-
-    // Skips clean services even if pending, returns null when none left dirty & unapproved
-    const allCleanOrApproved = {
-      auth: "approved",
-      billing: "approved",
-      docs: "pending",
-      web: "pending",
-    };
-    assert.equal(
-      pickNextDirtyService(sorted, "auth", (id) => allCleanOrApproved[id]),
-      null,
-    );
+    assert.deepEqual(sortServicesDirtyFirst(null), []);
   });
 
   test("filterSessionCommits excludes pre-session commits and keeps session commits", () => {
@@ -668,6 +638,7 @@ describe("changes-review review-logic", () => {
     assert.equal(snap.files.length, 0);
     assert.equal(snap.touched, true);
     assert.equal(snap.branch, "main");
+    assert.equal(snap.headHash, "845bbd44c7b586209dacee3c495946a6116b3edf");
     assert.equal(snap.commits.length, 2);
     assert.equal(calls.length, 2);
     assert.ok(calls.every((c) => READ_GIT_FLAGS.every((flag) => c.args.includes(flag))));
@@ -682,7 +653,301 @@ describe("changes-review review-logic", () => {
     const beforeCalls = calls.length;
     const noCommitSnap = await collectServiceWorkingSnapshot({ ...service }, null, false, { exec: mockExec });
     assert.equal(noCommitSnap.commits.length, 0);
+    assert.equal(noCommitSnap.headHash, "");
     assert.equal(noCommitSnap.touched, false);
     assert.equal(calls.length, beforeCalls + 1);
+
+    // Dirty repository attaches headHash from git rev-parse --verify HEAD
+    const dirtyExec = async (cmd, args) => {
+      if (args.includes("status")) {
+        return { code: 0, stdout: "## feat/auth...origin/feat/auth\0 M src/a.js\0", stderr: "" };
+      }
+      if (args.includes("rev-parse")) {
+        return { code: 0, stdout: "deadbeef1234567890abcdef1234567890abcdef\n", stderr: "" };
+      }
+      if (args.includes("diff")) {
+        return { code: 0, stdout: "3\t1\tsrc/a.js\0", stderr: "" };
+      }
+      throw new Error(`Unexpected git args: ${args.join(" ")}`);
+    };
+    const dirtySnap = await collectServiceWorkingSnapshot(
+      { id: "auth", name: "auth-api", relPath: "auth", root: "/ws/auth", isSibling: false },
+      "dev@host",
+      false,
+      { exec: dirtyExec },
+    );
+    assert.equal(dirtySnap.headHash, "deadbeef1234567890abcdef1234567890abcdef");
+    assert.equal(dirtySnap.files.length, 1);
+    assert.equal(dirtySnap.files[0].add, 3);
+    assert.equal(dirtySnap.files[0].del, 1);
+  });
+
+  test("computeFileReviewFingerprint and parseReviewedFileRecord capture file metadata accurately", () => {
+    assert.equal(computeFileReviewFingerprint(null), "");
+    assert.equal(computeFileReviewFingerprint(undefined), "");
+
+    const base = {
+      key: "auth::src/jwt.ts",
+      status: "M",
+      add: 12,
+      del: 3,
+      fresh: false,
+      binary: false,
+      sig: "420:1700000000123",
+      mtimeMs: 1700000000123,
+    };
+    const baseFp = computeFileReviewFingerprint(base);
+    assert.equal(baseFp, "M|12|3|0|0|420:1700000000123|1700000000123");
+
+    assert.notEqual(computeFileReviewFingerprint({ ...base, status: "A" }), baseFp);
+    assert.notEqual(computeFileReviewFingerprint({ ...base, add: 13 }), baseFp);
+    assert.notEqual(computeFileReviewFingerprint({ ...base, del: 4 }), baseFp);
+    assert.notEqual(computeFileReviewFingerprint({ ...base, fresh: true }), baseFp);
+    assert.notEqual(computeFileReviewFingerprint({ ...base, binary: true }), baseFp);
+    assert.notEqual(computeFileReviewFingerprint({ ...base, sig: "425:1700000000123" }), baseFp);
+    assert.notEqual(computeFileReviewFingerprint({ ...base, mtimeMs: 1700000009999 }), baseFp);
+
+    assert.deepEqual(parseReviewedFileRecord(true), { reviewed: true, fp: "", reviewedAt: 0 });
+    assert.deepEqual(
+      parseReviewedFileRecord({ reviewed: true, fp: baseFp, reviewedAt: 1700000001000 }),
+      { reviewed: true, fp: baseFp, reviewedAt: 1700000001000 },
+    );
+    assert.equal(parseReviewedFileRecord(false), null);
+    assert.equal(parseReviewedFileRecord(null), null);
+    assert.equal(parseReviewedFileRecord({ reviewed: false, fp: baseFp }), null);
+  });
+
+  test("reconcileReviewedFiles retains unchanged checks and invalidates on edits, commits, and working-tree removal", () => {
+    const fileA = {
+      key: "auth::src/a.js",
+      status: "M",
+      add: 5,
+      del: 2,
+      fresh: false,
+      binary: false,
+      sig: "100:1700000100000",
+      mtimeMs: 1700000100000,
+    };
+    const fileB = {
+      key: "auth::src/b.js",
+      status: "A",
+      add: 0,
+      del: 0,
+      fresh: true,
+      binary: false,
+      sig: "200:1700000100000",
+      mtimeMs: 1700000100000,
+    };
+    const fpA = computeFileReviewFingerprint(fileA);
+    const fpB = computeFileReviewFingerprint(fileB);
+
+    // 1. Retains unchanged working & commit checks
+    const initial = {
+      "working::auth::src/a.js": { reviewed: true, fp: fpA, reviewedAt: 1700000200000 },
+      "working::auth::src/b.js": { reviewed: true, fp: fpB, reviewedAt: 1700000200000 },
+      "commit:c1::auth::src/c.js": { reviewed: true, fp: "M|1|0|0|0||0", reviewedAt: 1700000200000 },
+    };
+    const unchangedRes = reconcileReviewedFiles(initial, { workingFiles: [fileA, fileB] });
+    assert.equal(unchangedRes.changed, false);
+    assert.deepEqual(unchangedRes.nextMap, initial);
+
+    // 2. Drops legacy un-fingerprinted boolean entries so files modified before migration require re-review
+    const legacyRes = reconcileReviewedFiles(
+      { "working::auth::src/a.js": true, "commit:c1::auth::src/c.js": true },
+      { workingFiles: [fileA] },
+    );
+    assert.equal(legacyRes.changed, true);
+    assert.deepEqual(legacyRes.nextMap, {});
+
+    // 3. Removes working check when agent edits file (sig/mtimeMs or add/del changes), keeps untouched fileB
+    const editedA = { ...fileA, sig: "110:1700000300000", mtimeMs: 1700000300000 };
+    const editedRes = reconcileReviewedFiles(initial, { workingFiles: [editedA, fileB] });
+    assert.equal(editedRes.changed, true);
+    assert.equal("working::auth::src/a.js" in editedRes.nextMap, false);
+    assert.equal("working::auth::src/b.js" in editedRes.nextMap, true);
+
+    const lineCountChangedB = { ...fileB, add: 10 };
+    const lineCountRes = reconcileReviewedFiles(initial, { workingFiles: [fileA, lineCountChangedB] });
+    assert.equal(lineCountRes.changed, true);
+    assert.equal("working::auth::src/b.js" in lineCountRes.nextMap, false);
+    assert.equal("working::auth::src/a.js" in lineCountRes.nextMap, true);
+
+    // 4. Removes working check when file leaves working tree (committed externally in terminal)
+    const committedOutRes = reconcileReviewedFiles(initial, { workingFiles: [fileB] });
+    assert.equal(committedOutRes.changed, true);
+    assert.equal("working::auth::src/a.js" in committedOutRes.nextMap, false);
+    assert.equal("working::auth::src/b.js" in committedOutRes.nextMap, true);
+
+    // Subsequent re-edit starts unreviewed because working::auth::src/a.js was cleared
+    assert.equal("working::auth::src/a.js" in committedOutRes.nextMap, false);
+
+    // 5. Removes working & commit checks when another commit touches the same file
+    const byCommittedSet = reconcileReviewedFiles(initial, {
+      workingFiles: [fileA, fileB],
+      committedFileKeys: new Set(["auth::src/a.js", "auth::src/c.js"]),
+    });
+    assert.equal(byCommittedSet.changed, true);
+    assert.equal("working::auth::src/a.js" in byCommittedSet.nextMap, false);
+    assert.equal("commit:c1::auth::src/c.js" in byCommittedSet.nextMap, false);
+    assert.equal("working::auth::src/b.js" in byCommittedSet.nextMap, true);
+
+    const byNewerCommitTs = reconcileReviewedFiles(initial, {
+      workingFiles: [fileA, fileB],
+      committedAfterByKey: new Map([
+        ["auth::src/c.js", 1700000250000], // newer than 1700000200000
+        ["auth::src/d.js", 1700000100000], // older than review
+      ]),
+    });
+    assert.equal(byNewerCommitTs.changed, true);
+    assert.equal("commit:c1::auth::src/c.js" in byNewerCommitTs.nextMap, false);
+    assert.equal("working::auth::src/a.js" in byNewerCommitTs.nextMap, true);
+
+    // 6. Preserves checks for services in erroredServiceIds even when workingFiles omits them
+    const erroredInitial = {
+      "working::billing::src/pay.js": { reviewed: true, fp: "M|1|1|0|0|10:1|1", reviewedAt: 1700000200000 },
+      "commit:c2::billing::src/pay.js": { reviewed: true, fp: "M|1|1|0|0||0", reviewedAt: 1700000200000 },
+      "working::auth::src/a.js": { reviewed: true, fp: fpA, reviewedAt: 1700000200000 },
+    };
+    const erroredRes = reconcileReviewedFiles(erroredInitial, {
+      workingFiles: [fileA],
+      committedFileKeys: new Set(["billing::src/pay.js"]),
+      erroredServiceIds: new Set(["billing"]),
+    });
+    assert.equal(erroredRes.changed, false);
+    assert.deepEqual(erroredRes.nextMap, erroredInitial);
+  });
+
+  test("mods/changes-review copies of dropdown-logic.js, dropdown.js, and markdown-syntax.js stay byte-identical to shared/", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { resolve, dirname } = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+    for (const file of ["dropdown-logic.js", "dropdown.js", "markdown-syntax.js"]) {
+      const canonical = readFileSync(resolve(repoRoot, "shared", file), "utf8");
+      const modCopy = readFileSync(resolve(repoRoot, "mods/changes-review", file), "utf8");
+      assert.equal(modCopy, canonical, `mods/changes-review/${file} must match shared/${file} verbatim`);
+    }
+  });
+
+  test("tokenizeDiffLine delegates md and mdx prose to shared markdown syntax without code-keyword rainbow noise", () => {
+    const prose = 'Use `const x = 1` when **bold** and or is in "quoted" text -> @user.';
+    for (const ext of ["md", "mdx", "MD"]) {
+      const toks = tokenizeDiffLine(prose, ext);
+      assert.ok(Array.isArray(toks));
+      assert.equal(toks.map(([, v]) => v).join(""), prose);
+      assert.deepEqual(toks, [
+        ["plain", "Use "],
+        ["string", "`const x = 1`"],
+        ["plain", ' when **bold** and or is in "quoted" text -> @user.'],
+      ]);
+      for (const [kind] of toks) {
+        assert.notEqual(kind, "keyword");
+        assert.notEqual(kind, "operator");
+        assert.notEqual(kind, "annotation");
+        assert.notEqual(kind, "number");
+      }
+    }
+
+    assert.deepEqual(tokenizeDiffLine("## Heading and or is", "md"), [
+      ["keyword", "##"],
+      ["plain", " "],
+      ["function", "Heading and or is"],
+    ]);
+
+    assert.deepEqual(tokenizeDiffLine('- list item with `code` and "quotes"', "md"), [
+      ["comment", "-"],
+      ["plain", " list item with "],
+      ["string", "`code`"],
+      ["plain", ' and "quotes"'],
+    ]);
+
+    assert.deepEqual(tokenizeDiffLine("- [x] shipped and or is", "mdx"), [
+      ["comment", "-"],
+      ["plain", " "],
+      ["constant", "[x]"],
+      ["plain", " shipped and or is"],
+    ]);
+  });
+
+  test("diffRows maintains per-side Markdown frontmatter/fence state and isolates deletions from active additions", () => {
+    const fmRows = diffRows([
+      "@@ -0,0 +1,5 @@",
+      "+---",
+      '+title: "Guide"',
+      "+---",
+      "+## Intro",
+      '+Prose with and or is "quoted" **bold**.',
+    ], "docs/guide.md");
+
+    assert.deepEqual(fmRows[1].tokens, [["comment", "---"]]);
+    assert.deepEqual(fmRows[2].tokens, [
+      ["type", "title"],
+      ["comment", ":"],
+      ["plain", ' "Guide"'],
+    ]);
+    assert.deepEqual(fmRows[3].tokens, [["comment", "---"]]);
+    assert.deepEqual(fmRows[4].tokens, [
+      ["keyword", "##"],
+      ["plain", " "],
+      ["function", "Intro"],
+    ]);
+    assert.deepEqual(fmRows[5].tokens, [
+      ["plain", 'Prose with and or is "quoted" **bold**.'],
+    ]);
+
+    // Later hunk keeps per-side fence state: `-` deletions must not corrupt `+` fence or leak fences into `+` prose,
+    // and non-contiguous `@` hunks reset unclosed fences cleanly.
+    const mdDiffRows = diffRows([
+      "@@ -10,4 +10,7 @@",
+      " ---",
+      "-Old prose with and or is - list item",
+      "+```js",
+      "-```",
+      "+const total = 42;",
+      "+```",
+      "+After fence with and or is **bold** and `inline()`.",
+      "@@ -25,2 +28,2 @@",
+      "-```python",
+      "+Replacement prose after deleted python fence: def and or is 1.",
+      "@@ -40,2 +45,2 @@",
+      " ```ts",
+      "-const a: string = 'old';",
+      "+const a: string = 'new';",
+      "@@ -80,1 +85,1 @@",
+      "+This and or is outside any unclosed fence from earlier hunks.",
+    ], "notes/README.mdx");
+
+    // Line 10 context "---" is a horizontal rule (not frontmatter)
+    assert.deepEqual(mdDiffRows[1].tokens, [["comment", "---"]]);
+    // Deleted prose line stays plain
+    assert.deepEqual(mdDiffRows[2].tokens, [["plain", "Old prose with and or is - list item"]]);
+    // Opening ```js fence on + side
+    assert.deepEqual(mdDiffRows[3].tokens, [["comment", "```"], ["type", "js"]]);
+    // Deleted ``` does NOT close active + fence, and stays comment on old side
+    assert.deepEqual(mdDiffRows[4].tokens, [["comment", "```"]]);
+    // Inside + js fence: JS syntax tokens active!
+    assert.ok(mdDiffRows[5].tokens.some(([k, v]) => k === "keyword" && v === "const"));
+    assert.ok(mdDiffRows[5].tokens.some(([k, v]) => k === "number" && v === "42"));
+    // Closing ``` on + side
+    assert.deepEqual(mdDiffRows[6].tokens, [["comment", "```"]]);
+    // Back to calm Markdown prose + inline code
+    assert.deepEqual(mdDiffRows[7].tokens, [
+      ["plain", "After fence with and or is **bold** and "],
+      ["string", "`inline()`"],
+      ["plain", "."],
+    ]);
+    // Deleted ```python opens fence on old side only; subsequent + prose stays strictly plain!
+    assert.deepEqual(mdDiffRows[9].tokens, [["comment", "```"], ["type", "python"]]);
+    assert.deepEqual(mdDiffRows[10].tokens, [
+      ["plain", "Replacement prose after deleted python fence: def and or is 1."],
+    ]);
+    // Context ```ts advances both old and new fence state cleanly for - and + lines inside hunk 3
+    assert.ok(mdDiffRows[13].tokens.some(([k, v]) => k === "keyword" && v === "const"));
+    assert.ok(mdDiffRows[14].tokens.some(([k, v]) => k === "keyword" && v === "const"));
+    // Non-contiguous hunk 4 resets unclosed ```ts fence from hunk 3 cleanly
+    assert.deepEqual(mdDiffRows[16].tokens, [
+      ["plain", "This and or is outside any unclosed fence from earlier hunks."],
+    ]);
   });
 });

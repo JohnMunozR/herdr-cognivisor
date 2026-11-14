@@ -1,6 +1,12 @@
 // Pure helper logic for changes-review: diff row parsing, linear syntax lexer, path normalization, watch filtering, and session baseline helpers.
 import * as fsPromises from "fs/promises";
 import { join } from "path";
+import {
+  isMarkdownExt,
+  createMarkdownState,
+  advanceMarkdownState,
+  tokenizeMarkdownLine,
+} from "./markdown-syntax.js";
 
 export const DIFF_KEYWORDS = new Set([
   "abstract", "and", "as", "assert", "async", "await", "break", "case", "catch", "class",
@@ -328,32 +334,42 @@ export function expandCodeTabs(rawText) {
 }
 
 // Linear single-pass lexer that preserves exact characters and avoids regex backtracking.
-export function tokenizeDiffLine(rawText, ext) {
-  if (!rawText) return null;
+export function tokenizeDiffLine(rawText, ext, mdState = null) {
+  const normExt = String(ext || "").toLowerCase();
+  const isMd = isMarkdownExt(normExt);
+  if (!rawText) {
+    if (mdState && isMd) {
+      return tokenizeMarkdownLine("", mdState, tokenizeDiffLine);
+    }
+    return null;
+  }
   const text = expandCodeTabs(rawText);
-  if (text.length > MAX_DIFF_SYNTAX_LINE_CHARS || ext === "txt" || ext === "log") return null;
+  if (text.length > MAX_DIFF_SYNTAX_LINE_CHARS || normExt === "txt" || normExt === "log") {
+    if (mdState && isMd) mdState.lineIndex += 1;
+    return null;
+  }
 
-  if (PROP_EXTS.has(ext)) {
+  if (isMd) {
+    return tokenizeMarkdownLine(text, mdState, tokenizeDiffLine);
+  }
+
+  if (PROP_EXTS.has(normExt)) {
     return tokenizeDiffPropertiesLine(text, []);
   }
 
   const tokens = [];
   const len = text.length;
-  const hashComments = HASH_COMMENT_EXTS.has(ext);
-  const slashComments = !ext || SLASH_COMMENT_EXTS.has(ext);
-  const markup = MARKUP_EXTS.has(ext);
-  const isPython = ext === "py" || ext === "pyw" || ext === "pyi";
-  const isJson = ext === "json" || ext === "jsonc" || ext === "json5";
-  const isYaml = ext === "yml" || ext === "yaml";
-  const isCss = ext === "css" || ext === "scss" || ext === "less";
-  const isSql = ext === "sql";
-  const isRust = ext === "rs";
-  const isMd = ext === "md" || ext === "mdx";
-  const docTagsEnabled = DOC_COMMENT_EXTS.has(ext);
+  const hashComments = HASH_COMMENT_EXTS.has(normExt);
+  const slashComments = !normExt || SLASH_COMMENT_EXTS.has(normExt);
+  const markup = MARKUP_EXTS.has(normExt);
+  const isPython = normExt === "py" || normExt === "pyw" || normExt === "pyi";
+  const isJson = normExt === "json" || normExt === "jsonc" || normExt === "json5";
+  const isYaml = normExt === "yml" || normExt === "yaml";
+  const isCss = normExt === "css" || normExt === "scss" || normExt === "less";
+  const isSql = normExt === "sql";
+  const isRust = normExt === "rs";
+  const docTagsEnabled = DOC_COMMENT_EXTS.has(normExt);
 
-  if (isMd && /^\s*#{1,6}\s/.test(text)) {
-    return [["keyword", text]];
-  }
   if (docTagsEnabled && /^\s*\*\s*(?:$|\*\/|@(?:param|returns?|throws|exception|see|since|deprecated|author|version|implSpec|implNote|apiNote|code|linkplain|link|value|inheritDoc)\b)/.test(text)) {
     emitDiffComment(tokens, text, true);
     return tokens;
@@ -453,7 +469,7 @@ export function tokenizeDiffLine(rawText, ext) {
         i++;
         continue;
       }
-      if (ch === "'" && (isMd || (i > 0 && isIdentPart(text[i - 1])))) {
+      if (ch === "'" && i > 0 && isIdentPart(text[i - 1])) {
         i++;
         continue;
       }
@@ -508,7 +524,7 @@ export function tokenizeDiffLine(rawText, ext) {
     }
 
     // Markup / JSX tags (<div, </div, <MyComponent)
-    if (ch === "<" && i + 1 < len && (markup || ext === "jsx" || ext === "tsx")) {
+    if (ch === "<" && i + 1 < len && (markup || normExt === "jsx" || normExt === "tsx")) {
       let tagStart = i + 1;
       if (text[tagStart] === "/") tagStart++;
       if (tagStart < len && /[A-Za-z]/.test(text[tagStart])) {
@@ -630,27 +646,74 @@ export function tokenizeDiffLine(rawText, ext) {
   return tokens;
 }
 
+function resetMdStateForLine(state, lineNo) {
+  if (!state) return;
+  const n = Number.isFinite(lineNo) && lineNo > 0 ? lineNo : 1;
+  state.lineIndex = n - 1;
+  state.inFrontmatter = false;
+  state.frontmatterClosed = n > 1;
+  state.fence = null;
+  state.fenceLang = "";
+}
+
 // Numbers and syntax-tokenizes each diff line once so frames only draw visible rows.
 export function diffRows(lines, filePath = "") {
   const ext = getFileExt(filePath);
-  let old = 0, next = 0;
+  const isMd = isMarkdownExt(ext);
+  const oldMdState = isMd ? createMarkdownState() : null;
+  const newMdState = isMd ? createMarkdownState() : null;
+  let old = 0;
+  let next = 0;
+  let hasHunk = false;
+
   return lines.map((rawLine) => {
-    const line = typeof rawLine === "string" && rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    const line = typeof rawLine === "string"
+      ? (rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine)
+      : String(rawLine ?? "");
     const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)/.exec(line);
-    if (match) { old = +match[1]; next = +match[2]; return { kind: "@", text: line }; }
+    if (match) {
+      const nextOld = +match[1];
+      const nextNew = +match[2];
+      if (isMd && (!hasHunk || nextOld !== old || nextNew !== next)) {
+        resetMdStateForLine(oldMdState, nextOld || 1);
+        resetMdStateForLine(newMdState, nextNew || 1);
+      }
+      old = nextOld;
+      next = nextNew;
+      hasHunk = true;
+      return { kind: "@", text: line };
+    }
+    if (
+      line.startsWith("diff ") ||
+      (!hasHunk && (
+        line.startsWith("index ") ||
+        line.startsWith("--- a/") ||
+        line.startsWith("--- /dev/null") ||
+        line.startsWith("+++ b/") ||
+        line.startsWith("+++ /dev/null")
+      ))
+    ) {
+      hasHunk = false;
+      if (isMd) {
+        resetMdStateForLine(oldMdState, 1);
+        resetMdStateForLine(newMdState, 1);
+      }
+      return { kind: "", text: expandCodeTabs(line) };
+    }
     const kind = line[0];
     if (kind === "-") {
       const code = expandCodeTabs(line.slice(1) || " ");
-      return { kind, number: old++, text: code, tokens: tokenizeDiffLine(code, ext) };
+      return { kind, number: old++, text: code, tokens: tokenizeDiffLine(code, ext, oldMdState) };
     }
     if (kind === "+") {
       const code = expandCodeTabs(line.slice(1) || " ");
-      return { kind, number: next++, text: code, tokens: tokenizeDiffLine(code, ext) };
+      return { kind, number: next++, text: code, tokens: tokenizeDiffLine(code, ext, newMdState) };
     }
     if (kind === " ") {
       old++;
       const code = expandCodeTabs(line.slice(1) || " ");
-      return { kind, number: next++, text: code, tokens: tokenizeDiffLine(code, ext) };
+      if (isMd) advanceMarkdownState(code, oldMdState);
+      return { kind, number: next++, text: code, tokens: tokenizeDiffLine(code, ext, newMdState) };
     }
     return { kind: "", text: expandCodeTabs(line) };
   });
@@ -1043,25 +1106,119 @@ export function sortServicesDirtyFirst(services) {
   });
 }
 
-export function pickNextDirtyService(sortedServices, currentServiceId, getServiceStatusFn) {
-  if (!Array.isArray(sortedServices) || sortedServices.length === 0) return null;
-  const getStatus = typeof getServiceStatusFn === "function" ? getServiceStatusFn : () => "pending";
-  const curIdx = currentServiceId ? sortedServices.findIndex((s) => s?.id === currentServiceId) : -1;
-  if (curIdx < 0) {
-    for (const cand of sortedServices) {
-      if (cand && (cand.workingCount || 0) > 0 && getStatus(cand.id, cand) !== "approved") {
-        return cand;
+/** Compute a deterministic fingerprint string for a changed file snapshot. */
+export function computeFileReviewFingerprint(file) {
+  if (!file || typeof file !== "object") return "";
+  return `${file.status || "M"}|${Number(file.add) || 0}|${Number(file.del) || 0}|${file.fresh ? 1 : 0}|${file.binary ? 1 : 0}|${file.sig || ""}|${Number(file.mtimeMs) || 0}`;
+}
+
+/** Normalize a stored reviewedFiles entry (legacy boolean or structured record). */
+export function parseReviewedFileRecord(entry) {
+  if (entry === true) return { reviewed: true, fp: "", reviewedAt: 0 };
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+  if (entry.reviewed !== true) return null;
+  const reviewedAtNum = Number(entry.reviewedAt);
+  return {
+    reviewed: true,
+    fp: typeof entry.fp === "string" ? entry.fp : "",
+    reviewedAt: Number.isFinite(reviewedAtNum) ? reviewedAtNum : 0,
+  };
+}
+
+function extractFileKeyServiceId(fileKey) {
+  const sep = fileKey.indexOf("::");
+  return sep >= 0 ? fileKey.slice(0, sep) : "";
+}
+
+/**
+ * Reconcile persisted file-reviewed records against current working files and new commits.
+ * Invalidates checks when a file leaves the working tree, is re-edited, or is modified by a newer commit.
+ */
+export function reconcileReviewedFiles(
+  prevReviewedFiles,
+  {
+    workingFiles = [],
+    committedFileKeys = new Set(),
+    committedAfterByKey = new Map(),
+    erroredServiceIds = new Set(),
+    scopeMode = "working",
+  } = {},
+) {
+  void scopeMode;
+  const prev = prevReviewedFiles && typeof prevReviewedFiles === "object" && !Array.isArray(prevReviewedFiles)
+    ? prevReviewedFiles
+    : {};
+  const workingByKey = new Map();
+  for (const f of Array.isArray(workingFiles) ? workingFiles : []) {
+    if (f?.key) workingByKey.set(f.key, f);
+  }
+  const committedSet = committedFileKeys instanceof Set
+    ? committedFileKeys
+    : new Set(Array.isArray(committedFileKeys) ? committedFileKeys : []);
+  const afterMap = committedAfterByKey instanceof Map
+    ? committedAfterByKey
+    : new Map(committedAfterByKey && typeof committedAfterByKey === "object" ? Object.entries(committedAfterByKey) : []);
+  const erroredSet = erroredServiceIds instanceof Set
+    ? erroredServiceIds
+    : new Set(Array.isArray(erroredServiceIds) ? erroredServiceIds : []);
+
+  const nextMap = {};
+  let changed = false;
+
+  for (const [rk, rawVal] of Object.entries(prev)) {
+    const rec = parseReviewedFileRecord(rawVal);
+    if (!rec) {
+      changed = true;
+      continue;
+    }
+
+    if (rk.startsWith("working::")) {
+      const fileKey = rk.slice("working::".length);
+      const serviceIdFromKey = extractFileKeyServiceId(fileKey);
+      if (erroredSet.has(serviceIdFromKey)) {
+        nextMap[rk] = rawVal;
+        continue;
       }
+      const curFile = workingByKey.get(fileKey);
+      if (!curFile || committedSet.has(fileKey)) {
+        changed = true;
+        continue;
+      }
+      const curFp = computeFileReviewFingerprint(curFile);
+      if (!rec.fp || rec.fp !== curFp) {
+        changed = true;
+        continue;
+      }
+      nextMap[rk] = rawVal;
+      continue;
     }
-    return null;
-  }
-  for (let offset = 1; offset < sortedServices.length; offset++) {
-    const cand = sortedServices[(curIdx + offset) % sortedServices.length];
-    if (cand && cand.id !== currentServiceId && (cand.workingCount || 0) > 0 && getStatus(cand.id, cand) !== "approved") {
-      return cand;
+
+    if (rk.startsWith("commit:")) {
+      const rest = rk.slice("commit:".length);
+      const hashSep = rest.indexOf("::");
+      const fileKey = hashSep >= 0 ? rest.slice(hashSep + 2) : "";
+      const serviceIdFromKey = fileKey ? extractFileKeyServiceId(fileKey) : "";
+      if (fileKey && erroredSet.has(serviceIdFromKey)) {
+        nextMap[rk] = rawVal;
+        continue;
+      }
+      if (
+        !rec.fp ||
+        (fileKey &&
+          (committedSet.has(fileKey) ||
+            (afterMap.has(fileKey) && Number(afterMap.get(fileKey)) > (rec.reviewedAt || 0))))
+      ) {
+        changed = true;
+        continue;
+      }
+      nextMap[rk] = rawVal;
+      continue;
     }
+
+    nextMap[rk] = rawVal;
   }
-  return null;
+
+  return { nextMap, changed };
 }
 
 export function filterSessionCommits(commits, sessionStartedAt) {
@@ -1567,10 +1724,11 @@ export async function collectServiceWorkingSnapshot(service, on, includeCommits 
       const commits = includeCommits
         ? await listCommitsWithExec(service.root, branch, on, service, execFn, readFlags)
         : [];
+      const headHash = commits[0]?.hash || "";
       service.workingCount = 0;
       service.aheadCount = aheadCount;
       service.branch = branch;
-      return { service, files: [], commits, branch, rawCount: 0, touched: aheadCount > 0 || commits.length > 0 };
+      return { service, files: [], commits, branch, headHash, rawCount: 0, touched: aheadCount > 0 || commits.length > 0 };
     }
 
     const dirEntries = [];
@@ -1598,10 +1756,14 @@ export async function collectServiceWorkingSnapshot(service, on, includeCommits 
       ? await listCommitsWithExec(service.root, branch, on, service, execFn, readFlags)
       : [];
     let serviceHasHead = true;
+    let headHash = commits[0]?.hash || "";
     const stats = {};
     if (fileEntries.length > 0) {
       const head = await git(["rev-parse", "--verify", "HEAD"]);
       serviceHasHead = head.code === 0;
+      if (serviceHasHead && head.stdout) {
+        headHash = String(head.stdout).trim() || headHash;
+      }
       const results = serviceHasHead
         ? [await git(["diff", "HEAD", "--numstat", "-z", "--no-renames"])]
         : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]), await git(["diff", "--numstat", "-z", "--no-renames"])];
@@ -1647,11 +1809,11 @@ export async function collectServiceWorkingSnapshot(service, on, includeCommits 
     service.workingCount = rawEntries.length;
     service.aheadCount = aheadCount;
     service.branch = branch;
-    return { service, files, commits, branch, rawCount: rawEntries.length, touched: true };
+    return { service, files, commits, branch, headHash, rawCount: rawEntries.length, touched: true };
   } catch (e) {
     service.workingCount = 0;
     service.aheadCount = 0;
     service.branch = service.branch || "HEAD";
-    return { service, files: [], commits: [], branch: service.branch, rawCount: 0, touched: false, error: e };
+    return { service, files: [], commits: [], branch: service.branch, headHash: "", rawCount: 0, touched: false, error: e };
   }
 }

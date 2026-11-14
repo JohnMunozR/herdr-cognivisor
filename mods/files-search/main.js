@@ -64,6 +64,13 @@ import {
 } from "./search-logic.js";
 import { computeWrapColumns, wrapStyledSpans } from "./code-wrap.js";
 import {
+  isMarkdownExt,
+  createMarkdownState,
+  advanceMarkdownState,
+  getMarkdownStateTag,
+  tokenizeMarkdownLine,
+} from "./markdown-syntax.js";
+import {
   resolveCachedCascade,
   MAX_CASCADE_DEPTH,
   POSIX_CASCADE_SCRIPT,
@@ -106,8 +113,9 @@ let VIEWER_ID_SEQ = 0;
 const MAX_PREVIEW_WRAP_CACHE = 400;
 const previewWrapCache = new Map();
 
-function getCachedPreviewRows(text, ext, query, isTarget, maxCols) {
-  const key = `${text || ""}\0${ext || ""}\0${isTarget && query ? query : ""}\0${isTarget ? 1 : 0}\0${maxCols}`;
+function getCachedPreviewRows(text, ext, query, isTarget, maxCols, mdState = null) {
+  const mdTag = mdState ? getMarkdownStateTag(mdState) : "";
+  const key = `${text || ""}\0${ext || ""}\0${mdTag}\0${isTarget && query ? query : ""}\0${isTarget ? 1 : 0}\0${maxCols}`;
   let hit = previewWrapCache.get(key);
   if (hit) {
     previewWrapCache.delete(key);
@@ -132,7 +140,7 @@ function getCachedPreviewRows(text, ext, query, isTarget, maxCols) {
         : [{ text: expanded, match: false }];
     hit = { mode: "match", rows: wrapStyledSpans(spans, maxCols, { toNbsp: true }) };
   } else {
-    const tokens = tokenizeCodeLine(expanded, ext);
+    const tokens = tokenizeCodeLine(expanded, ext, mdState ? { ...mdState } : null);
     if (!tokens || tokens.length === 0) {
       hit = { mode: "plain", rows: wrapStyledSpans([["plain", expanded]], maxCols, { toNbsp: true }) };
     } else {
@@ -3560,14 +3568,16 @@ export default class FilesSearch extends View {
       .child(div().text_color(t.dim).child(after.replace(/ /g, "\u00a0")));
   }
 
-  renderSyntaxLine(t, text, ext, query, isTarget) {
+  renderSyntaxLine(t, text, ext, query, isTarget, mdState = null) {
     const fontFamily = settings()?.font_family || "monospace";
     if (!text) {
       return div().flex_none().whitespace_nowrap().text_size(11.5).font_family(fontFamily).child("\u00a0");
     }
     const clean = expandCodeTabs(text);
     const displayText = clean.length > 4000 ? clean.slice(0, 4000) + "… (line truncated)" : clean;
-    const tokens = tokenizeCodeLine(displayText, ext);
+    const tokens = isMarkdownExt(ext)
+      ? tokenizeMarkdownLine(displayText, mdState, tokenizeCodeLine)
+      : tokenizeCodeLine(displayText, ext);
     if (!tokens) {
       return query
         ? this.renderHighlightedCodeLine(t, displayText, query)
@@ -3700,10 +3710,10 @@ export default class FilesSearch extends View {
       );
   }
 
-  renderWrappedSyntaxSegments(t, text, ext, query, isTarget, maxCols, resolvedFont = null, fillWidth = false) {
+  renderWrappedSyntaxSegments(t, text, ext, query, isTarget, maxCols, resolvedFont = null, fillWidth = false, mdState = null) {
     const fontFamily = resolvedFont || settings()?.font_family || "monospace";
     const applyWrapBox = (el) => (fillWidth ? el.flex_1().min_w(0).overflow_hidden() : el.flex_none());
-    const cached = getCachedPreviewRows(text, ext, query, isTarget, maxCols);
+    const cached = getCachedPreviewRows(text, ext, query, isTarget, maxCols, mdState);
 
     if (cached.mode === "empty") {
       return [
@@ -3924,6 +3934,17 @@ export default class FilesSearch extends View {
     const endIdx = Math.min(this.previewLines.length, startIdx + VISIBLE_ROWS);
     let renderedVisualRows = 0;
 
+    let mdState = null;
+    if (isMarkdownExt(ext)) {
+      mdState = createMarkdownState();
+      const baseLine = Math.max(0, (this.previewStartLine || 1) - 1);
+      mdState.lineIndex = baseLine;
+      if (baseLine > 0) mdState.frontmatterClosed = true;
+      for (let i = 0; i < startIdx; i++) {
+        advanceMarkdownState(this.previewLines[i] ?? "", mdState);
+      }
+    }
+
     for (let i = startIdx; i < endIdx && renderedVisualRows < VISIBLE_ROWS; i++) {
       const lineNum = (this.previewStartLine || 1) + i;
       const isTarget = lineNum === targetLine;
@@ -3937,8 +3958,12 @@ export default class FilesSearch extends View {
         isTarget,
         previewCols,
         monoFont,
-        true
+        true,
+        mdState
       );
+      if (mdState) {
+        advanceMarkdownState(lineContent, mdState);
+      }
 
       for (let s = 0; s < wrappedSegments.length && renderedVisualRows < VISIBLE_ROWS; s++) {
         const isFirstSeg = s === 0;

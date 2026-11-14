@@ -57,10 +57,67 @@ describe("git-history repo-logic", () => {
     );
   });
 
-  test("parseBranchesOutput parses local and remote refs from git for-each-ref", () => {
+  test("parseBranchesOutput parses tab-delimited (%09) local and remote refs while filtering symbolic /HEAD", () => {
+    const stdout = [
+      " \tfix/changes-review\trefs/heads/fix/changes-review\t885a77d",
+      "*\tmain\trefs/heads/main\t885a77d",
+      " \torigin\trefs/remotes/origin/HEAD\t885a77d",
+      " \tupstream\trefs/remotes/upstream/HEAD\t1234abc",
+      " \torigin/fix/changes-review\trefs/remotes/origin/fix/changes-review\t885a77d",
+      " \torigin/main\trefs/remotes/origin/main\t885a77d",
+      " \tupstream/main\trefs/remotes/upstream/main\t1234abc",
+      "",
+    ].join("\n");
+
+    const branches = parseBranchesOutput(stdout);
+    assert.deepEqual(branches, [
+      {
+        name: "fix/changes-review",
+        fullName: "refs/heads/fix/changes-review",
+        kind: "local",
+        isCurrent: false,
+        shortHash: "885a77d",
+      },
+      {
+        name: "main",
+        fullName: "refs/heads/main",
+        kind: "local",
+        isCurrent: true,
+        shortHash: "885a77d",
+      },
+      {
+        name: "origin/fix/changes-review",
+        fullName: "refs/remotes/origin/fix/changes-review",
+        kind: "remote",
+        isCurrent: false,
+        shortHash: "885a77d",
+      },
+      {
+        name: "origin/main",
+        fullName: "refs/remotes/origin/main",
+        kind: "remote",
+        isCurrent: false,
+        shortHash: "885a77d",
+      },
+      {
+        name: "upstream/main",
+        fullName: "refs/remotes/upstream/main",
+        kind: "remote",
+        isCurrent: false,
+        shortHash: "1234abc",
+      },
+    ]);
+    assert.equal(branches.some((b) => b.name === "origin" || b.fullName.endsWith("/HEAD")), false);
+    assert.deepEqual(parseBranchesOutput(""), []);
+    // Regression check: unexpanded literal %x1f from old format must not yield bogus branches
+    assert.deepEqual(parseBranchesOutput("*%x1fmain%x1frefs/heads/main%x1f885a77d\n"), []);
+  });
+
+  test("parseBranchesOutput maintains backwards compatibility with \\x1f delimited refs and filters /HEAD", () => {
     const stdout = [
       "*\x1fmain\x1frefs/heads/main\x1fa1b2c3d",
       " \x1ffeat/git-history\x1frefs/heads/feat/git-history\x1fd4e5f60",
+      " \x1forigin\x1frefs/remotes/origin/HEAD\x1fa1b2c3d",
       " \x1forigin/main\x1frefs/remotes/origin/main\x1fa1b2c3d",
       "",
     ].join("\n");
@@ -71,7 +128,6 @@ describe("git-history repo-logic", () => {
       { name: "feat/git-history", fullName: "refs/heads/feat/git-history", kind: "local", isCurrent: false, shortHash: "d4e5f60" },
       { name: "origin/main", fullName: "refs/remotes/origin/main", kind: "remote", isCurrent: false, shortHash: "a1b2c3d" },
     ]);
-    assert.deepEqual(parseBranchesOutput(""), []);
   });
 
   test("mergeDiscoveredWithServices preserves clean repos and enriches dirty repos from mesh.services", () => {

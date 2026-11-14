@@ -1,5 +1,11 @@
 // Pure zero-UI diff parsing, side-by-side alignment, syntax lexing, and theme palette helpers for git-history.
 import { countWrappedLines, wrapPlainText, wrapStyledSpans } from "./code-wrap.js";
+import {
+  isMarkdownExt,
+  createMarkdownState,
+  advanceMarkdownState,
+  tokenizeMarkdownLine,
+} from "./markdown-syntax.js";
 
 export const MAX_DIFF_SYNTAX_LINE_CHARS = 500;
 export const MAX_VIEWER_DIFF_LINES = 1500;
@@ -383,7 +389,6 @@ function emitDiffComment(tokens, slice, enableDocTags) {
 const TPL_VAR_NAME_RE = /^[a-zA-Z0-9_.:-]+$/;
 const PATH_VAR_NAME_RE = /^[a-zA-Z_][a-zA-Z0-9_.-]*$/;
 const PROP_NUMBER_RE = /^-?(?:0x[0-9a-fA-F_]+|\d+(?:\.\d+)?)(?:ms|s|m|h|d|kb|mb|gb)?$/i;
-const MD_HEADING_RE = /^\s*#{1,6}\s/;
 const DOC_LINE_START_RE = /^\s*\*\s*(?:$|\*\/|@(?:param|returns?|throws|exception|see|since|deprecated|author|version|implSpec|implNote|apiNote|code|linkplain|link|value|inheritDoc)\b)/;
 const UPPER_CONST_RE = /^[A-Z][A-Z0-9_]+$/;
 const PASCAL_TYPE_RE = /^[A-Z][a-zA-Z0-9_]*$/;
@@ -520,12 +525,25 @@ function tokenizeDiffPropertiesLine(text, tokens) {
   return tokens;
 }
 
-export function tokenizeDiffLine(line, ext) {
-  if (!line) return null;
-  const text = expandCodeTabs(line);
-  if (text.length > MAX_DIFF_SYNTAX_LINE_CHARS || ext === "txt" || ext === "log") return null;
-
+export function tokenizeDiffLine(line, ext, mdState = null) {
   const normExt = String(ext || "").toLowerCase();
+  const isMd = isMarkdownExt(normExt);
+  if (!line) {
+    if (mdState && isMd) {
+      return tokenizeMarkdownLine("", mdState, tokenizeDiffLine);
+    }
+    return null;
+  }
+  const text = expandCodeTabs(line);
+  if (text.length > MAX_DIFF_SYNTAX_LINE_CHARS || normExt === "txt" || normExt === "log") {
+    if (mdState && isMd) mdState.lineIndex += 1;
+    return null;
+  }
+
+  if (isMd) {
+    return tokenizeMarkdownLine(text, mdState, tokenizeDiffLine);
+  }
+
   if (PROP_EXTS.has(normExt)) {
     return tokenizeDiffPropertiesLine(text, []);
   }
@@ -542,12 +560,8 @@ export function tokenizeDiffLine(line, ext) {
   const isSql = normExt === "sql";
   const isRust = normExt === "rs";
   const isShell = normExt === "sh" || normExt === "bash" || normExt === "zsh" || normExt === "fish";
-  const isMd = normExt === "md" || normExt === "mdx";
   const docTagsEnabled = DOC_COMMENT_EXTS.has(normExt);
 
-  if (isMd && MD_HEADING_RE.test(text)) {
-    return [["keyword", text]];
-  }
   if (docTagsEnabled && DOC_LINE_START_RE.test(text)) {
     emitDiffComment(tokens, text, true);
     return tokens;
@@ -642,7 +656,7 @@ export function tokenizeDiffLine(line, ext) {
         i++;
         continue;
       }
-      if (ch === "'" && (isMd || (i > 0 && isIdentPart(text[i - 1])))) {
+      if (ch === "'" && i > 0 && isIdentPart(text[i - 1])) {
         i++;
         continue;
       }
@@ -1118,33 +1132,118 @@ function resolveMaxDiffLines(options) {
   return options?.expanded ? MAX_EXPANDED_VIEWER_DIFF_LINES : MAX_VIEWER_DIFF_LINES;
 }
 
-export function tokenizeDeferredRow(row, ext) {
+function sameMdState(a, b) {
+  if (!a || !b) return Boolean(a) === Boolean(b);
+  return (
+    a.inFrontmatter === b.inFrontmatter &&
+    a.fence === b.fence &&
+    a.fenceLang === b.fenceLang &&
+    (a.lineIndex === 0) === (b.lineIndex === 0)
+  );
+}
+
+function resetMdStateForLine(state, lineNo) {
+  state.lineIndex = Math.max(0, lineNo - 1);
+  state.inFrontmatter = false;
+  state.frontmatterClosed = lineNo > 1;
+  state.fence = null;
+  state.fenceLang = "";
+}
+
+export function tokenizeDeferredRow(row, ext, leftMdState = null, rightMdState = null) {
   if (!row || typeof row !== "object") return row;
   if (row.kind === "pair") {
     const left = row.left;
     const right = row.right;
     if (left && right && left.kind === "ctx" && right.kind === "ctx") {
       if (left._tokPending || right._tokPending) {
-        const toks = tokenizeDiffLine(left.text, ext);
-        left.tokens = toks;
-        right.tokens = toks;
+        if (left._mdState || right._mdState) {
+          let lState = left._mdState ? { ...left._mdState } : null;
+          let rState = right._mdState ? { ...right._mdState } : null;
+          if (leftMdState && left._mdState) {
+            Object.assign(leftMdState, left._mdState);
+            lState = leftMdState;
+          }
+          if (rightMdState && right._mdState) {
+            Object.assign(rightMdState, right._mdState);
+            rState = rightMdState;
+          }
+          if (sameMdState(lState, rState)) {
+            const toks = tokenizeDiffLine(left.text, ext, lState);
+            if (rState && rState !== lState) advanceMarkdownState(left.text, rState);
+            left.tokens = toks;
+            right.tokens = toks;
+          } else {
+            left.tokens = tokenizeDiffLine(left.text, ext, lState || leftMdState);
+            right.tokens = tokenizeDiffLine(right.text, ext, rState || rightMdState);
+          }
+          delete left._mdState;
+          delete right._mdState;
+        } else if (leftMdState || rightMdState) {
+          if (sameMdState(leftMdState, rightMdState)) {
+            const toks = tokenizeDiffLine(left.text, ext, leftMdState);
+            if (rightMdState && rightMdState !== leftMdState) {
+              advanceMarkdownState(left.text, rightMdState);
+            }
+            left.tokens = toks;
+            right.tokens = toks;
+          } else {
+            left.tokens = tokenizeDiffLine(left.text, ext, leftMdState);
+            right.tokens = tokenizeDiffLine(right.text, ext, rightMdState);
+          }
+        } else {
+          const toks = tokenizeDiffLine(left.text, ext);
+          left.tokens = toks;
+          right.tokens = toks;
+        }
         left._tokPending = false;
         right._tokPending = false;
       }
       return row;
     }
     if (left && left._tokPending) {
-      left.tokens = tokenizeDiffLine(left.text, ext);
+      let st = leftMdState;
+      if (left._mdState) {
+        if (leftMdState) {
+          Object.assign(leftMdState, left._mdState);
+          st = leftMdState;
+        } else {
+          st = { ...left._mdState };
+        }
+        delete left._mdState;
+      }
+      left.tokens = tokenizeDiffLine(left.text, ext, st);
       left._tokPending = false;
     }
     if (right && right._tokPending) {
-      right.tokens = tokenizeDiffLine(right.text, ext);
+      let st = rightMdState;
+      if (right._mdState) {
+        if (rightMdState) {
+          Object.assign(rightMdState, right._mdState);
+          st = rightMdState;
+        } else {
+          st = { ...right._mdState };
+        }
+        delete right._mdState;
+      }
+      right.tokens = tokenizeDiffLine(right.text, ext, st);
       right._tokPending = false;
     }
     return row;
   }
   if (row._tokPending) {
-    row.tokens = tokenizeDiffLine(row.text, ext);
+    const baseState = row.kind === "del" ? leftMdState : rightMdState;
+    let st = baseState;
+    if (row._mdState) {
+      if (baseState) {
+        Object.assign(baseState, row._mdState);
+        st = baseState;
+      } else {
+        st = { ...row._mdState };
+      }
+      delete row._mdState;
+    }
+    row.tokens = tokenizeDiffLine(row.text, ext, st);
     row._tokPending = false;
   }
   return row;
@@ -1152,8 +1251,51 @@ export function tokenizeDeferredRow(row, ext) {
 
 export function tokenizeSideBySidePage(rows, ext) {
   if (!Array.isArray(rows) || rows.length === 0) return rows;
+  const isMd = isMarkdownExt(ext);
+  let leftMdState = null;
+  let rightMdState = null;
+  if (isMd) {
+    leftMdState = createMarkdownState();
+    rightMdState = createMarkdownState();
+    const first = rows[0];
+    if (first?.kind === "pair") {
+      if (first.left?.lineNo > 1) {
+        leftMdState.lineIndex = first.left.lineNo - 1;
+        leftMdState.frontmatterClosed = true;
+      }
+      if (first.right?.lineNo > 1) {
+        rightMdState.lineIndex = first.right.lineNo - 1;
+        rightMdState.frontmatterClosed = true;
+      }
+    }
+  }
   for (let i = 0; i < rows.length; i++) {
-    tokenizeDeferredRow(rows[i], ext);
+    const row = rows[i];
+    if (isMd && row?.kind === "hunk") {
+      resetMdStateForLine(leftMdState, row.oldStart || 1);
+      resetMdStateForLine(rightMdState, row.newStart || 1);
+      continue;
+    }
+    if (isMd && row?.kind === "pair") {
+      const leftAlreadyDone = Boolean(row.left && !row.left._tokPending && row.left.kind !== "empty");
+      const rightAlreadyDone = Boolean(row.right && !row.right._tokPending && row.right.kind !== "empty");
+      if (leftAlreadyDone) {
+        if (row.left._mdState) {
+          Object.assign(leftMdState, row.left._mdState);
+          delete row.left._mdState;
+        }
+        advanceMarkdownState(row.left.text, leftMdState);
+      }
+      if (rightAlreadyDone) {
+        if (row.right._mdState) {
+          Object.assign(rightMdState, row.right._mdState);
+          delete row.right._mdState;
+        }
+        advanceMarkdownState(row.right.text, rightMdState);
+      }
+      if (leftAlreadyDone && rightAlreadyDone) continue;
+    }
+    tokenizeDeferredRow(row, ext, leftMdState, rightMdState);
   }
   return rows;
 }
@@ -1167,9 +1309,12 @@ export function buildSideBySideRows(patchText, filePath = "", options = {}) {
   }
 
   const ext = getFileExt(filePath);
+  const isMd = isMarkdownExt(ext);
   const deferTokens = Boolean(options?.deferTokens);
   const allRows = [];
   const rawLines = patchText.split("\n");
+  const leftMdState = isMd ? createMarkdownState() : null;
+  const rightMdState = isMd ? createMarkdownState() : null;
 
   let inHunk = false;
   let hunkIndex = 0;
@@ -1184,18 +1329,34 @@ export function buildSideBySideRows(patchText, filePath = "", options = {}) {
       let left;
       if (k < dels.length) {
         const text = expandCodeTabs(dels[k]);
-        left = deferTokens
-          ? { lineNo: oldLine++, text, kind: "del", tokens: null, _tokPending: true }
-          : { lineNo: oldLine++, text, kind: "del", tokens: tokenizeDiffLine(text, ext) };
+        if (deferTokens) {
+          left = { lineNo: oldLine++, text, kind: "del", tokens: null, _tokPending: true };
+          if (isMd) {
+            if (leftMdState.inFrontmatter || leftMdState.fence) {
+              left._mdState = { ...leftMdState };
+            }
+            advanceMarkdownState(text, leftMdState);
+          }
+        } else {
+          left = { lineNo: oldLine++, text, kind: "del", tokens: tokenizeDiffLine(text, ext, leftMdState) };
+        }
       } else {
         left = { lineNo: null, text: "", kind: "empty", tokens: null };
       }
       let right;
       if (k < adds.length) {
         const text = expandCodeTabs(adds[k]);
-        right = deferTokens
-          ? { lineNo: newLine++, text, kind: "add", tokens: null, _tokPending: true }
-          : { lineNo: newLine++, text, kind: "add", tokens: tokenizeDiffLine(text, ext) };
+        if (deferTokens) {
+          right = { lineNo: newLine++, text, kind: "add", tokens: null, _tokPending: true };
+          if (isMd) {
+            if (rightMdState.inFrontmatter || rightMdState.fence) {
+              right._mdState = { ...rightMdState };
+            }
+            advanceMarkdownState(text, rightMdState);
+          }
+        } else {
+          right = { lineNo: newLine++, text, kind: "add", tokens: tokenizeDiffLine(text, ext, rightMdState) };
+        }
       } else {
         right = { lineNo: null, text: "", kind: "empty", tokens: null };
       }
@@ -1226,6 +1387,10 @@ export function buildSideBySideRows(patchText, filePath = "", options = {}) {
       });
       oldLine = oldStart;
       newLine = newStart;
+      if (isMd) {
+        resetMdStateForLine(leftMdState, oldStart);
+        resetMdStateForLine(rightMdState, newStart);
+      }
       inHunk = true;
       continue;
     }
@@ -1244,11 +1409,31 @@ export function buildSideBySideRows(patchText, filePath = "", options = {}) {
       flushChangeBlock();
       const text = expandCodeTabs(line === "" ? "" : line.slice(1));
       if (deferTokens) {
-        allRows.push({
-          kind: "pair",
-          left: { lineNo: oldLine++, text, kind: "ctx", tokens: null, _tokPending: true },
-          right: { lineNo: newLine++, text, kind: "ctx", tokens: null, _tokPending: true },
-        });
+        const leftCell = { lineNo: oldLine++, text, kind: "ctx", tokens: null, _tokPending: true };
+        const rightCell = { lineNo: newLine++, text, kind: "ctx", tokens: null, _tokPending: true };
+        if (isMd) {
+          if (leftMdState.inFrontmatter || leftMdState.fence) leftCell._mdState = { ...leftMdState };
+          if (rightMdState.inFrontmatter || rightMdState.fence) rightCell._mdState = { ...rightMdState };
+          advanceMarkdownState(text, leftMdState);
+          advanceMarkdownState(text, rightMdState);
+        }
+        allRows.push({ kind: "pair", left: leftCell, right: rightCell });
+      } else if (isMd) {
+        if (sameMdState(leftMdState, rightMdState)) {
+          const tokens = tokenizeDiffLine(text, ext, leftMdState);
+          advanceMarkdownState(text, rightMdState);
+          allRows.push({
+            kind: "pair",
+            left: { lineNo: oldLine++, text, kind: "ctx", tokens },
+            right: { lineNo: newLine++, text, kind: "ctx", tokens },
+          });
+        } else {
+          allRows.push({
+            kind: "pair",
+            left: { lineNo: oldLine++, text, kind: "ctx", tokens: tokenizeDiffLine(text, ext, leftMdState) },
+            right: { lineNo: newLine++, text, kind: "ctx", tokens: tokenizeDiffLine(text, ext, rightMdState) },
+          });
+        }
       } else {
         const tokens = tokenizeDiffLine(text, ext);
         allRows.push({
@@ -1286,9 +1471,12 @@ export function buildUnifiedRows(patchText, filePath = "", options = {}) {
   }
 
   const ext = getFileExt(filePath);
+  const isMd = isMarkdownExt(ext);
   const deferTokens = Boolean(options?.deferTokens);
   const allRows = [];
   const rawLines = patchText.split("\n");
+  const oldMdState = isMd ? createMarkdownState() : null;
+  const newMdState = isMd ? createMarkdownState() : null;
 
   let inHunk = false;
   let hunkIndex = 0;
@@ -1315,6 +1503,10 @@ export function buildUnifiedRows(patchText, filePath = "", options = {}) {
       });
       oldLine = oldStart;
       newLine = newStart;
+      if (isMd) {
+        resetMdStateForLine(oldMdState, oldStart);
+        resetMdStateForLine(newMdState, newStart);
+      }
       inHunk = true;
       continue;
     }
@@ -1325,35 +1517,59 @@ export function buildUnifiedRows(patchText, filePath = "", options = {}) {
     const prefix = line[0];
     if (prefix === "-") {
       const text = expandCodeTabs(line.slice(1));
-      allRows.push({
+      const row = {
         kind: "del",
         oldLineNo: oldLine++,
         newLineNo: null,
         text,
-        tokens: deferTokens ? null : tokenizeDiffLine(text, ext),
+        tokens: deferTokens ? null : tokenizeDiffLine(text, ext, oldMdState),
         ...(deferTokens ? { _tokPending: true } : {}),
-      });
+      };
+      if (deferTokens && isMd) {
+        if (oldMdState.inFrontmatter || oldMdState.fence) row._mdState = { ...oldMdState };
+        advanceMarkdownState(text, oldMdState);
+      }
+      allRows.push(row);
     } else if (prefix === "+") {
       const text = expandCodeTabs(line.slice(1));
-      allRows.push({
+      const row = {
         kind: "add",
         oldLineNo: null,
         newLineNo: newLine++,
         text,
-        tokens: deferTokens ? null : tokenizeDiffLine(text, ext),
+        tokens: deferTokens ? null : tokenizeDiffLine(text, ext, newMdState),
         ...(deferTokens ? { _tokPending: true } : {}),
-      });
+      };
+      if (deferTokens && isMd) {
+        if (newMdState.inFrontmatter || newMdState.fence) row._mdState = { ...newMdState };
+        advanceMarkdownState(text, newMdState);
+      }
+      allRows.push(row);
     } else if (prefix === " " || line === "") {
       if (line === "" && i === rawLines.length - 1) continue;
       const text = expandCodeTabs(line === "" ? "" : line.slice(1));
-      allRows.push({
+      let tokens = null;
+      let mdSnap = null;
+      if (deferTokens) {
+        if (isMd) {
+          if (newMdState.inFrontmatter || newMdState.fence) mdSnap = { ...newMdState };
+          advanceMarkdownState(text, oldMdState);
+          advanceMarkdownState(text, newMdState);
+        }
+      } else {
+        if (isMd) advanceMarkdownState(text, oldMdState);
+        tokens = tokenizeDiffLine(text, ext, newMdState);
+      }
+      const row = {
         kind: "ctx",
         oldLineNo: oldLine++,
         newLineNo: newLine++,
         text,
-        tokens: deferTokens ? null : tokenizeDiffLine(text, ext),
+        tokens,
         ...(deferTokens ? { _tokPending: true } : {}),
-      });
+      };
+      if (mdSnap) row._mdState = mdSnap;
+      allRows.push(row);
     }
   }
 

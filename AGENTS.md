@@ -10,8 +10,9 @@ This repository is strictly governed by the **Fractal Spec-Graph** (`goal-and-re
 
 - **Root Requirements:** Consult `goal-and-requirements.md` to understand the product goal, user personas, capabilities, and non-goals.
 - **System Architecture:** Consult `architecture.md` for top-level layout topology, mod lifecycle, inter-mod shared state contracts, and system-wide invariants.
-- **Owning Module Specs:** When reading, altering, or adding features to layout templates or mods, read the owning `SPEC.md`:
+- **Owning Module Specs:** When reading, altering, or adding features to layout templates, shared modules, or mods, read the owning `SPEC.md`:
   - `layouts/SPEC.md` for layout topology and window container structures (`[[module-layouts]]`).
+  - `shared/SPEC.md` for canonical shared pure engines and GPUI UI adapters (`[[module-shared]]`).
   - `mods/SPEC.md` for the catalog of registered mods (`[[module-mods]]`).
   - `mods/changes-review/SPEC.md` for line-by-line diff review and agent feedback dispatch (`[[submodule-mod-changes-review]]`).
   - `mods/files-search/SPEC.md` for the IntelliJ-style Search Everywhere overlay and file tree viewer (`[[submodule-mod-files-search]]`).
@@ -50,6 +51,7 @@ Modularity in `herdr-mesh` is strict, declarative, and fractal:
    - `goal-and-requirements` (Root requirements: scope, value, personas)
      └── `architecture` (Top-level topology, cross-cutting contracts, invariants)
          ├── `module-layouts` (`layouts/SPEC.md` — layout definitions and container regions)
+         ├── `module-shared` (`shared/SPEC.md` — canonical reusable engines and GPUI UI adapters)
          └── `module-mods` (`mods/SPEC.md` — installed mod manifests and components)
              ├── `submodule-mod-changes-review` (`mods/changes-review/SPEC.md`)
              ├── `submodule-mod-files-search` (`mods/files-search/SPEC.md`)
@@ -89,6 +91,17 @@ All code in this repository runs inside Herdr's native GPUI shell (`gpui-shell 0
    - Herdr's default shipped layouts (`main.json`, `terminals.json`, `win98.json`) are immutable and restored on startup.
    - The primary custom layout owned and delivered by this project is `layouts/mesh.json`.
    - Modifications to layout structure must be tested in `layouts/mesh.json` or personal clones, never in Herdr's core shipped layouts.
+5. **Shared Reusable Components & `shared/` Registry:**
+   - Before introducing UI widgets, soft line-wrappers, dropdown popovers, or syntax tokenizers in any mod, developers and AI agents MUST inspect `shared/` (`[[module-shared]]`) first and extend or reuse the canonical engines and UI adapters (`code-wrap.js`, `dropdown-logic.js`, `dropdown.js`, `markdown-syntax.js`) rather than duplicating implementations per mod.
+   - Every shared file MUST be registered in `scripts/sync-shared.mjs` (`SHARED_TARGETS`), synced into `install.sh` (`for mod in "${MODS[@]}"`), and documented in `shared/SPEC.md`. Always run `node scripts/sync-shared.mjs` after editing `shared/*.js` and verify zero drift via `node scripts/sync-shared.mjs --check` (`npm test`).
+   - Keep pure engines (`code-wrap.js`, `dropdown-logic.js`, `markdown-syntax.js`) free of `gpui-kit`, `gpui-base`, and `herdr` imports so Node `--test` exercises them cleanly; keep shared GPUI UI adapters (`dropdown.js`) focused on declarative GPUI composition backed by pure `*-logic.js` helpers.
+6. **Performance & Rendering Optimization Invariant:**
+   - Virtualize scrollable lists, commit graphs, and diff views using `v_virtual_list` + `VirtualListScrollHandle` with precomputed/memoized row heights outside item render callbacks.
+   - Guarantee zero per-frame allocations when overlays, dropdown menus, or panels are closed/hidden (short-circuit hidden panels before querying state or constructing UI trees; gate popovers behind `.when(isOpen, ...)`).
+   - Size floating dropdown popovers adaptively (`computeDropdownMetrics`) so short menus shrink-wrap cleanly and enable `.h(bodyHeight).overflow_y_scrollbar()` only when `shouldScroll === true` (no empty overflow scrollboxes).
+   - Author tokenizers and parsers as single-pass `O(n)` linear scanners without catastrophic backtracking regexes, capping extreme line lengths and render tokens cleanly.
+   - Bound all caches (`WeakMap` keyed by immutable row/line objects or capped LRU maps) and coalesce resize reflows using `16ms` timers (`timer.after(16, ...)`).
+   - Enforce lock-free Git flags (`--no-optional-locks -c core.fsmonitor=false -c diff.autoRefreshIndex=false`), preflight cheap ref signature checks (`git show-ref --head` skip when refs and `HEAD` have not moved), and never call `cx.notify()`, `setShared()`, or `set_value()` synchronously inside `render()`.
 
 ---
 
@@ -110,9 +123,11 @@ Every agent developing, refactoring, or fixing bugs in `herdr-mesh` MUST write o
    for d in mods/*/; do herdr-app check "$d" || exit 1; done
    ```
    All mod checks (including the 5 active layout mods `files-search`, `changes-review`, `git-history`, `mesh-tabs`, `mesh-status`) must pass (exit code 0), verifying that view definitions, intra-mod imports, eager elements, and manifests materialize without errors. Note that `install.sh` installs all 5 active mods and registers `ctrl-p`/`alt-f` (`mod.open:files-search`) in `keys.json` (no default global shortcut is registered for `git-history` in `keys.json`).
-4. **Syntax Validation:**
+4. **Syntax & Sync Validation:**
    ```bash
-   for f in mods/*/*.js; do node --check "$f" || exit 1; done
+   node scripts/sync-shared.mjs --check
+   for f in mods/*/*.js shared/*.js; do node --check "$f" || exit 1; done
+   bash -n install.sh
    ```
 5. **JSON Structure Integrity:**
    ```bash

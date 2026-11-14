@@ -1,4 +1,5 @@
 // Pure helper logic for files-search: fuzzy scoring, directory-aware query ranking, text-search parsing, git header parsing, and syntax highlighting.
+import { isMarkdownExt, tokenizeMarkdownLine } from "./markdown-syntax.js";
 
 export const MAX_FILE_RESULTS = 50;
 export const MAX_TEXT_RESULTS = 35;
@@ -561,10 +562,20 @@ export function expandCodeTabs(rawText) {
 }
 
 // Single-pass linear tokenizer shared by preview rendering (lossless on all chars).
-export function tokenizeCodeLine(rawText, ext = "") {
-  if (!rawText) return null;
+export function tokenizeCodeLine(rawText, ext = "", mdState = null) {
+  const isMd = isMarkdownExt(ext);
+  if (!rawText) {
+    if (mdState && isMd) return tokenizeMarkdownLine("", mdState, tokenizeCodeLine);
+    return null;
+  }
   const text = expandCodeTabs(rawText);
-  if (text.length > MAX_PREVIEW_SYNTAX_LINE_CHARS || ext === "txt" || ext === "log") return null;
+  if (text.length > MAX_PREVIEW_SYNTAX_LINE_CHARS || ext === "txt" || ext === "log") {
+    if (mdState && isMd) mdState.lineIndex += 1;
+    return null;
+  }
+  if (isMd) {
+    return tokenizeMarkdownLine(text, mdState, tokenizeCodeLine);
+  }
 
   if (CODE_PROP_EXTS.has(ext)) {
     return tokenizePropertiesLine(text, []);
@@ -581,12 +592,8 @@ export function tokenizeCodeLine(rawText, ext = "") {
   const isCss = ext === "css" || ext === "scss" || ext === "less";
   const isSql = ext === "sql";
   const isRust = ext === "rs";
-  const isMd = ext === "md" || ext === "mdx";
   const docTagsEnabled = CODE_DOC_COMMENT_EXTS.has(ext);
 
-  if (isMd && /^\s*#{1,6}\s/.test(text)) {
-    return [["keyword", text]];
-  }
   if (docTagsEnabled && /^\s*\*\s*(?:$|\*\/|@(?:param|returns?|throws|exception|see|since|deprecated|author|version|implSpec|implNote|apiNote|code|linkplain|link|value|inheritDoc)\b)/.test(text)) {
     emitCommentTokens(tokens, text, true);
     return tokens;
@@ -685,7 +692,7 @@ export function tokenizeCodeLine(rawText, ext = "") {
         i++;
         continue;
       }
-      if (ch === "'" && (isMd || (i > 0 && isIdentPartCh(text[i - 1])))) {
+      if (ch === "'" && i > 0 && isIdentPartCh(text[i - 1])) {
         i++;
         continue;
       }
