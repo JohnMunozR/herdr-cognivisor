@@ -62,11 +62,11 @@ herdr-cognivisor/
 ├── package.json           <- Zero-dependency test runner entrypoint (`npm test`)
 ├── tests/                 <- Native `node --test` unit/regression suites (`*.test.mjs` + `helpers/herdr-mock.mjs`)
 ├── layouts/               <- [[module-layouts]]: Layout recipe (layouts/cognivisor.json) & SPEC.md
-├── shared/                <- [[module-shared]]: Canonical pure engines (`code-wrap.js`, `dropdown-logic.js`, `markdown-syntax.js`), UI adapters (`dropdown.js`), & `scripts/sync-shared.mjs`
+├── shared/                <- [[module-shared]]: Canonical pure engines (`code-wrap.js`, `code-syntax.js`, `code-nav-*.js`, `dropdown-logic.js`, `markdown-syntax.js`, `markdown-view-logic.js`), UI adapters (`dropdown.js`, `markdown-view.js`), & `scripts/sync-shared.mjs`
 ├── openspec/specs/        <- [[spec-lifecycle]]: Agent Workspace domain specification
 └── mods/                  <- [[module-mods]]: Independent GPUI-kit mod extensions
     ├── SPEC.md
-    ├── files-search/      <- [[submodule-mod-files-search]]: Search Everywhere, indexer engine (`indexer.js`, `search-logic.js`, `tree-logic.js`, `session-baseline.js`, `code-wrap.js`, `markdown-syntax.js`)
+    ├── files-search/      <- [[submodule-mod-files-search]]: Search Everywhere, interactive File Viewer (`indexer.js`, `symbol-index.js`, `code-viewer.js`, `search-logic.js`, `tree-logic.js`, `session-baseline.js`, synced `shared/` modules)
     ├── changes-review/    <- [[submodule-mod-changes-review]]: Per-service diff review & file approval (`review-logic.js`, `code-wrap.js`, `markdown-syntax.js`, `dropdown-logic.js`, `dropdown.js`)
     ├── git-history/       <- [[submodule-mod-git-history]]: Topological commit graph & Before/After diff viewer (`graph-logic.js`, `diff-logic.js`, `repo-logic.js`, `code-wrap.js`, `markdown-syntax.js`, `dropdown-logic.js`, `dropdown.js`)
     ├── cognivisor-tabs/   <- [[submodule-mod-cognivisor-tabs]]: Tab strip, auto-naming, `cognivisor.spacePanels` (`tab-logic.js`)
@@ -137,6 +137,6 @@ All bus keys outside mod-private namespaces MUST carry the `cognivisor.*` prefix
 6. **Pure Logic Decoupling & Mandatory Unit Tests:**
    Testable business logic (indexing, watch filtering, query scoring, Git/diff parsing, tab naming) MUST reside in zero-UI intra-mod helper modules (`indexer.js`, `*-logic.js`) covered by native `node --test` suites under `tests/*.test.mjs` (`npm test`) whenever developed or fixed.
 7. **Shared Reusable Components & `shared/` Registry (`[[module-shared]]`):**
-   Developers and AI agents MUST inspect `shared/` first and extend/reuse canonical shared engines (`code-wrap.js`, `dropdown-logic.js`, `markdown-syntax.js`) and GPUI UI adapters (`dropdown.js`) registered in `scripts/sync-shared.mjs` and `install.sh` rather than duplicating widgets, wrappers, dropdowns, or syntax tokenizers inside individual mods.
+   Developers and AI agents MUST inspect `shared/` first and extend/reuse canonical shared engines (`code-wrap.js`, `code-syntax.js`, `code-nav-logic.js`, `code-nav-js.js`, `code-nav-python.js`, `code-nav-java.js`, `dropdown-logic.js`, `markdown-syntax.js`, `markdown-view-logic.js`) and GPUI UI adapters (`dropdown.js`, `markdown-view.js`) registered in `scripts/sync-shared.mjs` and `install.sh` rather than duplicating widgets, wrappers, dropdowns, navigation analyzers, or syntax tokenizers inside individual mods.
 8. **Performance & Rendering Optimization Invariant:**
    Scrollable lists and diff panes MUST use `v_virtual_list` + `VirtualListScrollHandle` with precomputed/memoized row heights; closed overlays, dropdown menus, and hidden panels MUST produce zero per-frame UI allocations; floating popovers MUST size adaptively via `computeDropdownMetrics` without empty overflow scrollboxes; scanners and syntax tokenizers MUST run single-pass `O(n)` without catastrophic backtracking regexes; caches MUST be bounded (`WeakMap` or capped LRU maps); resize reflows MUST coalesce through `16ms` timers (`timer.after(16, ...)`); and background Git refreshes MUST combine lock-free flags with `git show-ref --head` signature skipping.

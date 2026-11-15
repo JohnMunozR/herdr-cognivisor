@@ -5,36 +5,41 @@ status: active
 title: Shared Reusable Components & Pure Engines Module (shared/)
 parent: architecture
 references: [submodule-mod-files-search, submodule-mod-changes-review, submodule-mod-git-history]
-covers: [soft-line-wrapping, column-budget-reflow, dropdown-geometry, reusable-gpui-dropdown, markdown-syntax-tokenization, markdown-rendered-preview]
-tags: [shared, pure-logic, ui-adapters, wrapping, dropdown, markdown, sync]
+covers: [soft-line-wrapping, column-budget-reflow, syntax-tokenization, code-navigation-analyzers, dropdown-geometry, reusable-gpui-dropdown, markdown-syntax-tokenization, markdown-rendered-preview]
+tags: [shared, pure-logic, ui-adapters, wrapping, syntax, code-navigation, dropdown, markdown, sync]
 ---
 
 ## Responsibility
 
 The `module-shared` directory holds the canonical source of truth for reusable pure JavaScript engines and shared GPUI UI adapters consumed across multiple `herdr-cognivisor` mods without violating Herdr's per-mod bundling and `herdr-app check` sandboxing rules (which disallow relative `../` imports across `mods/*/` directories).
 
-Developers and AI agents MUST inspect `shared/` first before creating any new wrapper, dropdown popover, syntax tokenizer, rendered Markdown viewer, or reusable GPUI widget inside an individual mod, and extend or reuse these canonical components via `scripts/sync-shared.mjs` and `install.sh`.
+Developers and AI agents MUST inspect `shared/` first before creating any new wrapper, dropdown popover, syntax tokenizer, code-navigation engine, rendered Markdown viewer, or reusable GPUI widget inside an individual mod, and extend or reuse these canonical components via `scripts/sync-shared.mjs` and `install.sh`.
 
 ## Boundary
 
 - **Owns:**
   - **Zero-Dependency Pure Logic & Engines** (executable identically under Node `--test` and QuickJS inside GPUI):
-    - `shared/code-wrap.js`: Pure soft line-wrapping engine (`DEFAULT_TAB_SIZE`, `computeWrapColumns`, `codeUnitEndForColumns`, `expandTabsFromColumn`, `expandTabs`, `computeWrapRanges`, `countWrappedLines`, `wrapPlainText`, `wrapStyledSpans`) synced to `mods/{files-search,changes-review,git-history}/code-wrap.js`.
-    - `shared/dropdown-logic.js`: Pure popover geometry, scroll-gating, and reopen-guard calculator (`DEFAULT_REOPEN_GUARD_MS`, `clampDropdownNumber`, `computeDropdownMetrics` returning `{ width, contentHeight, bodyHeight, shouldScroll }`, `shouldSuppressDropdownReopen`) synced to `mods/{changes-review,git-history}/dropdown-logic.js`.
+    - `shared/code-wrap.js`: Pure soft line-wrapping engine (`DEFAULT_TAB_SIZE`, `computeWrapColumns`, `codeUnitEndForColumns`, `expandTabsFromColumn`, `expandTabs`, `computeWrapRanges`, `countWrappedLines`, `wrapPlainText`, `wrapStyledSpans` preserving 3rd-element span metadata and incrementing `meta.col` across continuation splits) synced to `mods/{files-search,changes-review,git-history}/code-wrap.js`.
+    - `shared/code-syntax.js`: Unified single-pass `O(n)` syntax tokenizer and theme palette resolver (`getSyntaxExt`, `resolveEditorLanguage`, `getSyntaxPalette`, `getEditorSyntaxConfig`, `syntaxTokenStyle`, `diffSyntaxTokenColor`, `expandCodeTabs`, `createCodeSyntaxState`, `getSyntaxStateTag`, `cloneSyntaxState`, `advanceSyntaxState`, `tokenizeCodeLine`, `tokenizeInteractiveCodeLine` emitting `[kind, text, { col, nav }]` spans with multi-line block comment and Java/Python triple-quote block tracking) importing `./markdown-syntax.js`, synced to `mods/{files-search,changes-review,git-history}/code-syntax.js`.
+    - `shared/code-nav-logic.js`: Shared language-agnostic navigation core (`detectNavLanguage`, `maskNonCodeRegions`, `extractNavContext` including multiline signatures, type vs ternary/call-arg disambiguation, and `enclosingAnnotation` detection, `buildSymbolSummaryBase`, `rankResolvedCandidates`, `createNavHistoryState`, `pushNavHistory`, `canStepNavBack`, `canStepNavForward`, `stepNavBack`, `stepNavForward`) synced to `mods/files-search/code-nav-logic.js`.
+    - `shared/code-nav-js.js`: JS/TS/JSX/TSX scope, binding, destructuring, class/method, overload, ESM/CJS/re-export analyzer synced to `mods/files-search/code-nav-js.js`.
+    - `shared/code-nav-python.js`: Python (`py`/`pyw`/`pyi`) indentation LEGB scope, `global`/`nonlocal`, type hints, `self.attr`/inheritance, decorators, and absolute/relative import analyzer synced to `mods/files-search/code-nav-python.js`.
+    - `shared/code-nav-java.js`: Java `package`/imports, block/class/method/enhanced-for/lambda scopes, `var`/field/overload arity (`scoreJavaMethodParams`), container/builder chains (`BUILDER_TYPE_PREFIX`, `advanceJavaContainerOrBuilderType`), Spring/Lombok (`@Builder`, `@SuperBuilder`, `@Getter`, `@Data`, `@Value`, `@RequiredArgsConstructor`), cross-file hierarchy member resolution (`findJavaSummaryMemberCandidates`), and polymorphic `interface`/`abstract` -> concrete class implementation analyzer synced to `mods/files-search/code-nav-java.js`.
+    - `shared/dropdown-logic.js`: Pure popover geometry, scroll-gating, and reopen-guard calculator (`DEFAULT_REOPEN_GUARD_MS`, `clampDropdownNumber`, `computeDropdownMetrics` returning `{ width, contentHeight, bodyHeight, shouldScroll }`, `shouldSuppressDropdownReopen`) synced to `mods/{files-search,changes-review,git-history}/dropdown-logic.js`.
     - `shared/markdown-syntax.js`: Single-pass `O(n)` Markdown syntax tokenizer (`isMarkdownExt`, `isFrontmatterDelimiter`, `parseFenceOpen`, `parseFenceClose`, `createMarkdownState`, `getMarkdownStateTag`, `advanceMarkdownState`, `tokenizeMarkdownLine`) supporting YAML frontmatter (`---` on line 0 through closing `---`), fenced code blocks (` ```lang ` / `~~~lang` with `fallbackCodeTokenizer` delegation and lossless tab restoration), ATX headings (`#`–`######`), horizontal rules, blockquotes, lists and task checkboxes, inline code spans, HTML comments, autolinks, images, links, and escaped punctuation without regex backtracking, synced to `mods/{files-search,changes-review,git-history}/markdown-syntax.js`.
     - `shared/markdown-view-logic.js`: Pure Markdown preview preparation, link validation, and diff snapshot planner (`DEFAULT_MARKDOWN_MAX_CHARS`, `getFileExtension`, `isMarkdownFile`, `splitMarkdownFrontmatter`, `truncateMarkdownSafely`, `detectMdxCues`, `prepareMarkdownForRender`, `classifyMarkdownLink`, `isSafeExternalUrl`, `resolveRelativeMarkdownPath`, `getDiffMarkdownPlan`) importing only `./markdown-syntax.js`, synced to `mods/{files-search,changes-review,git-history}/markdown-view-logic.js`.
   - **Shared GPUI UI Adapters** (thin declarative GPUI builders paired with sibling pure `*-logic.js` modules):
-    - `shared/dropdown.js`: Reusable GPUI dropdown trigger (`renderDropdownTrigger`) and adaptive shrink-wrapping overlay popover (`renderDropdownPopover`) importing `computeDropdownMetrics` from `./dropdown-logic.js`, synced to `mods/{changes-review,git-history}/dropdown.js`.
+    - `shared/dropdown.js`: Reusable GPUI dropdown trigger (`renderDropdownTrigger`) and adaptive shrink-wrapping overlay popover (`renderDropdownPopover`) importing `computeDropdownMetrics` from `./dropdown-logic.js`, synced to `mods/{files-search,changes-review,git-history}/dropdown.js`.
     - `shared/markdown-view.js`: Reusable GPUI Markdown toggle pill (`renderMarkdownToggleButton`), bounded preparation cache (`createMarkdownRenderCache`), and scrollable `TextView.markdown` surface (`renderMarkdownViewer`) with compact frontmatter cards and guarded `cx.open_url` link dispatch, synced to `mods/{files-search,changes-review,git-history}/markdown-view.js`.
   - Sync parity enforcement: Maintained identically across consuming `mods/*/` directories via `scripts/sync-shared.mjs` (`SHARED_TARGETS`, `npm run sync:shared` / `npm run check:shared`, executed automatically in `npm test`) and synced during `install.sh`.
 - **Allowed deps:**
-  - **Zero-dependency pure engines (`code-wrap.js`, `dropdown-logic.js`, `markdown-syntax.js`, `markdown-view-logic.js`):** Zero external or host imports (`node`, `gpui-kit`, `gpui-base`, and `herdr` free; intra-shared pure imports such as `./markdown-syntax.js` permitted when both files sync together).
+  - **Zero-dependency pure engines (`code-wrap.js`, `code-syntax.js`, `code-nav-*.js`, `dropdown-logic.js`, `markdown-syntax.js`, `markdown-view-logic.js`):** Zero external or host imports (`node`, `gpui-kit`, `gpui-base`, and `herdr` free; intra-shared pure imports such as `./markdown-syntax.js` or `./code-nav-logic.js` permitted when both files sync together).
   - **Shared GPUI UI adapters (`dropdown.js`, `markdown-view.js`):** `gpui-kit` (`div`, `svg`), `gpui-base` (`v_flex`, `h_flex`, `TextView`, `Scrollbar`), and sibling intra-mod pure logic modules (`./dropdown-logic.js`, `./markdown-view-logic.js`); zero `localStorage`, DOM APIs, or hardcoded hex colors.
 - **Forbidden:**
   - Directly importing `shared/*.js` across `../` boundaries from inside `mods/*/`.
-  - Importing `gpui-kit`, `gpui-base`, or `herdr` inside zero-dependency pure logic engines (`code-wrap.js`, `dropdown-logic.js`, `markdown-syntax.js`, `markdown-view-logic.js`).
-  - Allowing any synced mod copy (`mods/{files-search,changes-review,git-history}/{code-wrap,markdown-syntax,markdown-view-logic,markdown-view,dropdown-logic,dropdown}.js`) to drift from canonical `shared/*.js`.
-  - Duplicating shared wrappers, dropdown popovers, rendered Markdown viewers, or Markdown/syntax tokenizers inside individual mods instead of registering and reusing them through `shared/`.
+  - Importing `gpui-kit`, `gpui-base`, or `herdr` inside zero-dependency pure logic engines (`code-wrap.js`, `code-syntax.js`, `code-nav-*.js`, `dropdown-logic.js`, `markdown-syntax.js`, `markdown-view-logic.js`).
+  - Allowing any synced mod copy (`mods/{files-search,changes-review,git-history}/{code-wrap,code-syntax,code-nav-*,markdown-syntax,markdown-view-logic,markdown-view,dropdown-logic,dropdown}.js`) to drift from canonical `shared/*.js`.
+  - Duplicating shared wrappers, dropdown popovers, rendered Markdown viewers, navigation analyzers, or Markdown/syntax tokenizers inside individual mods instead of registering and reusing them through `shared/`.
 
 ## Invariants
 

@@ -4,8 +4,25 @@ import {
   isMarkdownExt,
   createMarkdownState,
   advanceMarkdownState,
-  tokenizeMarkdownLine,
 } from "./markdown-syntax.js";
+import {
+  CODE_KEYWORDS,
+  EXTRA_DIFF_KEYWORDS,
+  CODE_BOOLEANS,
+  CODE_CONSTANTS,
+  CODE_SPECIAL_VARS,
+  CODE_BUILTIN_VARS,
+  CODE_TYPES,
+  EXTRA_DIFF_TYPES,
+  HASH_COMMENT_EXTS,
+  SLASH_COMMENT_EXTS,
+  MARKUP_EXTS,
+  getSyntaxExt as getFileExt,
+  getDiffSyntaxPalette,
+  diffSyntaxTokenColor,
+  expandCodeTabs,
+  tokenizeCodeLine,
+} from "./code-syntax.js";
 import { getDiffMarkdownPlan } from "./markdown-view-logic.js";
 
 export const MAX_DIFF_SYNTAX_LINE_CHARS = 500;
@@ -19,178 +36,71 @@ export const DIFF_WAVE_MAX_CENTER_OFFSET_ROWS = 2;
 const MAX_EXPANDED_VIEWER_DIFF_LINES = 4000;
 const MAX_WIDTH_ESTIMATE_COLS = 4000;
 
-export const DIFF_KEYWORDS = new Set([
-  "abstract", "and", "as", "assert", "async", "await", "break", "case", "catch", "class",
-  "const", "continue", "crate", "debugger", "declare", "def", "default", "defer", "del",
-  "delete", "do", "done", "dyn", "elif", "else", "enum", "esac", "except", "export",
-  "extends", "fallthrough", "fi", "final", "finally", "fn", "for", "from", "fun", "func",
-  "function", "get", "global", "go", "if", "impl", "implements", "import", "in",
-  "instanceof", "interface", "is", "keyof", "lambda", "let", "local", "loop", "match",
-  "mod", "move", "mut", "namespace", "native", "new", "nonlocal", "not", "of", "or",
-  "override", "package", "pass", "permits", "private", "protected", "pub", "public",
-  "raise", "range", "readonly", "record", "ref", "return", "satisfies", "sealed", "select",
-  "set", "static", "strictfp", "struct", "switch", "synchronized", "then", "throw",
-  "throws", "trait", "transient", "try", "type", "typeof", "unsafe", "unset", "use",
-  "using", "val", "var", "virtual", "volatile", "where", "while", "with", "yield",
-  "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "ON", "GROUP", "BY",
-  "ORDER", "HAVING", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "CREATE", "ALTER",
-  "DROP", "TABLE", "INDEX", "AS", "AND", "OR", "NOT", "IN", "IS", "NULL", "CASE", "WHEN",
-  "THEN", "ELSE", "END", "DISTINCT", "LIMIT", "OFFSET", "UNION", "EXISTS", "RETURNING",
-]);
+export const DIFF_KEYWORDS = new Set([...CODE_KEYWORDS, ...EXTRA_DIFF_KEYWORDS]);
+export const DIFF_BOOLEANS = CODE_BOOLEANS;
+export const DIFF_CONSTANTS = new Set([...CODE_CONSTANTS, "iota"]);
+export const DIFF_SPECIAL_VARS = new Set([...CODE_SPECIAL_VARS, "Self"]);
+export const DIFF_BUILTIN_VARS = CODE_BUILTIN_VARS;
+export const DIFF_TYPES = new Set([...CODE_TYPES, ...EXTRA_DIFF_TYPES]);
 
-const SQL_LOWER_KEYWORDS = new Set([
-  "select", "from", "where", "join", "left", "right", "inner", "outer", "on", "group", "by",
-  "order", "having", "insert", "into", "values", "update", "set", "delete", "create", "alter",
-  "drop", "table", "index", "as", "and", "or", "not", "in", "is", "null", "case", "when",
-  "then", "else", "end", "distinct", "limit", "offset", "union", "exists", "returning",
-  "primary", "key", "foreign", "references", "default", "unique", "begin", "commit", "rollback",
-]);
+export {
+  HASH_COMMENT_EXTS,
+  SLASH_COMMENT_EXTS,
+  MARKUP_EXTS,
+  getDiffSyntaxPalette,
+  diffSyntaxTokenColor,
+};
 
-export const DIFF_BOOLEANS = new Set(["true", "false", "True", "False"]);
+const UTF8_DECODER = typeof TextDecoder !== "undefined" ? new TextDecoder("utf-8", { fatal: false }) : null;
+const GIT_ESCAPE_MAP = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
 
-export const DIFF_CONSTANTS = new Set([
-  "null", "nil", "None", "undefined", "NaN", "Infinity", "iota",
-]);
-
-export const DIFF_SPECIAL_VARS = new Set(["this", "super", "self", "Self", "cls"]);
-
-export const DIFF_BUILTIN_VARS = new Set([
-  "console", "process", "window", "document", "globalThis", "module", "exports",
-]);
-
-export const DIFF_TYPES = new Set([
-  "void", "int", "long", "short", "byte", "float", "double", "boolean", "bool", "char",
-  "string", "number", "any", "unknown", "never", "object", "symbol", "bigint", "str",
-  "list", "dict", "set", "tuple", "frozenset", "bytes", "rune", "error", "uintptr",
-  "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64", "float32", "float64",
-  "complex64", "complex128",
-  "usize", "isize", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "f32", "f64",
-  "String", "Object", "Class", "Integer", "Long", "Double", "Float", "Boolean", "Character", "Byte", "Short",
-  "Number", "BigDecimal", "BigInteger", "UUID", "Instant", "LocalDate", "LocalDateTime", "Duration",
-  "List", "ArrayList", "Map", "HashMap", "LinkedHashMap", "Set", "HashSet", "Collection", "Iterable",
-  "Stream", "Optional", "CompletableFuture", "Future", "ResponseEntity", "HttpStatus", "HttpHeaders",
-  "Pageable", "Page", "Slice", "Sort", "Model", "Exception", "RuntimeException", "Throwable",
-  "Promise", "Array", "Record", "Date", "RegExp", "Error", "Any", "Union", "Dict", "Tuple",
-  "Sequence", "Mapping", "Callable", "Coroutine", "Vec", "Option", "Result", "Box", "Arc",
-]);
-
-export const HASH_COMMENT_EXTS = new Set([
-  "py", "pyw", "pyi", "rb", "sh", "bash", "zsh", "fish", "yml", "yaml", "toml", "ps1", "psm1", "psd1",
-  "r", "pl", "pm", "mk", "makefile", "dockerfile", "env", "ini", "conf", "cfg", "properties",
-  "tf", "tfvars", "gitignore",
-]);
-
-export const SLASH_COMMENT_EXTS = new Set([
-  "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "java", "kt", "kts", "cs",
-  "go", "rs", "c", "cpp", "cc", "cxx", "h", "hpp", "swift", "scala", "groovy", "gradle",
-  "php", "css", "scss", "less", "jsonc", "json5", "dart", "proto",
-]);
-
-export const MARKUP_EXTS = new Set(["html", "htm", "xml", "svg", "vue", "svelte"]);
-const PROP_EXTS = new Set(["properties", "env", "ini", "conf", "cfg"]);
-const DOC_COMMENT_EXTS = new Set(["java", "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "kt", "kts", "groovy", "scala"]);
-const DOC_TAG_RE = /@(?:param|returns?|throws|exception|see|since|deprecated|author|version|implSpec|implNote|apiNote|code|linkplain|link|value|inheritDoc)\b/g;
-
-function parseHexRgb(hex) {
-  if (typeof hex !== "string" || !hex.startsWith("#")) return null;
-  let h = hex.slice(1);
-  if (h.length === 3 || h.length === 4) {
-    h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
-  } else if (h.length !== 6 && h.length !== 8) {
-    return null;
+function pushUtf8CodePoint(cp, bytes) {
+  if (cp < 0x80) {
+    bytes.push(cp);
+  } else if (cp < 0x800) {
+    bytes.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+  } else if (cp >= 0xd800 && cp <= 0xdfff) {
+    // Unpaired UTF-16 surrogate -> UTF-8 replacement char U+FFFD
+    bytes.push(0xef, 0xbf, 0xbd);
+  } else if (cp < 0x10000) {
+    bytes.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+  } else {
+    bytes.push(
+      0xf0 | (cp >> 18),
+      0x80 | ((cp >> 12) & 0x3f),
+      0x80 | ((cp >> 6) & 0x3f),
+      0x80 | (cp & 0x3f),
+    );
   }
-  const n = parseInt(h.slice(0, 6), 16);
-  if (Number.isNaN(n)) return null;
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 
-function hexLuma(hex) {
-  const rgb = parseHexRgb(hex);
-  if (!rgb) return null;
-  return (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) / 255;
-}
-
-function isDarkTheme(t) {
-  if (!t) return true;
-  if (typeof t.is_dark === "boolean") return t.is_dark;
-  if (t.appearance === "light") return false;
-  if (t.appearance === "dark") return true;
-  const bg = hexLuma(t.background);
-  return bg === null ? true : bg < 0.5;
-}
-
-function pickTone(candidate, fallback, isDark, minDarkLuma = 0.36, maxLightLuma = 0.58) {
-  const luma = hexLuma(candidate);
-  if (luma === null) return fallback;
-  if (isDark ? luma < minDarkLuma : luma > maxLightLuma) return fallback;
-  return candidate;
-}
-
-let cachedDiffThemeRef = null;
-let cachedDiffThemeSig = "";
-let cachedDiffPalette = null;
-
-function buildThemePaletteSig(t) {
-  if (!t || typeof t !== "object") return "default";
-  return `${t.is_dark}|${t.appearance}|${t.background}|${t.foreground}|${t.dim}|${t.muted}|${t.ansi1}|${t.ansi2}|${t.ansi3}|${t.ansi4}|${t.ansi5}|${t.ansi6}`;
-}
-
-export function getDiffSyntaxPalette(t) {
-  if (t && t === cachedDiffThemeRef && cachedDiffPalette) return cachedDiffPalette;
-  if (t && t._isSyntaxPalette) return t;
-  const sig = buildThemePaletteSig(t);
-  if (cachedDiffPalette && sig === cachedDiffThemeSig) {
-    if (t) cachedDiffThemeRef = t;
-    return cachedDiffPalette;
+function decodeUtf8Bytes(bytes) {
+  if (UTF8_DECODER) return UTF8_DECODER.decode(new Uint8Array(bytes));
+  // Pure-JS UTF-8 decoder fallback for QuickJS runtimes without global TextDecoder
+  let out = "";
+  for (let i = 0; i < bytes.length; ) {
+    const b0 = bytes[i];
+    if (b0 < 0x80) {
+      out += String.fromCharCode(b0);
+      i += 1;
+    } else if ((b0 & 0xe0) === 0xc0 && i + 1 < bytes.length && (bytes[i + 1] & 0xc0) === 0x80) {
+      const cp = ((b0 & 0x1f) << 6) | (bytes[i + 1] & 0x3f);
+      out += cp >= 0x80 ? String.fromCharCode(cp) : "\ufffd";
+      i += 2;
+    } else if ((b0 & 0xf0) === 0xe0 && i + 2 < bytes.length && (bytes[i + 1] & 0xc0) === 0x80 && (bytes[i + 2] & 0xc0) === 0x80) {
+      const cp = ((b0 & 0x0f) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f);
+      out += cp >= 0x800 && (cp < 0xd800 || cp > 0xdfff) ? String.fromCharCode(cp) : "\ufffd";
+      i += 3;
+    } else if ((b0 & 0xf8) === 0xf0 && i + 3 < bytes.length && (bytes[i + 1] & 0xc0) === 0x80 && (bytes[i + 2] & 0xc0) === 0x80 && (bytes[i + 3] & 0xc0) === 0x80) {
+      const cp = ((b0 & 0x07) << 18) | ((bytes[i + 1] & 0x3f) << 12) | ((bytes[i + 2] & 0x3f) << 6) | (bytes[i + 3] & 0x3f);
+      out += cp >= 0x10000 && cp <= 0x10ffff ? String.fromCodePoint(cp) : "\ufffd";
+      i += 4;
+    } else {
+      out += "\ufffd";
+      i += 1;
+    }
   }
-  const isDark = isDarkTheme(t);
-  const warmAmber = isDark ? "#d19a66" : "#b35900";
-  const cyan = pickTone(t?.ansi6, isDark ? "#56b6c2" : "#0e7490", isDark);
-  const coral = pickTone(t?.ansi1, isDark ? "#e06c75" : "#cf222e", isDark);
-  const palette = {
-    _isSyntaxPalette: true,
-    _sig: sig,
-    isDark,
-    keyword: pickTone(t?.ansi5, isDark ? "#c678dd" : "#8250df", isDark),
-    string: pickTone(t?.ansi2, isDark ? "#98c379" : "#116329", isDark),
-    escape: cyan,
-    comment: pickTone(t?.dim || t?.muted, isDark ? "#7f848e" : "#6e7781", isDark, 0.34, 0.56),
-    function: pickTone(t?.ansi4, isDark ? "#61afef" : "#0969da", isDark),
-    type: pickTone(t?.ansi3, isDark ? "#e5c07b" : "#9a6700", isDark),
-    annotation: coral,
-    variable: coral,
-    number: warmAmber,
-    boolean: warmAmber,
-    constant: warmAmber,
-    operator: cyan,
-    plain: pickTone(t?.foreground, isDark ? "#abb2bf" : "#24292f", isDark, 0.45, 0.45),
-    muted: pickTone(t?.muted || t?.dim, isDark ? "#8b93a2" : "#57606a", isDark, 0.34, 0.56),
-  };
-  cachedDiffThemeSig = sig;
-  cachedDiffPalette = palette;
-  if (t) {
-    cachedDiffThemeRef = t;
-  }
-  return palette;
-}
-
-export function diffSyntaxTokenColor(kind, t) {
-  const p = t && t._isSyntaxPalette ? t : getDiffSyntaxPalette(t);
-  switch (kind) {
-    case "keyword": return p.keyword;
-    case "string": return p.string;
-    case "string.escape": return p.escape;
-    case "comment": return p.comment;
-    case "function": return p.function;
-    case "type": return p.type;
-    case "annotation": return p.annotation;
-    case "variable": return p.variable;
-    case "number": return p.number;
-    case "boolean": return p.boolean;
-    case "constant": return p.constant;
-    case "operator": return p.operator;
-    default: return p.plain;
-  }
+  return out;
 }
 
 export function toNbspString(text) {
@@ -228,17 +138,28 @@ export function prepareRenderLineData(tokens, plainText, paletteOrTheme, fallbac
   }
 
   const spans = [];
+  let runColor = null;
+  let runRaw = "";
   for (let i = 0; i < tokList.length; i++) {
     const tok = tokList[i];
+    const txt = tok[1];
+    if (!txt) continue;
     const color = diffSyntaxTokenColor(tok[0], palette);
-    const nbsp = toNbspString(tok[1] || "");
-    if (!nbsp) continue;
-    const prev = spans.length > 0 ? spans[spans.length - 1] : null;
-    if (prev && prev[0] === color) {
-      prev[1] += nbsp;
+    if (runColor === null) {
+      runColor = color;
+      runRaw = txt;
+    } else if (runColor === color) {
+      runRaw += txt;
     } else {
-      spans.push([color, nbsp]);
+      const nbsp = toNbspString(runRaw);
+      if (nbsp) spans.push([runColor, nbsp]);
+      runColor = color;
+      runRaw = txt;
     }
+  }
+  if (runColor !== null && runRaw) {
+    const nbsp = toNbspString(runRaw);
+    if (nbsp) spans.push([runColor, nbsp]);
   }
 
   if (spans.length === 0) {
@@ -318,546 +239,40 @@ export function prepareWrappedRenderLines(tokens, plainText, paletteOrTheme, fal
   return out;
 }
 
-export function getFileExt(filePath) {
-  if (!filePath) return "";
-  const slash = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"));
-  const base = (slash >= 0 ? filePath.slice(slash + 1) : filePath).toLowerCase();
-  if (base === "dockerfile") return "dockerfile";
-  if (base === "makefile" || base === "gnumakefile") return "makefile";
-  if (base === ".gitignore" || base === ".dockerignore") return "gitignore";
-  if (base.startsWith(".env")) return "env";
-  const dot = base.lastIndexOf(".");
-  return dot > 0 ? base.slice(dot + 1) : "";
-}
-
-export function expandCodeTabs(text, tabSize = 4) {
-  if (!text) return "";
-  const s = String(text);
-  if (s.indexOf("\t") === -1) return s;
-  const size = Number.isFinite(Number(tabSize)) && Number(tabSize) > 0 ? Math.floor(Number(tabSize)) : 4;
-  return s.replace(/\t/g, " ".repeat(size));
-}
-
-function pushSyntaxToken(tokens, kind, text) {
-  if (!text) return;
-  const last = tokens.length ? tokens[tokens.length - 1] : null;
-  if (last && last[0] === kind) {
-    last[1] += text;
-  } else {
-    tokens.push([kind, text]);
-  }
-}
-
-function isIdentStart(ch) {
-  const c = ch.charCodeAt(0);
-  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36;
-}
-
-function isIdentPart(ch) {
-  const c = ch.charCodeAt(0);
-  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 36;
-}
-
-function isDigit(ch) {
-  const c = ch.charCodeAt(0);
-  return c >= 48 && c <= 57;
-}
-
-function isPyStringPrefix(str) {
-  const s = str.toLowerCase();
-  return s === "f" || s === "r" || s === "b" || s === "u" || s === "fr" || s === "rf" || s === "br" || s === "rb";
-}
-
-function emitDiffComment(tokens, slice, enableDocTags) {
-  if (!enableDocTags || slice.indexOf("@") === -1) {
-    pushSyntaxToken(tokens, "comment", slice);
-    return;
-  }
-  DOC_TAG_RE.lastIndex = 0;
-  let last = 0;
-  let m;
-  while ((m = DOC_TAG_RE.exec(slice)) !== null) {
-    const idx = m.index;
-    const prev = idx > 0 ? slice[idx - 1] : " ";
-    if (prev !== " " && prev !== "\t" && prev !== "{" && prev !== "*") continue;
-    if (idx > last) pushSyntaxToken(tokens, "comment", slice.slice(last, idx));
-    pushSyntaxToken(tokens, "annotation", m[0]);
-    last = idx + m[0].length;
-  }
-  if (last < slice.length) pushSyntaxToken(tokens, "comment", slice.slice(last));
-}
-
-const TPL_VAR_NAME_RE = /^[a-zA-Z0-9_.:-]+$/;
-const PATH_VAR_NAME_RE = /^[a-zA-Z_][a-zA-Z0-9_.-]*$/;
-const PROP_NUMBER_RE = /^-?(?:0x[0-9a-fA-F_]+|\d+(?:\.\d+)?)(?:ms|s|m|h|d|kb|mb|gb)?$/i;
-const DOC_LINE_START_RE = /^\s*\*\s*(?:$|\*\/|@(?:param|returns?|throws|exception|see|since|deprecated|author|version|implSpec|implNote|apiNote|code|linkplain|link|value|inheritDoc)\b)/;
-const UPPER_CONST_RE = /^[A-Z][A-Z0-9_]+$/;
-const PASCAL_TYPE_RE = /^[A-Z][a-zA-Z0-9_]*$/;
-
-function isHexDigitChar(ch) {
-  const c = ch.charCodeAt(0);
-  return (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102);
-}
-
-function isAsciiAlphaChar(ch) {
-  const c = ch.charCodeAt(0);
-  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
-}
-
-function isDigitUnderscoreChar(ch) {
-  const c = ch.charCodeAt(0);
-  return (c >= 48 && c <= 57) || c === 95;
-}
-
-function isDecDotChar(ch) {
-  const c = ch.charCodeAt(0);
-  return (c >= 48 && c <= 57) || c === 46 || c === 95;
-}
-
-function isNumSuffixChar(ch) {
-  return isAsciiAlphaChar(ch) || ch === "%";
-}
-
-function emitDiffStringSegments(tokens, slice, baseKind, opts = {}) {
-  if (baseKind !== "string") {
-    pushSyntaxToken(tokens, baseKind, slice);
-    return;
-  }
-  const { isTemplate = false, isFString = false, allowPathVars = false } = opts;
-  const len = slice.length;
-  let i = 0;
-  let segStart = 0;
-  const flushSeg = (end) => {
-    if (end > segStart) pushSyntaxToken(tokens, "string", slice.slice(segStart, end));
-    segStart = end;
-  };
-  while (i < len) {
-    const ch = slice[i];
-    if (ch === "\\") {
-      flushSeg(i);
-      const escEnd = Math.min(len, slice[i + 1] === "u" ? i + 6 : slice[i + 1] === "x" ? i + 4 : i + 2);
-      pushSyntaxToken(tokens, "string.escape", slice.slice(i, escEnd));
-      i = segStart = escEnd;
-      continue;
-    }
-    if (ch === "$" && i + 1 < len && slice[i + 1] === "{") {
-      const close = slice.indexOf("}", i + 2);
-      if (close > i + 2 && (isTemplate || TPL_VAR_NAME_RE.test(slice.slice(i + 2, close)))) {
-        flushSeg(i);
-        pushSyntaxToken(tokens, "string.escape", slice.slice(i, close + 1));
-        i = segStart = close + 1;
-        continue;
-      }
-    }
-    if (ch === "{") {
-      if (isFString && slice[i + 1] === "{") {
-        flushSeg(i);
-        pushSyntaxToken(tokens, "string.escape", "{{");
-        i = segStart = i + 2;
-        continue;
-      }
-      const close = slice.indexOf("}", i + 1);
-      if (close > i) {
-        const inner = slice.slice(i + 1, close);
-        const isPathOrSlf4j = allowPathVars && (inner === "" || (slice[i - 1] === "/" && PATH_VAR_NAME_RE.test(inner)));
-        const isPyInterp = isFString && inner.length > 0 && !inner.includes("\n");
-        if (isPathOrSlf4j || isPyInterp) {
-          flushSeg(i);
-          pushSyntaxToken(tokens, "string.escape", slice.slice(i, close + 1));
-          i = segStart = close + 1;
-          continue;
-        }
-      }
-    }
-    if (isFString && ch === "}" && slice[i + 1] === "}") {
-      flushSeg(i);
-      pushSyntaxToken(tokens, "string.escape", "}}");
-      i = segStart = i + 2;
-      continue;
-    }
-    i++;
-  }
-  flushSeg(len);
-}
-
-function tokenizeDiffPropertiesLine(text, tokens) {
-  let lead = 0;
-  while (lead < text.length && text[lead] === " ") lead++;
-  if (lead > 0) pushSyntaxToken(tokens, "plain", text.slice(0, lead));
-  const trimmed = text.slice(lead);
-  if (!trimmed) return tokens;
-  if (trimmed[0] === "#" || trimmed[0] === "!") {
-    pushSyntaxToken(tokens, "comment", trimmed);
-    return tokens;
-  }
-  const eqIdx = text.indexOf("=", lead);
-  const colIdx = text.indexOf(":", lead);
-  const sep = eqIdx >= 0 && colIdx >= 0 ? Math.min(eqIdx, colIdx) : Math.max(eqIdx, colIdx);
-  if (sep < 0) {
-    pushSyntaxToken(tokens, "plain", trimmed);
-    return tokens;
-  }
-  const keySlice = text.slice(lead, sep);
-  const trimmedKey = keySlice.trimEnd();
-  if (trimmedKey) pushSyntaxToken(tokens, "function", trimmedKey);
-  if (trimmedKey.length < keySlice.length) {
-    pushSyntaxToken(tokens, "plain", keySlice.slice(trimmedKey.length));
-  }
-  pushSyntaxToken(tokens, "operator", text[sep]);
-  const valRaw = text.slice(sep + 1);
-  let valLead = 0;
-  while (valLead < valRaw.length && valRaw[valLead] === " ") valLead++;
-  if (valLead > 0) pushSyntaxToken(tokens, "plain", valRaw.slice(0, valLead));
-  const valBody = valRaw.slice(valLead);
-  const valTrim = valBody.trimEnd();
-  const tailWs = valBody.slice(valTrim.length);
-  if (valTrim) {
-    if (DIFF_BOOLEANS.has(valTrim)) {
-      pushSyntaxToken(tokens, "boolean", valTrim);
-    } else if (DIFF_CONSTANTS.has(valTrim)) {
-      pushSyntaxToken(tokens, "constant", valTrim);
-    } else if (PROP_NUMBER_RE.test(valTrim)) {
-      pushSyntaxToken(tokens, "number", valTrim);
-    } else {
-      emitDiffStringSegments(tokens, valTrim, "string", { allowPathVars: false });
-    }
-  }
-  if (tailWs) pushSyntaxToken(tokens, "plain", tailWs);
-  return tokens;
-}
+export {
+  getFileExt,
+  expandCodeTabs,
+};
 
 export function tokenizeDiffLine(line, ext, mdState = null) {
-  const normExt = String(ext || "").toLowerCase();
-  const isMd = isMarkdownExt(normExt);
-  if (!line) {
-    if (mdState && isMd) {
-      return tokenizeMarkdownLine("", mdState, tokenizeDiffLine);
-    }
-    return null;
-  }
-  const text = expandCodeTabs(line);
-  if (text.length > MAX_DIFF_SYNTAX_LINE_CHARS || normExt === "txt" || normExt === "log") {
-    if (mdState && isMd) mdState.lineIndex += 1;
-    return null;
-  }
-
-  if (isMd) {
-    return tokenizeMarkdownLine(text, mdState, tokenizeDiffLine);
-  }
-
-  if (PROP_EXTS.has(normExt)) {
-    return tokenizeDiffPropertiesLine(text, []);
-  }
-
-  const tokens = [];
-  const len = text.length;
-  const hashComments = HASH_COMMENT_EXTS.has(normExt);
-  const slashComments = !normExt || SLASH_COMMENT_EXTS.has(normExt);
-  const markup = MARKUP_EXTS.has(normExt);
-  const isPython = normExt === "py" || normExt === "pyw" || normExt === "pyi";
-  const isJson = normExt === "json" || normExt === "jsonc" || normExt === "json5";
-  const isYaml = normExt === "yml" || normExt === "yaml";
-  const isCss = normExt === "css" || normExt === "scss" || normExt === "less";
-  const isSql = normExt === "sql";
-  const isRust = normExt === "rs";
-  const isShell = normExt === "sh" || normExt === "bash" || normExt === "zsh" || normExt === "fish";
-  const docTagsEnabled = DOC_COMMENT_EXTS.has(normExt);
-
-  if (docTagsEnabled && DOC_LINE_START_RE.test(text)) {
-    emitDiffComment(tokens, text, true);
-    return tokens;
-  }
-
-  let i = 0;
-  let plainStart = 0;
-  const flushPlain = (end) => {
-    if (end > plainStart) {
-      pushSyntaxToken(tokens, "plain", text.slice(plainStart, end));
-    }
-    plainStart = end;
-  };
-
-  while (i < len) {
-    const ch = text[i];
-
-    if (markup && ch === "<" && text.startsWith("<!--", i)) {
-      flushPlain(i);
-      const close = text.indexOf("-->", i + 4);
-      const end = close >= 0 ? close + 3 : len;
-      pushSyntaxToken(tokens, "comment", text.slice(i, end));
-      i = plainStart = end;
-      continue;
-    }
-
-    if (slashComments && ch === "/" && i + 1 < len) {
-      const next = text[i + 1];
-      if (next === "/") {
-        flushPlain(i);
-        emitDiffComment(tokens, text.slice(i), docTagsEnabled);
-        return tokens;
-      }
-      if (next === "*") {
-        flushPlain(i);
-        const close = text.indexOf("*/", i + 2);
-        const end = close >= 0 ? close + 2 : len;
-        emitDiffComment(tokens, text.slice(i, end), docTagsEnabled);
-        i = plainStart = end;
-        continue;
-      }
-    }
-
-    if (hashComments && ch === "#") {
-      flushPlain(i);
-      pushSyntaxToken(tokens, "comment", text.slice(i));
-      return tokens;
-    }
-
-    if (isSql && ch === "-" && text[i + 1] === "-") {
-      flushPlain(i);
-      pushSyntaxToken(tokens, "comment", text.slice(i));
-      return tokens;
-    }
-
-    if (isPython && (ch === "f" || ch === "F" || ch === "r" || ch === "R" || ch === "b" || ch === "B" || ch === "u" || ch === "U") && (i === 0 || !isIdentPart(text[i - 1]))) {
-      let qOff = i + 1;
-      if (qOff < len && (text[qOff] === "f" || text[qOff] === "F" || text[qOff] === "r" || text[qOff] === "R" || text[qOff] === "b" || text[qOff] === "B")) {
-        qOff++;
-      }
-      const prefix = text.slice(i, qOff);
-      const quote = text[qOff];
-      if ((quote === '"' || quote === "'") && isPyStringPrefix(prefix)) {
-        const isTriple = text[qOff + 1] === quote && text[qOff + 2] === quote;
-        const step = isTriple ? 3 : 1;
-        const delim = isTriple ? quote + quote + quote : quote;
-        let end = qOff + step;
-        const isRaw = prefix.toLowerCase().includes("r");
-        while (end < len) {
-          if (!isRaw && text[end] === "\\") {
-            end = end + 1 < len ? end + 2 : len;
-            continue;
-          }
-          if (isTriple ? text.startsWith(delim, end) : text[end] === quote) {
-            end += step;
-            break;
-          }
-          end++;
-        }
-        flushPlain(i);
-        pushSyntaxToken(tokens, "keyword", prefix);
-        emitDiffStringSegments(tokens, text.slice(qOff, end), "string", {
-          isFString: prefix.toLowerCase().includes("f"),
-        });
-        i = plainStart = end;
-        continue;
-      }
-    }
-
-    if (ch === '"' || ch === "'" || ch === "`") {
-      if (isRust && ch === "'" && i + 1 < len && text[i + 1] !== "\\" && (i + 2 >= len || text[i + 2] !== "'")) {
-        i++;
-        continue;
-      }
-      if (ch === "'" && i > 0 && isIdentPart(text[i - 1])) {
-        i++;
-        continue;
-      }
-      const isTriple = (ch === '"' || ch === "'") && text[i + 1] === ch && text[i + 2] === ch;
-      const step = isTriple ? 3 : 1;
-      const delim = isTriple ? ch + ch + ch : ch;
-      let end = i + step;
-      while (end < len) {
-        if (text[end] === "\\") {
-          end = end + 1 < len ? end + 2 : len;
-          continue;
-        }
-        if (isTriple ? text.startsWith(delim, end) : text[end] === ch) {
-          end += step;
-          break;
-        }
-        end++;
-      }
-      flushPlain(i);
-      let kind = "string";
-      if (isJson && ch === '"') {
-        let look = end;
-        while (look < len && text[look] === " ") look++;
-        if (look < len && text[look] === ":") kind = "function";
-      }
-      emitDiffStringSegments(tokens, text.slice(i, end), kind, {
-        isTemplate: ch === "`" || (isShell && ch === '"'),
-        allowPathVars: ch === '"',
-      });
-      i = plainStart = end;
-      continue;
-    }
-
-    if (isShell && ch === "$" && i + 1 < len && (text[i + 1] === "{" || isIdentStart(text[i + 1]))) {
-      let end = i + 1;
-      if (text[end] === "{") {
-        const close = text.indexOf("}", end + 1);
-        end = close > end ? close + 1 : len;
-      } else {
-        end++;
-        while (end < len && isIdentPart(text[end])) end++;
-      }
-      flushPlain(i);
-      pushSyntaxToken(tokens, "variable", text.slice(i, end));
-      i = plainStart = end;
-      continue;
-    }
-
-    if (isCss && ch === "#" && i + 1 < len && isHexDigitChar(text[i + 1])) {
-      let end = i + 1;
-      while (end < len && isHexDigitChar(text[end])) end++;
-      flushPlain(i);
-      pushSyntaxToken(tokens, "number", text.slice(i, end));
-      i = plainStart = end;
-      continue;
-    }
-
-    if (ch === "@" && i + 1 < len && isIdentStart(text[i + 1]) && (i === 0 || !isIdentPart(text[i - 1]))) {
-      let end = i + 2;
-      while (end < len && (isIdentPart(text[end]) || text[end] === ".")) end++;
-      flushPlain(i);
-      pushSyntaxToken(tokens, isCss ? "keyword" : "annotation", text.slice(i, end));
-      i = plainStart = end;
-      continue;
-    }
-
-    if (ch === "<" && i + 1 < len && (markup || normExt === "jsx" || normExt === "tsx")) {
-      let tagStart = i + 1;
-      if (text[tagStart] === "/") tagStart++;
-      if (tagStart < len && isAsciiAlphaChar(text[tagStart])) {
-        let end = tagStart + 1;
-        while (end < len && (isIdentPart(text[end]) || text[end] === "-" || text[end] === ":" || text[end] === ".")) end++;
-        flushPlain(tagStart);
-        const tagName = text.slice(tagStart, end);
-        const isComponent = tagName[0] >= "A" && tagName[0] <= "Z";
-        pushSyntaxToken(tokens, isComponent ? "type" : "keyword", tagName);
-        i = plainStart = end;
-        continue;
-      }
-    }
-
-    if (isDigit(ch) && (i === 0 || !isIdentPart(text[i - 1]))) {
-      let end = i + 1;
-      if (ch === "0" && end < len && (text[end] === "x" || text[end] === "X" || text[end] === "b" || text[end] === "B")) {
-        end++;
-        while (end < len && (isHexDigitChar(text[end]) || text[end] === "_")) end++;
-      } else {
-        while (end < len && isDecDotChar(text[end])) end++;
-        if (
-          end < len &&
-          (text[end] === "e" || text[end] === "E") &&
-          end + 1 < len &&
-          (isDigit(text[end + 1]) || text[end + 1] === "+" || text[end + 1] === "-")
-        ) {
-          end += 2;
-          while (end < len && isDigitUnderscoreChar(text[end])) end++;
-        }
-        while (end < len && isNumSuffixChar(text[end])) end++;
-      }
-      flushPlain(i);
-      pushSyntaxToken(tokens, "number", text.slice(i, end));
-      i = plainStart = end;
-      continue;
-    }
-
-    if (
-      (ch === "-" && text[i + 1] === ">") ||
-      (ch === "<" && text[i + 1] === "-") ||
-      (ch === "=" && text[i + 1] === ">") ||
-      (ch === ":" && (text[i + 1] === ":" || text[i + 1] === "=")) ||
-      (ch === "?" && (text[i + 1] === "." || text[i + 1] === "?")) ||
-      (ch === "." && text[i + 1] === "." && text[i + 2] === ".")
-    ) {
-      const opLen = ch === "." ? 3 : 2;
-      flushPlain(i);
-      pushSyntaxToken(tokens, "operator", text.slice(i, i + opLen));
-      i = plainStart = i + opLen;
-      continue;
-    }
-
-    if ((ch === "<" || ch === ">") && (text[i + 1] === "=" || text[i + 1] === ch)) {
-      let end = i + 2;
-      if (ch === ">" && text[i + 1] === ">" && text[i + 2] === ">") end = i + 3;
-      if (text[end] === "=") end++;
-      flushPlain(i);
-      pushSyntaxToken(tokens, "operator", text.slice(i, end));
-      i = plainStart = end;
-      continue;
-    }
-
-    if (
-      ch === "=" || ch === "!" || ch === "&" || ch === "|" || ch === "+" ||
-      ch === "-" || ch === "*" || ch === "/" || ch === "%" || ch === "^" || ch === "~"
-    ) {
-      let end = i + 1;
-      while (end < len && (text[end] === "=" || text[end] === "&" || text[end] === "|" || text[end] === "*" || text[end] === "+")) {
-        end++;
-      }
-      flushPlain(i);
-      pushSyntaxToken(tokens, "operator", text.slice(i, end));
-      i = plainStart = end;
-      continue;
-    }
-
-    if (isIdentStart(ch)) {
-      let end = i + 1;
-      while (end < len && (isIdentPart(text[end]) || (isYaml && text[end] === "-"))) end++;
-      const word = text.slice(i, end);
-      let kind = "plain";
-      let look = end;
-      while (look < len && text[look] === " ") look++;
-      const isCall = text[look] === "(";
-      const prevTwo = i >= 2 ? text.slice(i - 2, i) : "";
-
-      if (isYaml && text[look] === ":" && (look + 1 === len || text[look + 1] === " ")) {
-        kind = "function";
-      } else if (prevTwo === "::" && word !== "new") {
-        kind = "function";
-      } else if (DIFF_SPECIAL_VARS.has(word) || (!isPython && DIFF_BUILTIN_VARS.has(word))) {
-        kind = "variable";
-      } else if (DIFF_BOOLEANS.has(word)) {
-        kind = "boolean";
-      } else if (DIFF_CONSTANTS.has(word) || (word.length > 1 && UPPER_CONST_RE.test(word) && !(isSql && DIFF_KEYWORDS.has(word)))) {
-        kind = "constant";
-      } else if (isPython && word === "type" && isCall) {
-        kind = "function";
-      } else if (DIFF_KEYWORDS.has(word) || (isSql && SQL_LOWER_KEYWORDS.has(word.toLowerCase()))) {
-        kind = "keyword";
-      } else if (PASCAL_TYPE_RE.test(word) || (DIFF_TYPES.has(word) && !isCall)) {
-        kind = "type";
-      } else if (isCall || prevTwo === "::") {
-        kind = "function";
-      }
-
-      if (kind !== "plain") {
-        flushPlain(i);
-        pushSyntaxToken(tokens, kind, word);
-        i = plainStart = end;
-        continue;
-      }
-      i = end;
-      continue;
-    }
-
-    i++;
-  }
-
-  flushPlain(len);
-  return tokens;
+  return tokenizeCodeLine(line, ext, mdState, {
+    maxLineChars: MAX_DIFF_SYNTAX_LINE_CHARS,
+    allowShellVars: true,
+    allowSqlLowerKeywords: true,
+    extraKeywords: true,
+    extraTypes: true,
+    includeSelfUpper: true,
+    includeIota: true,
+  });
 }
 
 function unquoteGitPath(raw) {
   const s = String(raw || "");
   if (s.length < 2 || !s.startsWith('"') || !s.endsWith('"')) return s;
   const inner = s.slice(1, -1);
+  if (inner.indexOf("\\") === -1) return inner;
   const bytes = [];
   for (let i = 0; i < inner.length; i++) {
     const ch = inner[i];
     if (ch !== "\\" || i + 1 >= inner.length) {
-      for (const b of new TextEncoder().encode(ch)) bytes.push(b);
+      const code = inner.charCodeAt(i);
+      if (code < 0x80) {
+        bytes.push(code);
+      } else {
+        const cp = inner.codePointAt(i);
+        pushUtf8CodePoint(cp, bytes);
+        if (cp > 0xffff) i += 1;
+      }
       continue;
     }
     const next = inner[++i];
@@ -867,16 +282,22 @@ function unquoteGitPath(raw) {
       if (i + 1 < inner.length && inner[i + 1] >= "0" && inner[i + 1] <= "7") oct += inner[++i];
       bytes.push(parseInt(oct, 8) & 0xff);
     } else {
-      const escMap = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
-      const code = escMap[next];
+      const code = GIT_ESCAPE_MAP[next];
       if (code !== undefined) {
         bytes.push(code);
       } else {
-        for (const b of new TextEncoder().encode(next)) bytes.push(b);
+        const nextCode = next.charCodeAt(0);
+        if (nextCode < 0x80) {
+          bytes.push(nextCode);
+        } else {
+          const cp = inner.codePointAt(i);
+          pushUtf8CodePoint(cp, bytes);
+          if (cp > 0xffff) i += 1;
+        }
       }
     }
   }
-  return new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(bytes));
+  return decodeUtf8Bytes(bytes);
 }
 
 function joinRenameSegments(prefix, mid, suffix) {
@@ -1312,8 +733,8 @@ export function buildSideBySideRows(patchText, filePath = "", options = {}) {
   const ext = getFileExt(filePath);
   const isMd = isMarkdownExt(ext);
   const deferTokens = Boolean(options?.deferTokens);
-  const allRows = [];
-  const rawLines = patchText.split("\n");
+  const maxLines = resolveMaxDiffLines(options);
+  const rows = [];
   const leftMdState = isMd ? createMarkdownState() : null;
   const rightMdState = isMd ? createMarkdownState() : null;
 
@@ -1321,136 +742,169 @@ export function buildSideBySideRows(patchText, filePath = "", options = {}) {
   let hunkIndex = 0;
   let oldLine = 0;
   let newLine = 0;
+  let totalEmitted = 0;
   let dels = [];
   let adds = [];
+  let delCount = 0;
+  let addCount = 0;
 
   const flushChangeBlock = () => {
-    const pairCount = Math.max(dels.length, adds.length);
-    for (let k = 0; k < pairCount; k++) {
-      let left;
-      if (k < dels.length) {
-        const text = expandCodeTabs(dels[k]);
-        if (deferTokens) {
-          left = { lineNo: oldLine++, text, kind: "del", tokens: null, _tokPending: true };
-          if (isMd) {
-            if (leftMdState.inFrontmatter || leftMdState.fence) {
-              left._mdState = { ...leftMdState };
+    const pairCount = Math.max(delCount, addCount);
+    if (pairCount === 0) return;
+    totalEmitted += pairCount;
+    const room = maxLines - rows.length;
+    if (room > 0) {
+      const take = Math.min(pairCount, room);
+      for (let k = 0; k < take; k++) {
+        let left;
+        if (k < dels.length) {
+          const text = expandCodeTabs(dels[k]);
+          if (deferTokens) {
+            left = { lineNo: oldLine++, text, kind: "del", tokens: null, _tokPending: true };
+            if (isMd) {
+              if (leftMdState.inFrontmatter || leftMdState.fence) {
+                left._mdState = { ...leftMdState };
+              }
+              advanceMarkdownState(text, leftMdState);
             }
-            advanceMarkdownState(text, leftMdState);
+          } else {
+            left = { lineNo: oldLine++, text, kind: "del", tokens: tokenizeDiffLine(text, ext, leftMdState) };
           }
         } else {
-          left = { lineNo: oldLine++, text, kind: "del", tokens: tokenizeDiffLine(text, ext, leftMdState) };
+          left = { lineNo: null, text: "", kind: "empty", tokens: null };
         }
-      } else {
-        left = { lineNo: null, text: "", kind: "empty", tokens: null };
-      }
-      let right;
-      if (k < adds.length) {
-        const text = expandCodeTabs(adds[k]);
-        if (deferTokens) {
-          right = { lineNo: newLine++, text, kind: "add", tokens: null, _tokPending: true };
-          if (isMd) {
-            if (rightMdState.inFrontmatter || rightMdState.fence) {
-              right._mdState = { ...rightMdState };
+        let right;
+        if (k < adds.length) {
+          const text = expandCodeTabs(adds[k]);
+          if (deferTokens) {
+            right = { lineNo: newLine++, text, kind: "add", tokens: null, _tokPending: true };
+            if (isMd) {
+              if (rightMdState.inFrontmatter || rightMdState.fence) {
+                right._mdState = { ...rightMdState };
+              }
+              advanceMarkdownState(text, rightMdState);
             }
-            advanceMarkdownState(text, rightMdState);
+          } else {
+            right = { lineNo: newLine++, text, kind: "add", tokens: tokenizeDiffLine(text, ext, rightMdState) };
           }
         } else {
-          right = { lineNo: newLine++, text, kind: "add", tokens: tokenizeDiffLine(text, ext, rightMdState) };
+          right = { lineNo: null, text: "", kind: "empty", tokens: null };
         }
-      } else {
-        right = { lineNo: null, text: "", kind: "empty", tokens: null };
+        rows.push({ kind: "pair", left, right });
       }
-      allRows.push({ kind: "pair", left, right });
     }
-    dels = [];
-    adds = [];
+    if (dels.length > 0) dels = [];
+    if (adds.length > 0) adds = [];
+    delCount = 0;
+    addCount = 0;
   };
 
-  for (let i = 0; i < rawLines.length; i++) {
-    const raw = rawLines[i];
-    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
-    const hunkMatch = HUNK_HEADER_RE.exec(line);
-    if (hunkMatch) {
-      flushChangeBlock();
-      const oldStart = parseInt(hunkMatch[1], 10);
-      const oldCount = hunkMatch[2] !== undefined ? parseInt(hunkMatch[2], 10) : 1;
-      const newStart = parseInt(hunkMatch[3], 10);
-      const newCount = hunkMatch[4] !== undefined ? parseInt(hunkMatch[4], 10) : 1;
-      allRows.push({
-        kind: "hunk",
-        header: line,
-        oldStart,
-        oldCount,
-        newStart,
-        newCount,
-        hunkIndex: hunkIndex++,
-      });
-      oldLine = oldStart;
-      newLine = newStart;
-      if (isMd) {
-        resetMdStateForLine(leftMdState, oldStart);
-        resetMdStateForLine(rightMdState, newStart);
+  const patchLen = patchText.length;
+  let pos = 0;
+  while (pos <= patchLen) {
+    const nl = patchText.indexOf("\n", pos);
+    const hasNext = nl !== -1;
+    const rawEnd = hasNext ? nl : patchLen;
+    const lineEnd = rawEnd > pos && patchText.charCodeAt(rawEnd - 1) === 13 ? rawEnd - 1 : rawEnd;
+    const lineStart = pos;
+    pos = hasNext ? nl + 1 : patchLen + 1;
+
+    const lineLen = lineEnd - lineStart;
+    if (lineLen === 0 && !hasNext) break;
+
+    const c0 = lineLen > 0 ? patchText.charCodeAt(lineStart) : 0;
+    if (c0 === 64 && lineLen >= 10 && patchText.charCodeAt(lineStart + 1) === 64) {
+      const line = patchText.slice(lineStart, lineEnd);
+      const hunkMatch = HUNK_HEADER_RE.exec(line);
+      if (hunkMatch) {
+        flushChangeBlock();
+        totalEmitted += 1;
+        inHunk = true;
+        if (rows.length < maxLines) {
+          const oldStart = parseInt(hunkMatch[1], 10);
+          const oldCount = hunkMatch[2] !== undefined ? parseInt(hunkMatch[2], 10) : 1;
+          const newStart = parseInt(hunkMatch[3], 10);
+          const newCount = hunkMatch[4] !== undefined ? parseInt(hunkMatch[4], 10) : 1;
+          rows.push({
+            kind: "hunk",
+            header: line,
+            oldStart,
+            oldCount,
+            newStart,
+            newCount,
+            hunkIndex: hunkIndex++,
+          });
+          oldLine = oldStart;
+          newLine = newStart;
+          if (isMd) {
+            resetMdStateForLine(leftMdState, oldStart);
+            resetMdStateForLine(rightMdState, newStart);
+          }
+        }
+        continue;
       }
-      inHunk = true;
-      continue;
     }
 
     if (!inHunk) continue;
-    if (line.startsWith("\\")) continue;
+    if (c0 === 92) continue;
 
-    const prefix = line[0];
-    if (prefix === "-") {
-      if (adds.length > 0) flushChangeBlock();
-      dels.push(line.slice(1));
-    } else if (prefix === "+") {
-      adds.push(line.slice(1));
-    } else if (prefix === " " || line === "") {
-      if (line === "" && i === rawLines.length - 1) continue;
+    if (c0 === 45) {
+      if (addCount > 0) flushChangeBlock();
+      if (dels.length < maxLines - rows.length) {
+        dels.push(patchText.slice(lineStart + 1, lineEnd));
+      }
+      delCount += 1;
+    } else if (c0 === 43) {
+      if (adds.length < maxLines - rows.length) {
+        adds.push(patchText.slice(lineStart + 1, lineEnd));
+      }
+      addCount += 1;
+    } else if (c0 === 32 || lineLen === 0) {
       flushChangeBlock();
-      const text = expandCodeTabs(line === "" ? "" : line.slice(1));
-      if (deferTokens) {
-        const leftCell = { lineNo: oldLine++, text, kind: "ctx", tokens: null, _tokPending: true };
-        const rightCell = { lineNo: newLine++, text, kind: "ctx", tokens: null, _tokPending: true };
-        if (isMd) {
-          if (leftMdState.inFrontmatter || leftMdState.fence) leftCell._mdState = { ...leftMdState };
-          if (rightMdState.inFrontmatter || rightMdState.fence) rightCell._mdState = { ...rightMdState };
-          advanceMarkdownState(text, leftMdState);
-          advanceMarkdownState(text, rightMdState);
-        }
-        allRows.push({ kind: "pair", left: leftCell, right: rightCell });
-      } else if (isMd) {
-        if (sameMdState(leftMdState, rightMdState)) {
-          const tokens = tokenizeDiffLine(text, ext, leftMdState);
-          advanceMarkdownState(text, rightMdState);
-          allRows.push({
+      totalEmitted += 1;
+      if (rows.length < maxLines) {
+        const text = lineLen === 0 ? "" : expandCodeTabs(patchText.slice(lineStart + 1, lineEnd));
+        if (deferTokens) {
+          const leftCell = { lineNo: oldLine++, text, kind: "ctx", tokens: null, _tokPending: true };
+          const rightCell = { lineNo: newLine++, text, kind: "ctx", tokens: null, _tokPending: true };
+          if (isMd) {
+            if (leftMdState.inFrontmatter || leftMdState.fence) leftCell._mdState = { ...leftMdState };
+            if (rightMdState.inFrontmatter || rightMdState.fence) rightCell._mdState = { ...rightMdState };
+            advanceMarkdownState(text, leftMdState);
+            advanceMarkdownState(text, rightMdState);
+          }
+          rows.push({ kind: "pair", left: leftCell, right: rightCell });
+        } else if (isMd) {
+          if (sameMdState(leftMdState, rightMdState)) {
+            const tokens = tokenizeDiffLine(text, ext, leftMdState);
+            advanceMarkdownState(text, rightMdState);
+            rows.push({
+              kind: "pair",
+              left: { lineNo: oldLine++, text, kind: "ctx", tokens },
+              right: { lineNo: newLine++, text, kind: "ctx", tokens },
+            });
+          } else {
+            rows.push({
+              kind: "pair",
+              left: { lineNo: oldLine++, text, kind: "ctx", tokens: tokenizeDiffLine(text, ext, leftMdState) },
+              right: { lineNo: newLine++, text, kind: "ctx", tokens: tokenizeDiffLine(text, ext, rightMdState) },
+            });
+          }
+        } else {
+          const tokens = tokenizeDiffLine(text, ext);
+          rows.push({
             kind: "pair",
             left: { lineNo: oldLine++, text, kind: "ctx", tokens },
             right: { lineNo: newLine++, text, kind: "ctx", tokens },
           });
-        } else {
-          allRows.push({
-            kind: "pair",
-            left: { lineNo: oldLine++, text, kind: "ctx", tokens: tokenizeDiffLine(text, ext, leftMdState) },
-            right: { lineNo: newLine++, text, kind: "ctx", tokens: tokenizeDiffLine(text, ext, rightMdState) },
-          });
         }
-      } else {
-        const tokens = tokenizeDiffLine(text, ext);
-        allRows.push({
-          kind: "pair",
-          left: { lineNo: oldLine++, text, kind: "ctx", tokens },
-          right: { lineNo: newLine++, text, kind: "ctx", tokens },
-        });
       }
     }
   }
   flushChangeBlock();
 
-  const maxLines = resolveMaxDiffLines(options);
-  const totalLines = allRows.length;
+  const totalLines = totalEmitted;
   const truncated = totalLines > maxLines;
-  const rows = truncated ? allRows.slice(0, maxLines) : allRows;
 
   let leftMaxChars = 0;
   let rightMaxChars = 0;
@@ -1474,8 +928,8 @@ export function buildUnifiedRows(patchText, filePath = "", options = {}) {
   const ext = getFileExt(filePath);
   const isMd = isMarkdownExt(ext);
   const deferTokens = Boolean(options?.deferTokens);
-  const allRows = [];
-  const rawLines = patchText.split("\n");
+  const maxLines = resolveMaxDiffLines(options);
+  const rows = [];
   const oldMdState = isMd ? createMarkdownState() : null;
   const newMdState = isMd ? createMarkdownState() : null;
 
@@ -1483,101 +937,124 @@ export function buildUnifiedRows(patchText, filePath = "", options = {}) {
   let hunkIndex = 0;
   let oldLine = 0;
   let newLine = 0;
+  let totalEmitted = 0;
 
-  for (let i = 0; i < rawLines.length; i++) {
-    const raw = rawLines[i];
-    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
-    const hunkMatch = HUNK_HEADER_RE.exec(line);
-    if (hunkMatch) {
-      const oldStart = parseInt(hunkMatch[1], 10);
-      const oldCount = hunkMatch[2] !== undefined ? parseInt(hunkMatch[2], 10) : 1;
-      const newStart = parseInt(hunkMatch[3], 10);
-      const newCount = hunkMatch[4] !== undefined ? parseInt(hunkMatch[4], 10) : 1;
-      allRows.push({
-        kind: "hunk",
-        header: line,
-        oldStart,
-        oldCount,
-        newStart,
-        newCount,
-        hunkIndex: hunkIndex++,
-      });
-      oldLine = oldStart;
-      newLine = newStart;
-      if (isMd) {
-        resetMdStateForLine(oldMdState, oldStart);
-        resetMdStateForLine(newMdState, newStart);
+  const patchLen = patchText.length;
+  let pos = 0;
+  while (pos <= patchLen) {
+    const nl = patchText.indexOf("\n", pos);
+    const hasNext = nl !== -1;
+    const rawEnd = hasNext ? nl : patchLen;
+    const lineEnd = rawEnd > pos && patchText.charCodeAt(rawEnd - 1) === 13 ? rawEnd - 1 : rawEnd;
+    const lineStart = pos;
+    pos = hasNext ? nl + 1 : patchLen + 1;
+
+    const lineLen = lineEnd - lineStart;
+    if (lineLen === 0 && !hasNext) break;
+
+    const c0 = lineLen > 0 ? patchText.charCodeAt(lineStart) : 0;
+    if (c0 === 64 && lineLen >= 10 && patchText.charCodeAt(lineStart + 1) === 64) {
+      const line = patchText.slice(lineStart, lineEnd);
+      const hunkMatch = HUNK_HEADER_RE.exec(line);
+      if (hunkMatch) {
+        totalEmitted += 1;
+        inHunk = true;
+        if (rows.length < maxLines) {
+          const oldStart = parseInt(hunkMatch[1], 10);
+          const oldCount = hunkMatch[2] !== undefined ? parseInt(hunkMatch[2], 10) : 1;
+          const newStart = parseInt(hunkMatch[3], 10);
+          const newCount = hunkMatch[4] !== undefined ? parseInt(hunkMatch[4], 10) : 1;
+          rows.push({
+            kind: "hunk",
+            header: line,
+            oldStart,
+            oldCount,
+            newStart,
+            newCount,
+            hunkIndex: hunkIndex++,
+          });
+          oldLine = oldStart;
+          newLine = newStart;
+          if (isMd) {
+            resetMdStateForLine(oldMdState, oldStart);
+            resetMdStateForLine(newMdState, newStart);
+          }
+        }
+        continue;
       }
-      inHunk = true;
-      continue;
     }
 
     if (!inHunk) continue;
-    if (line.startsWith("\\")) continue;
+    if (c0 === 92) continue;
 
-    const prefix = line[0];
-    if (prefix === "-") {
-      const text = expandCodeTabs(line.slice(1));
-      const row = {
-        kind: "del",
-        oldLineNo: oldLine++,
-        newLineNo: null,
-        text,
-        tokens: deferTokens ? null : tokenizeDiffLine(text, ext, oldMdState),
-        ...(deferTokens ? { _tokPending: true } : {}),
-      };
-      if (deferTokens && isMd) {
-        if (oldMdState.inFrontmatter || oldMdState.fence) row._mdState = { ...oldMdState };
-        advanceMarkdownState(text, oldMdState);
-      }
-      allRows.push(row);
-    } else if (prefix === "+") {
-      const text = expandCodeTabs(line.slice(1));
-      const row = {
-        kind: "add",
-        oldLineNo: null,
-        newLineNo: newLine++,
-        text,
-        tokens: deferTokens ? null : tokenizeDiffLine(text, ext, newMdState),
-        ...(deferTokens ? { _tokPending: true } : {}),
-      };
-      if (deferTokens && isMd) {
-        if (newMdState.inFrontmatter || newMdState.fence) row._mdState = { ...newMdState };
-        advanceMarkdownState(text, newMdState);
-      }
-      allRows.push(row);
-    } else if (prefix === " " || line === "") {
-      if (line === "" && i === rawLines.length - 1) continue;
-      const text = expandCodeTabs(line === "" ? "" : line.slice(1));
-      let tokens = null;
-      let mdSnap = null;
-      if (deferTokens) {
-        if (isMd) {
-          if (newMdState.inFrontmatter || newMdState.fence) mdSnap = { ...newMdState };
+    if (c0 === 45) {
+      totalEmitted += 1;
+      if (rows.length < maxLines) {
+        const text = expandCodeTabs(patchText.slice(lineStart + 1, lineEnd));
+        const row = {
+          kind: "del",
+          oldLineNo: oldLine++,
+          newLineNo: null,
+          text,
+          tokens: deferTokens ? null : tokenizeDiffLine(text, ext, oldMdState),
+          ...(deferTokens ? { _tokPending: true } : {}),
+        };
+        if (deferTokens && isMd) {
+          if (oldMdState.inFrontmatter || oldMdState.fence) row._mdState = { ...oldMdState };
           advanceMarkdownState(text, oldMdState);
+        }
+        rows.push(row);
+      }
+    } else if (c0 === 43) {
+      totalEmitted += 1;
+      if (rows.length < maxLines) {
+        const text = expandCodeTabs(patchText.slice(lineStart + 1, lineEnd));
+        const row = {
+          kind: "add",
+          oldLineNo: null,
+          newLineNo: newLine++,
+          text,
+          tokens: deferTokens ? null : tokenizeDiffLine(text, ext, newMdState),
+          ...(deferTokens ? { _tokPending: true } : {}),
+        };
+        if (deferTokens && isMd) {
+          if (newMdState.inFrontmatter || newMdState.fence) row._mdState = { ...newMdState };
           advanceMarkdownState(text, newMdState);
         }
-      } else {
-        if (isMd) advanceMarkdownState(text, oldMdState);
-        tokens = tokenizeDiffLine(text, ext, newMdState);
+        rows.push(row);
       }
-      const row = {
-        kind: "ctx",
-        oldLineNo: oldLine++,
-        newLineNo: newLine++,
-        text,
-        tokens,
-        ...(deferTokens ? { _tokPending: true } : {}),
-      };
-      if (mdSnap) row._mdState = mdSnap;
-      allRows.push(row);
+    } else if (c0 === 32 || lineLen === 0) {
+      totalEmitted += 1;
+      if (rows.length < maxLines) {
+        const text = lineLen === 0 ? "" : expandCodeTabs(patchText.slice(lineStart + 1, lineEnd));
+        let tokens = null;
+        let mdSnap = null;
+        if (deferTokens) {
+          if (isMd) {
+            if (newMdState.inFrontmatter || newMdState.fence) mdSnap = { ...newMdState };
+            advanceMarkdownState(text, oldMdState);
+            advanceMarkdownState(text, newMdState);
+          }
+        } else {
+          if (isMd) advanceMarkdownState(text, oldMdState);
+          tokens = tokenizeDiffLine(text, ext, newMdState);
+        }
+        const row = {
+          kind: "ctx",
+          oldLineNo: oldLine++,
+          newLineNo: newLine++,
+          text,
+          tokens,
+          ...(deferTokens ? { _tokPending: true } : {}),
+        };
+        if (mdSnap) row._mdState = mdSnap;
+        rows.push(row);
+      }
     }
   }
 
-  const maxLines = resolveMaxDiffLines(options);
-  const totalLines = allRows.length;
+  const totalLines = totalEmitted;
   const truncated = totalLines > maxLines;
-  const rows = truncated ? allRows.slice(0, maxLines) : allRows;
 
   let maxChars = 0;
   for (const row of rows) {

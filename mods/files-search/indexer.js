@@ -28,6 +28,29 @@ export const AGENT_PREWARM_DEBOUNCE_MS = 250;
 
 export const OVERLAY_INDEX_CACHE = new Map();
 export const RG_AVAILABLE_CACHE = new Map();
+const RG_AVAILABLE_TS = new Map();
+const RG_AVAILABLE_FAIL_TTL_MS = 60000;
+
+export function isRgAvailable(onKey = "local") {
+  const key = onKey || "local";
+  const cached = RG_AVAILABLE_CACHE.get(key);
+  if (cached !== false) return cached;
+  const ts = RG_AVAILABLE_TS.get(key) || 0;
+  if (ts > 0 && Date.now() - ts >= RG_AVAILABLE_FAIL_TTL_MS) {
+    RG_AVAILABLE_CACHE.delete(key);
+    RG_AVAILABLE_TS.delete(key);
+    return undefined;
+  }
+  return false;
+}
+
+export function markRgAvailable(onKey = "local", ok) {
+  const key = onKey || "local";
+  const boolOk = Boolean(ok);
+  RG_AVAILABLE_CACHE.set(key, boolOk);
+  if (boolOk) RG_AVAILABLE_TS.delete(key);
+  else RG_AVAILABLE_TS.set(key, Date.now());
+}
 
 const INDEX_INFLIGHT = new Map();
 const DISK_LOAD_INFLIGHT = new Map();
@@ -36,7 +59,7 @@ const INDEX_GENERATION = new Map();
 const INDEX_DIRTY_SEQ = new Map();
 const ACTIVE_ROOT_WATCHERS = new Map();
 
-const READ_GIT = [
+export const READ_GIT = [
   "--no-optional-locks",
   "-c", "core.fsmonitor=false",
   "-c", "diff.autoRefreshIndex=false",
@@ -68,6 +91,21 @@ export const COMMON_IGNORE_GLOBS = [
   "--glob", "!.terraform",
   "--glob", "!.angular",
   "--glob", "!.nx",
+  "--glob", "!.cargo",
+  "--glob", "!.rustup",
+  "--glob", "!.npm",
+  "--glob", "!.pnpm-store",
+  "--glob", "!.bun",
+  "--glob", "!.local/share",
+  "--glob", "!.mozilla",
+  "--glob", "!.config/google-chrome",
+  "--glob", "!.config/chromium",
+  "--glob", "!.Trash",
+  "--glob", "!.var",
+  "--glob", "!.m2",
+  "--glob", "!go/pkg",
+  "--glob", "!*.egg-info",
+  "--glob", "!.sass-cache",
 ];
 
 export function normPathStr(p) {
@@ -523,8 +561,11 @@ export async function fsListWorkspace(root, maxFiles = MAX_OVERLAY_FILES, maxDir
   };
 
   pushEntries(root, "", rootEntries);
-  while (queue.length > 0 && files.length < maxFiles) {
-    const batch = queue.splice(0, 16);
+  let qHead = 0;
+  while (qHead < queue.length && files.length < maxFiles) {
+    const end = Math.min(queue.length, qHead + 16);
+    const batch = queue.slice(qHead, end);
+    qHead = end;
     const dirLists = await Promise.all(
       batch.map(async item => {
         const entries = await readdir(item.abs, { withFileTypes: true }).catch(() => []);
@@ -658,6 +699,7 @@ export async function handleWatchForIndex(root, on, isWindows, info, changedPath
     return markIndexDirty(indexKey, cached);
   }
 
+  const toVerify = [];
   for (const raw of changedPaths) {
     if (!raw || isIgnoredWatchPath(raw, root)) continue;
     const rel = getRelToWorkspace(raw, root);
@@ -674,8 +716,14 @@ export async function handleWatchForIndex(root, on, isWindows, info, changedPath
     if (!known) {
       return markIndexDirty(indexKey, cached);
     }
-    const stillThere = await exists(joinSubPath(root, cleanRel)).catch(() => false);
-    if (!stillThere) {
+    toVerify.push(cleanRel);
+  }
+
+  for (let i = 0; i < toVerify.length; i += 8) {
+    const checks = await Promise.all(
+      toVerify.slice(i, i + 8).map((cleanRel) => exists(joinSubPath(root, cleanRel)).catch(() => false))
+    );
+    if (checks.some((ok) => !ok)) {
       return markIndexDirty(indexKey, cached);
     }
   }
@@ -683,6 +731,18 @@ export async function handleWatchForIndex(root, on, isWindows, info, changedPath
   // Only existing files were edited; refresh timestamp without rescanning or rewriting disk cache.
   cached.ts = Date.now();
   return false;
+}
+
+function sameIndexedSnapshot(prev, files, dirs) {
+  if (!prev || !Array.isArray(prev.files) || !Array.isArray(prev.dirs)) return false;
+  if (prev.files.length !== files.length || prev.dirs.length !== dirs.length) return false;
+  for (let i = 0; i < files.length; i += 1) {
+    if (prev.files[i] !== files[i]) return false;
+  }
+  for (let i = 0; i < dirs.length; i += 1) {
+    if (prev.dirs[i] !== dirs[i]) return false;
+  }
+  return true;
 }
 
 export async function ensureWorkspaceIndex({ root, on = null, isWindows = false, discoverRepos, force = false, cx = null }) {
@@ -708,17 +768,36 @@ export async function ensureWorkspaceIndex({ root, on = null, isWindows = false,
     let extraDirs = [];
     // Fast ripgrep file list (respects nested .gitignores and skips noisy directories)
     let rgRes = null;
-    if (RG_AVAILABLE_CACHE.get(onKey) !== false) {
-      rgRes = await exec(
-        "rg",
-        ["--files", "--hidden", "--path-separator", "/", "--threads", "4", ...COMMON_IGNORE_GLOBS],
-        { cwd: root, on, timeout: 10000 }
-      ).catch(() => null);
-      if (rgRes) {
-        RG_AVAILABLE_CACHE.set(onKey, true);
+    if (isRgAvailable(onKey) !== false) {
+      if (!isWindows) {
+        const rgLineCap = MAX_OVERLAY_FILES + 1;
+        const rgScript = `command -v rg >/dev/null 2>&1 || exit 127; rg "$@" 2>/dev/null | head -n ${rgLineCap}`;
+        rgRes = await exec(
+          "sh",
+          ["-c", rgScript, "sh", "--files", "--hidden", "--path-separator", "/", "--threads", "4", ...COMMON_IGNORE_GLOBS],
+          { cwd: root, on, timeout: 10000 }
+        ).catch(() => null);
+        if (rgRes && rgRes.code === 127) {
+          markRgAvailable(onKey, false);
+          rgRes = null;
+        } else if (rgRes) {
+          markRgAvailable(onKey, true);
+        } else {
+          const probe = await exec("rg", ["--version"], { on, timeout: 2500 }).catch(() => null);
+          markRgAvailable(onKey, Boolean(probe && probe.code === 0));
+        }
       } else {
-        const probe = await exec("rg", ["--version"], { on, timeout: 2500 }).catch(() => null);
-        RG_AVAILABLE_CACHE.set(onKey, Boolean(probe && probe.code === 0));
+        rgRes = await exec(
+          "rg",
+          ["--files", "--hidden", "--path-separator", "/", "--threads", "4", ...COMMON_IGNORE_GLOBS],
+          { cwd: root, on, timeout: 10000 }
+        ).catch(() => null);
+        if (rgRes) {
+          markRgAvailable(onKey, true);
+        } else {
+          const probe = await exec("rg", ["--version"], { on, timeout: 2500 }).catch(() => null);
+          markRgAvailable(onKey, Boolean(probe && probe.code === 0));
+        }
       }
     }
 
@@ -824,8 +903,16 @@ export async function ensureWorkspaceIndex({ root, on = null, isWindows = false,
       watching: hasActiveRootWatcher(indexKey),
       fromDisk: false,
     };
+    const unchangedSnapshot = Boolean(
+      cached &&
+      !force &&
+      sameIndexedSnapshot(cached, slicedFiles, dirs) &&
+      Date.now() - (cached.ts || 0) < INDEX_WATCHED_TTL_MS
+    );
     putIndexCache(indexKey, record);
-    await saveDiskIndex(record);
+    if (!unchangedSnapshot) {
+      await saveDiskIndex(record);
+    }
     return record;
   })();
 

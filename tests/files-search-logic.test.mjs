@@ -9,6 +9,7 @@ import {
   prepareSearchQuery,
   scoreIndexEntry,
   buildTopFileItems,
+  MAX_PREVIEW_RENDER_LINE_CHARS,
   getSyntaxExt,
   resolveEditorLanguage,
   getSyntaxPalette,
@@ -26,6 +27,8 @@ import {
   findMatchingOpenFileTab,
   resolveViewerMarkdownToggleOnLoad,
   selectViewerMarkdownRawText,
+  selectViewerRawText,
+  shouldReuseInFlightPendingViewerOpen,
   buildViewerMarkdownCacheKey,
   buildViewerMarkdownViewIds,
   resolveRelativeMarkdownTarget,
@@ -33,7 +36,21 @@ import {
   shouldResetPreviewMarkdown,
   shouldLoadFullMarkdownPreview,
   buildPreviewMarkdownViewIds,
+  isNavModifierActive,
+  splitCodeViewerLines,
+  tokenizeInteractiveWrappedLine,
+  buildWrappedViewerDocument,
+  computeWindowedViewerSlice,
+  computeTargetCenterScrollRow,
+  computeScrollbarMetrics,
+  resolveWheelLineDelta,
+  resolveClickScrollbarRow,
+  buildDisambiguationDropdownItems,
+  buildViewerNavigationNotice,
+  applyTabNavMeta,
+  shouldOpenNavInNewTab,
 } from "../mods/files-search/search-logic.js";
+import { normalizeNavCandidate } from "../shared/code-nav-logic.js";
 import { isMarkdownFile } from "../mods/files-search/markdown-view-logic.js";
 
 describe("files-search search-logic", () => {
@@ -588,6 +605,40 @@ describe("files-search search-logic", () => {
     assert.equal(isMarkdownFile("/repo/main.js"), false);
   });
 
+  test("selectViewerRawText retains raw text for code, config, and Markdown files so non-Markdown viewers build documents instead of staying on Loading file", () => {
+    const javaSrc = "package com.rag.scaffold;\npublic class TenantController {\n  void getTenants() {}\n}\n";
+    const jsSrc = "export function main() { return 42; }\n";
+    const pySrc = "def main():\n    return 42\n";
+    const mdSrc = "# Title\n";
+
+    assert.equal(selectViewerRawText(javaSrc, false), javaSrc);
+    assert.equal(selectViewerRawText(jsSrc, false), jsSrc);
+    assert.equal(selectViewerRawText(pySrc, false), pySrc);
+    assert.equal(selectViewerRawText(mdSrc, false), mdSrc);
+    assert.equal(selectViewerRawText("", false), "");
+
+    // Regression: selectViewerMarkdownRawText previously returned null for .java/.js/.py,
+    // which left viewerRawText === null and viewerDoc === null ("Loading file…").
+    assert.equal(selectViewerMarkdownRawText("/repo/TenantController.java", javaSrc, false), null);
+    const rawForDoc = selectViewerRawText(javaSrc, false);
+    const doc = buildWrappedViewerDocument(rawForDoc, "/repo/TenantController.java", 88);
+    assert.ok(doc && doc.totalLines >= 3 && doc.rows.length >= 3);
+
+    // Errors, null, or binary content must return null
+    assert.equal(selectViewerRawText(javaSrc, true), null);
+    assert.equal(selectViewerRawText(null, false), null);
+    assert.equal(selectViewerRawText("abc\0def", false), null);
+  });
+
+  test("shouldReuseInFlightPendingViewerOpen deduplicates sub-window double open calls before spaces() materializes the new tab", () => {
+    const pending = { viewerId: "fv-1", ts: 1000 };
+    assert.equal(shouldReuseInFlightPendingViewerOpen(pending, 1004), true);
+    assert.equal(shouldReuseInFlightPendingViewerOpen(pending, 1399), true);
+    assert.equal(shouldReuseInFlightPendingViewerOpen(pending, 1400), false);
+    assert.equal(shouldReuseInFlightPendingViewerOpen(pending, 999), false);
+    assert.equal(shouldReuseInFlightPendingViewerOpen(null, 1004), false);
+  });
+
   test("buildViewerMarkdownCacheKey and buildViewerMarkdownViewIds scope keys and scroll IDs per target and loadSeq", () => {
     assert.equal(buildViewerMarkdownCacheKey("/repo/README.md", 3), "/repo/README.md|3");
     assert.equal(buildViewerMarkdownCacheKey("", 1), "");
@@ -661,5 +712,246 @@ describe("files-search search-logic", () => {
     const otherFileIds = buildPreviewMarkdownViewIds("docs/SPEC.md", 1, "chunk-24");
     assert.notEqual(chunkIds.scrollId, fullIds.scrollId);
     assert.notEqual(chunkIds.scrollId, otherFileIds.scrollId);
+  });
+
+  test("isNavModifierActive handles Ctrl/Cmd cleanly and ignores AltGr control+alt chord", () => {
+    assert.equal(isNavModifierActive({ control: true }), true);
+    assert.equal(isNavModifierActive({ platform: true }), true);
+    assert.equal(isNavModifierActive({ control: true, shift: true }), true);
+    assert.equal(isNavModifierActive({ control: true, alt: true }), false);
+    assert.equal(isNavModifierActive({ alt: true }), false);
+    assert.equal(isNavModifierActive(null), false);
+  });
+
+  test("tokenizeInteractiveWrappedLine and buildWrappedViewerDocument preserve interactive metadata across soft wraps", () => {
+    const src = [
+      "import { computeTotal } from './math.js';",
+      "\tconst invoiceTotal = computeTotal(orderItemA, orderItemB, fallbackDiscountRate);",
+      "",
+      "return invoiceTotal;",
+    ].join("\n");
+
+    const singleRows = tokenizeInteractiveWrappedLine(
+      "\tconst x = computeTotal(alpha);",
+      "js",
+      null,
+      18,
+    );
+    assert.ok(singleRows.length >= 2);
+    const flatToks = singleRows.flat();
+    const callTok = flatToks.find(([, txt, meta]) => txt === "computeTotal" && meta?.nav);
+    assert.ok(callTok, "computeTotal token must keep nav: true after wrapStyledSpans");
+    assert.ok(Number.isInteger(callTok[2].col) && callTok[2].col > 1);
+
+    const doc = buildWrappedViewerDocument(src, "src/billing.js", 36);
+    assert.equal(doc.totalLines, 4);
+    assert.equal(doc.rows[0].lineNum, 1);
+    assert.equal(doc.rows[0].isFirstWrap, true);
+    assert.ok(doc.lineRowCounts[1] >= 2, "long line 2 wraps into multiple visual rows");
+    const line4First = doc.lineFirstRowIndex[3];
+    assert.equal(doc.rows[line4First].lineNum, 4);
+    assert.equal(doc.rows[line4First].isFirstWrap, true);
+    for (let i = 1; i < doc.lineRowCounts[1]; i += 1) {
+      assert.equal(doc.rows[doc.lineFirstRowIndex[1] + i].isFirstWrap, false);
+    }
+
+    const lines = splitCodeViewerLines("a\r\nb\nc");
+    assert.deepEqual(lines, ["a", "b", "c"]);
+  });
+
+  test("windowed code viewer scroll, centering, wheel sign, and scrollbar geometry behave deterministically", () => {
+    const src = Array.from({ length: 80 }, (_, idx) => `const value_${idx + 1} = compute_${idx + 1}();`).join("\n");
+    const doc = buildWrappedViewerDocument(src, "src/index.js", 100);
+    const slice0 = computeWindowedViewerSlice(doc.rows.length, -10, 400, 20);
+    assert.equal(slice0.visibleCount, 20);
+    assert.equal(slice0.maxScrollTop, 60);
+    assert.equal(slice0.scrollTop, 0);
+
+    const centerRow = computeTargetCenterScrollRow(doc, 45, 400, 20);
+    assert.ok(centerRow > 25 && centerRow < 45);
+
+    const hiddenBar = computeScrollbarMetrics(10, 0, 20, 400);
+    assert.equal(hiddenBar.visible, false);
+
+    const barTop = computeScrollbarMetrics(80, 0, 20, 400);
+    const barEnd = computeScrollbarMetrics(80, 60, 20, 400);
+    assert.equal(barTop.visible, true);
+    assert.equal(barTop.thumbTop, 0);
+    assert.equal(barEnd.thumbTop + barEnd.thumbHeight, 400);
+
+    // Positive delta.y scrolls UP (negative row delta); negative delta.y scrolls DOWN
+    assert.equal(resolveWheelLineDelta(15, 0), -3);
+    assert.equal(resolveWheelLineDelta(-15, 0), 3);
+    assert.equal(resolveWheelLineDelta(0, 2), -6);
+    assert.equal(resolveClickScrollbarRow(400, 400, 80, 20), 60);
+  });
+
+  test("disambiguation items, nav notices, and tab nav metadata preserve context cleanly", () => {
+    const items = buildDisambiguationDropdownItems([
+      {
+        filePath: "/repo/billing/src/StripeGateway.java",
+        serviceRoot: "/repo/billing",
+        serviceName: "billing",
+        line: 27,
+        column: 17,
+        containerName: "StripeGateway",
+        symbol: "charge",
+        signature: "public Receipt charge(Order order, Currency currency)",
+        kind: "implementation",
+      },
+      {
+        filePath: "/repo/orders/src/FallbackGateway.java",
+        serviceRoot: "/repo/orders",
+        serviceName: "orders",
+        line: 14,
+        column: 10,
+        containerName: "FallbackGateway",
+        symbol: "charge",
+        kind: "implementation",
+      },
+    ], "/repo/billing", "billing");
+
+    assert.equal(items.length, 2);
+    assert.equal(items[0].label, "StripeGateway.charge");
+    assert.equal(items[0].subline, "src/StripeGateway.java:27");
+    assert.equal(items[0].badge, "");
+    assert.equal(items[1].badge, "orders");
+    assert.equal(items[1].rightText, ":14");
+
+    const extNotice = buildViewerNavigationNotice({ status: "external", externalPackage: "java.util.List" }, { symbol: "List" }, "declaration");
+    assert.match(extNotice.message, /java\.util\.List/);
+    const nfNotice = buildViewerNavigationNotice({ status: "not-found" }, { symbol: "missingFn" }, "implementation");
+    assert.equal(nfNotice.level, "warn");
+    assert.match(nfNotice.message, /missingFn/);
+    const sameNotice = buildViewerNavigationNotice({ status: "already-there" }, { symbol: "targetFn" }, "implementation");
+    assert.match(sameNotice.message, /Already at implementation/);
+
+    const patchedTab = applyTabNavMeta({ tabId: "t1", line: 9 }, { column: 15, highlightSymbol: "processOrder", navSeq: 4 });
+    assert.equal(patchedTab.column, 15);
+    assert.equal(patchedTab.highlightSymbol, "processOrder");
+    assert.equal(patchedTab.navSeq, 4);
+  });
+
+  test("wrapped markdown viewer tracks multi-line frontmatter state without making YAML keys navigable", () => {
+    const mdText = [
+      "---",
+      "title: Architecture Notes",
+      "author: Alice",
+      "---",
+      "",
+      "```js",
+      "const result = computeValue();",
+      "```",
+    ].join("\n");
+    const doc = buildWrappedViewerDocument(mdText, "/repo/docs/guide.md", 80);
+
+    // Line 2 (`title: Architecture Notes`) inside YAML frontmatter must tokenize as frontmatter key (`type`) with zero navigable tokens.
+    const fmRowIdx = doc.lineFirstRowIndex[1];
+    const fmRow = doc.rows[fmRowIdx];
+    assert.equal(fmRow.segments[0]?.[0], "type");
+    assert.equal(fmRow.segments.filter((seg) => seg[2]?.nav).length, 0);
+
+    // Line 7 (`const result = computeValue();`) inside fenced JS block should tokenize syntax (`keyword` for const).
+    const fenceRowIdx = doc.lineFirstRowIndex[6];
+    const fenceRow = doc.rows[fenceRowIdx];
+    assert.ok(fenceRow.segments.some((seg) => seg[0] === "keyword" && seg[1].includes("const")));
+    assert.equal(fenceRow.segments.filter((seg) => seg[2]?.nav).length, 0);
+  });
+
+  test("disambiguation dropdown works with real normalizeNavCandidate output and monotonic navSeq breaks same-ms ties", () => {
+    const c1 = normalizeNavCandidate({
+      filePath: "/repo/billing/src/StripeGateway.java",
+      root: "/repo/billing",
+      serviceId: "bill",
+      serviceName: "billing",
+      line: 27,
+      column: 17,
+      name: "charge",
+      kind: "implementation",
+      containerName: "StripeGateway",
+      signature: "public void charge(int cents)",
+    });
+    const c2 = normalizeNavCandidate({
+      filePath: "/repo/orders/src/FallbackGateway.java",
+      root: "/repo/orders",
+      serviceId: "orders",
+      serviceName: "orders",
+      line: 14,
+      column: 10,
+      name: "charge",
+      kind: "implementation",
+      containerName: "FallbackGateway",
+    });
+
+    const items = buildDisambiguationDropdownItems([c1, c2], "/repo/billing", "billing");
+    assert.equal(items.length, 2);
+    assert.equal(items[0].label, "StripeGateway.charge");
+    assert.equal(items[0].subline, "src/StripeGateway.java:27");
+    assert.equal(items[0].badge, "");
+    assert.equal(items[1].label, "FallbackGateway.charge");
+    assert.equal(items[1].subline, "src/FallbackGateway.java:14");
+    assert.equal(items[1].badge, "orders");
+
+    const fixedTs = 1700000000123;
+    const first = applyTabNavMeta({ tabId: "t1", line: 10, updatedAt: fixedTs }, { column: 5, highlightSymbol: "foo", navSeq: 1 });
+    const second = applyTabNavMeta({ tabId: "t1", line: 42, updatedAt: fixedTs }, { column: 9, highlightSymbol: "bar", navSeq: 2 });
+    assert.equal(first.updatedAt, second.updatedAt);
+    assert.ok(second.navSeq > first.navSeq);
+    assert.equal(second.line, 42);
+    assert.equal(second.highlightSymbol, "bar");
+
+    assert.equal(shouldOpenNavInNewTab("/repo/a.js", "/repo/a.js", null, null, false), false);
+    assert.equal(shouldOpenNavInNewTab("/repo/b.js", "/repo/a.js", null, null, false), true);
+    assert.equal(shouldOpenNavInNewTab("/repo/a.js", "/repo/a.js", "ssh-box", null, false), true);
+    assert.equal(shouldOpenNavInNewTab("C:\\Repo\\Sub\\File.ts", "C:/repo/sub/file.ts", null, null, true), false);
+  });
+
+  test("buildWrappedViewerDocument reuses tokenizedLines across width resizes with identical output and clips huge plain lines", () => {
+    const sample = [
+      'import { helper } from "./helper.js";',
+      "export function computeTotal(items, discountRate = 0.15) {",
+      '  const label = "order_summary_value_that_wraps_across_multiple_visual_rows";',
+      "  return items.map((x) => helper(x, label, discountRate));",
+      "}",
+      `const tail = "${"x".repeat(MAX_PREVIEW_RENDER_LINE_CHARS + 250)}";`,
+    ].join("\n");
+
+    const coldNarrow = buildWrappedViewerDocument(sample, "/repo/src/calc.js", 28);
+    assert.ok(Array.isArray(coldNarrow.tokenizedLines));
+    assert.equal(coldNarrow.tokenizedLines.length, coldNarrow.totalLines);
+
+    // Resize to wide width reusing tokenizedLines without re-tokenizing
+    const warmWide = buildWrappedViewerDocument("", "/repo/src/calc.js", 110, {
+      tokenizedLines: coldNarrow.tokenizedLines,
+      truncated: coldNarrow.truncated,
+    });
+    const coldWide = buildWrappedViewerDocument(sample, "/repo/src/calc.js", 110);
+
+    assert.deepEqual(warmWide.rows, coldWide.rows);
+    assert.deepEqual(warmWide.lineFirstRowIndex, coldWide.lineFirstRowIndex);
+    assert.deepEqual(warmWide.lineRowCounts, coldWide.lineRowCounts);
+    assert.equal(warmWide.totalLines, coldWide.totalLines);
+    assert.equal(warmWide.truncated, coldWide.truncated);
+
+    // Resize back to very narrow width
+    const warmNarrow2 = buildWrappedViewerDocument("", "/repo/src/calc.js", 24, {
+      tokenizedLines: coldNarrow.tokenizedLines,
+      truncated: coldNarrow.truncated,
+    });
+    const coldNarrow2 = buildWrappedViewerDocument(sample, "/repo/src/calc.js", 24);
+    assert.deepEqual(warmNarrow2.rows, coldNarrow2.rows);
+    assert.deepEqual(warmNarrow2.lineFirstRowIndex, coldNarrow2.lineFirstRowIndex);
+    assert.deepEqual(warmNarrow2.lineRowCounts, coldNarrow2.lineRowCounts);
+
+    // Plain/unknown-extension ultra-long line clipping + computeCodeContentWidth tab-free/charPx guards
+    const hugePlain = `${"a".repeat(MAX_PREVIEW_RENDER_LINE_CHARS + 500)}\nshort\tline\n`;
+    const plainDoc = buildWrappedViewerDocument(hugePlain, "/repo/raw.unknownext", 20000);
+    assert.equal(plainDoc.rows[0].segments[0][1].endsWith("\u00a0…"), true);
+    assert.ok(plainDoc.rows[0].segments[0][1].length <= MAX_PREVIEW_RENDER_LINE_CHARS + 4);
+    assert.equal(
+      computeCodeContentWidth(["plain ascii", "\tindented"]),
+      computeCodeContentWidth(["plain ascii", "    indented"]),
+    );
+    assert.equal(computeCodeContentWidth(["abc"], { charPx: Number.NaN, minWidth: 240, gutterPx: 92 }), 240);
   });
 });

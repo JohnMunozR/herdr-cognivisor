@@ -1,6 +1,19 @@
 // Pure helper logic for files-search: fuzzy scoring, directory-aware query ranking, text-search parsing, git header parsing, and syntax highlighting.
-import { isMarkdownExt, tokenizeMarkdownLine } from "./markdown-syntax.js";
 import { isMarkdownFile, resolveRelativeMarkdownPath } from "./markdown-view-logic.js";
+import { wrapStyledSpans } from "./code-wrap.js";
+import {
+  MAX_PREVIEW_SYNTAX_LINE_CHARS,
+  MAX_PREVIEW_RENDER_LINE_CHARS,
+  getSyntaxExt,
+  resolveEditorLanguage,
+  getSyntaxPalette,
+  getEditorSyntaxConfig,
+  syntaxTokenStyle,
+  expandCodeTabs,
+  createCodeSyntaxState,
+  tokenizeCodeLine,
+  tokenizeInteractiveCodeLine,
+} from "./code-syntax.js";
 
 export const MAX_FILE_RESULTS = 50;
 export const MAX_TEXT_RESULTS = 35;
@@ -15,11 +28,11 @@ export function repoMatchesTranscript(service, files, transcript) {
   if (!transcript) return false;
   const normRoot = String(service.root || "").replace(/\\/g, "/").replace(/\/+$/, "");
   if (normRoot && transcript.includes(normRoot)) return true;
-  if (service.relPath && service.relPath.length >= 2) {
+  if (service.relPath && service.relPath.length >= 2 && transcript.includes(`${service.relPath}/`)) {
     const relRe = new RegExp(`(?:^|[\\s"'\`(:\\/])${escapeRegexStr(service.relPath)}/`);
     if (relRe.test(transcript)) return true;
   }
-  if (service.name && service.name.length >= 3) {
+  if (service.name && service.name.length >= 3 && transcript.includes(`${service.name}/`)) {
     const nameRe = new RegExp(`(?:^|[\\s"'\`(:\\/])${escapeRegexStr(service.name)}/`);
     if (nameRe.test(transcript)) return true;
   }
@@ -159,17 +172,17 @@ export function scoreIndexEntry(entry, qs) {
   let score = -Infinity;
   let fromName = false;
   if (!useHasSlash) {
-    const nameTarget = useEndsSlash ? `${entry.lowerName}/` : entry.lowerName;
+    const nameTarget = useEndsSlash ? (entry.lowerNameSlash || (entry.lowerNameSlash = `${entry.lowerName}/`)) : entry.lowerName;
     const ns = scoreSubseqFast(nameTarget, useChars, useLen);
     if (ns > -Infinity) {
       score = ns + 15;
       fromName = true;
     } else {
-      const pathTarget = useEndsSlash ? `${entry.lowerPath}/` : entry.lowerPath;
+      const pathTarget = useEndsSlash ? (entry.lowerPathSlash || (entry.lowerPathSlash = `${entry.lowerPath}/`)) : entry.lowerPath;
       score = scoreSubseqFast(pathTarget, useChars, useLen);
     }
   } else {
-    const pathTarget = useEndsSlash ? `${entry.lowerPath}/` : entry.lowerPath;
+    const pathTarget = useEndsSlash ? (entry.lowerPathSlash || (entry.lowerPathSlash = `${entry.lowerPath}/`)) : entry.lowerPath;
     score = scoreSubseqFast(pathTarget, useChars, useLen);
   }
   if (score > -Infinity) {
@@ -190,685 +203,18 @@ export function buildTopFileItems(top, q, withHits) {
   }));
 }
 
-const EDITOR_LANG_ALIASES = {
-  ts: "js",
-  tsx: "js",
-  mts: "js",
-  cts: "js",
-  jsx: "js",
-  mjs: "js",
-  cjs: "js",
-  pyw: "py",
-  pyi: "py",
-  toml: "yaml",
-  jsonc: "json",
-  json5: "json",
-  svelte: "html",
-  vue: "html",
-  gradle: "groovy",
-  env: "sh",
-  gitignore: "sh",
+export {
+  MAX_PREVIEW_SYNTAX_LINE_CHARS,
+  MAX_PREVIEW_RENDER_LINE_CHARS,
+  getSyntaxExt,
+  resolveEditorLanguage,
+  getSyntaxPalette,
+  getEditorSyntaxConfig,
+  syntaxTokenStyle,
+  expandCodeTabs,
+  tokenizeCodeLine,
+  tokenizeInteractiveCodeLine,
 };
-
-const CODE_KEYWORDS = new Set([
-  "abstract", "and", "as", "assert", "async", "await", "break", "case", "catch", "class",
-  "const", "continue", "crate", "debugger", "declare", "def", "default", "defer", "del",
-  "delete", "do", "elif", "else", "enum", "except", "export", "extends", "final", "finally",
-  "fn", "for", "from", "fun", "function", "get", "global", "go", "if", "impl", "implements",
-  "import", "in", "instanceof", "interface", "is", "keyof", "lambda", "let", "match", "mod",
-  "mut", "namespace", "native", "new", "nonlocal", "not", "of", "or", "override", "package",
-  "pass", "permits", "private", "protected", "pub", "public", "raise", "readonly", "record",
-  "return", "satisfies", "sealed", "select", "set", "static", "strictfp", "struct", "switch",
-  "synchronized", "throw", "throws", "trait", "transient", "try", "type", "typeof", "use",
-  "using", "val", "var", "virtual", "volatile", "where", "while", "with", "yield",
-  "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "ON", "GROUP", "BY",
-  "ORDER", "HAVING", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "CREATE", "ALTER",
-  "DROP", "TABLE", "INDEX", "AS", "AND", "OR", "NOT", "IN", "IS", "NULL", "CASE", "WHEN",
-  "THEN", "ELSE", "END", "DISTINCT", "LIMIT", "OFFSET", "UNION", "EXISTS", "RETURNING",
-]);
-
-const CODE_BOOLEANS = new Set(["true", "false", "True", "False"]);
-
-const CODE_CONSTANTS = new Set(["null", "nil", "None", "undefined", "NaN", "Infinity"]);
-
-const CODE_SPECIAL_VARS = new Set(["this", "super", "self", "cls"]);
-
-const CODE_BUILTIN_VARS = new Set([
-  "console", "process", "window", "document", "globalThis", "module", "exports",
-]);
-
-const CODE_TYPES = new Set([
-  "void", "int", "long", "short", "byte", "float", "double", "boolean", "bool", "char",
-  "string", "number", "any", "unknown", "never", "object", "symbol", "bigint", "str",
-  "list", "dict", "set", "tuple", "frozenset", "bytes",
-  "usize", "isize", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "f32", "f64",
-  "String", "Object", "Class", "Integer", "Long", "Double", "Float", "Boolean", "Character", "Byte", "Short",
-  "Number", "BigDecimal", "BigInteger", "UUID", "Instant", "LocalDate", "LocalDateTime", "Duration",
-  "List", "ArrayList", "Map", "HashMap", "LinkedHashMap", "Set", "HashSet", "Collection", "Iterable",
-  "Stream", "Optional", "CompletableFuture", "Future", "ResponseEntity", "HttpStatus", "HttpHeaders",
-  "Pageable", "Page", "Slice", "Sort", "Model", "Exception", "RuntimeException", "Throwable",
-  "Promise", "Array", "Record", "Date", "RegExp", "Error", "Any", "Union", "Dict", "Tuple",
-  "Sequence", "Mapping", "Callable", "Coroutine", "Vec", "Option", "Result", "Box", "Arc",
-]);
-
-const CODE_HASH_COMMENT_EXTS = new Set([
-  "py", "pyw", "pyi", "rb", "sh", "bash", "zsh", "fish", "yml", "yaml", "toml", "ps1", "psm1", "psd1",
-  "r", "pl", "pm", "mk", "makefile", "dockerfile", "env", "ini", "conf", "cfg", "properties",
-  "tf", "tfvars", "gitignore",
-]);
-
-const CODE_SLASH_COMMENT_EXTS = new Set([
-  "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "java", "kt", "kts", "cs",
-  "go", "rs", "c", "cpp", "cc", "cxx", "h", "hpp", "swift", "scala", "groovy", "gradle",
-  "php", "css", "scss", "less", "jsonc", "json5", "dart", "proto",
-]);
-
-const CODE_MARKUP_EXTS = new Set(["html", "htm", "xml", "svg", "vue", "svelte"]);
-const CODE_PROP_EXTS = new Set(["properties", "env", "ini", "conf", "cfg"]);
-const CODE_DOC_COMMENT_EXTS = new Set(["java", "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "kt", "kts", "groovy", "scala"]);
-const DOC_TAG_RE = /@(?:param|returns?|throws|exception|see|since|deprecated|author|version|implSpec|implNote|apiNote|code|linkplain|link|value|inheritDoc)\b/g;
-
-export function getSyntaxExt(filePath) {
-  if (!filePath) return "";
-  const slash = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"));
-  const base = (slash >= 0 ? filePath.slice(slash + 1) : filePath).toLowerCase();
-  if (base === "dockerfile") return "dockerfile";
-  if (base === "makefile" || base === "gnumakefile") return "makefile";
-  if (base === ".gitignore" || base === ".dockerignore") return "gitignore";
-  if (base.startsWith(".env")) return "env";
-  const dot = base.lastIndexOf(".");
-  return dot > 0 ? base.slice(dot + 1) : "";
-}
-
-export function resolveEditorLanguage(filePath) {
-  const ext = getSyntaxExt(filePath);
-  if (!ext) return "txt";
-  return EDITOR_LANG_ALIASES[ext] ?? ext;
-}
-
-function parseHexColorRgb(hex) {
-  if (typeof hex !== "string" || !hex.startsWith("#")) return null;
-  let h = hex.slice(1);
-  if (h.length === 3 || h.length === 4) {
-    h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
-  } else if (h.length !== 6 && h.length !== 8) {
-    return null;
-  }
-  const n = parseInt(h.slice(0, 6), 16);
-  if (Number.isNaN(n)) return null;
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-}
-
-function hexPerceivedLuma(hex) {
-  const rgb = parseHexColorRgb(hex);
-  if (!rgb) return null;
-  return (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) / 255;
-}
-
-function detectDarkTheme(t) {
-  if (!t) return true;
-  if (typeof t.is_dark === "boolean") return t.is_dark;
-  if (t.appearance === "light") return false;
-  if (t.appearance === "dark") return true;
-  const bg = hexPerceivedLuma(t.background);
-  return bg === null ? true : bg < 0.5;
-}
-
-function pickSyntaxTone(candidate, fallback, isDark, minDarkLuma = 0.36, maxLightLuma = 0.58) {
-  const luma = hexPerceivedLuma(candidate);
-  if (luma === null) return fallback;
-  if (isDark ? luma < minDarkLuma : luma > maxLightLuma) return fallback;
-  return candidate;
-}
-
-let cachedPaletteTheme = null;
-let cachedPaletteValue = null;
-
-export function getSyntaxPalette(t) {
-  if (t && t === cachedPaletteTheme && cachedPaletteValue) return cachedPaletteValue;
-  const isDark = detectDarkTheme(t);
-  const warmAmber = isDark ? "#d19a66" : "#b35900";
-  const cyan = pickSyntaxTone(t?.ansi6, isDark ? "#56b6c2" : "#0e7490", isDark);
-  const coral = pickSyntaxTone(t?.ansi1, isDark ? "#e06c75" : "#cf222e", isDark);
-  const palette = {
-    isDark,
-    keyword: pickSyntaxTone(t?.ansi5, isDark ? "#c678dd" : "#8250df", isDark),
-    string: pickSyntaxTone(t?.ansi2, isDark ? "#98c379" : "#116329", isDark),
-    escape: cyan,
-    comment: pickSyntaxTone(t?.dim, isDark ? "#7f848e" : "#6e7781", isDark, 0.34, 0.56),
-    function: pickSyntaxTone(t?.ansi4, isDark ? "#61afef" : "#0969da", isDark),
-    type: pickSyntaxTone(t?.ansi3, isDark ? "#e5c07b" : "#9a6700", isDark),
-    annotation: coral,
-    variable: coral,
-    number: warmAmber,
-    boolean: warmAmber,
-    constant: warmAmber,
-    operator: cyan,
-    punctuation: isDark ? "#8b93a2" : "#57606a",
-    plain: pickSyntaxTone(t?.foreground, isDark ? "#abb2bf" : "#24292f", isDark, 0.45, 0.45),
-    muted: pickSyntaxTone(t?.muted || t?.dim, isDark ? "#8b93a2" : "#57606a", isDark, 0.34, 0.56),
-  };
-  if (t) {
-    cachedPaletteTheme = t;
-    cachedPaletteValue = palette;
-  }
-  return palette;
-}
-
-export function getEditorSyntaxConfig(t) {
-  const p = getSyntaxPalette(t);
-  return {
-    keyword: p.keyword,
-    string: p.string,
-    "string.escape": p.escape,
-    comment: p.comment,
-    function: p.function,
-    type: p.type,
-    number: p.number,
-    boolean: p.boolean,
-    constant: p.constant,
-    variable: p.variable,
-    operator: p.operator,
-    punctuation: p.punctuation,
-  };
-}
-
-export function syntaxTokenStyle(kind, t, isTarget = true) {
-  const p = getSyntaxPalette(t);
-  switch (kind) {
-    case "keyword": return { color: p.keyword, bold: true };
-    case "annotation": return { color: p.annotation, bold: true };
-    case "string": return { color: p.string, bold: false };
-    case "string.escape": return { color: p.escape, bold: false };
-    case "comment": return { color: p.comment, bold: false };
-    case "function": return { color: p.function, bold: false };
-    case "type": return { color: p.type, bold: false };
-    case "number": return { color: p.number, bold: false };
-    case "boolean": return { color: p.boolean, bold: false };
-    case "constant": return { color: p.constant, bold: false };
-    case "variable": return { color: p.variable, bold: false };
-    case "operator": return { color: p.operator, bold: false };
-    default: return { color: isTarget ? p.plain : p.muted, bold: false };
-  }
-}
-
-function pushCodeToken(tokens, kind, text) {
-  if (!text) return;
-  const last = tokens.length ? tokens[tokens.length - 1] : null;
-  if (last && last[0] === kind) {
-    last[1] += text;
-  } else {
-    tokens.push([kind, text]);
-  }
-}
-
-function isIdentStartCh(ch) {
-  const c = ch.charCodeAt(0);
-  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36;
-}
-
-function isIdentPartCh(ch) {
-  const c = ch.charCodeAt(0);
-  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 36;
-}
-
-function isDigitCh(ch) {
-  const c = ch.charCodeAt(0);
-  return c >= 48 && c <= 57;
-}
-
-function isPyStringPrefix(str) {
-  const s = str.toLowerCase();
-  return s === "f" || s === "r" || s === "b" || s === "u" || s === "fr" || s === "rf" || s === "br" || s === "rb";
-}
-
-function emitCommentTokens(tokens, slice, enableDocTags) {
-  if (!enableDocTags || slice.indexOf("@") === -1) {
-    pushCodeToken(tokens, "comment", slice);
-    return;
-  }
-  DOC_TAG_RE.lastIndex = 0;
-  let last = 0;
-  let m;
-  while ((m = DOC_TAG_RE.exec(slice)) !== null) {
-    const idx = m.index;
-    const prev = idx > 0 ? slice[idx - 1] : " ";
-    if (prev !== " " && prev !== "\t" && prev !== "{" && prev !== "*") continue;
-    if (idx > last) pushCodeToken(tokens, "comment", slice.slice(last, idx));
-    pushCodeToken(tokens, "annotation", m[0]);
-    last = idx + m[0].length;
-  }
-  if (last < slice.length) pushCodeToken(tokens, "comment", slice.slice(last));
-}
-
-function isSimplePlaceholder(inner) {
-  return /^[a-zA-Z_][a-zA-Z0-9_.-]*$/.test(inner);
-}
-
-function emitStringTokens(tokens, slice, baseKind, opts = {}) {
-  if (baseKind !== "string") {
-    pushCodeToken(tokens, baseKind, slice);
-    return;
-  }
-  const { isTemplate = false, isFString = false, allowPathVars = false } = opts;
-  const len = slice.length;
-  let i = 0;
-  let segStart = 0;
-  const flushSeg = (end) => {
-    if (end > segStart) pushCodeToken(tokens, "string", slice.slice(segStart, end));
-    segStart = end;
-  };
-  while (i < len) {
-    const ch = slice[i];
-    if (ch === "\\") {
-      flushSeg(i);
-      const escEnd = Math.min(len, slice[i + 1] === "u" ? i + 6 : slice[i + 1] === "x" ? i + 4 : i + 2);
-      pushCodeToken(tokens, "string.escape", slice.slice(i, escEnd));
-      i = segStart = escEnd;
-      continue;
-    }
-    if (ch === "$" && i + 1 < len && slice[i + 1] === "{") {
-      const close = slice.indexOf("}", i + 2);
-      if (close > i + 2 && (isTemplate || /^[a-zA-Z0-9_.:-]+$/.test(slice.slice(i + 2, close)))) {
-        flushSeg(i);
-        pushCodeToken(tokens, "string.escape", slice.slice(i, close + 1));
-        i = segStart = close + 1;
-        continue;
-      }
-    }
-    if (ch === "{") {
-      if (isFString && slice[i + 1] === "{") {
-        flushSeg(i);
-        pushCodeToken(tokens, "string.escape", "{{");
-        i = segStart = i + 2;
-        continue;
-      }
-      const close = slice.indexOf("}", i + 1);
-      if (close > i) {
-        const inner = slice.slice(i + 1, close);
-        const isPathOrSlf4j = allowPathVars && (inner === "" || (slice[i - 1] === "/" && isSimplePlaceholder(inner)));
-        const isPyInterp = isFString && inner.length > 0 && !inner.includes("\n");
-        if (isPathOrSlf4j || isPyInterp) {
-          flushSeg(i);
-          pushCodeToken(tokens, "string.escape", slice.slice(i, close + 1));
-          i = segStart = close + 1;
-          continue;
-        }
-      }
-    }
-    if (isFString && ch === "}" && slice[i + 1] === "}") {
-      flushSeg(i);
-      pushCodeToken(tokens, "string.escape", "}}");
-      i = segStart = i + 2;
-      continue;
-    }
-    i++;
-  }
-  flushSeg(len);
-}
-
-function tokenizePropertiesLine(text, tokens) {
-  let lead = 0;
-  while (lead < text.length && text[lead] === " ") lead++;
-  if (lead > 0) pushCodeToken(tokens, "plain", text.slice(0, lead));
-  const trimmed = text.slice(lead);
-  if (!trimmed) return tokens;
-  if (trimmed[0] === "#" || trimmed[0] === "!") {
-    pushCodeToken(tokens, "comment", trimmed);
-    return tokens;
-  }
-  const eqIdx = text.indexOf("=", lead);
-  const colIdx = text.indexOf(":", lead);
-  const sep = eqIdx >= 0 && colIdx >= 0 ? Math.min(eqIdx, colIdx) : Math.max(eqIdx, colIdx);
-  if (sep < 0) {
-    pushCodeToken(tokens, "plain", trimmed);
-    return tokens;
-  }
-  const keySlice = text.slice(lead, sep);
-  const trimmedKey = keySlice.trimEnd();
-  if (trimmedKey) pushCodeToken(tokens, "function", trimmedKey);
-  if (trimmedKey.length < keySlice.length) {
-    pushCodeToken(tokens, "plain", keySlice.slice(trimmedKey.length));
-  }
-  pushCodeToken(tokens, "operator", text[sep]);
-  const valRaw = text.slice(sep + 1);
-  let valLead = 0;
-  while (valLead < valRaw.length && valRaw[valLead] === " ") valLead++;
-  if (valLead > 0) pushCodeToken(tokens, "plain", valRaw.slice(0, valLead));
-  const valBody = valRaw.slice(valLead);
-  const valTrim = valBody.trimEnd();
-  const tailWs = valBody.slice(valTrim.length);
-  if (valTrim) {
-    if (CODE_BOOLEANS.has(valTrim)) {
-      pushCodeToken(tokens, "boolean", valTrim);
-    } else if (CODE_CONSTANTS.has(valTrim)) {
-      pushCodeToken(tokens, "constant", valTrim);
-    } else if (/^-?(?:0x[0-9a-fA-F_]+|\d+(?:\.\d+)?)(?:ms|s|m|h|d|kb|mb|gb)?$/i.test(valTrim)) {
-      pushCodeToken(tokens, "number", valTrim);
-    } else {
-      emitStringTokens(tokens, valTrim, "string", { allowPathVars: false });
-    }
-  }
-  if (tailWs) pushCodeToken(tokens, "plain", tailWs);
-  return tokens;
-}
-
-export const MAX_PREVIEW_SYNTAX_LINE_CHARS = 1600;
-export const MAX_PREVIEW_RENDER_LINE_CHARS = 4000;
-
-export function expandCodeTabs(rawText) {
-  if (!rawText) return "";
-  const s = String(rawText);
-  return s.indexOf("\t") !== -1 ? s.replace(/\t/g, "    ") : s;
-}
-
-// Single-pass linear tokenizer shared by preview rendering (lossless on all chars).
-export function tokenizeCodeLine(rawText, ext = "", mdState = null) {
-  const isMd = isMarkdownExt(ext);
-  if (!rawText) {
-    if (mdState && isMd) return tokenizeMarkdownLine("", mdState, tokenizeCodeLine);
-    return null;
-  }
-  const text = expandCodeTabs(rawText);
-  if (text.length > MAX_PREVIEW_SYNTAX_LINE_CHARS || ext === "txt" || ext === "log") {
-    if (mdState && isMd) mdState.lineIndex += 1;
-    return null;
-  }
-  if (isMd) {
-    return tokenizeMarkdownLine(text, mdState, tokenizeCodeLine);
-  }
-
-  if (CODE_PROP_EXTS.has(ext)) {
-    return tokenizePropertiesLine(text, []);
-  }
-
-  const tokens = [];
-  const len = text.length;
-  const hashComments = CODE_HASH_COMMENT_EXTS.has(ext);
-  const slashComments = !ext || CODE_SLASH_COMMENT_EXTS.has(ext);
-  const markup = CODE_MARKUP_EXTS.has(ext);
-  const isPython = ext === "py" || ext === "pyw" || ext === "pyi";
-  const isJson = ext === "json" || ext === "jsonc" || ext === "json5";
-  const isYaml = ext === "yml" || ext === "yaml";
-  const isCss = ext === "css" || ext === "scss" || ext === "less";
-  const isSql = ext === "sql";
-  const isRust = ext === "rs";
-  const docTagsEnabled = CODE_DOC_COMMENT_EXTS.has(ext);
-
-  if (docTagsEnabled && /^\s*\*\s*(?:$|\*\/|@(?:param|returns?|throws|exception|see|since|deprecated|author|version|implSpec|implNote|apiNote|code|linkplain|link|value|inheritDoc)\b)/.test(text)) {
-    emitCommentTokens(tokens, text, true);
-    return tokens;
-  }
-
-  let i = 0;
-  let plainStart = 0;
-  const flushPlain = (end) => {
-    if (end > plainStart) {
-      pushCodeToken(tokens, "plain", text.slice(plainStart, end));
-    }
-    plainStart = end;
-  };
-
-  while (i < len) {
-    const ch = text[i];
-
-    // Markup <!-- comment -->
-    if (markup && ch === "<" && text.startsWith("<!--", i)) {
-      flushPlain(i);
-      const close = text.indexOf("-->", i + 4);
-      const end = close >= 0 ? close + 3 : len;
-      pushCodeToken(tokens, "comment", text.slice(i, end));
-      i = plainStart = end;
-      continue;
-    }
-
-    // Line & block comments
-    if (slashComments && ch === "/" && i + 1 < len) {
-      const next = text[i + 1];
-      if (next === "/") {
-        flushPlain(i);
-        emitCommentTokens(tokens, text.slice(i), docTagsEnabled);
-        return tokens;
-      }
-      if (next === "*") {
-        flushPlain(i);
-        const close = text.indexOf("*/", i + 2);
-        const end = close >= 0 ? close + 2 : len;
-        emitCommentTokens(tokens, text.slice(i, end), docTagsEnabled);
-        i = plainStart = end;
-        continue;
-      }
-    }
-
-    if (hashComments && ch === "#") {
-      flushPlain(i);
-      pushCodeToken(tokens, "comment", text.slice(i));
-      return tokens;
-    }
-
-    if (isSql && ch === "-" && text[i + 1] === "-") {
-      flushPlain(i);
-      pushCodeToken(tokens, "comment", text.slice(i));
-      return tokens;
-    }
-
-    // Python prefixed strings (f"...", r"...", b"...", fr"...")
-    if (isPython && (ch === "f" || ch === "F" || ch === "r" || ch === "R" || ch === "b" || ch === "B" || ch === "u" || ch === "U") && (i === 0 || !isIdentPartCh(text[i - 1]))) {
-      let qOff = i + 1;
-      if (qOff < len && (text[qOff] === "f" || text[qOff] === "F" || text[qOff] === "r" || text[qOff] === "R" || text[qOff] === "b" || text[qOff] === "B")) {
-        qOff++;
-      }
-      const prefix = text.slice(i, qOff);
-      const quote = text[qOff];
-      if ((quote === '"' || quote === "'") && isPyStringPrefix(prefix)) {
-        const isTriple = text[qOff + 1] === quote && text[qOff + 2] === quote;
-        const step = isTriple ? 3 : 1;
-        const delim = isTriple ? quote + quote + quote : quote;
-        let end = qOff + step;
-        const isRaw = prefix.toLowerCase().includes("r");
-        while (end < len) {
-          if (!isRaw && text[end] === "\\") {
-            end = end + 1 < len ? end + 2 : len;
-            continue;
-          }
-          if (isTriple ? text.startsWith(delim, end) : text[end] === quote) {
-            end += step;
-            break;
-          }
-          end++;
-        }
-        flushPlain(i);
-        pushCodeToken(tokens, "keyword", prefix);
-        emitStringTokens(tokens, text.slice(qOff, end), "string", {
-          isFString: prefix.toLowerCase().includes("f"),
-        });
-        i = plainStart = end;
-        continue;
-      }
-    }
-
-    // Strings ("...", '...', `...`, and """...""" / '''...''')
-    if (ch === '"' || ch === "'" || ch === "`") {
-      if (isRust && ch === "'" && i + 1 < len && text[i + 1] !== "\\" && (i + 2 >= len || text[i + 2] !== "'")) {
-        i++;
-        continue;
-      }
-      if (ch === "'" && i > 0 && isIdentPartCh(text[i - 1])) {
-        i++;
-        continue;
-      }
-      const isTriple = (ch === '"' || ch === "'") && text[i + 1] === ch && text[i + 2] === ch;
-      const step = isTriple ? 3 : 1;
-      const delim = isTriple ? ch + ch + ch : ch;
-      let end = i + step;
-      while (end < len) {
-        if (text[end] === "\\") {
-          end = end + 1 < len ? end + 2 : len;
-          continue;
-        }
-        if (isTriple ? text.startsWith(delim, end) : text[end] === ch) {
-          end += step;
-          break;
-        }
-        end++;
-      }
-      flushPlain(i);
-      let kind = "string";
-      if (isJson && ch === '"') {
-        let look = end;
-        while (look < len && text[look] === " ") look++;
-        if (look < len && text[look] === ":") kind = "function";
-      }
-      emitStringTokens(tokens, text.slice(i, end), kind, {
-        isTemplate: ch === "`",
-        allowPathVars: ch === '"',
-      });
-      i = plainStart = end;
-      continue;
-    }
-
-    // CSS #hex color literals
-    if (isCss && ch === "#" && i + 1 < len && /[0-9a-fA-F]/.test(text[i + 1])) {
-      let end = i + 1;
-      while (end < len && /[0-9a-fA-F]/.test(text[end])) end++;
-      flushPlain(i);
-      pushCodeToken(tokens, "number", text.slice(i, end));
-      i = plainStart = end;
-      continue;
-    }
-
-    // Decorators / Spring Annotations (@RestController, @GetMapping, @app.get, CSS @media)
-    if (ch === "@" && i + 1 < len && isIdentStartCh(text[i + 1]) && (i === 0 || !isIdentPartCh(text[i - 1]))) {
-      let end = i + 2;
-      while (end < len && (isIdentPartCh(text[end]) || text[end] === ".")) end++;
-      flushPlain(i);
-      pushCodeToken(tokens, isCss ? "keyword" : "annotation", text.slice(i, end));
-      i = plainStart = end;
-      continue;
-    }
-
-    // Markup / JSX tags (<div, </div, <MyComponent)
-    if (ch === "<" && i + 1 < len && (markup || ext === "jsx" || ext === "tsx")) {
-      let tagStart = i + 1;
-      if (text[tagStart] === "/") tagStart++;
-      if (tagStart < len && /[A-Za-z]/.test(text[tagStart])) {
-        let end = tagStart + 1;
-        while (end < len && (isIdentPartCh(text[end]) || text[end] === "-" || text[end] === ":" || text[end] === ".")) end++;
-        flushPlain(tagStart);
-        const tagName = text.slice(tagStart, end);
-        const isComponent = tagName[0] >= "A" && tagName[0] <= "Z";
-        pushCodeToken(tokens, isComponent ? "type" : "keyword", tagName);
-        i = plainStart = end;
-        continue;
-      }
-    }
-
-    // Numbers (standalone, not trailing digits inside foo123)
-    if (isDigitCh(ch) && (i === 0 || !isIdentPartCh(text[i - 1]))) {
-      let end = i + 1;
-      if (ch === "0" && end < len && (text[end] === "x" || text[end] === "X" || text[end] === "b" || text[end] === "B")) {
-        end++;
-        while (end < len && /[0-9a-fA-F_]/.test(text[end])) end++;
-      } else {
-        while (end < len && /[0-9._]/.test(text[end])) end++;
-        if (end < len && (text[end] === "e" || text[end] === "E") && end + 1 < len && /[0-9+\-]/.test(text[end + 1])) {
-          end += 2;
-          while (end < len && /[0-9_]/.test(text[end])) end++;
-        }
-        while (end < len && /[a-zA-Z%]/.test(text[end])) end++;
-      }
-      flushPlain(i);
-      pushCodeToken(tokens, "number", text.slice(i, end));
-      i = plainStart = end;
-      continue;
-    }
-
-    // Operators & language arrows (->, =>, ::, ?., ??, ===, !==, <=, >=, ..., :=, &&, ||, arithmetic/comparisons)
-    if (
-      (ch === "-" && text[i + 1] === ">") ||
-      (ch === "=" && text[i + 1] === ">") ||
-      (ch === ":" && (text[i + 1] === ":" || text[i + 1] === "=")) ||
-      (ch === "?" && (text[i + 1] === "." || text[i + 1] === "?")) ||
-      (ch === "." && text[i + 1] === "." && text[i + 2] === ".")
-    ) {
-      const opLen = ch === "." ? 3 : 2;
-      flushPlain(i);
-      pushCodeToken(tokens, "operator", text.slice(i, i + opLen));
-      i = plainStart = i + opLen;
-      continue;
-    }
-
-    if ((ch === "<" || ch === ">") && (text[i + 1] === "=" || text[i + 1] === ch)) {
-      let end = i + 2;
-      if (ch === ">" && text[i + 1] === ">" && text[i + 2] === ">") end = i + 3;
-      if (text[end] === "=") end++;
-      flushPlain(i);
-      pushCodeToken(tokens, "operator", text.slice(i, end));
-      i = plainStart = end;
-      continue;
-    }
-
-    if (
-      ch === "=" || ch === "!" || ch === "&" || ch === "|" || ch === "+" ||
-      ch === "-" || ch === "*" || ch === "/" || ch === "%" || ch === "^" || ch === "~"
-    ) {
-      let end = i + 1;
-      while (end < len && (text[end] === "=" || text[end] === "&" || text[end] === "|" || text[end] === "*" || text[end] === "+")) {
-        end++;
-      }
-      flushPlain(i);
-      pushCodeToken(tokens, "operator", text.slice(i, end));
-      i = plainStart = end;
-      continue;
-    }
-
-    // Identifiers / Keywords / Types / Constants / Booleans / Special Vars / Function calls / Method refs / YAML keys
-    if (isIdentStartCh(ch)) {
-      let end = i + 1;
-      while (end < len && (isIdentPartCh(text[end]) || (isYaml && text[end] === "-"))) end++;
-      const word = text.slice(i, end);
-      let kind = "plain";
-      let look = end;
-      while (look < len && text[look] === " ") look++;
-      const isCall = text[look] === "(";
-      const prevTwo = i >= 2 ? text.slice(i - 2, i) : "";
-
-      if (isYaml && text[look] === ":" && (look + 1 === len || text[look + 1] === " ")) {
-        kind = "function";
-      } else if (prevTwo === "::" && word !== "new") {
-        kind = "function";
-      } else if (CODE_SPECIAL_VARS.has(word) || (!isPython && CODE_BUILTIN_VARS.has(word))) {
-        kind = "variable";
-      } else if (CODE_BOOLEANS.has(word)) {
-        kind = "boolean";
-      } else if (CODE_CONSTANTS.has(word) || (word.length > 1 && /^[A-Z][A-Z0-9_]+$/.test(word))) {
-        kind = "constant";
-      } else if (isPython && word === "type" && isCall) {
-        kind = "function";
-      } else if (CODE_KEYWORDS.has(word)) {
-        kind = "keyword";
-      } else if (/^[A-Z][a-zA-Z0-9_]*$/.test(word) || (CODE_TYPES.has(word) && !isCall)) {
-        kind = "type";
-      } else if (isCall || prevTwo === "::") {
-        kind = "function";
-      }
-
-      if (kind !== "plain") {
-        flushPlain(i);
-        pushCodeToken(tokens, kind, word);
-        i = plainStart = end;
-        continue;
-      }
-      i = end;
-      continue;
-    }
-
-    i++;
-  }
-
-  flushPlain(len);
-  return tokens;
-}
 
 const EXACT_FILE_ICONS = {
   "pom.xml": { kind: "build", tone: "operator" },
@@ -1039,11 +385,20 @@ export function resolveFileIcon(filePath, t) {
 
 // Stack-safe pixel width estimation for horizontal code preview scrolling.
 export function computeCodeContentWidth(lines, { minWidth = 240, charPx = 7.6, gutterPx = 92 } = {}) {
+  if (!Number.isFinite(charPx) || charPx <= 0) return minWidth;
   let maxCols = 0;
+  const capCols = MAX_PREVIEW_RENDER_LINE_CHARS + 32;
   for (const line of lines || []) {
     if (!line) continue;
-    const expanded = expandCodeTabs(line);
-    const cols = Math.min(expanded.length, MAX_PREVIEW_RENDER_LINE_CHARS + 32);
+    let cols;
+    if (line.length >= capCols) {
+      cols = capCols;
+    } else if (!line.includes("\t")) {
+      cols = line.length;
+    } else {
+      const expanded = expandCodeTabs(line);
+      cols = Math.min(expanded.length, capCols);
+    }
     if (cols > maxCols) maxCols = cols;
   }
   return Math.max(minWidth, Math.ceil(maxCols * charPx) + gutterPx);
@@ -1270,6 +625,24 @@ export function selectViewerMarkdownRawText(targetPath, text, hasError = false) 
 }
 
 /**
+ * Retain raw text in viewer state for any valid non-binary text file (code, config, or Markdown).
+ */
+export function selectViewerRawText(text, hasError = false) {
+  if (hasError || typeof text !== "string" || text.includes("\0")) return null;
+  return text;
+}
+
+/**
+ * Return true when an unmaterialized viewer open request was just dispatched and
+ * `spaces()` may not have reflected the newly created tab yet.
+ */
+export function shouldReuseInFlightPendingViewerOpen(pendingEntry, now, windowMs = 400) {
+  if (!pendingEntry || typeof pendingEntry !== "object") return false;
+  const elapsed = Number(now) - Number(pendingEntry.ts);
+  return Number.isFinite(elapsed) && elapsed >= 0 && elapsed < windowMs;
+}
+
+/**
  * Build cache key `${targetPath}|${viewerLoadSeq}` for the viewer's bounded Markdown preparation cache.
  */
 export function buildViewerMarkdownCacheKey(targetPath, loadSeq = 0) {
@@ -1343,4 +716,321 @@ export function buildPreviewMarkdownViewIds(targetPath, seq = 0, sourceTag = "ch
     id: `preview-md-text-${pathHash}-${s}-${sourceTag}`,
     scrollId: `preview-md-scroll-${pathHash}-${s}-${sourceTag}`,
   };
+}
+
+/**
+ * Determine whether the primary code-navigation modifier (Ctrl on Linux/Win, Cmd on macOS) is active.
+ * Excludes AltGr combinations (`control && alt`) so international keyboard layouts do not misfire.
+ */
+export function isNavModifierActive(modifiers) {
+  if (!modifiers || typeof modifiers !== "object") return false;
+  if (modifiers.alt) return false;
+  return Boolean(modifiers.control || modifiers.platform);
+}
+
+/**
+ * Split code text cleanly into logical source lines without trailing carriage returns.
+ */
+export function splitCodeViewerLines(text) {
+  if (text == null || text === "") return [""];
+  const raw = String(text).split("\n");
+  for (let i = 0; i < raw.length; i += 1) {
+    if (raw[i].endsWith("\r")) {
+      raw[i] = raw[i].slice(0, -1);
+    }
+  }
+  return raw;
+}
+
+function tokenizeViewerLineSpans(rawLine, ext, syntaxState) {
+  const spans = tokenizeInteractiveCodeLine(rawLine || "", ext, syntaxState);
+  if (Array.isArray(spans) && spans.length > 0) return spans;
+  const str = String(rawLine || "");
+  if (!str) return null;
+  const clippedRaw = str.length > MAX_PREVIEW_RENDER_LINE_CHARS
+    ? `${str.slice(0, MAX_PREVIEW_RENDER_LINE_CHARS)} …`
+    : str;
+  const expanded = expandCodeTabs(clippedRaw);
+  if (!expanded) return null;
+  const clipped = expanded.length > MAX_PREVIEW_RENDER_LINE_CHARS
+    ? `${expanded.slice(0, MAX_PREVIEW_RENDER_LINE_CHARS)} …`
+    : expanded;
+  return [["plain", clipped, { col: 1, nav: false }]];
+}
+
+/**
+ * Tokenize and soft-wrap one raw source line into interactive `[kind, text, { col, nav }]` visual rows.
+ */
+export function tokenizeInteractiveWrappedLine(rawLine, ext = "", mdState = null, maxCols = 88) {
+  const limit = Math.max(8, Math.floor(Number(maxCols) || 88));
+  const spans = tokenizeViewerLineSpans(rawLine, ext, mdState);
+  if (!spans) {
+    return [[["plain", "", { col: 1, nav: false }]]];
+  }
+  return wrapStyledSpans(spans, limit, { toNbsp: true });
+}
+
+/**
+ * Build a soft-wrapped, interactive token-indexed code document for the windowed `#main` viewer.
+ */
+export function buildWrappedViewerDocument(text, filePath = "", maxCols = 88, options = {}) {
+  const limit = Math.max(8, Math.floor(Number(maxCols) || 88));
+  const ext = getSyntaxExt(filePath || "");
+  const maxLines = Number.isFinite(options?.maxLines) && options.maxLines > 0
+    ? Math.floor(options.maxLines)
+    : Number.POSITIVE_INFINITY;
+
+  const cachedTokenized = Array.isArray(options?.tokenizedLines) ? options.tokenizedLines : null;
+  let lineLimit;
+  let truncated;
+  let tokenizedLines;
+  let lines = null;
+  let syntaxState = null;
+
+  if (cachedTokenized) {
+    tokenizedLines = cachedTokenized;
+    lineLimit = Math.min(tokenizedLines.length, maxLines);
+    truncated = Boolean(options?.truncated) || tokenizedLines.length > lineLimit;
+  } else {
+    syntaxState = createCodeSyntaxState(ext);
+    lines = splitCodeViewerLines(text);
+    lineLimit = Math.min(lines.length, maxLines);
+    truncated = lines.length > lineLimit;
+    tokenizedLines = new Array(lineLimit);
+  }
+
+  const rows = [];
+  const lineFirstRowIndex = new Array(lineLimit);
+  const lineRowCounts = new Array(lineLimit);
+
+  for (let i = 0; i < lineLimit; i += 1) {
+    const lineNum = i + 1;
+    lineFirstRowIndex[i] = rows.length;
+    let spans;
+    if (cachedTokenized) {
+      spans = cachedTokenized[i];
+    } else {
+      // tokenizeViewerLineSpans -> tokenizeInteractiveCodeLine advances syntaxState once per line.
+      spans = tokenizeViewerLineSpans(lines[i], ext, syntaxState);
+      tokenizedLines[i] = spans;
+    }
+    const wrappedRows = spans
+      ? wrapStyledSpans(spans, limit, { toNbsp: true })
+      : [[["plain", "", { col: 1, nav: false }]]];
+    lineRowCounts[i] = wrappedRows.length;
+    for (let r = 0; r < wrappedRows.length; r += 1) {
+      rows.push({
+        rowIndex: rows.length,
+        lineNum,
+        isFirstWrap: r === 0,
+        segments: wrappedRows[r],
+      });
+    }
+  }
+
+  return {
+    totalLines: lineLimit,
+    truncated,
+    ext,
+    maxCols: limit,
+    rows,
+    lineFirstRowIndex,
+    lineRowCounts,
+    tokenizedLines,
+  };
+}
+
+/**
+ * Compute visible visual-row bounds for the windowed code viewer.
+ */
+export function computeWindowedViewerSlice(totalRows, scrollTopRows, viewportHeightPx, lineHeightPx = 20) {
+  const total = Math.max(0, Math.floor(Number(totalRows) || 0));
+  const lh = Math.max(12, Number(lineHeightPx) || 20);
+  const vpH = Math.max(lh, Number(viewportHeightPx) || 400);
+  const visibleCount = Math.max(1, Math.floor(vpH / lh));
+  const maxScrollTop = Math.max(0, total - visibleCount);
+  const scrollTop = Math.max(0, Math.min(maxScrollTop, Math.floor(Number(scrollTopRows) || 0)));
+  const end = Math.min(total, scrollTop + visibleCount + 1);
+  return {
+    start: scrollTop,
+    end,
+    visibleCount,
+    maxScrollTop,
+    scrollTop,
+  };
+}
+
+/**
+ * Compute scroll row index that places `targetLine` comfortably inside the upper-middle viewport.
+ */
+export function computeTargetCenterScrollRow(doc, targetLine, viewportHeightPx, lineHeightPx = 20) {
+  if (!doc || !Array.isArray(doc.rows) || doc.rows.length === 0) return 0;
+  const lineIdx = Math.max(0, Math.min((doc.totalLines || 1) - 1, Math.floor(Number(targetLine) || 1) - 1));
+  const firstRow = Number.isFinite(doc.lineFirstRowIndex?.[lineIdx]) ? doc.lineFirstRowIndex[lineIdx] : 0;
+  const slice = computeWindowedViewerSlice(doc.rows.length, 0, viewportHeightPx, lineHeightPx);
+  const leadRows = Math.floor(slice.visibleCount * 0.35);
+  return Math.max(0, Math.min(slice.maxScrollTop, firstRow - leadRows));
+}
+
+/**
+ * Compute proportional scrollbar track and thumb geometry for the windowed code viewer.
+ */
+export function computeScrollbarMetrics(totalRows, scrollTop, visibleCount, trackHeightPx) {
+  const total = Math.max(0, Math.floor(Number(totalRows) || 0));
+  const vis = Math.max(1, Math.floor(Number(visibleCount) || 1));
+  const trackHeight = Math.max(24, Number(trackHeightPx) || 200);
+  if (total <= vis) {
+    return { visible: false, trackHeight, thumbHeight: trackHeight, thumbTop: 0 };
+  }
+  const rawThumb = Math.round((vis / total) * trackHeight);
+  const thumbHeight = Math.max(24, Math.min(trackHeight, rawThumb));
+  const maxScrollTop = Math.max(1, total - vis);
+  const clampedTop = Math.max(0, Math.min(maxScrollTop, Number(scrollTop) || 0));
+  const maxThumbTop = Math.max(0, trackHeight - thumbHeight);
+  const thumbTop = Math.round((clampedTop / maxScrollTop) * maxThumbTop);
+  return {
+    visible: true,
+    trackHeight,
+    thumbHeight,
+    thumbTop,
+  };
+}
+
+/**
+ * Convert GPUI scroll wheel event deltas into row offsets (positive delta.y scrolls up).
+ */
+export function resolveWheelLineDelta(deltaY, deltaLinesY = 0) {
+  const linesY = Number(deltaLinesY);
+  if (Number.isFinite(linesY) && linesY !== 0) {
+    const scaled = -Math.trunc(linesY * 3);
+    return scaled !== 0 ? scaled : (linesY > 0 ? -1 : 1);
+  }
+  const dy = Number(deltaY);
+  if (Number.isFinite(dy) && dy !== 0) {
+    return dy > 0 ? -3 : 3;
+  }
+  return 0;
+}
+
+/**
+ * Map a scrollbar track Y coordinate onto a clamped `scrollTop` row index.
+ */
+export function resolveClickScrollbarRow(offsetY, trackHeightPx, totalRows, visibleCount) {
+  const total = Math.max(0, Math.floor(Number(totalRows) || 0));
+  const vis = Math.max(1, Math.floor(Number(visibleCount) || 1));
+  const maxScrollTop = Math.max(0, total - vis);
+  if (maxScrollTop === 0) return 0;
+  const trackHeight = Math.max(24, Number(trackHeightPx) || 200);
+  const ratio = Math.max(0, Math.min(1, (Number(offsetY) || 0) / trackHeight));
+  return Math.round(ratio * maxScrollTop);
+}
+
+/**
+ * Build adaptive dropdown items for polymorphic / multi-candidate implementation disambiguation.
+ */
+export function buildDisambiguationDropdownItems(candidates, currentRoot = "", currentServiceName = "") {
+  if (!Array.isArray(candidates) || candidates.length === 0) return [];
+  const normCurrentRoot = normalizeViewerSlashes(currentRoot || "").replace(/\/+$/, "");
+
+  return candidates.map((cand, idx) => {
+    const normPath = normalizeViewerSlashes(cand?.filePath || cand?.path || "");
+    const candRoot = normalizeViewerSlashes(cand?.root || cand?.serviceRoot || "").replace(/\/+$/, "");
+    let relPath = normPath;
+    if (candRoot && normPath.startsWith(`${candRoot}/`)) {
+      relPath = normPath.slice(candRoot.length + 1);
+    } else if (normCurrentRoot && normPath.startsWith(`${normCurrentRoot}/`)) {
+      relPath = normPath.slice(normCurrentRoot.length + 1);
+    }
+
+    const baseName = relPath.split("/").filter(Boolean).pop() || relPath || "file";
+    const sym = cand?.name || cand?.symbol || "";
+    const container = cand?.containerName || "";
+    const label = container && sym ? `${container}.${sym}` : (sym || baseName);
+    const sig = typeof cand?.signature === "string" ? cand.signature.trim() : "";
+    const meta = sig && sig !== label
+      ? (sig.length > 64 ? `${sig.slice(0, 61)}...` : sig)
+      : (cand?.kind || "");
+    const svcName = cand?.serviceName || "";
+    const badge = svcName && svcName !== currentServiceName ? svcName : "";
+    const line = Math.max(1, Number(cand?.line) || 1);
+    const column = Math.max(1, Number(cand?.column) || 1);
+
+    return {
+      id: `nav-cand-${idx}-${normPath}:${line}:${column}`,
+      label,
+      meta,
+      subline: `${relPath}:${line}`,
+      badge,
+      rightText: `:${line}`,
+      fontMedium: true,
+      selected: idx === 0,
+      candidate: cand,
+    };
+  });
+}
+
+/**
+ * Build user-facing inline feedback for non-jump code-navigation outcomes.
+ */
+export function buildViewerNavigationNotice(navResult, context = null, intent = "") {
+  const symbol = context?.symbol || navResult?.context?.symbol || "";
+  if (!navResult || navResult.status === "not-found") {
+    return {
+      level: "warn",
+      message: symbol
+        ? `No declaration or implementation found for "${symbol}"`
+        : "No declaration or implementation found",
+    };
+  }
+  if (navResult.status === "external") {
+    const pkg = navResult.externalPackage || symbol || "external library";
+    return {
+      level: "info",
+      message: `External declaration (${pkg}) — outside workspace sources`,
+    };
+  }
+  if (navResult.status === "already-there") {
+    const label = intent === "implementation" ? "implementation" : "declaration";
+    return {
+      level: "info",
+      message: symbol ? `Already at ${label} of "${symbol}"` : `Already at ${label}`,
+    };
+  }
+  return null;
+}
+
+/**
+ * Normalize optional column / highlight metadata onto an open file tab descriptor.
+ */
+export function applyTabNavMeta(tabEntry, navMeta = {}) {
+  if (!tabEntry || typeof tabEntry !== "object") return tabEntry;
+  const colNum = Number(navMeta?.column);
+  const column = Number.isFinite(colNum) && colNum >= 1 ? Math.floor(colNum) : null;
+  const highlightSymbol = typeof navMeta?.highlightSymbol === "string" && navMeta.highlightSymbol
+    ? navMeta.highlightSymbol
+    : null;
+  const navSeqNum = Number(navMeta?.navSeq);
+  const navSeq = Number.isFinite(navSeqNum) ? navSeqNum : (tabEntry.navSeq ?? null);
+  return {
+    ...tabEntry,
+    column,
+    highlightSymbol,
+    navSeq,
+  };
+}
+
+/**
+ * Determine whether a resolved code-navigation target points outside the active file
+ * and should therefore open or focus a dedicated viewer tab rather than replacing in-place.
+ */
+export function shouldOpenNavInNewTab(targetPath, currentPath, targetOn = null, currentOn = null, isWindows = false) {
+  const normalizeCmp = (raw) => {
+    const clean = String(raw || "").trim().replace(/\\/g, "/").replace(/\/+/g, "/").replace(/(.)\/+$/, "$1");
+    return isWindows ? clean.toLowerCase() : clean;
+  };
+  const left = normalizeCmp(targetPath);
+  if (!left) return false;
+  const right = normalizeCmp(currentPath);
+  const sameOn = (targetOn ?? null) === (currentOn ?? null);
+  return !(sameOn && left === right);
 }

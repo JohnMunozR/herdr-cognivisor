@@ -26,6 +26,12 @@ export const defaultExec = async (cmd, args = [], opts = {}) => {
   }
 };
 
+export const defaultReadTextFile = async (p, opts = {}) => {
+  const rec = { path: p, opts };
+  globalThis.__HERDR_TEST_MOCK__.readTextFileCalls.push(rec);
+  return fs.readFile(p, "utf8");
+};
+
 export function resetHerdrMock(overrides = {}) {
   const current = {
     appHome: "",
@@ -37,6 +43,8 @@ export function resetHerdrMock(overrides = {}) {
     sharedData: {},
     execCalls: [],
     execImpl: defaultExec,
+    readTextFileCalls: [],
+    readTextFileImpl: defaultReadTextFile,
     ...overrides,
   };
   globalThis.__HERDR_TEST_MOCK__ = current;
@@ -75,6 +83,7 @@ export function installHerdrHooks() {
             export const agents = () => state().agents;
             export const focused = () => state().focused;
             export const exec = (...a) => state().execImpl(...a);
+            export const readTextFile = (...a) => state().readTextFileImpl(...a);
             export const appHome = () => state().appHome;
             export const shared = (k) => k ? state().sharedData[k] : state().sharedData;
             export const setShared = (k, v) => { state().sharedData[k] = v; };

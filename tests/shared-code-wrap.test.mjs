@@ -121,6 +121,27 @@ describe("shared code-wrap engine & mod parity", () => {
     assert.ok(wrappedObjs.length >= 3);
     assert.equal(wrappedObjs.map((r) => r.map((s) => s.text).join("")).join(""), objSpans.map((s) => s.text).join(""));
     assert.ok(wrappedObjs.flat().some((s) => s.match === true));
+
+    // 3rd-tuple metadata { col, nav } is preserved and column-shifted on wrapped continuation slices
+    const interactive = [
+      ["keyword", "const", { col: 1, nav: false }],
+      ["plain", " ", { col: 6, nav: false }],
+      ["plain", "extremelyLongIdentifierThatWrapsAcrossLines", { col: 7, nav: true }],
+    ];
+    const wrappedInteractive = wrapStyledSpans(interactive, 20, { toNbsp: false });
+    assert.ok(wrappedInteractive.length >= 3);
+    assert.deepEqual(wrappedInteractive[0][2], ["plain", "extremelyLongI", { col: 7, nav: true }]);
+    assert.deepEqual(wrappedInteractive[1][0], ["plain", "dentifierThatWrapsAc", { col: 21, nav: true }]);
+    assert.deepEqual(wrappedInteractive[2][0], ["plain", "rossLines", { col: 41, nav: true }]);
+
+    // Single-span tuple wrap also shifts col metadata cleanly
+    const singleLong = [["plain", "abcdefghijklmnopqrstuvwxyz", { col: 1, nav: true }]];
+    const wrappedSingle = wrapStyledSpans(singleLong, 10, { toNbsp: false });
+    assert.deepEqual(wrappedSingle, [
+      [["plain", "abcdefghij", { col: 1, nav: true }]],
+      [["plain", "klmnopqrst", { col: 11, nav: true }]],
+      [["plain", "uvwxyz", { col: 21, nav: true }]],
+    ]);
   });
 
   test("countWrappedLines matches wrapPlainText(...).length across tabs, surrogates, and narrow widths", () => {

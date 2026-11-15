@@ -196,14 +196,14 @@ for mod in "${MODS[@]}"; do
   say "Installing $mod mod..."
   copy_mod_clean "$pkg_root/mods/$mod" "$target_mods/$mod"
   if [ "$mod" = "files-search" ] || [ "$mod" = "changes-review" ] || [ "$mod" = "git-history" ]; then
-    for shared_file in code-wrap.js markdown-syntax.js markdown-view-logic.js markdown-view.js; do
+    for shared_file in code-wrap.js code-syntax.js markdown-syntax.js markdown-view-logic.js markdown-view.js dropdown-logic.js dropdown.js; do
       if [ -f "$pkg_root/shared/$shared_file" ]; then
         cp "$pkg_root/shared/$shared_file" "$target_mods/$mod/$shared_file"
       fi
     done
   fi
-  if [ "$mod" = "changes-review" ] || [ "$mod" = "git-history" ]; then
-    for shared_file in dropdown-logic.js dropdown.js; do
+  if [ "$mod" = "files-search" ]; then
+    for shared_file in code-nav-logic.js code-nav-js.js code-nav-python.js code-nav-java.js; do
       if [ -f "$pkg_root/shared/$shared_file" ]; then
         cp "$pkg_root/shared/$shared_file" "$target_mods/$mod/$shared_file"
       fi

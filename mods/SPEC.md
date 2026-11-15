@@ -20,7 +20,7 @@ Mods run as QuickJS JavaScript modules utilizing `gpui-kit` and `gpui-base` decl
 - **Owns:**
   - Active mod packages under `mods/*` (`files-search`, `changes-review`, `git-history`, `cognivisor-tabs`, `cognivisor-status`; legacy `mods/cognivisor-flow` excluded from `layouts/cognivisor.json` and cleaned up on install).
   - Manifest definitions (`mod.json`) and mod registration schemas.
-  - Mod view components (`main.js`), intra-mod pure logic modules (`indexer.js`, `search-logic.js`, `tree-logic.js`, `session-baseline.js`, `review-logic.js`, `graph-logic.js`, `diff-logic.js`, `repo-logic.js`, `tab-logic.js`), and synced `[[module-shared]]` runtime copies (`code-wrap.js`, `markdown-syntax.js`, `dropdown-logic.js`, `dropdown.js`).
+  - Mod view components (`main.js`, `code-viewer.js`), intra-mod pure logic modules (`indexer.js`, `symbol-index.js`, `search-logic.js`, `tree-logic.js`, `session-baseline.js`, `review-logic.js`, `graph-logic.js`, `diff-logic.js`, `repo-logic.js`, `tab-logic.js`), and synced `[[module-shared]]` runtime copies (`code-wrap.js`, `code-syntax.js`, `code-nav-logic.js`, `code-nav-js.js`, `code-nav-python.js`, `code-nav-java.js`, `markdown-syntax.js`, `markdown-view-logic.js`, `markdown-view.js`, `dropdown-logic.js`, `dropdown.js`).
   - Shared state event namespaces (`cognivisor.*`, `files-search.*`, `changes-review.*`, `git-history.*`) and cross-mod protocol contracts.
 - **Public surface:**
   - Active mod directories installed into `$HERDR_APP_HOME/mods/`:
@@ -52,7 +52,7 @@ Mods run as QuickJS JavaScript modules utilizing `gpui-kit` and `gpui-base` decl
 ## Shared Components & Performance Invariants
 
 1. **Shared Reusable Components & `shared/` Registry (`[[module-shared]]`):**
-   - Developers and AI agents MUST check `shared/` first before creating UI widgets, line wrappers, dropdowns, or syntax tokenizers inside any mod, extending and reusing `code-wrap.js`, `dropdown-logic.js`, `dropdown.js`, and `markdown-syntax.js` via `scripts/sync-shared.mjs`, `install.sh`, and `shared/SPEC.md`.
+   - Developers and AI agents MUST check `shared/` first before creating UI widgets, line wrappers, dropdowns, code-navigation analyzers, or syntax tokenizers inside any mod, extending and reusing `code-wrap.js`, `code-syntax.js`, `code-nav-*.js`, `dropdown-logic.js`, `dropdown.js`, `markdown-syntax.js`, `markdown-view-logic.js`, and `markdown-view.js` via `scripts/sync-shared.mjs`, `install.sh`, and `shared/SPEC.md`.
 2. **Performance & Rendering Optimization Invariant:**
    - Virtualize scrollable lists and diff/commit panes via `v_virtual_list` + `VirtualListScrollHandle` with precomputed/memoized row heights.
    - Ensure zero per-frame UI allocations when overlays, dropdown menus, or docked panels are closed/hidden.
@@ -94,7 +94,7 @@ All mods communicate solely through Herdr's persisted reactive bus (`shared()` /
 ### Bus Channels Summary
 
 - **`files-search.select` & `files-search.customSize`**: Tree directory/file reveal coordination `{ root, kind: "dir" | "reveal", path, line, ts }` and overlay geometry persistence `{ w, h }`.
-- **`cognivisor.openFileTabs` & `cognivisor.spaceAgentTabs`**: Per-tab non-terminal File Viewer metadata `{ tabId, spaceId, viewerId, root, path, absPath, displayPath, iconPath, iconColor, line, ... }` (for deduplication and tab-bar file icons) plus per-space active terminal/agent tab anchors `Record<spaceId, tabId>` updated by `files-search`, `changes-review`, and `git-history`.
+- **`cognivisor.openFileTabs` & `cognivisor.spaceAgentTabs`**: Per-tab non-terminal File Viewer metadata `{ tabId, spaceId, viewerId, root, path, absPath, displayPath, iconPath, iconColor, line, column?, highlightSymbol?, navOrigin?, navSeq?, ... }` (for deduplication, target symbol highlighting, and tab-bar file icons) plus per-space active terminal/agent tab anchors `Record<spaceId, tabId>` updated by `files-search`, `changes-review`, and `git-history`.
 - **`changes-review.activeDiff` & `cognivisor.reviewNotes`**: Per-space reusable Review tab state `{ spaceId, sourceTabId, openFileKey, openFile, files, services, viewMode, selectedCommit, requestSeq, focusLine, openCommentLine, ... }` and synchronized inline review notes keyed by `${spaceId}::${sourceTabId}`.
 - **`git-history.activeDiff` & `git-history.selectedRepo`**: Per-space reusable `git-history` comparison tab state `{ spaceId, sourceTabId, repoRoot, repoName, commitHash, shortHash, parentHashes, diffMode, openFileKey, openFile, files, expanded, requestSeq, ts }` and per-space repository selection `{ repoRoot, ts }` preserving clean-repo selections independently of `cognivisor.activeService`.
 - **`cognivisor.services` & `cognivisor.activeService`**: Discovered session-scoped microservice repository list (`{ tabId, workspaceRoot, on, services, candidates, sig, ts }`) published when `sig` changes or heartbeat refreshes (and read by `git-history` as candidate hints), plus synchronized active filter (`"all"` or `serviceId` with monotonic `ts`; `git-history` writes `cognivisor.activeService` only for repos present in `cognivisor.services`).

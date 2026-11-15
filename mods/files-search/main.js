@@ -1,6 +1,6 @@
 // FilesSearch: File browser with search button + floating IntelliJ-style Search Everywhere dialog.
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, Editor, EditorState, Input, InputState, Scrollbar, VirtualListScrollHandle, v_virtual_list } from "gpui-base";
+import { v_flex, h_flex, Editor, EditorState, Input, InputState, Scrollbar, ScrollHandle, VirtualListScrollHandle, v_virtual_list } from "gpui-base";
 import * as fsPromises from "fs/promises";
 const { readdir, exists } = fsPromises;
 import { join } from "path";
@@ -53,8 +53,6 @@ import {
   resolveEditorLanguage,
   getSyntaxPalette,
   getEditorSyntaxConfig,
-  syntaxTokenStyle,
-  tokenizeCodeLine,
   resolveFileIcon,
   expandCodeTabs,
   resolveViewerFilePath,
@@ -63,14 +61,56 @@ import {
   pruneOpenFileTabs,
   findMatchingOpenFileTab,
   resolveViewerMarkdownToggleOnLoad,
-  selectViewerMarkdownRawText,
+  selectViewerRawText,
+  shouldReuseInFlightPendingViewerOpen,
   buildViewerMarkdownCacheKey,
   buildViewerMarkdownViewIds,
   resolveRelativeMarkdownTarget,
   shouldResetPreviewMarkdown,
   shouldLoadFullMarkdownPreview,
   buildPreviewMarkdownViewIds,
+  MAX_PREVIEW_RENDER_LINE_CHARS,
+  buildWrappedViewerDocument,
+  computeWindowedViewerSlice,
+  computeTargetCenterScrollRow,
+  isNavModifierActive,
+  buildViewerNavigationNotice,
+  applyTabNavMeta,
+  shouldOpenNavInNewTab,
 } from "./search-logic.js";
+import {
+  tokenizeInteractiveCodeLine,
+  createCodeSyntaxState,
+  advanceSyntaxState,
+  cloneSyntaxState,
+  getSyntaxStateTag,
+} from "./code-syntax.js";
+import {
+  createNavHistoryState,
+  pushNavHistory,
+  canStepNavBack,
+  canStepNavForward,
+  stepNavBack,
+  stepNavForward,
+} from "./code-nav-logic.js";
+import {
+  getNavLanguageAnalyzer,
+  resolveCrossFileNavigation,
+  warmAllServiceSymbolIndices,
+  invalidateIndexedFiles,
+  peekCachedSourceText,
+  isServiceIndexWarmed,
+  warmFileImports,
+} from "./symbol-index.js";
+import {
+  CODE_VIEWER_LINE_HEIGHT,
+  renderInteractiveTokenSegments,
+  renderViewerNavToolbar,
+  renderCodeViewerBody,
+  renderNavToastBanner,
+  renderNavDisambiguationPopover,
+  computeCodeGutterWidth,
+} from "./code-viewer.js";
 import { isMarkdownFile } from "./markdown-view-logic.js";
 import {
   createMarkdownRenderCache,
@@ -80,9 +120,6 @@ import {
 import { computeWrapColumns, wrapStyledSpans } from "./code-wrap.js";
 import {
   isMarkdownExt,
-  createMarkdownState,
-  advanceMarkdownState,
-  getMarkdownStateTag,
   tokenizeMarkdownLine,
 } from "./markdown-syntax.js";
 import {
@@ -125,12 +162,43 @@ const ACTIVE_VIEWER_CLAIMS = new Map();
 const PENDING_VIEWER_OPENS = new Map();
 let VIEWER_ID_SEQ = 0;
 
+function countTextLinesFast(text) {
+  if (typeof text !== "string" || text.length === 0) return 1;
+  let count = 1;
+  let idx = text.indexOf("\n");
+  while (idx !== -1) {
+    count += 1;
+    idx = text.indexOf("\n", idx + 1);
+  }
+  return count;
+}
+
+function extractLineAtFast(text, lineNum) {
+  if (typeof text !== "string" || !lineNum || lineNum < 1) return "";
+  let curLine = 1;
+  let start = 0;
+  while (curLine < lineNum) {
+    const nl = text.indexOf("\n", start);
+    if (nl === -1) return "";
+    start = nl + 1;
+    curLine += 1;
+  }
+  const endNl = text.indexOf("\n", start);
+  let end = endNl === -1 ? text.length : endNl;
+  if (end > start && text.charCodeAt(end - 1) === 13) end -= 1;
+  return text.slice(start, end);
+}
+
 const MAX_PREVIEW_WRAP_CACHE = 400;
 const previewWrapCache = new Map();
 
-function getCachedPreviewRows(text, ext, query, isTarget, maxCols, mdState = null) {
-  const mdTag = mdState ? getMarkdownStateTag(mdState) : "";
-  const key = `${text || ""}\0${ext || ""}\0${mdTag}\0${isTarget && query ? query : ""}\0${isTarget ? 1 : 0}\0${maxCols}`;
+function getCachedPreviewRows(text, ext, maxCols, mdState = null) {
+  const strText = String(text || "");
+  const clippedText = strText.length > MAX_PREVIEW_RENDER_LINE_CHARS
+    ? `${strText.slice(0, MAX_PREVIEW_RENDER_LINE_CHARS)} …`
+    : strText;
+  const mdTag = mdState ? getSyntaxStateTag(mdState) : "";
+  const key = `${clippedText}\0${ext || ""}\0${mdTag}\0${maxCols}`;
   let hit = previewWrapCache.get(key);
   if (hit) {
     previewWrapCache.delete(key);
@@ -138,26 +206,16 @@ function getCachedPreviewRows(text, ext, query, isTarget, maxCols, mdState = nul
     return hit;
   }
 
-  const expanded = expandCodeTabs(text || "");
+  const expanded = expandCodeTabs(clippedText);
   if (!expanded) {
     hit = { mode: "empty", rows: null };
-  } else if (query && isTarget) {
-    const lowerText = expanded.toLowerCase();
-    const lowerQ = String(query).toLowerCase();
-    const idx = lowerQ ? lowerText.indexOf(lowerQ) : -1;
-    const spans =
-      idx >= 0
-        ? [
-            { text: expanded.slice(0, idx), match: false },
-            { text: expanded.slice(idx, idx + query.length), match: true },
-            { text: expanded.slice(idx + query.length), match: false },
-          ]
-        : [{ text: expanded, match: false }];
-    hit = { mode: "match", rows: wrapStyledSpans(spans, maxCols, { toNbsp: true }) };
   } else {
-    const tokens = tokenizeCodeLine(expanded, ext, mdState ? { ...mdState } : null);
+    const tokens = tokenizeInteractiveCodeLine(clippedText, ext, mdState ? cloneSyntaxState(mdState) : null);
     if (!tokens || tokens.length === 0) {
-      hit = { mode: "plain", rows: wrapStyledSpans([["plain", expanded]], maxCols, { toNbsp: true }) };
+      const plainText = expanded.length > MAX_PREVIEW_RENDER_LINE_CHARS
+        ? `${expanded.slice(0, MAX_PREVIEW_RENDER_LINE_CHARS)} …`
+        : expanded;
+      hit = { mode: "plain", rows: wrapStyledSpans([["plain", plainText, { col: 1, nav: false }]], maxCols, { toNbsp: true }) };
     } else {
       hit = { mode: "tokens", rows: wrapStyledSpans(tokens, maxCols, { toNbsp: true }) };
     }
@@ -324,12 +382,86 @@ function resolveServiceForFile(root, relOrPath, absPath, isWin = false, localSer
   return { serviceId: best.id || null, serviceName: best.name || null };
 }
 
+function collectRegisteredServices(localServices = null) {
+  const bus = asPlainObject(shared("cognivisor.services"));
+  const merged = [];
+  const seen = new Set();
+  const addList = list => {
+    for (const s of list || []) {
+      if (!s || !s.root) continue;
+      const key = `${s.root}::${s.id || s.name || ""}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(s);
+    }
+  };
+  addList(localServices);
+  addList(bus.services);
+  addList(bus.candidates);
+  return merged;
+}
+
+const INDEXED_FILES_SET_CACHE = new WeakMap();
+
+function collectIndexedFilesByRoot(services, fallbackRoot = "", fallbackOn = null) {
+  const map = new Map();
+  const roots = new Set();
+  if (fallbackRoot) roots.add(normPathStr(fallbackRoot));
+  for (const s of services || []) {
+    if (s?.root) roots.add(normPathStr(s.root));
+  }
+  const isWinDefault = !fallbackOn && window()?.platform === "windows";
+  for (const r of roots) {
+    const cached = getCachedIndex(makeIndexKey(r, fallbackOn ?? null, isWinDefault));
+    if (cached && Array.isArray(cached.entries) && cached.entries.length > 0) {
+      let files = INDEXED_FILES_SET_CACHE.get(cached.entries);
+      if (!files) {
+        files = new Set();
+        const entries = cached.entries;
+        for (let i = 0; i < entries.length; i += 1) {
+          const e = entries[i];
+          if (e && e.kind === "file" && e.path) {
+            let rel = normPathStr(e.path);
+            if (rel.startsWith("./")) rel = rel.slice(2);
+            if (rel) files.add(rel);
+          }
+        }
+        INDEXED_FILES_SET_CACHE.set(cached.entries, files);
+      }
+      if (files.size > 0) map.set(r, files);
+    }
+  }
+  return map;
+}
+
+function hasMatchingOpenTabInSpace(spaceId, root, absPath, isWin, excludeTabId = null) {
+  const allSpaces = spaces() || [];
+  const targetSpace = (spaceId ? allSpaces.find(s => s.id === spaceId) : null) || allSpaces.find(s => s.active) || null;
+  if (!targetSpace?.id) return false;
+  const allLiveTabIds = new Set();
+  for (const s of allSpaces) {
+    for (const t of s.tabs || []) {
+      if (t?.id) allLiveTabIds.add(t.id);
+    }
+  }
+  const filePaneTabIds = new Set(
+    (panes() || []).filter(p => p?.mod === "files-search" && p?.tab).map(p => p.tab)
+  );
+  const spaceTabIds = new Set((targetSpace.tabs || []).map(t => t?.id).filter(Boolean));
+  const { tabs: prunedTabs } = pruneOpenFileTabs(asPlainObject(shared("cognivisor.openFileTabs")), allLiveTabIds, filePaneTabIds);
+  const match = findMatchingOpenFileTab(prunedTabs, spaceTabIds, filePaneTabIds, normPathStr(root || targetSpace.folder || ""), absPath, isWin);
+  return Boolean(match && match.tabId !== excludeTabId);
+}
+
 function openFileInTab({
   spaceId = null,
   root = "",
   path = "",
   on = null,
   line = null,
+  column = null,
+  highlightSymbol = null,
+  navOrigin = null,
   serviceId = null,
   serviceName = null,
   localServices = null,
@@ -389,23 +521,29 @@ function openFileInTab({
   const match = findMatchingOpenFileTab(prunedTabs, spaceTabIds, filePaneTabIds, normRoot, absPath, isWin);
 
   if (match) {
+    const nextEntry = applyTabNavMeta({
+      ...match.entry,
+      tabId: match.tabId,
+      spaceId: resolvedSpaceId,
+      root: normRoot || match.entry.root || "",
+      path: relPath || match.entry.path || "",
+      absPath,
+      displayPath: displayPath || match.entry.displayPath || relPath || absPath,
+      iconPath: iconPath || match.entry.iconPath || "",
+      iconColor: iconColor || match.entry.iconColor || "",
+      line: resolvedLine,
+      navOrigin: navOrigin || null,
+      serviceId: resolvedServiceId ?? match.entry.serviceId ?? null,
+      serviceName: resolvedServiceName ?? match.entry.serviceName ?? null,
+      updatedAt: Date.now(),
+    }, {
+      column,
+      highlightSymbol,
+      navSeq: (Number(match.entry?.navSeq) || 0) + 1,
+    });
     const nextTabs = {
       ...prunedTabs,
-      [match.tabId]: {
-        ...match.entry,
-        tabId: match.tabId,
-        spaceId: resolvedSpaceId,
-        root: normRoot || match.entry.root || "",
-        path: relPath || match.entry.path || "",
-        absPath,
-        displayPath: displayPath || match.entry.displayPath || relPath || absPath,
-        iconPath: iconPath || match.entry.iconPath || "",
-        iconColor: iconColor || match.entry.iconColor || "",
-        line: resolvedLine,
-        serviceId: resolvedServiceId ?? match.entry.serviceId ?? null,
-        serviceName: resolvedServiceName ?? match.entry.serviceName ?? null,
-        updatedAt: Date.now(),
-      },
+      [match.tabId]: nextEntry,
     };
     setShared("cognivisor.openFileTabs", nextTabs);
     run("tab.select", { id: match.tabId });
@@ -432,6 +570,12 @@ function openFileInTab({
       run("tab.select", { id: unclaimedTab.id });
       return { reused: true, tabId: unclaimedTab.id, absPath };
     }
+    if (shouldReuseInFlightPendingViewerOpen(pendingEntry, now)) {
+      if (prunedChanged) {
+        setShared("cognivisor.openFileTabs", prunedTabs);
+      }
+      return { reused: true, pending: true, absPath };
+    }
   }
 
   if (prunedChanged) {
@@ -444,11 +588,17 @@ function openFileInTab({
   }
   const tabTitle = formatFileTabTitle(absPath || relPath, resolvedServiceName, existingTitles);
   const viewerId = `fv-${now.toString(36)}-${(++VIEWER_ID_SEQ).toString(36)}`;
+  const colNum = Number(column);
+  const resolvedColumn = Number.isFinite(colNum) && colNum >= 1 ? Math.floor(colNum) : null;
+  const resolvedHighlight = typeof highlightSymbol === "string" && highlightSymbol ? highlightSymbol : null;
+
   PENDING_VIEWER_OPENS.set(pendingKey, {
     viewerId,
     spaceId: resolvedSpaceId,
     key: viewerKey,
     line: resolvedLine,
+    column: resolvedColumn,
+    highlightSymbol: resolvedHighlight,
     ts: now,
   });
 
@@ -467,6 +617,9 @@ function openFileInTab({
       displayPath,
       on: resolvedOn ?? null,
       line: resolvedLine,
+      column: resolvedColumn,
+      highlightSymbol: resolvedHighlight,
+      navOrigin: navOrigin || null,
       serviceId: resolvedServiceId,
       serviceName: resolvedServiceName,
     },
@@ -1033,6 +1186,7 @@ export default class FilesSearch extends View {
             if (!hasOpenTerminalInSpace()) break;
             const info = analyzeWatchBatch(changed, root, null);
             if (!info.hasNonIgnored) continue;
+            invalidateIndexedFiles(root, changed, on);
             const dirty = await handleWatchForIndex(root, on, isWindows, info, changed);
             if (dirty && !this._indexerClosed && ownsRootWatcher(indexKey, token) && hasOpenTerminalInSpace()) {
               this.scheduleIndexerReindex(root, on, isWindows, indexKey, cx);
@@ -1085,6 +1239,19 @@ export default class FilesSearch extends View {
         const cached = getCachedIndex(indexKey);
         if (shouldRefreshIndex(cached, on)) {
           await ensureWorkspaceIndex({ root, on, isWindows, discoverRepos, cx });
+        }
+        // Skip eager background symbol indexing over SSH; Ctrl+Click resolves on demand via readTextFile/git grep.
+        if (!this._indexerClosed && !on && hasOpenTerminalInSpace()) {
+          const svcs = collectRegisteredServices();
+          const indexedByRoot = collectIndexedFilesByRoot(svcs, root, on);
+          warmAllServiceSymbolIndices({
+            services: svcs,
+            currentRoot: root,
+            on,
+            indexedFilesByRoot: indexedByRoot,
+            appHomeDir: getSafeAppHome(),
+            skipIfFreshMs: 15000,
+          }).catch(() => {});
         }
       } catch {
         // Prewarm failures remain silent and retry on next agent/watch trigger or manual overlay open.
@@ -1368,6 +1535,7 @@ export default class FilesSearch extends View {
             if (!this.current(context)) break;
             const info = analyzeWatchBatch(changed, root, this.folders);
             if (!info.hasNonIgnored) continue;
+            invalidateIndexedFiles(root, changed, null);
             if (info.invalidateRepos) this.candidateCache = null;
             if (info.dirtyDirs.has("*")) {
               this.dirtyFolders.add("*");
@@ -2476,6 +2644,11 @@ export default class FilesSearch extends View {
       this.schedulePanelSync(cx);
     }
 
+    if (!visible) {
+      this.visibleRowByKey = null;
+      return div().id("files");
+    }
+
     const t = theme();
     const isWin = Boolean(this.context?.isWindows);
     const selectedKey = this.selectedFile ? buildFileViewerKey(this.root, this.selectedFile, isWin) : "";
@@ -2732,6 +2905,14 @@ export default class FilesSearch extends View {
     this.previewMarkdownFullText = null;
     this.previewMarkdownFullPath = null;
     this.previewMarkdownCache = createMarkdownRenderCache(12);
+    this.previewCtrlHeld = false;
+    this.previewHoveredTokenKey = null;
+    this.previewDisambig = null;
+    this.previewNavNotice = null;
+    this.previewNoticeTask = null;
+    this.previewNavDropdownScroll = ScrollHandle.new();
+    this.previewNavSeq = 0;
+    this.previewFullTextCache = new Map();
 
     // Resize state (remembers user size preference)
     const savedSize = shared("files-search.customSize");
@@ -2799,6 +2980,36 @@ export default class FilesSearch extends View {
     this.textSearchTask = null;
     this.previewDebounceTask?.cancel();
     this.previewDebounceTask = null;
+    try { this.previewNoticeTask?.cancel(); } catch {}
+    this.previewNoticeTask = null;
+    try { this._resizeNotifyTask?.cancel(); } catch {}
+    this._resizeNotifyTask = null;
+    try { this._pendingPreviewScheduleTask?.cancel(); } catch {}
+    this._pendingPreviewScheduleTask = null;
+    this._pendingPreviewScheduleKey = null;
+    this._previewMdCheckpoints = null;
+    this.previewNavSeq = (this.previewNavSeq || 0) + 1;
+    this.previewDisambig = null;
+    this.previewNavNotice = null;
+    this.previewHoveredTokenKey = null;
+    this.previewCtrlHeld = false;
+    this.previewFullTextCache?.clear();
+    this.previewFullTextCache = null;
+    this.previewCache?.clear();
+    this._fileQueryCache?.clear();
+    this._narrowHistory = [];
+    this.textQueryCache?.clear();
+    this.textResults = [];
+    this.fileResults = [];
+    this.fileEntries = [];
+    this.fileList = [];
+    this._combinedResults = [];
+    this._combinedCacheKey = null;
+    this.previewLines = [];
+    this.previewDirEntries = [];
+    previewWrapCache.clear();
+    try { this.previewNavDropdownScroll?.release(); } catch {}
+    this.previewNavDropdownScroll = null;
     if (this.indexerWatchKey && this.indexerWatchToken) {
       this.stopIndexerWatching();
     }
@@ -2810,6 +3021,11 @@ export default class FilesSearch extends View {
     }
     this.pending?.clear();
     this.pendingTokens?.clear();
+    this.entries?.clear();
+    this.dirtyFolders?.clear();
+    this.folders?.clear();
+    this.expanded?.clear();
+    this.context = null;
     this.visibleRowByKey = null;
     this.resetPreviewMarkdownState({ clearCache: true });
     this.previewMarkdownCache = null;
@@ -2831,6 +3047,35 @@ export default class FilesSearch extends View {
     this.textSearchTask = null;
     this.previewDebounceTask?.cancel();
     this.previewDebounceTask = null;
+    try { this._resizeNotifyTask?.cancel(); } catch {}
+    this._resizeNotifyTask = null;
+    try { this._pendingPreviewScheduleTask?.cancel(); } catch {}
+    this._pendingPreviewScheduleTask = null;
+    this._pendingPreviewScheduleKey = null;
+    try { this.previewNoticeTask?.cancel(); } catch {}
+    this.previewNoticeTask = null;
+    this._previewMdCheckpoints = null;
+    this.previewNavSeq = (this.previewNavSeq || 0) + 1;
+    this.previewDisambig = null;
+    this.previewNavNotice = null;
+    this.previewHoveredTokenKey = null;
+    this.previewCtrlHeld = false;
+    this.previewFullTextCache?.clear();
+    this.previewCache?.clear();
+    this._fileQueryCache?.clear();
+    this._narrowHistory = [];
+    this.textQueryCache?.clear();
+    this.textResults = [];
+    this.fileResults = [];
+    this.fileEntries = [];
+    this.fileList = [];
+    this._combinedResults = [];
+    this._combinedCacheKey = null;
+    this.previewLines = [];
+    this.previewDirEntries = [];
+    previewWrapCache.clear();
+    try { this.previewNavDropdownScroll?.release(); } catch {}
+    this.previewNavDropdownScroll = null;
     this.resetPreviewMarkdownState({ clearCache: true });
     this.previewItem = null;
     this._currentPreviewKey = null;
@@ -2859,6 +3104,8 @@ export default class FilesSearch extends View {
     this.resizeStartY = e.position.y;
     this.resizeStartW = this.customWidth || defaultW;
     this.resizeStartH = this.customListHeight || LIST_H;
+    try { this._resizeNotifyTask?.cancel(); } catch {}
+    this._resizeNotifyTask = null;
     cx.stop_propagation();
     cx.notify();
   }
@@ -2867,14 +3114,26 @@ export default class FilesSearch extends View {
     if (!this.resizing) return;
     const totalDx = e.position.x - this.resizeStartX;
     const totalDy = e.position.y - this.resizeStartY;
-    this.customWidth = Math.max(minW, Math.min(maxW, Math.round(this.resizeStartW + totalDx)));
-    this.customListHeight = Math.max(minH, Math.min(maxH, Math.round(this.resizeStartH + totalDy)));
-    cx.notify();
+    const nextW = Math.max(minW, Math.min(maxW, Math.round(this.resizeStartW + totalDx)));
+    const nextH = Math.max(minH, Math.min(maxH, Math.round(this.resizeStartH + totalDy)));
+    if (nextW === this.customWidth && nextH === this.customListHeight) return;
+    this.customWidth = nextW;
+    this.customListHeight = nextH;
+    if (this._resizeNotifyTask || !cx?.timer) {
+      if (!cx?.timer) cx.notify();
+      return;
+    }
+    this._resizeNotifyTask = cx.timer.after(16, timerCx => {
+      this._resizeNotifyTask = null;
+      if (!this._overlayClosed) timerCx.notify();
+    });
   }
 
   handleResizeEnd(cx) {
     if (!this.resizing) return;
     this.resizing = false;
+    try { this._resizeNotifyTask?.cancel(); } catch {}
+    this._resizeNotifyTask = null;
     setShared("files-search.customSize", { w: this.customWidth, h: this.customListHeight });
     cx.notify();
   }
@@ -2928,9 +3187,155 @@ export default class FilesSearch extends View {
     this.previewMarkdownError = null;
     this.previewMarkdownFullText = null;
     this.previewMarkdownFullPath = null;
+    this.previewDisambig = null;
+    this.previewNavNotice = null;
+    this.previewHoveredTokenKey = null;
     if (clearCache) {
       this.previewMarkdownCache?.clear();
     }
+  }
+
+  setPreviewNavNotice(notice, cx) {
+    try { this.previewNoticeTask?.cancel(); } catch {}
+    this.previewNoticeTask = null;
+    this.previewNavNotice = notice || null;
+    if (notice && cx?.timer) {
+      this.previewNoticeTask = cx.timer.after(3200, timerCx => {
+        this.previewNoticeTask = null;
+        if (this._overlayClosed) return;
+        this.previewNavNotice = null;
+        timerCx.notify();
+      });
+    }
+    cx?.notify?.();
+  }
+
+  handlePreviewTokenHover(nextKey, _tokenKey, cx) {
+    if (this._overlayClosed) return;
+    const prev = this.previewHoveredTokenKey || null;
+    if (nextKey) {
+      if (prev === nextKey) return;
+      this.previewHoveredTokenKey = nextKey;
+    } else {
+      if (!prev || (_tokenKey && prev !== _tokenKey)) return;
+      this.previewHoveredTokenKey = null;
+    }
+    if (this.previewCtrlHeld) {
+      cx.notify();
+    }
+  }
+
+  openPreviewDisambigCandidate(cand, originEntry, cx) {
+    if (this._overlayClosed || !cand || !cand.filePath) return;
+    this.previewDisambig = null;
+    openFileInTab({
+      spaceId: this.searchSpaceId || spaces().find(s => s.active)?.id || null,
+      root: cand.root || cand.serviceRoot || this.searchRoot || "",
+      path: cand.filePath,
+      on: cand.on ?? this.searchOn ?? null,
+      line: cand.line || 1,
+      column: cand.column || 1,
+      highlightSymbol: cand.name || cand.symbol || originEntry?.symbol || null,
+      navOrigin: originEntry || null,
+      serviceId: cand.serviceId || null,
+      serviceName: cand.serviceName || null,
+    });
+    this.closeOverlay();
+    cx?.notify?.();
+  }
+
+  handlePreviewTokenClick(item, tokenInfo, cx) {
+    if (this._overlayClosed || !item || !item.path || !tokenInfo) return;
+    const navSeq = ++this.previewNavSeq;
+    const isWin = this.searchIsWindows;
+    const on = this.searchOn ?? null;
+    const absPath = resolveViewerFilePath(this.searchRoot, item.path);
+    if (!absPath) return;
+
+    const itemSvc = resolveServiceForFile(this.searchRoot, item.path, absPath, isWin);
+    const services = collectRegisteredServices();
+    const matchedSvc = services.find(s => s.id && s.id === itemSvc.serviceId)
+      || services.find(s => s.root && isSameOrChildPath(absPath, s.root, isWin))
+      || null;
+    const svcRoot = matchedSvc?.root || this.searchRoot || "";
+
+    const originEntry = {
+      root: svcRoot,
+      path: absPath,
+      on,
+      serviceId: matchedSvc?.id || itemSvc.serviceId || null,
+      serviceName: matchedSvc?.name || itemSvc.serviceName || null,
+      line: tokenInfo.line,
+      column: tokenInfo.col,
+      symbol: tokenInfo.symbol,
+    };
+
+    cx.spawn(async spawnCx => {
+      try {
+        const previewCacheKey = `${on || ""}::${absPath}`;
+        let sourceText = null;
+        if (!this.previewHasMore && (this.previewStartLine || 1) === 1 && this.previewLines.length > 0) {
+          sourceText = this.previewLines.join("\n");
+        } else if (this.previewFullTextCache?.has(previewCacheKey)) {
+          sourceText = this.previewFullTextCache.get(previewCacheKey);
+          this.previewFullTextCache.delete(previewCacheKey);
+          this.previewFullTextCache.set(previewCacheKey, sourceText);
+        } else {
+          sourceText = await readTextFile(absPath, { on });
+          if (typeof sourceText === "string" && this.previewFullTextCache) {
+            if (this.previewFullTextCache.size >= 20) {
+              const oldestKey = this.previewFullTextCache.keys().next().value;
+              if (oldestKey !== undefined) this.previewFullTextCache.delete(oldestKey);
+            }
+            this.previewFullTextCache.set(previewCacheKey, sourceText);
+          }
+        }
+        if (this._overlayClosed || navSeq !== this.previewNavSeq) return;
+        if (typeof sourceText !== "string") {
+          this.setPreviewNavNotice(buildViewerNavigationNotice({ status: "not-found" }, { symbol: tokenInfo.symbol }), spawnCx);
+          return;
+        }
+
+        const indexedFilesByRoot = collectIndexedFilesByRoot(services, this.searchRoot, on);
+        const result = await resolveCrossFileNavigation({
+          sourceText,
+          filePath: absPath,
+          line: tokenInfo.line,
+          col: tokenInfo.col,
+          currentRoot: svcRoot,
+          on,
+          services,
+          indexedFilesByRoot,
+          appHomeDir: getSafeAppHome(),
+        });
+        if (this._overlayClosed || navSeq !== this.previewNavSeq) return;
+
+        if (result?.status === "ok" && result.best) {
+          this.openPreviewDisambigCandidate(result.best, originEntry, spawnCx);
+          return;
+        }
+        if (result?.status === "ambiguous" && Array.isArray(result.candidates) && result.candidates.length > 0) {
+          this.previewNavNotice = null;
+          this.previewDisambig = {
+            candidates: result.candidates,
+            selectedIndex: 0,
+            origin: originEntry,
+            root: svcRoot,
+            serviceName: originEntry.serviceName || "",
+          };
+          spawnCx.notify();
+          return;
+        }
+        this.setPreviewNavNotice(
+          buildViewerNavigationNotice(result, result?.context || { symbol: tokenInfo.symbol }, result?.context?.intent),
+          spawnCx,
+        );
+      } catch {
+        if (!this._overlayClosed && navSeq === this.previewNavSeq) {
+          this.setPreviewNavNotice(buildViewerNavigationNotice({ status: "not-found" }, { symbol: tokenInfo.symbol }), spawnCx);
+        }
+      }
+    });
   }
 
   togglePreviewMarkdown(item, cx) {
@@ -3086,6 +3491,9 @@ export default class FilesSearch extends View {
   }
 
   schedulePreview(item, cx, immediate = false) {
+    try { this._pendingPreviewScheduleTask?.cancel(); } catch {}
+    this._pendingPreviewScheduleTask = null;
+    this._pendingPreviewScheduleKey = null;
     if (!item) {
       this.previewDebounceTask?.cancel();
       this.previewDebounceTask = null;
@@ -3121,6 +3529,8 @@ export default class FilesSearch extends View {
     // Check memory cache first
     const cached = this.previewCache.get(itemKey);
     if (cached) {
+      this.previewCache.delete(itemKey);
+      this.previewCache.set(itemKey, cached);
       this.previewDebounceTask?.cancel();
       this.previewDebounceTask = null;
       if (cached.kind === "dir") {
@@ -3272,7 +3682,7 @@ export default class FilesSearch extends View {
     const on = this.searchOn;
     const isWindows = this.searchIsWindows ?? (!on && window()?.platform === "windows");
     const targetPath = this.previewItem.path;
-    const itemKey = `${this.previewItem.path}:${this.previewItem.line || 0}`;
+    const itemKey = `${this.previewItem.kind || "file"}:${this.previewItem.path}:${this.previewItem.line || 0}`;
     const nextStartLine = this.previewStartLine + this.previewLines.length;
 
     cx.spawn(async cx => {
@@ -3287,6 +3697,8 @@ export default class FilesSearch extends View {
           if (cached) {
             cached.lines = this.previewLines;
             cached.hasMore = this.previewHasMore;
+            this.previewCache.delete(itemKey);
+            this.previewCache.set(itemKey, cached);
           }
         } else {
           this.previewHasMore = false;
@@ -3561,26 +3973,41 @@ export default class FilesSearch extends View {
           const results = [];
           const rgBaseArgs = [
             "--vimgrep", "--no-heading", "--color=never", "--smart-case",
-            "--path-separator", "/", "--max-count=3", "--max-columns=200",
-            "--max-filesize", "512K", "--threads", "4",
+            "--path-separator", "/", "--max-count=2", "--max-columns=200",
+            "--max-filesize", "256K", "--threads", "4",
             ...COMMON_IGNORE_GLOBS,
             "--glob", "!*.min.js", "--glob", "!*.min.css", "--glob", "!*.map",
           ];
+          const rgPipeScript = 'command -v rg >/dev/null 2>&1 || exit 127; rg "$@" 2>/dev/null | head -n 320';
+          const runRg = async (args) => {
+            if (!isWindows) {
+              const r = await exec("sh", ["-c", rgPipeScript, "sh", ...args], { cwd: root, on, timeout: 8000 }).catch(() => null);
+              if (r && r.code === 127) {
+                RG_AVAILABLE_CACHE.set(onKey, false);
+                return null;
+              }
+              return r;
+            }
+            return exec("rg", args, { cwd: root, on, timeout: 8000 }).catch(() => null);
+          };
 
           let res = null;
           let rgChecked = false;
           if (RG_AVAILABLE_CACHE.get(onKey) !== false) {
             rgChecked = true;
-            res = await exec("rg", [...rgBaseArgs, "--", q], { cwd: root, on, timeout: 8000 }).catch(() => null);
+            res = await runRg([...rgBaseArgs, "--", q]);
             if (this._overlayClosed || seq !== this.searchSeq) return;
-            if (res && res.code === 2) {
+            if (
+              res &&
+              (res.code === 2 || (!isWindows && res.code === 0 && !res.stdout && /[.*+?^${}()|[\]\\]/.test(q)))
+            ) {
               // Query contains unescaped regex characters; retry as literal fixed string.
-              res = await exec("rg", [...rgBaseArgs, "-F", "--", q], { cwd: root, on, timeout: 8000 }).catch(() => null);
+              res = await runRg([...rgBaseArgs, "-F", "--", q]);
               if (this._overlayClosed || seq !== this.searchSeq) return;
             }
             if (res) {
               RG_AVAILABLE_CACHE.set(onKey, true);
-            } else {
+            } else if (RG_AVAILABLE_CACHE.get(onKey) !== false) {
               const probe = await exec("rg", ["--version"], { on, timeout: 2500 }).catch(() => null);
               if (this._overlayClosed || seq !== this.searchSeq) return;
               RG_AVAILABLE_CACHE.set(onKey, Boolean(probe && probe.code === 0));
@@ -3600,12 +4027,23 @@ export default class FilesSearch extends View {
             ).catch(() => null);
             if (this._overlayClosed || seq !== this.searchSeq) return;
 
+            const runGitGrep = async (cwd) => {
+              const gitArgs = [
+                "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false",
+                "grep", "-nI", "-F", "-i", "-m", "2", "--", q,
+              ];
+              if (!isWindows) {
+                return exec(
+                  "sh",
+                  ["-c", 'git "$@" 2>/dev/null | head -n 320', "sh", ...gitArgs],
+                  { cwd, on, timeout: 6000 }
+                ).catch(() => null);
+              }
+              return exec("git", gitArgs, { cwd, on, timeout: 6000 }).catch(() => null);
+            };
+
             if (rev?.code === 0) {
-              const gitRes = await exec(
-                "git",
-                ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "grep", "-nI", "-F", "-i", "-m", "3", "--", q],
-                { cwd: root, on, timeout: 6000 }
-              ).catch(() => null);
+              const gitRes = await runGitGrep(root);
               if (this._overlayClosed || seq !== this.searchSeq) return;
               if (gitRes && gitRes.stdout) {
                 parseSearchOutputLines(gitRes.stdout, q, "", MAX_TEXT_RESULTS, results);
@@ -3630,11 +4068,7 @@ export default class FilesSearch extends View {
                   ordered,
                   4,
                   async s => {
-                    const sRes = await exec(
-                      "git",
-                      ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "grep", "-nI", "-F", "-i", "-m", "3", "--", q],
-                      { cwd: s.root, on, timeout: 6000 }
-                    ).catch(() => null);
+                    const sRes = await runGitGrep(s.root);
                     if (this._overlayClosed || seq !== this.searchSeq || !sRes || !sRes.stdout) return;
                     const prefix = s.relPath ? `${s.relPath}/` : "";
                     parseSearchOutputLines(sRes.stdout, q, prefix, MAX_TEXT_RESULTS, results);
@@ -3732,13 +4166,14 @@ export default class FilesSearch extends View {
   }
 
   renderHighlightedTitle(t, text, hits, isSelected) {
+    const safeText = typeof text === "string" ? text : String(text ?? "");
     if (!hits || !hits.length) {
-      return div().text_color(isSelected ? t.foreground : t.muted).child(text);
+      return div().text_color(isSelected ? t.foreground : t.muted).child(safeText);
     }
     const parts = [];
     let cur = "";
     let lit = false;
-    [...text].forEach((ch, i) => {
+    [...safeText].forEach((ch, i) => {
       const h = hits.includes(i);
       if (h !== lit && cur) {
         parts.push([cur, lit]);
@@ -3754,23 +4189,25 @@ export default class FilesSearch extends View {
         div()
           .text_color(h ? t.ansi4 : isSelected ? t.foreground : t.muted)
           .when(h, d => d.font_semibold())
-          .child(s.replace(/ /g, "\u00a0"))
+          .child(String(s).replace(/ /g, "\u00a0"))
       )
     );
   }
 
   renderTextSnippet(t, content, query, isSelected) {
-    if (!content || !query) return div().text_color(t.dim).child(content);
-    const lowerContent = content.toLowerCase();
-    const lowerQuery = query.toLowerCase();
+    const safeContent = typeof content === "string" ? content : String(content ?? "");
+    const safeQuery = typeof query === "string" ? query : String(query ?? "");
+    if (!safeContent || !safeQuery) return div().text_color(t.dim).child(safeContent);
+    const lowerContent = safeContent.toLowerCase();
+    const lowerQuery = safeQuery.toLowerCase();
     const idx = lowerContent.indexOf(lowerQuery);
     if (idx < 0) {
-      return div().text_size(11.5).truncate().text_color(t.dim).child(content);
+      return div().text_size(11.5).truncate().text_color(t.dim).child(safeContent);
     }
 
-    const before = content.slice(0, idx);
-    const match = content.slice(idx, idx + query.length);
-    const after = content.slice(idx + query.length);
+    const before = safeContent.slice(0, idx);
+    const match = safeContent.slice(idx, idx + safeQuery.length);
+    const after = safeContent.slice(idx + safeQuery.length);
 
     return h_flex()
       .text_size(11.5)
@@ -3780,152 +4217,10 @@ export default class FilesSearch extends View {
       .child(div().text_color(t.dim).child(after.replace(/ /g, "\u00a0")));
   }
 
-  renderSyntaxLine(t, text, ext, query, isTarget, mdState = null) {
-    const fontFamily = settings()?.font_family || "monospace";
-    if (!text) {
-      return div().flex_none().whitespace_nowrap().text_size(11.5).font_family(fontFamily).child("\u00a0");
-    }
-    const clean = expandCodeTabs(text);
-    const displayText = clean.length > 4000 ? clean.slice(0, 4000) + "… (line truncated)" : clean;
-    const tokens = isMarkdownExt(ext)
-      ? tokenizeMarkdownLine(displayText, mdState, tokenizeCodeLine)
-      : tokenizeCodeLine(displayText, ext);
-    if (!tokens) {
-      return query
-        ? this.renderHighlightedCodeLine(t, displayText, query)
-        : div()
-            .flex_none()
-            .whitespace_nowrap()
-            .text_size(11.5)
-            .font_family(fontFamily)
-            .text_color(t.foreground)
-            .child(displayText ? displayText.replace(/ /g, "\u00a0") : "\u00a0");
-    }
-
-    const spans = [];
-    const lowerQ = query ? query.toLowerCase() : "";
-    const addTextChunk = (str, color, isBold = false) => {
-      if (!str) return;
-      if (lowerQ && str.toLowerCase().includes(lowerQ)) {
-        const lowerStr = str.toLowerCase();
-        let cur = 0;
-        let qIdx = lowerStr.indexOf(lowerQ, cur);
-        while (qIdx !== -1) {
-          if (qIdx > cur) {
-            spans.push({ text: str.slice(cur, qIdx), color, bold: isBold });
-          }
-          spans.push({ text: str.slice(qIdx, qIdx + query.length), color: t.background, bold: true, bg: t.accent });
-          cur = qIdx + query.length;
-          qIdx = lowerStr.indexOf(lowerQ, cur);
-        }
-        if (cur < str.length) {
-          spans.push({ text: str.slice(cur), color, bold: isBold });
-        }
-      } else {
-        spans.push({ text: str, color, bold: isBold });
-      }
-    };
-
-    for (const [tokKind, tokText] of tokens) {
-      const style = syntaxTokenStyle(tokKind, t, isTarget);
-      addTextChunk(tokText, style.color, style.bold);
-    }
-
-    if (spans.length === 0) {
-      return div()
-        .flex_none()
-        .whitespace_nowrap()
-        .text_size(11.5)
-        .font_family(fontFamily)
-        .child(displayText ? displayText.replace(/ /g, "\u00a0") : "\u00a0");
-    }
-
-    const row = h_flex().flex_none().whitespace_nowrap().items_center();
-    spans.forEach((s) => {
-      const el = div()
-        .flex_none()
-        .whitespace_nowrap()
-        .text_size(11.5)
-        .font_family(fontFamily)
-        .text_color(s.color)
-        .when(Boolean(s.bold), d => d.font_semibold())
-        .when(Boolean(s.bg), d => d.bg(s.bg).rounded(2).px(2))
-        .child(s.text.replace(/ /g, "\u00a0"));
-      row.child(el);
-    });
-    return row;
-  }
-
-  renderHighlightedCodeLine(t, text, query) {
-    const fontFamily = settings()?.font_family || "monospace";
-    const clean = expandCodeTabs(text);
-    const displayText = clean.length > 4000 ? clean.slice(0, 4000) + "… (line truncated)" : clean;
-    if (!displayText || !query) {
-      return div()
-        .flex_none()
-        .whitespace_nowrap()
-        .text_size(11.5)
-        .font_family(fontFamily)
-        .text_color(t.foreground)
-        .child(displayText ? displayText.replace(/ /g, "\u00a0") : "\u00a0");
-    }
-    const lowerText = displayText.toLowerCase();
-    const lowerQ = query.toLowerCase();
-    const idx = lowerText.indexOf(lowerQ);
-    if (idx < 0) {
-      return div()
-        .flex_none()
-        .whitespace_nowrap()
-        .text_size(11.5)
-        .font_family(fontFamily)
-        .text_color(t.foreground)
-        .child(displayText ? displayText.replace(/ /g, "\u00a0") : "\u00a0");
-    }
-    const before = displayText.slice(0, idx);
-    const match = displayText.slice(idx, idx + query.length);
-    const after = displayText.slice(idx + query.length);
-
-    return h_flex()
-      .flex_none()
-      .whitespace_nowrap()
-      .items_center()
-      .child(
-        div()
-          .flex_none()
-          .whitespace_nowrap()
-          .text_size(11.5)
-          .font_family(fontFamily)
-          .text_color(t.foreground)
-          .child(before.replace(/ /g, "\u00a0"))
-      )
-      .child(
-        div()
-          .flex_none()
-          .whitespace_nowrap()
-          .text_size(11.5)
-          .font_family(fontFamily)
-          .bg(t.accent)
-          .text_color(t.background)
-          .font_semibold()
-          .rounded(2)
-          .px(2)
-          .child(match.replace(/ /g, "\u00a0"))
-      )
-      .child(
-        div()
-          .flex_none()
-          .whitespace_nowrap()
-          .text_size(11.5)
-          .font_family(fontFamily)
-          .text_color(t.foreground)
-          .child(after.replace(/ /g, "\u00a0"))
-      );
-  }
-
-  renderWrappedSyntaxSegments(t, text, ext, query, isTarget, maxCols, resolvedFont = null, fillWidth = false, mdState = null) {
+  renderWrappedSyntaxSegments(t, text, ext, query, isTarget, maxCols, resolvedFont = null, fillWidth = false, mdState = null, navOpts = null) {
     const fontFamily = resolvedFont || settings()?.font_family || "monospace";
     const applyWrapBox = (el) => (fillWidth ? el.flex_1().min_w(0).overflow_hidden() : el.flex_none());
-    const cached = getCachedPreviewRows(text, ext, query, isTarget, maxCols, mdState);
+    const cached = getCachedPreviewRows(text, ext, maxCols, mdState);
 
     if (cached.mode === "empty") {
       return [
@@ -3938,69 +4233,26 @@ export default class FilesSearch extends View {
       ];
     }
 
-    if (cached.mode === "match") {
-      return cached.rows.map((rowSpans) => {
-        if (!rowSpans.length) {
-          return applyWrapBox(div()).text_size(11.5).font_family(fontFamily).text_color(t.foreground).child("\u00a0");
-        }
-        return applyWrapBox(h_flex())
-          .items_center()
-          .children(
-            rowSpans.map((seg) =>
-              seg.match
-                ? div()
-                    .flex_none()
-                    .whitespace_nowrap()
-                    .text_size(11.5)
-                    .font_family(fontFamily)
-                    .bg(t.accent)
-                    .text_color(t.background)
-                    .font_semibold()
-                    .rounded(2)
-                    .px(2)
-                    .child(seg.text)
-                : div()
-                    .flex_none()
-                    .whitespace_nowrap()
-                    .text_size(11.5)
-                    .font_family(fontFamily)
-                    .text_color(t.foreground)
-                    .child(seg.text)
-            )
-          );
-      });
-    }
-
-    if (cached.mode === "plain") {
-      return cached.rows.map((rowToks) =>
-        applyWrapBox(div())
-          .whitespace_nowrap()
-          .text_size(11.5)
-          .font_family(fontFamily)
-          .text_color(isTarget ? t.foreground : t.muted)
-          .child(rowToks[0]?.[1] || "\u00a0")
-      );
-    }
-
-    return cached.rows.map((rowToks) => {
+    return cached.rows.map((rowToks, wrapIdx) => {
       if (!rowToks.length) {
         return applyWrapBox(div()).text_size(11.5).font_family(fontFamily).text_color(t.muted).child("\u00a0");
       }
-      return applyWrapBox(h_flex())
-        .items_center()
-        .children(
-          rowToks.map(([tokKind, tokText]) => {
-            const st = syntaxTokenStyle(tokKind, t, isTarget);
-            let el = div()
-              .flex_none()
-              .whitespace_nowrap()
-              .text_size(11.5)
-              .font_family(fontFamily)
-              .text_color(st.color);
-            if (st.bold) el = el.font_semibold();
-            return el.child(tokText);
-          })
-        );
+      return renderInteractiveTokenSegments({
+        t,
+        segments: rowToks,
+        query: isTarget ? query : "",
+        isTargetLine: isTarget,
+        baseTarget: isTarget,
+        monoFont: fontFamily,
+        ctrlHeld: Boolean(navOpts?.ctrlHeld),
+        hoveredTokenKey: navOpts?.hoveredTokenKey || null,
+        idPrefix: navOpts?.idPrefix || "prev",
+        lineNum: navOpts?.lineNum || 1,
+        wrapIdx,
+        fillWidth,
+        onTokenHover: navOpts?.onTokenHover || null,
+        onTokenClick: navOpts?.onTokenClick || null,
+      });
     });
   }
 
@@ -4150,14 +4402,29 @@ export default class FilesSearch extends View {
       const endIdx = Math.min(this.previewLines.length, startIdx + VISIBLE_ROWS);
       let renderedVisualRows = 0;
 
-      let mdState = null;
-      if (isMarkdownExt(ext)) {
-        mdState = createMarkdownState();
+      let mdState = createCodeSyntaxState(ext);
+      if (mdState) {
         const baseLine = Math.max(0, (this.previewStartLine || 1) - 1);
-        mdState.lineIndex = baseLine;
-        if (baseLine > 0) mdState.frontmatterClosed = true;
-        for (let i = 0; i < startIdx; i++) {
-          advanceMarkdownState(this.previewLines[i] ?? "", mdState);
+        const linesArr = this.previewLines;
+        let cache = this._previewMdCheckpoints;
+        if (!cache || cache.linesRef !== linesArr || cache.baseLine !== baseLine || cache.ext !== ext) {
+          mdState.lineIndex = baseLine;
+          if (baseLine > 0 && isMarkdownExt(ext)) mdState.frontmatterClosed = true;
+          cache = {
+            linesRef: linesArr,
+            baseLine,
+            ext,
+            checkpoints: [cloneSyntaxState(mdState)],
+          };
+          this._previewMdCheckpoints = cache;
+        }
+        const cpIdx = Math.min(Math.floor(startIdx / 32), cache.checkpoints.length - 1);
+        mdState = cloneSyntaxState(cache.checkpoints[cpIdx]);
+        for (let i = cpIdx * 32; i < startIdx; i++) {
+          advanceSyntaxState(linesArr[i] ?? "", mdState, ext);
+          if ((i + 1) % 32 === 0 && Math.floor((i + 1) / 32) === cache.checkpoints.length) {
+            cache.checkpoints.push(cloneSyntaxState(mdState));
+          }
         }
       }
 
@@ -4175,10 +4442,18 @@ export default class FilesSearch extends View {
           previewCols,
           monoFont,
           true,
-          mdState
+          mdState,
+          {
+            lineNum,
+            idPrefix: "prev-cv",
+            ctrlHeld: Boolean(this.previewCtrlHeld),
+            hoveredTokenKey: this.previewHoveredTokenKey,
+            onTokenHover: (nextKey, tokenKey, hoverCx) => this.handlePreviewTokenHover(nextKey, tokenKey, hoverCx),
+            onTokenClick: (tokenInfo, _clickEv, clickCx) => this.handlePreviewTokenClick(item, tokenInfo, clickCx),
+          }
         );
         if (mdState) {
-          advanceMarkdownState(lineContent, mdState);
+          advanceSyntaxState(lineContent, mdState, ext);
         }
 
         for (let s = 0; s < wrappedSegments.length && renderedVisualRows < VISIBLE_ROWS; s++) {
@@ -4319,6 +4594,7 @@ export default class FilesSearch extends View {
       // Preview Body
       .child(
         v_flex()
+          .relative()
           .flex_1()
           .min_h(0)
           .overflow_hidden()
@@ -4336,14 +4612,13 @@ export default class FilesSearch extends View {
                 const dy = Math.abs(e.delta?.y || 0);
                 if (dy > 0 && dy >= dx && !e.modifiers?.shift) {
                   const delta = e.delta.y > 0 ? -3 : 3;
-                  this.previewScroll = Math.max(0, this.previewScroll + delta);
+                  const max = Math.max(0, this.previewLines.length - VISIBLE_ROWS);
+                  this.previewScroll = Math.max(0, Math.min(this.previewScroll + delta, max));
                   if (this.previewHasMore && !this.previewLoadingMore) {
                     if (this.previewScroll + VISIBLE_ROWS >= this.previewLines.length - 15) {
                       this.loadNextPreviewChunk(cx);
                     }
                   }
-                  const max = Math.max(0, this.previewLines.length - VISIBLE_ROWS);
-                  this.previewScroll = Math.min(this.previewScroll, max);
                   cx.notify();
                 }
               })
@@ -4361,18 +4636,53 @@ export default class FilesSearch extends View {
           .when(!showRenderedMd && !this.previewLoading && !this.previewError && this.previewLines.length === 0, el =>
             el.child(div().p(20).text_center().text_size(12).text_color(t.dim).child("Empty file"))
           )
+          .when(Boolean(this.previewNavNotice), el =>
+            el.child(
+              div()
+                .absolute()
+                .bottom(10)
+                .left(14)
+                .right(14)
+                .child(
+                  renderNavToastBanner({
+                    id: "preview-nav-toast",
+                    t,
+                    notice: this.previewNavNotice,
+                    onDismiss: dismissCx => {
+                      this.previewNavNotice = null;
+                      dismissCx.notify();
+                    },
+                  })
+                )
+            )
+          )
       );
   }
 
   renderOverlay(cx) {
+    if (!this.isOverlay || this._overlayClosed || !this.input) {
+      return div();
+    }
     const t = theme();
     const results = this.searchResults();
     this.at = Math.min(this.at, Math.max(0, results.length - 1));
     const currentItem = results[this.at];
     if (this.showPreview && currentItem) {
       const itemKey = `${currentItem.kind || "file"}:${currentItem.path}:${currentItem.line || 0}`;
-      if (this._currentPreviewKey !== itemKey) {
-        this.schedulePreview(currentItem, cx, false);
+      if (this._currentPreviewKey !== itemKey && this._pendingPreviewScheduleKey !== itemKey && cx?.timer) {
+        this._pendingPreviewScheduleKey = itemKey;
+        try { this._pendingPreviewScheduleTask?.cancel(); } catch {}
+        this._pendingPreviewScheduleTask = cx.timer.after(0, nextCx => {
+          this._pendingPreviewScheduleTask = null;
+          if (this._overlayClosed) return;
+          this._pendingPreviewScheduleKey = null;
+          const nextResults = this.searchResults();
+          const nextItem = nextResults[this.at];
+          if (this.showPreview && nextItem) {
+            this.schedulePreview(nextItem, nextCx, false);
+            nextCx.notify();
+          }
+        });
       }
     }
 
@@ -4564,8 +4874,50 @@ export default class FilesSearch extends View {
           .bg(t.popover)
           .shadow_lg()
           .on_mouse_up("left", (_e, cx) => this.handleResizeEnd(cx))
+          .on_mouse_move((e, moveCx) => {
+            const nextCtrl = isNavModifierActive(e?.modifiers);
+            if (nextCtrl !== this.previewCtrlHeld) {
+              this.previewCtrlHeld = nextCtrl;
+              moveCx.notify();
+            }
+          })
+          .on_modifiers_changed((e, cx) => {
+            const nextCtrl = isNavModifierActive(e?.modifiers);
+            if (nextCtrl !== this.previewCtrlHeld) {
+              this.previewCtrlHeld = nextCtrl;
+              cx.notify();
+            }
+          })
           .on_key_down((e, cx) => {
         const k = e.key;
+        if (this.previewDisambig) {
+          const cands = this.previewDisambig.candidates || [];
+          const count = cands.length;
+          if (k === "escape") {
+            this.previewDisambig = null;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+          }
+          if (k === "down" && count > 0) {
+            this.previewDisambig.selectedIndex = ((this.previewDisambig.selectedIndex || 0) + 1) % count;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+          }
+          if (k === "up" && count > 0) {
+            this.previewDisambig.selectedIndex = ((this.previewDisambig.selectedIndex || 0) - 1 + count) % count;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+          }
+          if (k === "enter" && count > 0) {
+            const picked = cands[this.previewDisambig.selectedIndex || 0] || cands[0];
+            this.openPreviewDisambigCandidate(picked, this.previewDisambig.origin, cx);
+            cx.stop_propagation();
+            return;
+          }
+        }
         if (k === "escape") return this.closeOverlay();
         if (k === "tab") {
           this.cycleTab(e.shift ? -1 : 1, cx);
@@ -4889,6 +5241,33 @@ export default class FilesSearch extends View {
               .child(svg("mods/files-search/grip.svg").size(10))
           )
       )
+      .when(Boolean(this.previewDisambig), el =>
+        el.child(
+          renderNavDisambiguationPopover({
+            overlayId: "preview-nav-disambig-overlay",
+            menuId: "preview-nav-disambig-menu",
+            t,
+            monoFont: settings()?.font_family || "monospace",
+            disambig: this.previewDisambig,
+            currentRoot: this.previewDisambig?.root || this.searchRoot || "",
+            currentServiceName: this.previewDisambig?.serviceName || "",
+            scrollHandle: this.previewNavDropdownScroll,
+            top: 56,
+            right: 24,
+            minWidth: 320,
+            maxWidth: 480,
+            maxHeight: Math.max(200, listH - 40),
+            panelWidth: winW,
+            marginX: 28,
+            onSelectCandidate: (cand, pickCx) =>
+              this.openPreviewDisambigCandidate(cand, this.previewDisambig?.origin, pickCx),
+            onClose: closeCx => {
+              this.previewDisambig = null;
+              closeCx.notify();
+            },
+          })
+        )
+      )
       // When actively resizing, cover the entire card so moving fast over preview/input/rows
       // never loses the nwse-resize cursor, never triggers child hover states, and never breaks dragging
       .when(Boolean(this.resizing), el =>
@@ -4925,6 +5304,8 @@ export default class FilesSearch extends View {
     this.viewerDisplayPath = normPathStr(p.displayPath || "") || this.viewerPath || this.viewerTargetPath;
     this.viewerOn = p.on ?? null;
     this.viewerLine = p.line ? Number(p.line) : null;
+    this.viewerColumn = p.column ? Number(p.column) : null;
+    this.viewerHighlightSymbol = typeof p.highlightSymbol === "string" && p.highlightSymbol ? p.highlightSymbol : null;
     this.viewerServiceId = p.serviceId || null;
     this.viewerServiceName = p.serviceName || null;
     this.viewerTabTitle = typeof p.tabTitle === "string" && p.tabTitle
@@ -4933,6 +5314,43 @@ export default class FilesSearch extends View {
 
     this.viewerCode = null;
     this.viewerSyntaxSig = null;
+    this.viewerSelectTextMode = false;
+    this.viewerCtrlHeld = false;
+    this.viewerHoveredTokenKey = null;
+    this.viewerViewportWidth = 0;
+    this.viewerViewportHeight = 0;
+    this.viewerApproxLineCount = 0;
+    this.viewerGutterWidth = null;
+    this.viewerMaxCols = null;
+    this.viewerDoc = null;
+    this.viewerDocKey = null;
+    this._viewerTokenizedDoc = null;
+    this._pendingViewerSize = null;
+    this.viewerNavHistory = createNavHistoryState(50);
+    if (p.navOrigin && p.navOrigin.path && this.viewerTargetPath) {
+      this.viewerNavHistory = pushNavHistory(this.viewerNavHistory, p.navOrigin, {
+        root: this.viewerRoot,
+        path: this.viewerTargetPath,
+        on: this.viewerOn ?? null,
+        serviceId: this.viewerServiceId || null,
+        serviceName: this.viewerServiceName || null,
+        line: this.viewerLine || 1,
+        column: this.viewerColumn || 1,
+        symbol: this.viewerHighlightSymbol || "",
+      });
+    }
+    this.viewerNavDisambig = null;
+    this.viewerNavNotice = null;
+    this.viewerCopiedFile = false;
+    this.viewerCopiedLineNum = null;
+    this.viewerResizeTask = null;
+    this.viewerCopyTask = null;
+    this.viewerNoticeTask = null;
+    this.viewerFocusHandle = cx.focus_handle();
+    this.viewerNavDropdownScroll = ScrollHandle.new();
+    this.viewerScrollTop = 0;
+    this.viewerPendingScrollLine = this.viewerLine || null;
+
     this.viewerRawText = null;
     this.viewerMarkdownRendered = false;
     this.viewerMarkdownCache = createMarkdownRenderCache(12);
@@ -4949,10 +5367,20 @@ export default class FilesSearch extends View {
     this.viewerWasActive = false;
     this.viewerHasLoadedOnce = false;
     this.viewerLastSyncedUpdatedAt = 0;
+    this.viewerLastSyncedNavSeq = 0;
+    this.viewerLastWarmedSig = null;
 
     this.scheduleViewerSync(cx, 0);
     if (this.viewerTargetPath) {
-      this.loadViewerFile(cx);
+      const prefetched = peekCachedSourceText(this.viewerTargetPath, this.viewerOn ?? null);
+      if (typeof prefetched === "string" && !prefetched.includes("\0")) {
+        this.viewerLoading = false;
+        this.viewerHasLoadedOnce = true;
+        this.applyViewerText(this.viewerTargetPath, prefetched, ++this.viewerLoadSeq, { cx });
+        this.loadViewerFile(cx, { silent: true });
+      } else {
+        this.loadViewerFile(cx);
+      }
     }
   }
 
@@ -5057,15 +5485,63 @@ export default class FilesSearch extends View {
 
     const existingEntry = nextTabs[this.viewerTabId];
     if (existingEntry && existingEntry.viewerId === this.viewerId) {
-      if (existingEntry.updatedAt && existingEntry.updatedAt > this.viewerLastSyncedUpdatedAt) {
-        this.viewerLastSyncedUpdatedAt = existingEntry.updatedAt;
+      const entryNavSeq = Number(existingEntry.navSeq) || 0;
+      const hasNewNavUpdate = entryNavSeq > (this.viewerLastSyncedNavSeq || 0)
+        || (existingEntry.updatedAt && existingEntry.updatedAt > this.viewerLastSyncedUpdatedAt);
+      if (hasNewNavUpdate) {
+        if (existingEntry.updatedAt && existingEntry.updatedAt > this.viewerLastSyncedUpdatedAt) {
+          this.viewerLastSyncedUpdatedAt = existingEntry.updatedAt;
+        }
+        if (entryNavSeq > (this.viewerLastSyncedNavSeq || 0)) {
+          this.viewerLastSyncedNavSeq = entryNavSeq;
+        }
         const nextLine = existingEntry.line ? Number(existingEntry.line) : null;
+        const nextCol = existingEntry.column ? Number(existingEntry.column) : null;
+        const nextSym = typeof existingEntry.highlightSymbol === "string" && existingEntry.highlightSymbol
+          ? existingEntry.highlightSymbol
+          : null;
+        if (existingEntry.navOrigin && existingEntry.navOrigin.path && this.viewerTargetPath) {
+          this.viewerNavHistory = pushNavHistory(this.viewerNavHistory, existingEntry.navOrigin, {
+            root: this.viewerRoot,
+            path: this.viewerTargetPath,
+            on: this.viewerOn ?? null,
+            serviceId: this.viewerServiceId || null,
+            serviceName: this.viewerServiceName || null,
+            line: nextLine || 1,
+            column: nextCol || 1,
+            symbol: nextSym || "",
+          });
+        }
         if (nextLine !== (this.viewerLine || null)) {
           this.viewerLine = nextLine;
           dirty = true;
         }
-      } else if (!this.viewerLastSyncedUpdatedAt) {
-        this.viewerLastSyncedUpdatedAt = existingEntry.updatedAt || Date.now();
+        if (nextCol !== (this.viewerColumn || null)) {
+          this.viewerColumn = nextCol;
+          dirty = true;
+        }
+        if (nextSym !== (this.viewerHighlightSymbol || null)) {
+          this.viewerHighlightSymbol = nextSym;
+          dirty = true;
+        }
+        if (nextLine) {
+          if (this.viewerSelectTextMode) {
+            this.viewerSelectTextMode = false;
+            try { this.viewerCode?.release(); } catch {}
+            this.viewerCode = null;
+            this.viewerSyntaxSig = null;
+          }
+          this.viewerPendingScrollLine = nextLine;
+          this.scrollViewerToLine(nextLine);
+          dirty = true;
+        }
+      } else {
+        if (!this.viewerLastSyncedUpdatedAt) {
+          this.viewerLastSyncedUpdatedAt = existingEntry.updatedAt || Date.now();
+        }
+        if (entryNavSeq > (this.viewerLastSyncedNavSeq || 0)) {
+          this.viewerLastSyncedNavSeq = entryNavSeq;
+        }
       }
     }
 
@@ -5087,6 +5563,9 @@ export default class FilesSearch extends View {
       iconPath,
       iconColor,
       line: this.viewerLine || null,
+      column: this.viewerColumn || null,
+      highlightSymbol: this.viewerHighlightSymbol || null,
+      navSeq: this.viewerLastSyncedNavSeq || existingEntry?.navSeq || 0,
       serviceId: this.viewerServiceId || null,
       serviceName: this.viewerServiceName || null,
       updatedAt,
@@ -5100,8 +5579,12 @@ export default class FilesSearch extends View {
       existingEntry.iconPath !== desiredEntry.iconPath ||
       existingEntry.iconColor !== desiredEntry.iconColor ||
       (existingEntry.line || null) !== desiredEntry.line ||
+      (existingEntry.column || null) !== desiredEntry.column ||
+      (existingEntry.highlightSymbol || null) !== desiredEntry.highlightSymbol ||
+      (existingEntry.navSeq || 0) !== (desiredEntry.navSeq || 0) ||
       (existingEntry.serviceId || null) !== desiredEntry.serviceId ||
-      (existingEntry.serviceName || null) !== desiredEntry.serviceName;
+      (existingEntry.serviceName || null) !== desiredEntry.serviceName ||
+      Boolean(existingEntry.navOrigin);
 
     if (needsRegister) {
       nextTabs[this.viewerTabId] = desiredEntry;
@@ -5114,7 +5597,7 @@ export default class FilesSearch extends View {
     const syntaxCfg = getEditorSyntaxConfig(t);
     const fontFamily = settings()?.font_family || "";
     const nextSyntaxSig = `${JSON.stringify(syntaxCfg)}|${fontFamily}`;
-    if (this.viewerCode && this.viewerSyntaxSig && this.viewerSyntaxSig !== nextSyntaxSig && !this.viewerLoading && this.viewerTargetPath) {
+    if (this.viewerSelectTextMode && this.viewerCode && this.viewerSyntaxSig && this.viewerSyntaxSig !== nextSyntaxSig && !this.viewerLoading && this.viewerTargetPath) {
       const currentValue = this.viewerCode.value();
       this.viewerCode.release();
       this.viewerCode = EditorState.new({
@@ -5136,9 +5619,19 @@ export default class FilesSearch extends View {
     if (!this.viewerSeenActiveState) {
       this.viewerSeenActiveState = true;
       this.viewerWasActive = isActiveNow;
+      if (isActiveNow && !this.viewerSelectTextMode && this.viewerFocusHandle) {
+        try { cx.focus(this.viewerFocusHandle); } catch {}
+      }
     } else if (isActiveNow !== this.viewerWasActive) {
       this.viewerWasActive = isActiveNow;
       dirty = true;
+      if (!isActiveNow) {
+        this.viewerCtrlHeld = false;
+        this.viewerHoveredTokenKey = null;
+      }
+      if (isActiveNow && !this.viewerSelectTextMode && this.viewerFocusHandle) {
+        try { cx.focus(this.viewerFocusHandle); } catch {}
+      }
       if (isActiveNow && this.viewerHasLoadedOnce && this.viewerTargetPath) {
         this.loadViewerFile(cx, { silent: true });
       }
@@ -5147,35 +5640,160 @@ export default class FilesSearch extends View {
     if (dirty) cx.notify();
   }
 
-  applyViewerText(targetPath, text, reqSeq, { forceRecreate = false } = {}) {
-    const isWin = !this.viewerOn && window()?.platform === "windows";
-    this.viewerMarkdownRendered = resolveViewerMarkdownToggleOnLoad(
-      this.viewerLoadedTargetPath,
-      targetPath,
-      this.viewerMarkdownRendered,
-      isWin
+  getOrBuildViewerDoc() {
+    if (this.viewerError || typeof this.viewerRawText !== "string") return null;
+    const targetPath = this.viewerTargetPath || "";
+    const vpWidth = this.viewerViewportWidth || 760;
+    const totalLinesApprox = this.viewerApproxLineCount || 1;
+    let maxCols = this.viewerMaxCols;
+    if (
+      !maxCols ||
+      this._viewerColsWidth !== vpWidth ||
+      this._viewerColsLines !== totalLinesApprox
+    ) {
+      const gutterW = computeCodeGutterWidth(totalLinesApprox);
+      maxCols = computeWrapColumns({
+        viewportWidth: vpWidth,
+        gutterWidth: gutterW,
+        rightPadding: 28,
+        fontSize: 11.5,
+        minCols: 28,
+        fallbackCols: 88,
+      });
+      this.viewerGutterWidth = gutterW;
+      this.viewerMaxCols = maxCols;
+      this._viewerColsWidth = vpWidth;
+      this._viewerColsLines = totalLinesApprox;
+    }
+    const docKey = `${this.viewerContentSeq}::${targetPath}::${maxCols}`;
+    if (this.viewerDocKey !== docKey || !this.viewerDoc) {
+      const tokCache =
+        this._viewerTokenizedDoc &&
+        this._viewerTokenizedDoc.contentSeq === this.viewerContentSeq &&
+        this._viewerTokenizedDoc.path === targetPath
+          ? this._viewerTokenizedDoc
+          : null;
+      const doc = buildWrappedViewerDocument(
+        this.viewerRawText,
+        targetPath,
+        maxCols,
+        tokCache
+          ? { tokenizedLines: tokCache.tokenizedLines, truncated: tokCache.truncated }
+          : undefined
+      );
+      if (doc && Array.isArray(doc.tokenizedLines)) {
+        this._viewerTokenizedDoc = {
+          contentSeq: this.viewerContentSeq,
+          path: targetPath,
+          tokenizedLines: doc.tokenizedLines,
+          truncated: Boolean(doc.truncated),
+        };
+      }
+      this.viewerDoc = doc;
+      this.viewerDocKey = docKey;
+    }
+    return this.viewerDoc;
+  }
+
+  scrollViewerToLine(line, doc = null) {
+    if (this._viewerClosed || !line) return;
+    const targetDoc = doc || this.getOrBuildViewerDoc();
+    if (!targetDoc || !Array.isArray(targetDoc.rows) || targetDoc.rows.length === 0) return;
+    const targetLineNum = Math.max(1, Math.min(targetDoc.totalLines || 1, Math.floor(Number(line) || 1)));
+    const hasViewportSize = (this.viewerViewportWidth || 0) > 0 && (this.viewerViewportHeight || 0) > 0;
+    const vpH = Math.max(120, Number(this.viewerViewportHeight) || 560);
+    this.viewerScrollTop = computeTargetCenterScrollRow(targetDoc, targetLineNum, vpH - 8, CODE_VIEWER_LINE_HEIGHT);
+    if (hasViewportSize) {
+      this.viewerPendingScrollLine = null;
+    }
+  }
+
+  scrollViewerBy(deltaRows, cx = null) {
+    if (this._viewerClosed || this.viewerSelectTextMode) return;
+    const doc = this.getOrBuildViewerDoc();
+    if (!doc || !Array.isArray(doc.rows) || doc.rows.length === 0) {
+      if (this.viewerScrollTop !== 0) {
+        this.viewerScrollTop = 0;
+        cx?.notify?.();
+      }
+      return;
+    }
+    this.viewerPendingScrollLine = null;
+    const vpH = Math.max(120, Number(this.viewerViewportHeight) || 560);
+    const slice = computeWindowedViewerSlice(
+      doc.rows.length,
+      (this.viewerScrollTop || 0) + Math.trunc(Number(deltaRows) || 0),
+      vpH - 8,
+      CODE_VIEWER_LINE_HEIGHT,
     );
-    this.viewerLoadedTargetPath = targetPath;
-    this.viewerContentSeq = reqSeq;
+    if (slice.scrollTop !== this.viewerScrollTop) {
+      this.viewerScrollTop = slice.scrollTop;
+      cx?.notify?.();
+    }
+  }
 
-    if (text === null) {
-      this.viewerCode?.release();
-      this.viewerCode = null;
-      this.viewerRawText = null;
-      this.viewerError = "This file is no longer available";
+  scrollViewerToBoundary(end = false, cx = null) {
+    if (this._viewerClosed || this.viewerSelectTextMode) return;
+    this.viewerPendingScrollLine = null;
+    if (!end) {
+      if (this.viewerScrollTop !== 0) {
+        this.viewerScrollTop = 0;
+        cx?.notify?.();
+      }
       return;
     }
-    if (text.includes("\0")) {
-      this.viewerCode?.release();
-      this.viewerCode = null;
-      this.viewerRawText = null;
-      this.viewerError = "Binary file · no text preview";
+    const doc = this.getOrBuildViewerDoc();
+    const vpH = Math.max(120, Number(this.viewerViewportHeight) || 560);
+    const slice = computeWindowedViewerSlice(doc?.rows?.length || 0, 0, vpH - 8, CODE_VIEWER_LINE_HEIGHT);
+    if (this.viewerScrollTop !== slice.maxScrollTop) {
+      this.viewerScrollTop = slice.maxScrollTop;
+      cx?.notify?.();
+    }
+  }
+
+  scheduleViewerResizeReflow(width, height, cx) {
+    const w = Math.floor(Number(width) || 0);
+    const h = Math.floor(Number(height) || 0);
+    if (w <= 0) return;
+    if (Math.abs(w - (this.viewerViewportWidth || 0)) <= 4 && Math.abs(h - (this.viewerViewportHeight || 0)) <= 4) {
       return;
     }
+    this._pendingViewerSize = { w, h };
+    if (this.viewerResizeTask || !cx?.timer) return;
+    this.viewerResizeTask = cx.timer.after(16, timerCx => {
+      this.viewerResizeTask = null;
+      if (this._viewerClosed) return;
+      const next = this._pendingViewerSize;
+      this._pendingViewerSize = null;
+      if (!next) return;
+      const widthChanged = Math.abs(next.w - (this.viewerViewportWidth || 0)) > 4;
+      this.viewerViewportWidth = next.w;
+      this.viewerViewportHeight = next.h;
+      if (widthChanged) {
+        this.viewerDoc = null;
+        this.viewerDocKey = null;
+      }
+      const doc = this.getOrBuildViewerDoc();
+      if (doc && Array.isArray(doc.rows) && doc.rows.length > 0) {
+        if (this.viewerPendingScrollLine) {
+          this.scrollViewerToLine(this.viewerPendingScrollLine, doc);
+        } else {
+          const vpH = Math.max(120, next.h || 560);
+          this.viewerScrollTop = computeWindowedViewerSlice(
+            doc.rows.length,
+            this.viewerScrollTop || 0,
+            vpH - 8,
+            CODE_VIEWER_LINE_HEIGHT,
+          ).scrollTop;
+        }
+      } else {
+        this.viewerScrollTop = 0;
+      }
+      timerCx.notify();
+    });
+  }
 
-    this.viewerError = null;
-    this.viewerRawText = selectViewerMarkdownRawText(targetPath, text, false);
-
+  ensureViewerEditorState(targetPath, text, { forceRecreate = false } = {}) {
     const value = text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text;
     const t = theme();
     const syntaxCfg = getEditorSyntaxConfig(t);
@@ -5203,21 +5821,480 @@ export default class FilesSearch extends View {
     }
   }
 
-  switchViewerTarget(resolvedPath, prefetchedText, cx) {
-    if (this._viewerClosed || !resolvedPath) return;
-    const isWin = !this.viewerOn && window()?.platform === "windows";
-    let relPath = resolvedPath;
-    if (this.viewerRoot && isSameOrChildPath(resolvedPath, this.viewerRoot, isWin)) {
-      if (this.viewerRoot === "/") {
-        relPath = resolvedPath.slice(1) || resolvedPath;
-      } else if (resolvedPath.length > this.viewerRoot.length) {
-        relPath = resolvedPath.slice(this.viewerRoot.length + 1);
+  toggleViewerSelectText(cx) {
+    if (this._viewerClosed) return;
+    this.viewerSelectTextMode = !this.viewerSelectTextMode;
+    if (this.viewerSelectTextMode) {
+      if (typeof this.viewerRawText === "string" && !this.viewerError && this.viewerTargetPath) {
+        this.ensureViewerEditorState(this.viewerTargetPath, this.viewerRawText, { forceRecreate: true });
+      }
+    } else {
+      try { this.viewerCode?.release(); } catch {}
+      this.viewerCode = null;
+      this.viewerSyntaxSig = null;
+      if (this.viewerFocusHandle) {
+        try { cx.focus(this.viewerFocusHandle); } catch {}
+      }
+      if (this.viewerLine) {
+        this.viewerPendingScrollLine = this.viewerLine;
+        this.scrollViewerToLine(this.viewerLine);
       }
     }
-    const displayPath = (this.viewerRoot && isSameOrChildPath(resolvedPath, this.viewerRoot, isWin) && relPath)
+    cx.notify();
+  }
+
+  copyViewerText(text, lineNum, cx) {
+    if (this._viewerClosed || typeof text !== "string") return;
+    try { cx.write_to_clipboard(text); } catch {}
+    try { this.viewerCopyTask?.cancel(); } catch {}
+    this.viewerCopyTask = null;
+    if (lineNum != null) {
+      this.viewerCopiedLineNum = lineNum;
+      this.viewerCopiedFile = false;
+    } else {
+      this.viewerCopiedFile = true;
+      this.viewerCopiedLineNum = null;
+    }
+    if (cx?.timer) {
+      this.viewerCopyTask = cx.timer.after(1500, timerCx => {
+        this.viewerCopyTask = null;
+        if (this._viewerClosed) return;
+        this.viewerCopiedFile = false;
+        this.viewerCopiedLineNum = null;
+        timerCx.notify();
+      });
+    }
+    cx.notify();
+  }
+
+  setViewerNavNotice(notice, cx) {
+    try { this.viewerNoticeTask?.cancel(); } catch {}
+    this.viewerNoticeTask = null;
+    this.viewerNavNotice = notice || null;
+    if (notice && cx?.timer) {
+      this.viewerNoticeTask = cx.timer.after(3200, timerCx => {
+        this.viewerNoticeTask = null;
+        if (this._viewerClosed) return;
+        this.viewerNavNotice = null;
+        timerCx.notify();
+      });
+    }
+    cx?.notify?.();
+  }
+
+  handleViewerTokenHover(nextKey, _tokenKey, cx) {
+    if (this._viewerClosed) return;
+    const prev = this.viewerHoveredTokenKey || null;
+    if (nextKey) {
+      if (prev === nextKey) return;
+      this.viewerHoveredTokenKey = nextKey;
+    } else {
+      if (!prev || (_tokenKey && prev !== _tokenKey)) return;
+      this.viewerHoveredTokenKey = null;
+    }
+    if (this.viewerCtrlHeld) {
+      cx.notify();
+    }
+  }
+
+  navigateViewerToLocation(loc, { recordOrigin = null, cx } = {}) {
+    if (this._viewerClosed || !loc) return;
+    const targetPath = loc.filePath || loc.path;
+    if (!targetPath) return;
+
+    this.viewerNavDisambig = null;
+    this.viewerNavNotice = null;
+
+    const targetOn = loc.on ?? this.viewerOn ?? null;
+    const isWin = !targetOn && window()?.platform === "windows";
+    const resolvedTarget = resolveViewerFilePath(loc.root || loc.serviceRoot || this.viewerRoot, targetPath) || targetPath;
+    const targetLine = Math.max(1, Number(loc.line) || 1);
+    const targetCol = Math.max(1, Number(loc.column) || 1);
+    const targetSym = loc.symbol || loc.name || loc.highlightSymbol || null;
+
+    const services = collectRegisteredServices();
+    const matchedSvc = services.find(s => (loc.serviceId && s.id === loc.serviceId) || (s.root && isSameOrChildPath(resolvedTarget, s.root, isWin))) || null;
+    const targetRoot = normPathStr(loc.root || loc.serviceRoot || matchedSvc?.root || this.viewerRoot || "");
+
+    const targetNavEntry = {
+      root: targetRoot,
+      path: resolvedTarget,
+      on: targetOn,
+      serviceId: loc.serviceId ?? matchedSvc?.id ?? null,
+      serviceName: loc.serviceName ?? matchedSvc?.name ?? null,
+      line: targetLine,
+      column: targetCol,
+      symbol: targetSym || "",
+    };
+
+    if (recordOrigin && recordOrigin.path) {
+      this.viewerNavHistory = pushNavHistory(this.viewerNavHistory, recordOrigin, targetNavEntry);
+    }
+
+    const sameFile = resolvedTarget === this.viewerTargetPath && (targetOn ?? null) === (this.viewerOn ?? null);
+    if (sameFile && typeof this.viewerRawText === "string" && !this.viewerError) {
+      this.viewerLine = targetLine;
+      this.viewerColumn = targetCol;
+      this.viewerHighlightSymbol = targetSym;
+      this.viewerPendingScrollLine = targetLine;
+      this.scrollViewerToLine(targetLine);
+      this.scheduleViewerSync(cx, 0);
+      cx.notify();
+      return;
+    }
+
+    this.viewerRoot = targetRoot || this.viewerRoot;
+    this.viewerOn = targetOn;
+    this.viewerLine = targetLine;
+    this.viewerColumn = targetCol;
+    this.viewerHighlightSymbol = targetSym;
+    this.viewerPendingScrollLine = targetLine;
+
+    if (typeof loc.prefetchedText === "string") {
+      this.switchViewerTarget(resolvedTarget, loc.prefetchedText, cx, {
+        targetRoot,
+        on: targetOn,
+        line: targetLine,
+        column: targetCol,
+        highlightSymbol: targetSym,
+        serviceId: targetNavEntry.serviceId,
+        serviceName: targetNavEntry.serviceName,
+      });
+      return;
+    }
+
+    const navSeq = ++this.viewerNavSeq;
+    const spawnCx = typeof cx?.spawn === "function" ? cx : null;
+    if (!spawnCx) return;
+    this.viewerLoading = true;
+    this.viewerError = null;
+    cx.notify();
+
+    spawnCx.spawn(async innerCx => {
+      try {
+        const text = await readTextFile(resolvedTarget, { on: targetOn }).catch(() => null);
+        if (this._viewerClosed || navSeq !== this.viewerNavSeq) return;
+        if (typeof text !== "string" || text.includes("\0")) {
+          this.viewerLoading = false;
+          this.setViewerNavNotice(buildViewerNavigationNotice({ status: "not-found" }, { symbol: targetSym || resolvedTarget }), innerCx);
+          return;
+        }
+        this.switchViewerTarget(resolvedTarget, text, innerCx, {
+          targetRoot,
+          on: targetOn,
+          line: targetLine,
+          column: targetCol,
+          highlightSymbol: targetSym,
+          serviceId: targetNavEntry.serviceId,
+          serviceName: targetNavEntry.serviceName,
+        });
+      } catch {
+        if (!this._viewerClosed && navSeq === this.viewerNavSeq) {
+          this.viewerLoading = false;
+          this.setViewerNavNotice(buildViewerNavigationNotice({ status: "not-found" }, { symbol: targetSym || resolvedTarget }), innerCx);
+        }
+      }
+    });
+  }
+
+  openNavTarget(loc, originEntry = null, cx = null) {
+    if (this._viewerClosed || !loc) return;
+    const targetPath = loc.filePath || loc.path;
+    if (!targetPath) return;
+
+    const targetOn = loc.on ?? this.viewerOn ?? null;
+    const isWin = !targetOn && window()?.platform === "windows";
+    const resolvedTarget = resolveViewerFilePath(loc.root || loc.serviceRoot || this.viewerRoot, targetPath) || targetPath;
+
+    if (!shouldOpenNavInNewTab(resolvedTarget, this.viewerTargetPath, targetOn, this.viewerOn ?? null, isWin)) {
+      this.navigateViewerToLocation(loc, { recordOrigin: originEntry, cx });
+      return;
+    }
+
+    this.viewerNavDisambig = null;
+    this.viewerNavNotice = null;
+    this.viewerCtrlHeld = false;
+    this.viewerHoveredTokenKey = null;
+    cx?.notify?.();
+
+    const targetLine = Math.max(1, Number(loc.line) || 1);
+    const targetCol = Math.max(1, Number(loc.column) || 1);
+    const targetSym = loc.symbol || loc.name || loc.highlightSymbol || null;
+    const services = collectRegisteredServices();
+    const matchedSvc = services.find(
+      s => (loc.serviceId && s.id === loc.serviceId) || (s.root && isSameOrChildPath(resolvedTarget, s.root, isWin))
+    ) || null;
+    const targetRoot = normPathStr(loc.root || loc.serviceRoot || matchedSvc?.root || this.viewerRoot || "");
+    const serviceId = loc.serviceId ?? matchedSvc?.id ?? null;
+    const serviceName = loc.serviceName ?? matchedSvc?.name ?? null;
+    const navOrigin = originEntry && originEntry.path
+      ? {
+          ...originEntry,
+          tabId: originEntry.tabId || this.viewerTabId || null,
+          spaceId: originEntry.spaceId || this.viewerSpaceId || null,
+        }
+      : null;
+
+    openFileInTab({
+      spaceId: this.viewerSpaceId || null,
+      root: targetRoot,
+      path: resolvedTarget,
+      on: targetOn,
+      line: targetLine,
+      column: targetCol,
+      highlightSymbol: targetSym,
+      navOrigin,
+      serviceId,
+      serviceName,
+      localServices: services,
+    });
+  }
+
+  scheduleViewerNavWarmup(targetPath, sourceText, cx = null) {
+    if (this._viewerClosed || this.viewerOn || !targetPath || typeof sourceText !== "string") return;
+    if (!getNavLanguageAnalyzer(targetPath)) return;
+    const sig = `${targetPath}:${sourceText.length}`;
+    if (this.viewerLastWarmedSig === sig) return;
+    this.viewerLastWarmedSig = sig;
+    const spawnCx = typeof cx?.spawn === "function" ? cx : null;
+    if (!spawnCx) return;
+    spawnCx.spawn(async () => {
+      try {
+        if (this._viewerClosed) return;
+        const services = collectRegisteredServices();
+        const root = normPathStr(this.viewerRoot || services[0]?.root || "");
+        const appHomeDir = getSafeAppHome();
+        const indexedFilesByRoot = collectIndexedFilesByRoot(services, root, null);
+        await warmFileImports({
+          filePath: targetPath,
+          sourceText,
+          currentRoot: root,
+          services,
+          on: null,
+          indexedFilesByRoot,
+          appHomeDir,
+        });
+        if (!this._viewerClosed && root && !isServiceIndexWarmed(root, null)) {
+          warmAllServiceSymbolIndices({
+            services,
+            currentRoot: root,
+            on: null,
+            indexedFilesByRoot,
+            appHomeDir,
+            skipIfFreshMs: 15000,
+          }).catch(() => {});
+        }
+      } catch {}
+    });
+  }
+
+  stepViewerHistory(dir, cx) {
+    if (this._viewerClosed) return;
+    const step = dir === "back"
+      ? stepNavBack(this.viewerNavHistory)
+      : stepNavForward(this.viewerNavHistory);
+    if (!step?.entry) return;
+    this.viewerNavHistory = step.state;
+    const targetOn = step.entry.on ?? this.viewerOn ?? null;
+    const isWin = !targetOn && window()?.platform === "windows";
+    const resolvedStepPath = resolveViewerFilePath(step.entry.root || this.viewerRoot, step.entry.path) || step.entry.path;
+    const stepRoot = normPathStr(step.entry.root || this.viewerRoot || "");
+    if (
+      shouldOpenNavInNewTab(resolvedStepPath, this.viewerTargetPath, targetOn, this.viewerOn ?? null, isWin) &&
+      hasMatchingOpenTabInSpace(this.viewerSpaceId || step.entry.spaceId || null, stepRoot, resolvedStepPath, isWin, this.viewerTabId)
+    ) {
+      openFileInTab({
+        spaceId: this.viewerSpaceId || step.entry.spaceId || null,
+        root: stepRoot,
+        path: resolvedStepPath,
+        on: targetOn,
+        line: Math.max(1, Number(step.entry.line) || 1),
+        column: Math.max(1, Number(step.entry.column) || 1),
+        highlightSymbol: step.entry.symbol || null,
+        navOrigin: null,
+        serviceId: step.entry.serviceId || null,
+        serviceName: step.entry.serviceName || null,
+      });
+      cx?.notify?.();
+      return;
+    }
+    this.navigateViewerToLocation(step.entry, { recordOrigin: null, cx });
+  }
+
+  handleViewerTokenClick(tokenInfo, cx) {
+    if (this._viewerClosed || !tokenInfo || !this.viewerTargetPath || typeof this.viewerRawText !== "string") return;
+    const navSeq = ++this.viewerNavSeq;
+    const originPath = this.viewerTargetPath;
+    const originRoot = this.viewerRoot;
+    const originOn = this.viewerOn ?? null;
+    const originEntry = {
+      root: originRoot,
+      path: originPath,
+      on: originOn,
+      serviceId: this.viewerServiceId || null,
+      serviceName: this.viewerServiceName || null,
+      line: tokenInfo.line,
+      column: tokenInfo.col,
+      symbol: tokenInfo.symbol,
+    };
+
+    cx.spawn(async innerCx => {
+      try {
+        const services = collectRegisteredServices();
+        const indexedFilesByRoot = collectIndexedFilesByRoot(services, originRoot, originOn);
+        const openFilesTextMap = new Map([[originPath, this.viewerRawText]]);
+        const result = await resolveCrossFileNavigation({
+          sourceText: this.viewerRawText,
+          filePath: originPath,
+          line: tokenInfo.line,
+          col: tokenInfo.col,
+          currentRoot: originRoot,
+          on: originOn,
+          services,
+          openFilesTextMap,
+          indexedFilesByRoot,
+          appHomeDir: getSafeAppHome(),
+        });
+        if (this._viewerClosed || navSeq !== this.viewerNavSeq || this.viewerTargetPath !== originPath) return;
+
+        if (result?.status === "ok" && result.best) {
+          const target = result.best;
+          const sameLine = target.filePath === originPath && Number(target.line) === Number(tokenInfo.line);
+          const sameCol = !target.column || Math.abs(Number(target.column) - Number(tokenInfo.col)) <= 1;
+          if (sameLine && sameCol) {
+            this.setViewerNavNotice(
+              buildViewerNavigationNotice({ status: "already-there" }, result.context || { symbol: tokenInfo.symbol }, result.context?.intent),
+              innerCx,
+            );
+            return;
+          }
+          this.openNavTarget(target, originEntry, innerCx);
+          return;
+        }
+        if (result?.status === "ambiguous" && Array.isArray(result.candidates) && result.candidates.length > 0) {
+          this.viewerNavNotice = null;
+          this.viewerNavDisambig = {
+            candidates: result.candidates,
+            selectedIndex: 0,
+            origin: originEntry,
+            root: originRoot,
+            serviceName: this.viewerServiceName || "",
+            mode: result.mode || null,
+          };
+          innerCx.notify();
+          return;
+        }
+        this.setViewerNavNotice(
+          buildViewerNavigationNotice(result, result?.context || { symbol: tokenInfo.symbol }, result?.context?.intent),
+          innerCx,
+        );
+      } catch {
+        if (!this._viewerClosed && navSeq === this.viewerNavSeq) {
+          this.setViewerNavNotice(buildViewerNavigationNotice({ status: "not-found" }, { symbol: tokenInfo.symbol }), innerCx);
+        }
+      }
+    });
+  }
+
+  applyViewerText(targetPath, text, reqSeq, { forceRecreate = false, cx = null } = {}) {
+    const isWin = !this.viewerOn && window()?.platform === "windows";
+    const targetChanged = Boolean(this.viewerLoadedTargetPath && this.viewerLoadedTargetPath !== targetPath);
+    if (
+      !forceRecreate &&
+      !targetChanged &&
+      typeof text === "string" &&
+      !text.includes("\0") &&
+      !this.viewerError &&
+      !this.viewerSelectTextMode &&
+      this.viewerDoc &&
+      selectViewerRawText(text, false) === this.viewerRawText
+    ) {
+      this.viewerLoadedTargetPath = targetPath;
+      this.viewerContentSeq = reqSeq;
+      if (this.viewerPendingScrollLine) {
+        this.scrollViewerToLine(this.viewerPendingScrollLine, this.viewerDoc);
+      }
+      this.scheduleViewerNavWarmup(targetPath, this.viewerRawText, cx);
+      return;
+    }
+    if (targetChanged) {
+      this.viewerScrollTop = 0;
+    }
+    this.viewerMarkdownRendered = resolveViewerMarkdownToggleOnLoad(
+      this.viewerLoadedTargetPath,
+      targetPath,
+      this.viewerMarkdownRendered,
+      isWin
+    );
+    this.viewerLoadedTargetPath = targetPath;
+    this.viewerContentSeq = reqSeq;
+    this.viewerDoc = null;
+    this.viewerDocKey = null;
+    this._viewerTokenizedDoc = null;
+
+    if (text === null) {
+      this.viewerCode?.release();
+      this.viewerCode = null;
+      this.viewerRawText = null;
+      this.viewerApproxLineCount = 0;
+      this.viewerScrollTop = 0;
+      this.viewerError = "This file is no longer available";
+      return;
+    }
+    if (text.includes("\0")) {
+      this.viewerCode?.release();
+      this.viewerCode = null;
+      this.viewerRawText = null;
+      this.viewerApproxLineCount = 0;
+      this.viewerScrollTop = 0;
+      this.viewerError = "Binary file · no text preview";
+      return;
+    }
+
+    this.viewerError = null;
+    this.viewerRawText = selectViewerRawText(text, false);
+    this.viewerApproxLineCount = countTextLinesFast(this.viewerRawText);
+
+    if (this.viewerSelectTextMode) {
+      this.ensureViewerEditorState(targetPath, this.viewerRawText, { forceRecreate });
+    } else {
+      this.viewerCode?.release();
+      this.viewerCode = null;
+      this.viewerSyntaxSig = null;
+      const doc = this.getOrBuildViewerDoc();
+      if (this.viewerPendingScrollLine) {
+        this.scrollViewerToLine(this.viewerPendingScrollLine, doc);
+      } else if (doc && Array.isArray(doc.rows)) {
+        const vpH = Math.max(120, Number(this.viewerViewportHeight) || 560);
+        this.viewerScrollTop = computeWindowedViewerSlice(
+          doc.rows.length,
+          targetChanged ? 0 : (this.viewerScrollTop || 0),
+          vpH - 8,
+          CODE_VIEWER_LINE_HEIGHT,
+        ).scrollTop;
+      }
+    }
+    this.scheduleViewerNavWarmup(targetPath, this.viewerRawText, cx);
+  }
+
+  switchViewerTarget(resolvedPath, prefetchedText, cx, navMeta = {}) {
+    if (this._viewerClosed || !resolvedPath) return;
+    const isWin = !(navMeta.on ?? this.viewerOn) && window()?.platform === "windows";
+    const effectiveRoot = normPathStr(navMeta.targetRoot || this.viewerRoot || "");
+    let relPath = resolvedPath;
+    if (effectiveRoot && isSameOrChildPath(resolvedPath, effectiveRoot, isWin)) {
+      if (effectiveRoot === "/") {
+        relPath = resolvedPath.slice(1) || resolvedPath;
+      } else if (resolvedPath.length > effectiveRoot.length) {
+        relPath = resolvedPath.slice(effectiveRoot.length + 1);
+      }
+    }
+    const displayPath = (effectiveRoot && isSameOrChildPath(resolvedPath, effectiveRoot, isWin) && relPath)
       ? relPath
       : resolvedPath;
-    const svc = resolveServiceForFile(this.viewerRoot, relPath, resolvedPath, isWin);
+    const svc = navMeta.serviceName
+      ? { serviceId: navMeta.serviceId || null, serviceName: navMeta.serviceName }
+      : resolveServiceForFile(effectiveRoot, relPath, resolvedPath, isWin);
 
     const allSpaces = spaces() || [];
     const ownerSpace = (this.viewerSpaceId ? allSpaces.find(s => s.id === this.viewerSpaceId) : null)
@@ -5230,14 +6307,20 @@ export default class FilesSearch extends View {
     );
     const nextTitle = formatFileTabTitle(resolvedPath, svc.serviceName, existingTitles);
 
+    this.viewerRoot = effectiveRoot || this.viewerRoot;
+    if ("on" in navMeta) this.viewerOn = navMeta.on ?? null;
     this.viewerPath = relPath;
     this.viewerAbsPath = resolvedPath;
     this.viewerTargetPath = resolvedPath;
     this.viewerDisplayPath = displayPath;
-    this.viewerLine = null;
+    this.viewerLine = navMeta.line ? Number(navMeta.line) : null;
+    this.viewerColumn = navMeta.column ? Number(navMeta.column) : null;
+    this.viewerHighlightSymbol = navMeta.highlightSymbol || null;
+    this.viewerPendingScrollLine = this.viewerLine || 1;
     this.viewerServiceId = svc.serviceId;
     this.viewerServiceName = svc.serviceName;
     this.viewerTabTitle = nextTitle;
+    this.viewerHoveredTokenKey = null;
 
     try {
       if (this.viewerTabId && nextTitle) {
@@ -5286,6 +6369,26 @@ export default class FilesSearch extends View {
         if (typeof text !== "string" || text.includes("\0")) {
           return;
         }
+        const originEntry = {
+          root: this.viewerRoot,
+          path: originPath,
+          on,
+          serviceId: this.viewerServiceId || null,
+          serviceName: this.viewerServiceName || null,
+          line: this.viewerLine || 1,
+          column: this.viewerColumn || 1,
+          symbol: this.viewerHighlightSymbol || "",
+        };
+        this.viewerNavHistory = pushNavHistory(this.viewerNavHistory, originEntry, {
+          root: this.viewerRoot,
+          path: resolvedPath,
+          on,
+          serviceId: this.viewerServiceId || null,
+          serviceName: this.viewerServiceName || null,
+          line: 1,
+          column: 1,
+          symbol: "",
+        });
         this.switchViewerTarget(resolvedPath, text, innerCx);
       } catch {
         // Ignore missing or unreadable relative link targets without clobbering current viewer state.
@@ -5309,12 +6412,14 @@ export default class FilesSearch extends View {
       try {
         const text = await readTextFile(targetPath, { on });
         if (this._viewerClosed || reqSeq !== this.viewerLoadSeq) return;
-        this.applyViewerText(targetPath, text, reqSeq, { forceRecreate });
+        this.applyViewerText(targetPath, text, reqSeq, { forceRecreate, cx });
       } catch {
         if (!this._viewerClosed && reqSeq === this.viewerLoadSeq) {
           this.viewerCode?.release();
           this.viewerCode = null;
           this.viewerRawText = null;
+          this.viewerApproxLineCount = 0;
+          this._viewerTokenizedDoc = null;
           this.viewerContentSeq = reqSeq;
           this.viewerError = "Cannot open this file (binary, too large, or unreadable)";
         }
@@ -5334,8 +6439,29 @@ export default class FilesSearch extends View {
     this.viewerNavSeq = (this.viewerNavSeq || 0) + 1;
     try { this.viewerSyncTask?.cancel(); } catch {}
     this.viewerSyncTask = null;
+    try { this.viewerResizeTask?.cancel(); } catch {}
+    this.viewerResizeTask = null;
+    try { this.viewerCopyTask?.cancel(); } catch {}
+    this.viewerCopyTask = null;
+    try { this.viewerNoticeTask?.cancel(); } catch {}
+    this.viewerNoticeTask = null;
+    this.viewerScrollTop = 0;
+    try { this.viewerNavDropdownScroll?.release(); } catch {}
+    this.viewerNavDropdownScroll = null;
     try { this.viewerCode?.release(); } catch {}
     this.viewerCode = null;
+    this.viewerSyntaxSig = null;
+    this.viewerDoc = null;
+    this.viewerDocKey = null;
+    this._viewerTokenizedDoc = null;
+    this._pendingViewerSize = null;
+    this.viewerApproxLineCount = 0;
+    this.viewerGutterWidth = null;
+    this.viewerMaxCols = null;
+    this.viewerHoveredTokenKey = null;
+    this.viewerCtrlHeld = false;
+    this.viewerNavDisambig = null;
+    this.viewerNavNotice = null;
     this.viewerTargetPath = "";
     this.viewerLoadedTargetPath = null;
     this.viewerRawText = null;
@@ -5378,11 +6504,19 @@ export default class FilesSearch extends View {
     const isActiveNow = Boolean(
       this.viewerTabId && activeSpace && (activeSpace.tabs || []).some(tab => tab.id === this.viewerTabId && tab.active)
     );
+    const sharedNavSeq = Number(sharedEntry?.navSeq) || 0;
     const hasNewSharedUpdate = Boolean(
-      sharedEntry && sharedEntry.updatedAt && sharedEntry.updatedAt > this.viewerLastSyncedUpdatedAt
+      sharedEntry && (
+        sharedNavSeq > (this.viewerLastSyncedNavSeq || 0) ||
+        (sharedEntry.updatedAt && sharedEntry.updatedAt > this.viewerLastSyncedUpdatedAt)
+      )
     );
-    const currentSyntaxSig = `${JSON.stringify(getEditorSyntaxConfig(t))}|${settings()?.font_family || ""}`;
-    const needsSyntaxUpdate = Boolean(this.viewerCode && this.viewerSyntaxSig && this.viewerSyntaxSig !== currentSyntaxSig);
+    const needsSyntaxUpdate = Boolean(
+      this.viewerSelectTextMode &&
+      this.viewerCode &&
+      this.viewerSyntaxSig &&
+      this.viewerSyntaxSig !== `${JSON.stringify(getEditorSyntaxConfig(t))}|${settings()?.font_family || ""}`
+    );
     const isMd = isMarkdownFile(this.viewerTargetPath);
     const showRenderedMd = Boolean(
       isMd &&
@@ -5403,20 +6537,107 @@ export default class FilesSearch extends View {
     }
 
     const activeLine = (sharedEntry && hasNewSharedUpdate ? sharedEntry.line : null) ?? this.viewerLine;
+    const activeCol = (sharedEntry && hasNewSharedUpdate ? sharedEntry.column : null) ?? this.viewerColumn;
+    const activeSym = (sharedEntry && hasNewSharedUpdate ? sharedEntry.highlightSymbol : null) ?? this.viewerHighlightSymbol;
+    const monoFont = settings()?.font_family || "monospace";
     const fileIcon = resolveFileIcon(this.viewerTargetPath || this.viewerPath || "file", t);
     const normDisplay = normPathStr(this.viewerDisplayPath || this.viewerPath || this.viewerTargetPath || "");
     const slashIdx = normDisplay.lastIndexOf("/");
     const fileName = slashIdx >= 0 ? normDisplay.slice(slashIdx + 1) : (normDisplay || "Untitled");
     const parentDir = slashIdx >= 0 ? normDisplay.slice(0, slashIdx) : "";
+    const viewerDoc = (!showRenderedMd && !this.viewerSelectTextMode) ? this.getOrBuildViewerDoc() : null;
+    const canBack = canStepNavBack(this.viewerNavHistory);
+    const canForward = canStepNavForward(this.viewerNavHistory);
 
     return v_flex()
       .id("file-viewer")
+      .relative()
+      .when(Boolean(this.viewerFocusHandle), el => el.track_focus(this.viewerFocusHandle))
       .size_full()
       .min_h(0)
       .min_w(0)
       .bg(t.background)
       .text_color(t.foreground)
       .text_size(13)
+      .on_mouse_down("left", (_e, mouseCx) => {
+        if (!this.viewerSelectTextMode && this.viewerFocusHandle) {
+          try { mouseCx.focus(this.viewerFocusHandle); } catch {}
+        }
+      })
+      .on_mouse_move((e, moveCx) => {
+        const nextCtrl = isNavModifierActive(e?.modifiers);
+        if (nextCtrl !== this.viewerCtrlHeld) {
+          this.viewerCtrlHeld = nextCtrl;
+          moveCx.notify();
+        }
+      })
+      .on_modifiers_changed((e, modCx) => {
+        const nextCtrl = isNavModifierActive(e?.modifiers);
+        if (nextCtrl !== this.viewerCtrlHeld) {
+          this.viewerCtrlHeld = nextCtrl;
+          modCx.notify();
+        }
+      })
+      .on_key_down((e, keyCx) => {
+        const k = e.key;
+        if (this.viewerNavDisambig) {
+          const cands = this.viewerNavDisambig.candidates || [];
+          const count = cands.length;
+          if (k === "escape") {
+            this.viewerNavDisambig = null;
+            keyCx.stop_propagation();
+            keyCx.notify();
+            return;
+          }
+          if ((k === "down" || k === "arrowdown") && count > 0) {
+            this.viewerNavDisambig.selectedIndex = ((this.viewerNavDisambig.selectedIndex || 0) + 1) % count;
+            keyCx.stop_propagation();
+            keyCx.notify();
+            return;
+          }
+          if ((k === "up" || k === "arrowup") && count > 0) {
+            this.viewerNavDisambig.selectedIndex = ((this.viewerNavDisambig.selectedIndex || 0) - 1 + count) % count;
+            keyCx.stop_propagation();
+            keyCx.notify();
+            return;
+          }
+          if (k === "enter" && count > 0) {
+            const picked = cands[this.viewerNavDisambig.selectedIndex || 0] || cands[0];
+            this.openNavTarget(picked, this.viewerNavDisambig.origin, keyCx);
+            keyCx.stop_propagation();
+            return;
+          }
+        }
+        if (e.modifiers?.alt && (k === "left" || k === "arrowleft")) {
+          this.stepViewerHistory("back", keyCx);
+          keyCx.stop_propagation();
+        } else if (e.modifiers?.alt && (k === "right" || k === "arrowright")) {
+          this.stepViewerHistory("forward", keyCx);
+          keyCx.stop_propagation();
+        } else if (!this.viewerSelectTextMode && !this.viewerNavDisambig && !e.modifiers?.alt && !e.modifiers?.control && !e.modifiers?.platform) {
+          const vpH = Math.max(120, Number(this.viewerViewportHeight) || 560);
+          const pageStep = Math.max(1, Math.floor((vpH - 8) / CODE_VIEWER_LINE_HEIGHT) - 2);
+          if (k === "down" || k === "arrowdown") {
+            this.scrollViewerBy(1, keyCx);
+            keyCx.stop_propagation();
+          } else if (k === "up" || k === "arrowup") {
+            this.scrollViewerBy(-1, keyCx);
+            keyCx.stop_propagation();
+          } else if (k === "pagedown") {
+            this.scrollViewerBy(pageStep, keyCx);
+            keyCx.stop_propagation();
+          } else if (k === "pageup") {
+            this.scrollViewerBy(-pageStep, keyCx);
+            keyCx.stop_propagation();
+          } else if (k === "home") {
+            this.scrollViewerToBoundary(false, keyCx);
+            keyCx.stop_propagation();
+          } else if (k === "end") {
+            this.scrollViewerToBoundary(true, keyCx);
+            keyCx.stop_propagation();
+          }
+        }
+      })
       .child(
         h_flex()
           .h(40)
@@ -5488,6 +6709,24 @@ export default class FilesSearch extends View {
                 .child(`Ln ${activeLine}`)
             )
           )
+          .child(
+            renderViewerNavToolbar({
+              t,
+              canBack,
+              canForward,
+              selectTextMode: Boolean(this.viewerSelectTextMode),
+              copiedFile: Boolean(this.viewerCopiedFile),
+              hasFile: Boolean(!this.viewerError && typeof this.viewerRawText === "string"),
+              onBack: backCx => this.stepViewerHistory("back", backCx),
+              onForward: fwdCx => this.stepViewerHistory("forward", fwdCx),
+              onCopyFile: copyCx => {
+                if (typeof this.viewerRawText === "string") {
+                  this.copyViewerText(this.viewerRawText, null, copyCx);
+                }
+              },
+              onToggleSelectText: toggleCx => this.toggleViewerSelectText(toggleCx),
+            })
+          )
           .when(isMd, el =>
             el.child(
               renderMarkdownToggleButton({
@@ -5532,9 +6771,7 @@ export default class FilesSearch extends View {
       .child(
         showRenderedMd
           ? this.renderViewerMarkdown(t)
-          : this.viewerCode
-            ? Editor.new(this.viewerCode).flex_1().min_h(0).w_full().min_w(0)
-            : this.viewerError
+          : this.viewerError
             ? v_flex()
                 .flex_1()
                 .min_h(0)
@@ -5561,17 +6798,90 @@ export default class FilesSearch extends View {
                       .child("Retry")
                   )
                 )
-            : h_flex()
-                .flex_1()
-                .min_h(0)
-                .w_full()
-                .p(20)
-                .gap(8)
-                .items_start()
-                .text_size(12.5)
-                .text_color(t.dim)
-                .child(svg("mods/files-search/spinner.svg").size(13).flex_none().spin(900))
-                .child("Loading file…")
+            : this.viewerSelectTextMode && this.viewerCode
+              ? Editor.new(this.viewerCode).flex_1().min_h(0).w_full().min_w(0)
+              : viewerDoc
+                ? renderCodeViewerBody({
+                    listId: "viewer-code-lines",
+                    idPrefix: "main-cv",
+                    t,
+                    monoFont,
+                    doc: viewerDoc,
+                    scrollTop: this.viewerScrollTop || 0,
+                    viewportHeight: this.viewerViewportHeight || 560,
+                    targetLine: activeLine,
+                    targetCol: activeCol,
+                    highlightSymbol: activeSym || "",
+                    hoveredTokenKey: this.viewerHoveredTokenKey,
+                    ctrlHeld: Boolean(this.viewerCtrlHeld),
+                    copiedLineNum: this.viewerCopiedLineNum,
+                    onTokenHover: (nextKey, tokenKey, hoverCx) => this.handleViewerTokenHover(nextKey, tokenKey, hoverCx),
+                    onTokenClick: (tokenInfo, _ev, clickCx) => this.handleViewerTokenClick(tokenInfo, clickCx),
+                    onCopyLine: (lineNum, lineCx) => {
+                      const lineText = extractLineAtFast(this.viewerRawText, lineNum);
+                      this.copyViewerText(lineText, lineNum, lineCx);
+                    },
+                    onScrollDelta: (deltaRows, wheelCx) => this.scrollViewerBy(deltaRows, wheelCx),
+                    onSizeChange: (w, h, sizeCx) => this.scheduleViewerResizeReflow(w, h, sizeCx),
+                  })
+                : h_flex()
+                    .flex_1()
+                    .min_h(0)
+                    .w_full()
+                    .p(20)
+                    .gap(8)
+                    .items_start()
+                    .text_size(12.5)
+                    .text_color(t.dim)
+                    .child(svg("mods/files-search/spinner.svg").size(13).flex_none().spin(900))
+                    .child("Loading file…")
+      )
+      .when(Boolean(this.viewerNavNotice), el =>
+        el.child(
+          div()
+            .absolute()
+            .bottom(14)
+            .right(18)
+            .max_w(440)
+            .child(
+              renderNavToastBanner({
+                id: "viewer-nav-toast",
+                t,
+                notice: this.viewerNavNotice,
+                onDismiss: dismissCx => {
+                  this.viewerNavNotice = null;
+                  dismissCx.notify();
+                },
+              })
+            )
+        )
+      )
+      .when(Boolean(this.viewerNavDisambig), el =>
+        el.child(
+          renderNavDisambiguationPopover({
+            overlayId: "viewer-nav-disambig-overlay",
+            menuId: "viewer-nav-disambig-menu",
+            t,
+            monoFont,
+            disambig: this.viewerNavDisambig,
+            currentRoot: this.viewerNavDisambig?.root || this.viewerRoot || "",
+            currentServiceName: this.viewerNavDisambig?.serviceName || "",
+            scrollHandle: this.viewerNavDropdownScroll,
+            top: 44,
+            right: 16,
+            minWidth: 320,
+            maxWidth: 480,
+            maxHeight: 280,
+            panelWidth: Math.max(480, this.viewerViewportWidth || 760),
+            marginX: 20,
+            onSelectCandidate: (cand, pickCx) =>
+              this.openNavTarget(cand, this.viewerNavDisambig?.origin, pickCx),
+            onClose: closeCx => {
+              this.viewerNavDisambig = null;
+              closeCx.notify();
+            },
+          })
+        )
       );
   }
 

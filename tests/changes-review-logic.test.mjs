@@ -1105,4 +1105,31 @@ describe("changes-review review-logic", () => {
       /HEAD|untracked/i,
     );
   });
+
+  test("isIgnoredWatchPath filters .git internals, node_modules, and logs while computeDiffContentWidth guards tabs and charPx", () => {
+    const repoRoot = "/workspace/repo-a";
+    assert.equal(isIgnoredWatchPath("/workspace/repo-a/.git", repoRoot), true);
+    assert.equal(isIgnoredWatchPath("/workspace/repo-a/.git/", repoRoot), true);
+    assert.equal(isIgnoredWatchPath("/workspace/repo-a/.git/objects/aa/bb", repoRoot), true);
+    assert.equal(isIgnoredWatchPath("/workspace/repo-a/.git/index.lock", repoRoot), true);
+    assert.equal(isIgnoredWatchPath("/workspace/repo-a/.git/logs/HEAD", repoRoot), true);
+    assert.equal(isIgnoredWatchPath("/workspace/repo-a/.git/COMMIT_EDITMSG", repoRoot), true);
+    assert.equal(isIgnoredWatchPath("/workspace/repo-a/.git/index", repoRoot), false);
+    assert.equal(isIgnoredWatchPath("/workspace/repo-a/.git/HEAD", repoRoot), false);
+    assert.equal(isIgnoredWatchPath("/workspace/repo-a/.git//refs/heads/main", repoRoot), false);
+    assert.equal(isIgnoredWatchPath("/workspace/repo-a/packages/api/node_modules/pkg/index.js", repoRoot), true);
+    assert.equal(isIgnoredWatchPath("/workspace/repo-a/logs/output.log", repoRoot), true);
+
+    assert.equal(isIgnoredWatchPath("/workspace/repo-a/.gitignore", repoRoot), false);
+    assert.equal(isIgnoredWatchPath("/workspace/repo-a/src/.gitkeep", repoRoot), false);
+    assert.equal(isIgnoredWatchPath("/workspace/repo-a/src/app.js", repoRoot), false);
+    assert.equal(isIgnoredWatchPath("/workspace/other/.git/objects/00/11", repoRoot), true);
+
+    const noTabWidth = computeDiffContentWidth([{ type: "line", content: "alpha    beta" }]);
+    const tabWidth = computeDiffContentWidth([{ type: "line", content: "alpha\tbeta" }]);
+    assert.ok(tabWidth > 0 && noTabWidth > 0);
+    assert.equal(computeDiffContentWidth([{ type: "line", content: "abc" }], { minWidth: 300, charPx: 0 }), 300);
+    assert.equal(computeDiffContentWidth([{ type: "line", content: "abc" }], { minWidth: 300, charPx: Number.NaN }), 300);
+    assert.equal(computeDiffContentWidth([{ type: "line", content: "abc" }], { minWidth: 300, charPx: -4 }), 300);
+  });
 });

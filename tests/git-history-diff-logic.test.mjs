@@ -1042,4 +1042,55 @@ describe("git-history diff-logic", () => {
       assert.ok(bad.unavailableReason.length > 0);
     }
   });
+
+  test("buildSideBySideRows and buildUnifiedRows keep exact totalLines when truncated mid-change-block, and parseCommitFiles unquotes UTF-8 octal paths", () => {
+    const diffLines = [
+      "diff --git a/big.js b/big.js",
+      "index 1111111..2222222 100644",
+      "--- a/big.js",
+      "+++ b/big.js",
+      "@@ -1,8 +1,8 @@",
+    ];
+    for (let i = 1; i <= 8; i += 1) diffLines.push(`-const old_${i} = ${i};`);
+    for (let i = 1; i <= 8; i += 1) diffLines.push(`+const new_${i} = ${i * 10};`);
+    diffLines.push(" const tail = true;");
+    const patch = diffLines.join("\n");
+
+    const fullSbs = buildSideBySideRows(patch, "big.js", { maxLines: 500 });
+    const cutSbs = buildSideBySideRows(patch, "big.js", { maxLines: 4 });
+    assert.equal(cutSbs.truncated, true);
+    assert.equal(cutSbs.rows.length, 4);
+    assert.equal(cutSbs.totalLines, fullSbs.totalLines);
+
+    const fullUni = buildUnifiedRows(patch, "big.js", { maxLines: 500 });
+    const cutUni = buildUnifiedRows(patch, "big.js", { maxLines: 4 });
+    assert.equal(cutUni.truncated, true);
+    assert.equal(cutUni.rows.length, 4);
+    assert.equal(cutUni.totalLines, fullUni.totalLines);
+
+    // Octal UTF-8 path unquoting + plain backslash-free fast path
+    const files = parseCommitFiles(
+      '3\t1\t"docs/caf\\303\\251\\tnotes.md"\n1\t0\tsrc/plain.js\n',
+      'M\t"docs/caf\\303\\251\\tnotes.md"\nA\tsrc/plain.js\n',
+    );
+    assert.equal(files[0].path, "docs/café\tnotes.md");
+    assert.equal(files[1].path, "src/plain.js");
+
+    // Merging adjacent same-color runs before NBSP normalization
+    const pal = getDiffSyntaxPalette(null);
+    const rendered = prepareRenderLineData(
+      [
+        ["plain", "foo  "],
+        ["plain", "\tbar"],
+      ],
+      "foo  \tbar",
+      pal,
+      "#eee",
+    );
+    assert.deepEqual(rendered, {
+      kind: "single",
+      color: pal.plain,
+      text: toNbspString("foo  \tbar"),
+    });
+  });
 });

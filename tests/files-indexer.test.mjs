@@ -284,4 +284,39 @@ describe("files-search indexer — cache, disk persistence & watch invalidation"
     assert.equal(idx.isIgnoredWatchPath("C:\\Repo\\target\\debug\\app.exe", "C:\\Repo"), true);
     assert.equal(idx.isIgnoredWatchPath("C:\\Repo\\src\\App.tsx", "C:\\Repo"), false);
   });
+
+  test("COMMON_IGNORE_GLOBS skips noisy home/cache trees and ensureWorkspaceIndex handles missing rg (exit 127) cleanly", async () => {
+    for (const pat of ["!.cargo", "!.npm", "!.local/share", "!.mozilla", "!.m2", "!*.egg-info"]) {
+      assert.ok(idx.COMMON_IGNORE_GLOBS.includes(pat), `expected ignore glob ${pat}`);
+    }
+
+    const wsRoot = path.join(tmpRoot, "missing-rg-ws");
+    await buildSampleWorkspace(wsRoot);
+    idx.OVERLAY_INDEX_CACHE.clear();
+    idx.RG_AVAILABLE_CACHE.clear();
+
+    const mock = (await import("./helpers/herdr-mock.mjs")).getHerdrMock();
+    mock.execImpl = async (cmd, args) => {
+      if (cmd === "sh" || cmd === "rg") {
+        return { code: 127, stdout: "", stderr: "rg: not found" };
+      }
+      if (cmd === "git" && Array.isArray(args) && args.includes("ls-files")) {
+        return { code: 0, stdout: "README.md\nsrc/app.js\n", stderr: "" };
+      }
+      return { code: 1, stdout: "", stderr: "" };
+    };
+
+    const first = await idx.ensureWorkspaceIndex({ root: wsRoot, on: null, isWindows: process.platform === "win32", force: true });
+    assert.ok(first.files.includes("src/app.js"));
+    assert.equal(mock.execCalls[0].cmd, process.platform === "win32" ? "rg" : "sh");
+
+    // Second call skips rg cleanly once RG_AVAILABLE_CACHE is false
+    mock.execCalls.length = 0;
+    const second = await idx.ensureWorkspaceIndex({ root: wsRoot, on: null, isWindows: process.platform === "win32", force: true });
+    assert.ok(second.files.includes("src/app.js"));
+    assert.equal(mock.execCalls.some((c) => c.cmd === "rg" || c.cmd === "sh"), false);
+
+    idx.OVERLAY_INDEX_CACHE.clear();
+    idx.RG_AVAILABLE_CACHE.clear();
+  });
 });

@@ -263,11 +263,17 @@ export function wrapPlainText(text, maxCols, options = {}) {
   return out;
 }
 
-function makeSpanSlice(template, sliceText) {
+function makeSpanSlice(template, sliceText, sliceColDelta = 0) {
   if (Array.isArray(template)) {
     const next = template.slice();
     next[1] = sliceText;
+    if (sliceColDelta > 0 && next.length > 2 && next[2] && typeof next[2] === "object" && Number.isFinite(next[2].col)) {
+      next[2] = { ...next[2], col: next[2].col + sliceColDelta };
+    }
     return next;
+  }
+  if (sliceColDelta > 0 && template && typeof template === "object" && Number.isFinite(template.col)) {
+    return { ...template, text: sliceText, col: template.col + sliceColDelta };
   }
   return { ...template, text: sliceText };
 }
@@ -295,14 +301,18 @@ export function wrapStyledSpans(spans, maxCols, options = {}) {
     const expanded = needsExpandSingle ? expandTabsFromColumn(rawText, 0, tabSize).text : rawText;
     if (!expanded) return [[]];
     if (expanded.length <= limit) {
-      return [[makeSpanSlice(span, toNbsp ? applyNbsp(expanded, true) : expanded)]];
+      const nbsp = toNbsp && expanded.indexOf(" ") !== -1 ? applyNbsp(expanded, true) : expanded;
+      if (!needsExpandSingle && nbsp === rawText) {
+        return [[span]];
+      }
+      return [[makeSpanSlice(span, nbsp)]];
     }
     const ranges = computeWrapRanges(expanded, limit);
     const rows = new Array(ranges.length);
     for (let r = 0; r < ranges.length; r += 1) {
       const [s, e] = ranges[r];
       const slice = expanded.slice(s, e);
-      rows[r] = [makeSpanSlice(span, toNbsp ? applyNbsp(slice, true) : slice)];
+      rows[r] = [makeSpanSlice(span, toNbsp ? applyNbsp(slice, true) : slice, s)];
     }
     return rows;
   }
@@ -310,6 +320,8 @@ export function wrapStyledSpans(spans, maxCols, options = {}) {
   let fastTotalChars = 0;
   let needsExpand = false;
   let hasAnyContent = false;
+  let hasEmptySpan = false;
+  let hasAnySpace = false;
   const spanCount = spans.length;
 
   for (let i = 0; i < spanCount; i += 1) {
@@ -318,9 +330,13 @@ export function wrapStyledSpans(spans, maxCols, options = {}) {
       ? (span[1] == null ? "" : String(span[1]))
       : (span?.text == null ? "" : String(span.text));
     if (rawText.length > 0) hasAnyContent = true;
+    else hasEmptySpan = true;
     fastTotalChars += rawText.length;
     if (!needsExpand && (rawText.indexOf("\t") !== -1 || rawText.indexOf("\r") !== -1)) {
       needsExpand = true;
+    }
+    if (toNbsp && !hasAnySpace && rawText.indexOf(" ") !== -1) {
+      hasAnySpace = true;
     }
   }
 
@@ -330,6 +346,9 @@ export function wrapStyledSpans(spans, maxCols, options = {}) {
 
   // Zero-wrap fast path when expanded code units fit inside `limit`.
   if (!needsExpand && fastTotalChars <= limit) {
+    if (!hasEmptySpan && (!toNbsp || !hasAnySpace)) {
+      return [spans.slice()];
+    }
     const singleRow = [];
     for (let i = 0; i < spanCount; i += 1) {
       const span = spans[i];
@@ -337,7 +356,11 @@ export function wrapStyledSpans(spans, maxCols, options = {}) {
         ? (span[1] == null ? "" : String(span[1]))
         : (span?.text == null ? "" : String(span.text));
       if (!rawText) continue;
-      singleRow.push(makeSpanSlice(span, toNbsp ? applyNbsp(rawText, true) : rawText));
+      if (toNbsp && rawText.indexOf(" ") !== -1) {
+        singleRow.push(makeSpanSlice(span, applyNbsp(rawText, true)));
+      } else {
+        singleRow.push(span);
+      }
     }
     return [singleRow.length > 0 ? singleRow : []];
   }
@@ -393,7 +416,7 @@ export function wrapStyledSpans(spans, maxCols, options = {}) {
         const piece = (sliceStart === 0 && sliceEnd === item.text.length)
           ? item.text
           : item.text.slice(sliceStart, sliceEnd);
-        rowSpans.push(makeSpanSlice(item.span, toNbsp ? applyNbsp(piece, true) : piece));
+        rowSpans.push(makeSpanSlice(item.span, toNbsp ? applyNbsp(piece, true) : piece, sliceStart));
       }
       if (item.end <= segEnd) {
         k += 1;

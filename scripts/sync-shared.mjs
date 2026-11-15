@@ -16,6 +16,14 @@ const SHARED_TARGETS = [
     ],
   },
   {
+    source: "shared/code-syntax.js",
+    targets: [
+      "mods/files-search/code-syntax.js",
+      "mods/changes-review/code-syntax.js",
+      "mods/git-history/code-syntax.js",
+    ],
+  },
+  {
     source: "shared/markdown-syntax.js",
     targets: [
       "mods/files-search/markdown-syntax.js",
@@ -42,6 +50,7 @@ const SHARED_TARGETS = [
   {
     source: "shared/dropdown-logic.js",
     targets: [
+      "mods/files-search/dropdown-logic.js",
       "mods/changes-review/dropdown-logic.js",
       "mods/git-history/dropdown-logic.js",
     ],
@@ -49,8 +58,33 @@ const SHARED_TARGETS = [
   {
     source: "shared/dropdown.js",
     targets: [
+      "mods/files-search/dropdown.js",
       "mods/changes-review/dropdown.js",
       "mods/git-history/dropdown.js",
+    ],
+  },
+  {
+    source: "shared/code-nav-logic.js",
+    targets: [
+      "mods/files-search/code-nav-logic.js",
+    ],
+  },
+  {
+    source: "shared/code-nav-js.js",
+    targets: [
+      "mods/files-search/code-nav-js.js",
+    ],
+  },
+  {
+    source: "shared/code-nav-python.js",
+    targets: [
+      "mods/files-search/code-nav-python.js",
+    ],
+  },
+  {
+    source: "shared/code-nav-java.js",
+    targets: [
+      "mods/files-search/code-nav-java.js",
     ],
   },
 ];
