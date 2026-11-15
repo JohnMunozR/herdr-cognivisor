@@ -77,6 +77,8 @@ import {
   buildViewerNavigationNotice,
   applyTabNavMeta,
   shouldOpenNavInNewTab,
+  computeLocalAnchorRect,
+  shouldAllowUnderlyingScroll,
 } from "./search-logic.js";
 import {
   tokenizeInteractiveCodeLine,
@@ -2993,6 +2995,8 @@ export default class FilesSearch extends View {
     this.previewNavNotice = null;
     this.previewHoveredTokenKey = null;
     this.previewCtrlHeld = false;
+    this._overlayContainerBounds = null;
+    this._overlayLastPointer = null;
     this.previewFullTextCache?.clear();
     this.previewFullTextCache = null;
     this.previewCache?.clear();
@@ -3060,6 +3064,8 @@ export default class FilesSearch extends View {
     this.previewNavNotice = null;
     this.previewHoveredTokenKey = null;
     this.previewCtrlHeld = false;
+    this._overlayContainerBounds = null;
+    this._overlayLastPointer = null;
     this.previewFullTextCache?.clear();
     this.previewCache?.clear();
     this._fileQueryCache?.clear();
@@ -3322,6 +3328,9 @@ export default class FilesSearch extends View {
             origin: originEntry,
             root: svcRoot,
             serviceName: originEntry.serviceName || "",
+            symbol: tokenInfo.symbol || "",
+            mode: result.mode || result?.context?.intent || null,
+            anchorRect: computeLocalAnchorRect(tokenInfo, this._overlayContainerBounds, this._overlayLastPointer),
           };
           spawnCx.notify();
           return;
@@ -4367,6 +4376,7 @@ export default class FilesSearch extends View {
               el
                 .py(4)
                 .on_scroll_wheel((e, cx) => {
+                  if (!shouldAllowUnderlyingScroll({ hasDisambiguationPopover: Boolean(this.previewDisambig) })) return;
                   const delta = e.delta.y > 0 ? -3 : 3;
                   this.previewScroll = Math.max(0, Math.min(this.previewScroll + delta, maxDirScroll));
                   cx.notify();
@@ -4608,6 +4618,7 @@ export default class FilesSearch extends View {
           .when(!showRenderedMd && this.previewLines.length > 0, el =>
             el
               .on_scroll_wheel((e, cx) => {
+                if (!shouldAllowUnderlyingScroll({ hasDisambiguationPopover: Boolean(this.previewDisambig) })) return;
                 const dx = Math.abs(e.delta?.x || 0);
                 const dy = Math.abs(e.delta?.y || 0);
                 if (dy > 0 && dy >= dx && !e.modifiers?.shift) {
@@ -4874,7 +4885,13 @@ export default class FilesSearch extends View {
           .bg(t.popover)
           .shadow_lg()
           .on_mouse_up("left", (_e, cx) => this.handleResizeEnd(cx))
+          .on_mouse_down("left", (e, _cx) => {
+            if (e?.bounds) this._overlayContainerBounds = e.bounds;
+            if (e?.local_position) this._overlayLastPointer = e.local_position;
+          })
           .on_mouse_move((e, moveCx) => {
+            if (e?.bounds) this._overlayContainerBounds = e.bounds;
+            if (e?.local_position) this._overlayLastPointer = e.local_position;
             const nextCtrl = isNavModifierActive(e?.modifiers);
             if (nextCtrl !== this.previewCtrlHeld) {
               this.previewCtrlHeld = nextCtrl;
@@ -4899,14 +4916,18 @@ export default class FilesSearch extends View {
             cx.notify();
             return;
           }
-          if (k === "down" && count > 0) {
-            this.previewDisambig.selectedIndex = ((this.previewDisambig.selectedIndex || 0) + 1) % count;
+          if ((k === "down" || k === "arrowdown") && count > 0) {
+            const nextIdx = ((this.previewDisambig.selectedIndex || 0) + 1) % count;
+            this.previewDisambig.selectedIndex = nextIdx;
+            try { this.previewNavDropdownScroll?.scroll_to_item(nextIdx); } catch {}
             cx.stop_propagation();
             cx.notify();
             return;
           }
-          if (k === "up" && count > 0) {
-            this.previewDisambig.selectedIndex = ((this.previewDisambig.selectedIndex || 0) - 1 + count) % count;
+          if ((k === "up" || k === "arrowup") && count > 0) {
+            const nextIdx = ((this.previewDisambig.selectedIndex || 0) - 1 + count) % count;
+            this.previewDisambig.selectedIndex = nextIdx;
+            try { this.previewNavDropdownScroll?.scroll_to_item(nextIdx); } catch {}
             cx.stop_propagation();
             cx.notify();
             return;
@@ -5121,6 +5142,7 @@ export default class FilesSearch extends View {
                       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
                       .when(fixed, el => el.h(listH).overflow_hidden())
                       .on_scroll_wheel((e, cx) => {
+                        if (!shouldAllowUnderlyingScroll({ hasDisambiguationPopover: Boolean(this.previewDisambig) })) return;
                         this.scroll = Math.max(0, Math.min(this.scroll - e.delta.y, this.maxScroll));
                         while (this.at < results.length - 1 && this.at * ROW_H < this.scroll) this.at++;
                         while (this.at > 0 && (this.at + 1) * ROW_H > this.scroll + listH) this.at--;
@@ -5252,13 +5274,15 @@ export default class FilesSearch extends View {
             currentRoot: this.previewDisambig?.root || this.searchRoot || "",
             currentServiceName: this.previewDisambig?.serviceName || "",
             scrollHandle: this.previewNavDropdownScroll,
-            top: 56,
-            right: 24,
-            minWidth: 320,
-            maxWidth: 480,
-            maxHeight: Math.max(200, listH - 40),
-            panelWidth: winW,
-            marginX: 28,
+            anchorRect: this.previewDisambig?.anchorRect || null,
+            containerWidth: Number(this._overlayContainerBounds?.width) || winW,
+            containerHeight: Number(this._overlayContainerBounds?.height) || (listH + 148),
+            minWidth: 300,
+            maxWidth: 460,
+            maxHeight: Math.max(200, listH - 20),
+            marginX: 14,
+            marginTop: 14,
+            marginBottom: 14,
             onSelectCandidate: (cand, pickCx) =>
               this.openPreviewDisambigCandidate(cand, this.previewDisambig?.origin, pickCx),
             onClose: closeCx => {
@@ -5709,7 +5733,11 @@ export default class FilesSearch extends View {
   }
 
   scrollViewerBy(deltaRows, cx = null) {
-    if (this._viewerClosed || this.viewerSelectTextMode) return;
+    if (!shouldAllowUnderlyingScroll({
+      closed: this._viewerClosed,
+      selectTextMode: this.viewerSelectTextMode,
+      hasDisambiguationPopover: Boolean(this.viewerNavDisambig),
+    })) return;
     const doc = this.getOrBuildViewerDoc();
     if (!doc || !Array.isArray(doc.rows) || doc.rows.length === 0) {
       if (this.viewerScrollTop !== 0) {
@@ -5733,7 +5761,11 @@ export default class FilesSearch extends View {
   }
 
   scrollViewerToBoundary(end = false, cx = null) {
-    if (this._viewerClosed || this.viewerSelectTextMode) return;
+    if (!shouldAllowUnderlyingScroll({
+      closed: this._viewerClosed,
+      selectTextMode: this.viewerSelectTextMode,
+      hasDisambiguationPopover: Boolean(this.viewerNavDisambig),
+    })) return;
     this.viewerPendingScrollLine = null;
     if (!end) {
       if (this.viewerScrollTop !== 0) {
@@ -6173,13 +6205,18 @@ export default class FilesSearch extends View {
         }
         if (result?.status === "ambiguous" && Array.isArray(result.candidates) && result.candidates.length > 0) {
           this.viewerNavNotice = null;
+          if (!this.viewerSelectTextMode && this.viewerFocusHandle) {
+            try { innerCx.focus(this.viewerFocusHandle); } catch {}
+          }
           this.viewerNavDisambig = {
             candidates: result.candidates,
             selectedIndex: 0,
             origin: originEntry,
             root: originRoot,
             serviceName: this.viewerServiceName || "",
-            mode: result.mode || null,
+            mode: result.mode || result?.context?.intent || null,
+            symbol: tokenInfo.symbol || "",
+            anchorRect: computeLocalAnchorRect(tokenInfo, this._viewerContainerBounds, this._viewerLastPointer),
           };
           innerCx.notify();
           return;
@@ -6455,6 +6492,8 @@ export default class FilesSearch extends View {
     this.viewerDocKey = null;
     this._viewerTokenizedDoc = null;
     this._pendingViewerSize = null;
+    this._viewerContainerBounds = null;
+    this._viewerLastPointer = null;
     this.viewerApproxLineCount = 0;
     this.viewerGutterWidth = null;
     this.viewerMaxCols = null;
@@ -6559,12 +6598,16 @@ export default class FilesSearch extends View {
       .bg(t.background)
       .text_color(t.foreground)
       .text_size(13)
-      .on_mouse_down("left", (_e, mouseCx) => {
+      .on_mouse_down("left", (e, mouseCx) => {
+        if (e?.bounds) this._viewerContainerBounds = e.bounds;
+        if (e?.local_position) this._viewerLastPointer = e.local_position;
         if (!this.viewerSelectTextMode && this.viewerFocusHandle) {
           try { mouseCx.focus(this.viewerFocusHandle); } catch {}
         }
       })
       .on_mouse_move((e, moveCx) => {
+        if (e?.bounds) this._viewerContainerBounds = e.bounds;
+        if (e?.local_position) this._viewerLastPointer = e.local_position;
         const nextCtrl = isNavModifierActive(e?.modifiers);
         if (nextCtrl !== this.viewerCtrlHeld) {
           this.viewerCtrlHeld = nextCtrl;
@@ -6590,13 +6633,17 @@ export default class FilesSearch extends View {
             return;
           }
           if ((k === "down" || k === "arrowdown") && count > 0) {
-            this.viewerNavDisambig.selectedIndex = ((this.viewerNavDisambig.selectedIndex || 0) + 1) % count;
+            const nextIdx = ((this.viewerNavDisambig.selectedIndex || 0) + 1) % count;
+            this.viewerNavDisambig.selectedIndex = nextIdx;
+            try { this.viewerNavDropdownScroll?.scroll_to_item(nextIdx); } catch {}
             keyCx.stop_propagation();
             keyCx.notify();
             return;
           }
           if ((k === "up" || k === "arrowup") && count > 0) {
-            this.viewerNavDisambig.selectedIndex = ((this.viewerNavDisambig.selectedIndex || 0) - 1 + count) % count;
+            const nextIdx = ((this.viewerNavDisambig.selectedIndex || 0) - 1 + count) % count;
+            this.viewerNavDisambig.selectedIndex = nextIdx;
+            try { this.viewerNavDropdownScroll?.scroll_to_item(nextIdx); } catch {}
             keyCx.stop_propagation();
             keyCx.notify();
             return;
@@ -6821,7 +6868,13 @@ export default class FilesSearch extends View {
                       const lineText = extractLineAtFast(this.viewerRawText, lineNum);
                       this.copyViewerText(lineText, lineNum, lineCx);
                     },
-                    onScrollDelta: (deltaRows, wheelCx) => this.scrollViewerBy(deltaRows, wheelCx),
+                    onScrollDelta: shouldAllowUnderlyingScroll({
+                      closed: this._viewerClosed,
+                      selectTextMode: this.viewerSelectTextMode,
+                      hasDisambiguationPopover: Boolean(this.viewerNavDisambig),
+                    })
+                      ? (deltaRows, wheelCx) => this.scrollViewerBy(deltaRows, wheelCx)
+                      : null,
                     onSizeChange: (w, h, sizeCx) => this.scheduleViewerResizeReflow(w, h, sizeCx),
                   })
                 : h_flex()
@@ -6867,13 +6920,15 @@ export default class FilesSearch extends View {
             currentRoot: this.viewerNavDisambig?.root || this.viewerRoot || "",
             currentServiceName: this.viewerNavDisambig?.serviceName || "",
             scrollHandle: this.viewerNavDropdownScroll,
-            top: 44,
-            right: 16,
-            minWidth: 320,
-            maxWidth: 480,
-            maxHeight: 280,
-            panelWidth: Math.max(480, this.viewerViewportWidth || 760),
-            marginX: 20,
+            anchorRect: this.viewerNavDisambig?.anchorRect || null,
+            containerWidth: Math.max(220, Number(this._viewerContainerBounds?.width) || Number(this.viewerViewportWidth) || 760),
+            containerHeight: Math.max(180, Number(this._viewerContainerBounds?.height) || ((Number(this.viewerViewportHeight) || 560) + 40)),
+            minWidth: 280,
+            maxWidth: 460,
+            maxHeight: Math.max(180, Math.min(300, (Number(this.viewerViewportHeight) || 560) - 60)),
+            marginX: 12,
+            marginTop: 46,
+            marginBottom: 14,
             onSelectCandidate: (cand, pickCx) =>
               this.openNavTarget(cand, this.viewerNavDisambig?.origin, pickCx),
             onClose: closeCx => {

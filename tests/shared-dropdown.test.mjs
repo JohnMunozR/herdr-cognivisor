@@ -7,6 +7,7 @@ import {
   DEFAULT_REOPEN_GUARD_MS,
   clampDropdownNumber,
   computeDropdownMetrics,
+  computeAnchoredPopoverPosition,
   shouldSuppressDropdownReopen,
 } from "../shared/dropdown-logic.js";
 
@@ -179,5 +180,108 @@ describe("shared dropdown engine & git-history sync parity", () => {
     assert.equal(shouldSuppressDropdownReopen(undefined, t0), false);
     assert.equal(shouldSuppressDropdownReopen(0, t0), false);
     assert.equal(shouldSuppressDropdownReopen(t0, t0 - 5), false);
+  });
+
+  test("computeDropdownMetrics accounts for subline rows, fixed headers, and chromeTopHeight without clipping", () => {
+    const items = [];
+    for (let i = 0; i < 7; i += 1) {
+      items.push({
+        type: "option",
+        label: `Impl${i}.execute`,
+        subline: `src/services/Impl${i}.java:${10 + i}`,
+        rightText: `→ Ln ${10 + i}`,
+      });
+    }
+    // Without subline awareness (7 * 31 = 217), 7 items wouldn't trigger scroll against 280px maxHeight;
+    // with 44px subline height + 32px header + 10px pad + 6px gap = 356px > 280px, scroll activates cleanly.
+    const metrics = computeDropdownMetrics({
+      items,
+      panelWidth: 800,
+      minWidth: 280,
+      maxWidth: 460,
+      maxHeight: 280,
+      chromeTopHeight: 32,
+      headerTitle: "Implementations of veryLongMethodName",
+    });
+    assert.equal(metrics.shouldScroll, true);
+    assert.equal(metrics.bodyHeight, 280);
+    assert.ok(metrics.contentHeight > 280);
+    assert.ok(metrics.width >= 280 && metrics.width <= 460);
+  });
+
+  test("computeAnchoredPopoverPosition clamps near left/right/bottom edges and centers cleanly when unanchored", () => {
+    // Far-left word must never place left < marginX (behind left limit)
+    const farLeft = computeAnchoredPopoverPosition({
+      anchorX: 4,
+      anchorY: 120,
+      anchorBottomY: 140,
+      popoverWidth: 360,
+      popoverHeight: 180,
+      containerWidth: 900,
+      containerHeight: 600,
+      marginX: 12,
+      marginTop: 46,
+      marginBottom: 14,
+    });
+    assert.equal(farLeft.left, 12);
+    assert.equal(farLeft.top, 146);
+    assert.equal(farLeft.placement, "below");
+
+    // Far-right word shifts leftward so menu fits strictly within right margin
+    const farRight = computeAnchoredPopoverPosition({
+      anchorX: 860,
+      anchorY: 120,
+      anchorBottomY: 140,
+      popoverWidth: 360,
+      popoverHeight: 180,
+      containerWidth: 900,
+      containerHeight: 600,
+      marginX: 12,
+      marginTop: 46,
+      marginBottom: 14,
+    });
+    assert.equal(farRight.left, 900 - 360 - 12);
+    assert.equal(farRight.top, 146);
+
+    // Near bottom edge flips cleanly above the clicked token
+    const nearBottom = computeAnchoredPopoverPosition({
+      anchorX: 200,
+      anchorY: 500,
+      anchorBottomY: 520,
+      popoverWidth: 320,
+      popoverHeight: 180,
+      containerWidth: 900,
+      containerHeight: 600,
+      marginX: 12,
+      marginTop: 46,
+      marginBottom: 14,
+      gapY: 6,
+      alignOffsetX: 12,
+    });
+    assert.equal(nearBottom.left, 188);
+    assert.equal(nearBottom.top, 314);
+    assert.equal(nearBottom.placement, "above");
+
+    // Missing anchor coordinates center horizontally cleanly instead of hugging right edge
+    const unanchored = computeAnchoredPopoverPosition({
+      popoverWidth: 320,
+      popoverHeight: 160,
+      containerWidth: 800,
+      containerHeight: 600,
+      marginX: 12,
+      marginTop: 46,
+    });
+    assert.equal(unanchored.left, 240);
+    assert.equal(unanchored.top, 54);
+    assert.equal(unanchored.placement, "center");
+  });
+
+  test("renderDropdownPopover stops scroll_wheel propagation on both overlay backdrop and popover card", () => {
+    const src = readFileSync(resolve(ROOT, "shared/dropdown.js"), "utf8");
+    const popoverIdx = src.indexOf("export function renderDropdownPopover(");
+    assert.ok(popoverIdx >= 0, "renderDropdownPopover export must exist");
+    const popoverSrc = src.slice(popoverIdx);
+    const wheelStopMatches = popoverSrc.match(/\.on_scroll_wheel\(\(_e,\s*cx\)\s*=>\s*cx\.stop_propagation\(\)\)/g) || [];
+    assert.equal(wheelStopMatches.length, 2, "both overlay backdrop and menu card must stop scroll wheel propagation");
   });
 });

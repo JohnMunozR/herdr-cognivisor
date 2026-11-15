@@ -61,6 +61,9 @@ export function computeDropdownMetrics(options = {}) {
     dividerHeight = 9,
     emptyHeight = 31,
     defaultRowHeight = 31,
+    sublineRowHeight = 44,
+    chromeTopHeight = 0,
+    headerTitle = "",
     itemGap = 1,
     padding = 5,
     marginX = 20,
@@ -75,13 +78,15 @@ export function computeDropdownMetrics(options = {}) {
   const safePad = Number.isFinite(padding) && padding >= 0 ? padding : 5;
   const safeGap = Number.isFinite(itemGap) && itemGap >= 0 ? itemGap : 1;
   const safeDefaultRowH = Number.isFinite(defaultRowHeight) && defaultRowHeight > 0 ? defaultRowHeight : 31;
+  const safeSublineRowH = Number.isFinite(sublineRowHeight) && sublineRowHeight > 0 ? Math.max(safeDefaultRowH, sublineRowHeight) : Math.max(safeDefaultRowH, 44);
+  const safeChromeTopH = Number.isFinite(chromeTopHeight) && chromeTopHeight > 0 ? chromeTopHeight : 0;
   const safeHeaderH = Number.isFinite(headerHeight) && headerHeight > 0 ? headerHeight : 26;
   const safeDividerH = Number.isFinite(dividerHeight) && dividerHeight > 0 ? dividerHeight : 9;
   const safeEmptyH = Number.isFinite(emptyHeight) && emptyHeight > 0 ? emptyHeight : 31;
 
   let itemCount = 0;
   let rowsHeight = 0;
-  let maxItemWidth = 0;
+  let maxItemWidth = headerTitle ? estimateTextWidth(headerTitle, 6.8) + 110 : 0;
   const containerChrome = safePad * 2 + 18 + 12;
 
   for (let i = 0; i < list.length; i += 1) {
@@ -111,7 +116,8 @@ export function computeDropdownMetrics(options = {}) {
       continue;
     }
 
-    rowsHeight += Number.isFinite(explicitH) && explicitH > 0 ? explicitH : safeDefaultRowH;
+    const rowFallbackH = hasBadgeValue(item.subline) ? safeSublineRowH : safeDefaultRowH;
+    rowsHeight += Number.isFinite(explicitH) && explicitH > 0 ? explicitH : rowFallbackH;
 
     const iconSize = Number.isFinite(Number(item.iconSize)) && Number(item.iconSize) > 0 ? Number(item.iconSize) : 14;
     const leftChrome = (item.dotColor ? 15 : 0) + (item.icon ? iconSize + 10 : 0);
@@ -133,15 +139,16 @@ export function computeDropdownMetrics(options = {}) {
     if (rowWidth > maxItemWidth) maxItemWidth = rowWidth;
   }
 
-  const contentHeight =
+  const listContentHeight =
     itemCount === 0
       ? safeDefaultRowH + safePad * 2
       : rowsHeight + (itemCount - 1) * safeGap + safePad * 2;
+  const contentHeight = safeChromeTopH + listContentHeight;
 
   const shouldScroll = contentHeight > safeMaxH;
   const bodyHeight = shouldScroll ? safeMaxH : contentHeight;
   const effectiveMaxWidth = Math.max(safeMinW, Math.min(safeMaxW, safePanelW - safeMarginX));
-  const desiredWidth = maxItemWidth + (shouldScroll ? 8 : 0);
+  const desiredWidth = maxItemWidth + (shouldScroll ? 12 : 0);
   const width = clampDropdownNumber(Math.ceil(desiredWidth), safeMinW, effectiveMaxWidth);
 
   return {
@@ -150,6 +157,111 @@ export function computeDropdownMetrics(options = {}) {
     bodyHeight,
     shouldScroll,
   };
+}
+
+/**
+ * Compute viewport-clamped (left, top) placement for an anchored floating popover.
+ * Ensures popovers never clip behind left/right/top/bottom container edges and flip
+ * above the anchor when there isn't enough space below.
+ * @param {{
+ *   anchorX?: number|null,
+ *   anchorY?: number|null,
+ *   anchorBottomY?: number|null,
+ *   popoverWidth?: number,
+ *   popoverHeight?: number,
+ *   containerWidth?: number,
+ *   containerHeight?: number,
+ *   marginX?: number,
+ *   marginTop?: number,
+ *   marginBottom?: number,
+ *   gapY?: number,
+ *   alignOffsetX?: number,
+ * }} [options]
+ * @returns {{ left: number, top: number, placement: "below"|"above"|"center" }}
+ */
+export function computeAnchoredPopoverPosition(options = {}) {
+  const opts = options && typeof options === "object" ? options : {};
+  const {
+    anchorX = null,
+    anchorY = null,
+    anchorBottomY = null,
+    popoverWidth = 320,
+    popoverHeight = 160,
+    containerWidth = 760,
+    containerHeight = 560,
+    marginX = 12,
+    marginTop = 12,
+    marginBottom = 12,
+    gapY = 6,
+    alignOffsetX = 12,
+  } = opts;
+
+  const safeMarginX = Number.isFinite(marginX) && marginX >= 0 ? marginX : 12;
+  const safeMarginTop = Number.isFinite(marginTop) && marginTop >= 0 ? marginTop : 12;
+  const safeMarginBottom = Number.isFinite(marginBottom) && marginBottom >= 0 ? marginBottom : 12;
+  const safeContainerW = Number.isFinite(containerWidth) && containerWidth > 0 ? containerWidth : 760;
+  const safeContainerH = Number.isFinite(containerHeight) && containerHeight > 0 ? containerHeight : 560;
+  const safePopW = Math.min(
+    Number.isFinite(popoverWidth) && popoverWidth > 0 ? popoverWidth : 320,
+    Math.max(120, safeContainerW - safeMarginX * 2)
+  );
+  const safePopH = Math.min(
+    Number.isFinite(popoverHeight) && popoverHeight > 0 ? popoverHeight : 160,
+    Math.max(80, safeContainerH - safeMarginTop - safeMarginBottom)
+  );
+  const safeGapY = Number.isFinite(gapY) && gapY >= 0 ? gapY : 6;
+  const safeAlignX = Number.isFinite(alignOffsetX) && alignOffsetX >= 0 ? alignOffsetX : 12;
+
+  const maxLeft = Math.max(safeMarginX, safeContainerW - safePopW - safeMarginX);
+  const hasAnchorX = anchorX !== null && anchorX !== undefined && Number.isFinite(Number(anchorX));
+  const rawLeft = hasAnchorX
+    ? Math.round(Number(anchorX) - safeAlignX)
+    : Math.round((safeContainerW - safePopW) / 2);
+  const left = clampDropdownNumber(rawLeft, safeMarginX, maxLeft);
+
+  const maxTop = Math.max(safeMarginTop, safeContainerH - safePopH - safeMarginBottom);
+  const hasAnchorY =
+    (anchorY !== null && anchorY !== undefined && Number.isFinite(Number(anchorY))) ||
+    (anchorBottomY !== null && anchorBottomY !== undefined && Number.isFinite(Number(anchorBottomY)));
+
+  if (!hasAnchorY) {
+    return {
+      left,
+      top: clampDropdownNumber(safeMarginTop + 8, safeMarginTop, maxTop),
+      placement: "center",
+    };
+  }
+
+  const numY = anchorY !== null && anchorY !== undefined && Number.isFinite(Number(anchorY))
+    ? Number(anchorY)
+    : Number(anchorBottomY) - 20;
+  const numBottomY = anchorBottomY !== null && anchorBottomY !== undefined && Number.isFinite(Number(anchorBottomY))
+    ? Number(anchorBottomY)
+    : numY + 20;
+
+  const belowTop = Math.round(numBottomY + safeGapY);
+  if (belowTop <= maxTop) {
+    return {
+      left,
+      top: clampDropdownNumber(belowTop, safeMarginTop, maxTop),
+      placement: "below",
+    };
+  }
+
+  const aboveTop = Math.round(numY - safePopH - safeGapY);
+  if (aboveTop >= safeMarginTop) {
+    return {
+      left,
+      top: aboveTop,
+      placement: "above",
+    };
+  }
+
+  const spaceBelow = Math.max(0, safeContainerH - safeMarginBottom - numBottomY);
+  const spaceAbove = Math.max(0, numY - safeMarginTop);
+  const placement = spaceAbove > spaceBelow ? "above" : "below";
+  const top = clampDropdownNumber(placement === "above" ? aboveTop : belowTop, safeMarginTop, maxTop);
+  return { left, top, placement };
 }
 
 /**

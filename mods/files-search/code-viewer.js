@@ -3,15 +3,18 @@ import { div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import { syntaxTokenStyle } from "./code-syntax.js";
 import { renderDropdownPopover } from "./dropdown.js";
+import { computeDropdownMetrics, computeAnchoredPopoverPosition } from "./dropdown-logic.js";
 import {
   isNavModifierActive,
   buildDisambiguationDropdownItems,
+  buildDisambiguationHeaderMeta,
   computeWindowedViewerSlice,
   computeScrollbarMetrics,
   resolveWheelLineDelta,
 } from "./search-logic.js";
 
 export const CODE_VIEWER_LINE_HEIGHT = 20;
+let pendingTokenPointerDown = null;
 
 /**
  * Compute responsive monospace line-number gutter width from logical line count.
@@ -187,17 +190,27 @@ export function renderInteractiveTokenSegments({
         .on_hover((hovered, cx) => {
           onTokenHover?.(hovered ? tokenKey : null, tokenKey, cx);
         })
+        .on_mouse_down("left", (e, _cx) => {
+          pendingTokenPointerDown = {
+            key: tokenKey,
+            bounds: e?.bounds || null,
+            position: e?.position || null,
+          };
+        })
         .on_click((e, cx) => {
           const mods = e?.modifiers || e;
           if (!isNavModifierActive(mods) && !ctrlHeld) return;
           cx?.stop_propagation?.();
+          const downMeta = pendingTokenPointerDown?.key === tokenKey ? pendingTokenPointerDown : null;
+          pendingTokenPointerDown = null;
           onTokenClick(
             {
               line: lineNum,
               col: tokenCol,
               symbol: segText,
               tokenKey,
-              bounds: e?.bounds || null,
+              bounds: downMeta?.bounds || e?.bounds || null,
+              position: downMeta?.position || null,
             },
             e,
             cx,
@@ -578,15 +591,15 @@ export function renderNavDisambiguationPopover({
   currentRoot = "",
   currentServiceName = "",
   scrollHandle = null,
-  top = 42,
-  left = null,
-  right = 12,
-  anchor = left != null ? "left" : "right",
-  minWidth = 300,
-  maxWidth = 480,
+  anchorRect = null,
+  containerWidth = 520,
+  containerHeight = 420,
+  minWidth = 280,
+  maxWidth = 460,
   maxHeight = 280,
-  panelWidth = 520,
-  marginX = 20,
+  marginX = 12,
+  marginTop = 44,
+  marginBottom = 14,
   onSelectCandidate = null,
   onClose = null,
 }) {
@@ -606,20 +619,101 @@ export function renderNavDisambiguationPopover({
     onSelect: (_e, cx) => onSelectCandidate?.(item.candidate, cx),
   }));
 
+  const headerMeta = buildDisambiguationHeaderMeta({
+    symbol: disambig.symbol || disambig.origin?.symbol || "",
+    mode: disambig.mode || "",
+    count: items.length,
+  });
+  const headerHeight = 32;
+  const safeContainerW = Number.isFinite(Number(containerWidth)) && Number(containerWidth) > 0 ? Number(containerWidth) : 520;
+  const safeContainerH = Number.isFinite(Number(containerHeight)) && Number(containerHeight) > 0 ? Number(containerHeight) : 420;
+  const effectiveMinW = Math.min(minWidth, Math.max(180, safeContainerW - marginX * 2));
+  const effectiveMaxH = Math.max(120, Math.min(maxHeight, safeContainerH - marginTop - marginBottom));
+
+  const metrics = computeDropdownMetrics({
+    items,
+    panelWidth: safeContainerW,
+    minWidth: effectiveMinW,
+    maxWidth,
+    maxHeight: effectiveMaxH,
+    marginX: marginX * 2,
+    chromeTopHeight: headerHeight,
+    headerTitle: headerMeta.title,
+  });
+
+  const rect = anchorRect ?? disambig.anchorRect ?? null;
+  const pos = computeAnchoredPopoverPosition({
+    anchorX: rect?.x ?? null,
+    anchorY: rect?.y ?? null,
+    anchorBottomY: rect?.bottomY ?? null,
+    popoverWidth: metrics.width,
+    popoverHeight: metrics.bodyHeight,
+    containerWidth: safeContainerW,
+    containerHeight: safeContainerH,
+    marginX,
+    marginTop,
+    marginBottom,
+    gapY: 6,
+    alignOffsetX: 12,
+  });
+
+  const themeObj = t || {};
+  const headerEl = h_flex()
+    .h(headerHeight)
+    .w_full()
+    .flex_none()
+    .px(10)
+    .gap(8)
+    .items_center()
+    .bg(themeObj.raised || themeObj.chrome || themeObj.background)
+    .border_b(1)
+    .border_color(themeObj.border)
+    .child(div().w(6).h(6).rounded_full().flex_none().bg(themeObj.accent || themeObj.foreground))
+    .child(
+      div()
+        .flex_1()
+        .min_w(0)
+        .truncate()
+        .text_size(11.5)
+        .font_semibold()
+        .text_color(themeObj.foreground)
+        .child(headerMeta.title)
+    )
+    .child(
+      div()
+        .flex_none()
+        .px(5)
+        .py(1)
+        .rounded(4)
+        .bg(themeObj.background)
+        .text_size(10)
+        .text_color(themeObj.muted || themeObj.dim)
+        .child(headerMeta.countText)
+    )
+    .child(
+      div()
+        .flex_none()
+        .text_size(10)
+        .text_color(themeObj.dim)
+        .child(headerMeta.hintText)
+    );
+
   return renderDropdownPopover({
     overlayId,
     menuId,
     triggerId,
-    top,
-    left: left ?? 10,
-    right: right ?? 12,
-    anchor,
-    minWidth,
+    top: pos.top,
+    left: pos.left,
+    anchor: "left",
+    minWidth: effectiveMinW,
     maxWidth,
-    maxHeight,
-    panelWidth,
-    marginX,
+    maxHeight: effectiveMaxH,
+    panelWidth: safeContainerW,
+    marginX: marginX * 2,
     items,
+    header: headerEl,
+    headerHeight,
+    headerTitle: headerMeta.title,
     scrollHandle,
     monoFont,
     t,

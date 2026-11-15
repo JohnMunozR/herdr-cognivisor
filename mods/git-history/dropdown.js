@@ -1,6 +1,6 @@
 // Shared reusable GPUI dropdown trigger and adaptive shrink-wrapping popover component.
 import { div, svg } from "gpui-kit";
-import { v_flex, h_flex } from "gpui-base";
+import { v_flex, h_flex, Scrollbar } from "gpui-base";
 import {
   DEFAULT_REOPEN_GUARD_MS,
   computeDropdownMetrics,
@@ -310,6 +310,9 @@ export function renderDropdownPopover({
   panelWidth = 420,
   marginX = 20,
   items = [],
+  header = null,
+  headerHeight = 34,
+  headerTitle = "",
   scrollHandle = null,
   monoFont = "monospace",
   t,
@@ -317,6 +320,8 @@ export function renderDropdownPopover({
 } = {}) {
   const themeObj = t || {};
   const listItems = Array.isArray(items) ? items : [];
+  const hasHeader = Boolean(header);
+  const fixedHeaderH = hasHeader && Number.isFinite(headerHeight) && headerHeight > 0 ? headerHeight : 0;
   const guardKey = triggerId || menuId || overlayId || "dropdown-trigger";
   const metrics = computeDropdownMetrics({
     items: listItems,
@@ -325,6 +330,8 @@ export function renderDropdownPopover({
     maxWidth,
     maxHeight,
     marginX,
+    chromeTopHeight: fixedHeaderH,
+    headerTitle,
   });
 
   const children = [];
@@ -339,11 +346,16 @@ export function renderDropdownPopover({
     }
   }
 
+  const resolvedMenuId = menuId || "dropdown-menu";
+  const scrollAreaId = `${resolvedMenuId}-scroll`;
+  const scrollViewportH = Math.max(48, metrics.bodyHeight - fixedHeaderH);
+
   return div()
     .id(overlayId || "dropdown-overlay")
     .absolute()
     .inset_0()
     .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+    .on_scroll_wheel((_e, cx) => cx.stop_propagation())
     .on_click((e, cx) => {
       cx.stop_propagation();
       recordDropdownDismiss(guardKey);
@@ -351,7 +363,7 @@ export function renderDropdownPopover({
     })
     .child(
       v_flex()
-        .id(menuId || "dropdown-menu")
+        .id(resolvedMenuId)
         .absolute()
         .top(top)
         .when(anchor === "right", (el) => el.right(right))
@@ -362,17 +374,45 @@ export function renderDropdownPopover({
         .border_1()
         .border_color(themeObj.border)
         .shadow_xl()
-        .p(5)
-        .gap(1)
-        // CRITICAL GPUI FIX: only attach fixed height + scrollbar when overflowing so short lists shrink-wrap tightly
-        .when(metrics.shouldScroll === true, (el) =>
-          el
-            .h(metrics.bodyHeight)
-            .overflow_y_scrollbar()
-            .when(Boolean(scrollHandle), (s) => s.track_scroll(scrollHandle))
-        )
+        .overflow_hidden()
         .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_scroll_wheel((_e, cx) => cx.stop_propagation())
         .on_click((_e, cx) => cx.stop_propagation())
-        .children(children)
+        .when(hasHeader, (el) => el.child(header))
+        .child(
+          metrics.shouldScroll === true
+            ? div()
+                .relative()
+                .w_full()
+                .h(scrollViewportH)
+                .overflow_hidden()
+                .child(
+                  v_flex()
+                    .id(scrollAreaId)
+                    .size_full()
+                    .overflow_y_scroll()
+                    .when(Boolean(scrollHandle), (s) => s.track_scroll(scrollHandle))
+                    .pt(5)
+                    .pb(5)
+                    .pl(5)
+                    .pr(14)
+                    .gap(1)
+                    .children(children)
+                )
+                .child(
+                  div()
+                    .absolute()
+                    .top(4)
+                    .bottom(4)
+                    .right(3)
+                    .w(8)
+                    .child(Scrollbar.vertical(scrollAreaId).absolute().inset_0())
+                )
+            : v_flex()
+                .w_full()
+                .p(5)
+                .gap(1)
+                .children(children)
+        )
     );
 }

@@ -46,6 +46,9 @@ import {
   resolveWheelLineDelta,
   resolveClickScrollbarRow,
   buildDisambiguationDropdownItems,
+  buildDisambiguationHeaderMeta,
+  computeLocalAnchorRect,
+  shouldAllowUnderlyingScroll,
   buildViewerNavigationNotice,
   applyTabNavMeta,
   shouldOpenNavInNewTab,
@@ -953,5 +956,58 @@ describe("files-search search-logic", () => {
       computeCodeContentWidth(["plain ascii", "    indented"]),
     );
     assert.equal(computeCodeContentWidth(["abc"], { charPx: Number.NaN, minWidth: 240, gutterPx: 92 }), 240);
+  });
+
+  test("buildDisambiguationHeaderMeta, buildDisambiguationDropdownItems, and computeLocalAnchorRect provide consistent target clarity and local anchors", () => {
+    const implHeader = buildDisambiguationHeaderMeta({ symbol: "ChatService", mode: "implementations", count: 3 });
+    assert.equal(implHeader.title, "Implementations of ChatService");
+    assert.equal(implHeader.countText, "3 matches");
+    assert.equal(implHeader.hintText, "↑↓ · Enter · Esc");
+
+    assert.equal(buildDisambiguationHeaderMeta({ symbol: "getTenantId", mode: "declarations", count: 1 }).countText, "1 match");
+    assert.equal(buildDisambiguationHeaderMeta({ symbol: "ask", mode: "references", count: 4 }).title, "Usages of ask");
+    assert.equal(buildDisambiguationHeaderMeta({ symbol: "User", mode: "", count: 2 }).title, "Go to User");
+
+    const rows = buildDisambiguationDropdownItems([
+      {
+        filePath: "/repo/app/src/ChatImpl.java",
+        root: "/repo/app",
+        line: 27,
+        column: 12,
+        containerName: "ChatImpl",
+        name: "ask",
+        kind: "method",
+      },
+    ], "/repo/app", "");
+    assert.equal(rows[0].height, 44);
+    assert.equal(rows[0].rightText, ":27");
+
+    // Bounds-based anchor converts window coords to container-local rect accurately
+    const fromBounds = computeLocalAnchorRect(
+      { bounds: { x: 140, y: 260, width: 88, height: 18 } },
+      { x: 100, y: 120, width: 700, height: 500 },
+      { x: 12, y: 12 },
+    );
+    assert.deepEqual(fromBounds, { x: 40, y: 140, bottomY: 158 });
+
+    // Position fallback when bounds absent
+    const fromPos = computeLocalAnchorRect(
+      { position: { x: 250, y: 300 } },
+      { x: 100, y: 100, width: 700, height: 500 },
+      null,
+    );
+    assert.deepEqual(fromPos, { x: 150, y: 190, bottomY: 210 });
+
+    // Container pointer fallback when neither bounds nor position are present
+    assert.deepEqual(computeLocalAnchorRect({}, null, { x: 85, y: 95 }), { x: 85, y: 85, bottomY: 105 });
+    assert.equal(computeLocalAnchorRect({}, null, null), null);
+  });
+
+  test("shouldAllowUnderlyingScroll blocks file/preview/list scrolling while a disambiguation dropdown is open", () => {
+    assert.equal(shouldAllowUnderlyingScroll({}), true);
+    assert.equal(shouldAllowUnderlyingScroll({ hasDisambiguationPopover: false, closed: false, selectTextMode: false }), true);
+    assert.equal(shouldAllowUnderlyingScroll({ hasDisambiguationPopover: true }), false);
+    assert.equal(shouldAllowUnderlyingScroll({ selectTextMode: true }), false);
+    assert.equal(shouldAllowUnderlyingScroll({ closed: true }), false);
   });
 });

@@ -962,11 +962,78 @@ export function buildDisambiguationDropdownItems(candidates, currentRoot = "", c
       subline: `${relPath}:${line}`,
       badge,
       rightText: `:${line}`,
+      height: 44,
       fontMedium: true,
       selected: idx === 0,
       candidate: cand,
     };
   });
+}
+
+/**
+ * Build descriptive header metadata for a code-navigation disambiguation popover.
+ */
+export function buildDisambiguationHeaderMeta({ symbol = "", mode = "", count = 0 } = {}) {
+  const sym = typeof symbol === "string" ? symbol.trim() : "";
+  const rawMode = String(mode || "").toLowerCase();
+  let action = "Select target";
+  if (rawMode === "implementations" || rawMode === "implementation") {
+    action = sym ? `Implementations of ${sym}` : "Implementations";
+  } else if (rawMode === "declarations" || rawMode === "declaration") {
+    action = sym ? `Declarations of ${sym}` : "Declarations";
+  } else if (rawMode === "references" || rawMode === "usages") {
+    action = sym ? `Usages of ${sym}` : "Usages";
+  } else if (sym) {
+    action = `Go to ${sym}`;
+  }
+  const n = Math.max(0, Number(count) || 0);
+  return {
+    title: action,
+    countText: `${n} ${n === 1 ? "match" : "matches"}`,
+    hintText: "↑↓ · Enter · Esc",
+  };
+}
+
+/**
+ * Compute container-local anchor coordinates from a clicked token event's bounds/position.
+ */
+export function computeLocalAnchorRect(tokenInfo, containerBounds = null, lastPointer = null) {
+  const tb = tokenInfo?.bounds;
+  if (
+    tb &&
+    containerBounds &&
+    Number.isFinite(Number(tb.x)) &&
+    Number.isFinite(Number(tb.y)) &&
+    Number.isFinite(Number(containerBounds.x)) &&
+    Number.isFinite(Number(containerBounds.y))
+  ) {
+    const x = Number(tb.x) - Number(containerBounds.x);
+    const y = Number(tb.y) - Number(containerBounds.y);
+    const h = Number.isFinite(Number(tb.height)) && Number(tb.height) > 0 ? Number(tb.height) : 20;
+    return { x, y, bottomY: y + h };
+  }
+
+  const pos = tokenInfo?.position;
+  if (
+    pos &&
+    containerBounds &&
+    Number.isFinite(Number(pos.x)) &&
+    Number.isFinite(Number(pos.y)) &&
+    Number.isFinite(Number(containerBounds.x)) &&
+    Number.isFinite(Number(containerBounds.y))
+  ) {
+    const x = Number(pos.x) - Number(containerBounds.x);
+    const y = Number(pos.y) - Number(containerBounds.y);
+    return { x, y: y - 10, bottomY: y + 10 };
+  }
+
+  if (lastPointer && Number.isFinite(Number(lastPointer.x)) && Number.isFinite(Number(lastPointer.y))) {
+    const x = Number(lastPointer.x);
+    const y = Number(lastPointer.y);
+    return { x, y: y - 10, bottomY: y + 10 };
+  }
+
+  return null;
 }
 
 /**
@@ -1033,4 +1100,16 @@ export function shouldOpenNavInNewTab(targetPath, currentPath, targetOn = null, 
   const right = normalizeCmp(currentPath);
   const sameOn = (targetOn ?? null) === (currentOn ?? null);
   return !(sameOn && left === right);
+}
+
+/**
+ * Determine whether wheel/keyboard scrolling on the underlying code viewer,
+ * preview pane, or search results list should run given current overlay state.
+ */
+export function shouldAllowUnderlyingScroll({
+  closed = false,
+  selectTextMode = false,
+  hasDisambiguationPopover = false,
+} = {}) {
+  return !closed && !selectTextMode && !hasDisambiguationPopover;
 }
