@@ -37,6 +37,7 @@ import {
   findRecentFlowWorkspaceBaseline,
   findRecentWorkspaceBaseline,
   countBaselineDirtyFiles,
+  compactFlowsMap,
   extractResumeKeyFromTranscript,
   filterUnbaselinedRepoEntries,
   resolveWorkspaceRoot,
@@ -75,32 +76,57 @@ function getSafeAppHome() {
   }
 }
 
+const SESSION_BASELINE_CACHE = new Map();
+const MAX_BASELINE_CACHE_ENTRIES = 32;
+let flowsBusOomDetected = false;
+
+function cacheSessionBaseline(tabId, baseline) {
+  if (!tabId || !baseline) return;
+  if (SESSION_BASELINE_CACHE.size >= MAX_BASELINE_CACHE_ENTRIES && !SESSION_BASELINE_CACHE.has(tabId)) {
+    const oldest = SESSION_BASELINE_CACHE.keys().next().value;
+    if (oldest !== undefined) SESSION_BASELINE_CACHE.delete(oldest);
+  }
+  SESSION_BASELINE_CACHE.set(tabId, baseline);
+}
+
+function safeReadFlows() {
+  try {
+    return readPlainObject(shared("cognivisor.flows"));
+  } catch (err) {
+    const msg = String(err?.message || err || "");
+    if (!err || /out of memory/i.test(msg)) {
+      flowsBusOomDetected = true;
+    }
+    return {};
+  }
+}
+
 function mergeSessionBaselineIntoFlow(tabId, baseline, sessionRepos = null, force = false) {
   if (!tabId) return;
   const normalized = normalizeSessionBaseline(baseline);
   if (!normalized) return;
-  const flows = readPlainObject(shared("cognivisor.flows"));
+  cacheSessionBaseline(tabId, normalized);
+  const rawFlows = safeReadFlows();
+  const liveTabIds = getLiveTabIdsSet();
+  const flows = compactFlowsMap(rawFlows, liveTabIds);
+  const hadLegacyBaseline = Object.values(rawFlows).some((f) => f && typeof f === "object" && Boolean(f.sessionBaseline));
+  const prunedCount = Object.keys(rawFlows).length !== Object.keys(flows).length;
   const cur = flows[tabId] && typeof flows[tabId] === "object" ? flows[tabId] : {};
-  const curReposCount = Object.keys(cur.sessionBaseline?.repos || {}).length;
-  const nextReposCount = Object.keys(normalized.repos || {}).length;
-  const curDirtyCount = countBaselineDirtyFiles(cur.sessionBaseline);
-  const nextDirtyCount = countBaselineDirtyFiles(normalized);
   const prevRepos = Array.isArray(cur.sessionRepos) ? cur.sessionRepos.map((r) => normPathStr(r)) : [];
   const nextRepos = Array.isArray(sessionRepos) ? sessionRepos.map((r) => normPathStr(r)).filter(Boolean) : null;
   const reposChanged = Boolean(nextRepos && (prevRepos.length !== nextRepos.length || prevRepos.some((r, idx) => r !== nextRepos[idx])));
-  const baselineChanged =
+  const metaChanged =
     force ||
-    !cur.sessionBaseline ||
-    cur.sessionBaseline.startedAt !== normalized.startedAt ||
-    cur.sessionStartedAt !== normalized.startedAt ||
-    curReposCount !== nextReposCount ||
-    curDirtyCount !== nextDirtyCount;
-  if (!baselineChanged && !reposChanged) return;
+    flowsBusOomDetected ||
+    hadLegacyBaseline ||
+    prunedCount ||
+    cur.sessionStartedAt !== normalized.startedAt;
+  if (!metaChanged && !reposChanged) return;
+  flowsBusOomDetected = false;
   setShared("cognivisor.flows", {
     ...flows,
     [tabId]: {
       ...cur,
-      sessionBaseline: normalized,
       sessionStartedAt: normalized.startedAt,
       ...(nextRepos ? { sessionRepos: nextRepos } : {}),
       updatedAt: Date.now(),
@@ -130,18 +156,25 @@ async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTer
     new Set((serviceResults || []).map((r) => String(r.branch || r.service?.branch || "").trim()).filter(Boolean))
   );
 
-  const flows = readPlainObject(shared("cognivisor.flows"));
+  const cached = normalizeSessionBaseline(SESSION_BASELINE_CACHE.get(sessionTabId));
+  if (cached && (!normWs || !cached.workspaceRoot || cached.workspaceRoot === normWs)) {
+    return { baseline: cached, isFresh: false, anchored: false, dirtyChanged: false, primaryBranch };
+  }
+
+  const flows = safeReadFlows();
   const curFlow = readPlainObject(flows[sessionTabId]);
   const rawExisting = curFlow.sessionBaseline;
   const existing = normalizeSessionBaseline(rawExisting);
   if (existing && (!normWs || !existing.workspaceRoot || existing.workspaceRoot === normWs)) {
-    return { baseline: existing, isFresh: false, anchored: false, dirtyChanged: false, primaryBranch };
+    cacheSessionBaseline(sessionTabId, existing);
+    return { baseline: existing, isFresh: false, anchored: false, dirtyChanged: true, primaryBranch };
   }
 
   const appHomeDir = getSafeAppHome();
   if (appHomeDir) {
     const fromTab = await readDiskSessionBaseline(appHomeDir, sessionTabId, workspaceRoot, candidateBranches, false, fsPromises);
     if (fromTab) {
+      cacheSessionBaseline(sessionTabId, fromTab);
       return { baseline: fromTab, isFresh: false, anchored: false, dirtyChanged: false, primaryBranch };
     }
   }
@@ -163,6 +196,7 @@ async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTer
         fsPromises
       );
       if (fromResume) {
+        cacheSessionBaseline(sessionTabId, fromResume);
         return { baseline: fromResume, isFresh: false, anchored: false, dirtyChanged: true, primaryBranch, resumeKey };
       }
     }
@@ -176,6 +210,7 @@ async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTer
     liveTabIds,
   });
   if (recentFlowBaseline) {
+    cacheSessionBaseline(sessionTabId, recentFlowBaseline);
     return { baseline: recentFlowBaseline, isFresh: false, anchored: false, dirtyChanged: true, primaryBranch, resumeKey };
   }
   if (appHomeDir) {
@@ -185,6 +220,7 @@ async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTer
       fsDeps: fsPromises,
     });
     if (recentDiskBaseline) {
+      cacheSessionBaseline(sessionTabId, recentDiskBaseline);
       return { baseline: recentDiskBaseline, isFresh: false, anchored: false, dirtyChanged: true, primaryBranch, resumeKey };
     }
   }
@@ -195,6 +231,7 @@ async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTer
     startedAt,
     anchored,
   });
+  cacheSessionBaseline(sessionTabId, baseline);
   return { baseline, isFresh: true, anchored, dirtyChanged: true, primaryBranch, resumeKey };
 }
 
@@ -313,35 +350,46 @@ function isChangesVisible() {
   return block ? !block.hidden : false;
 }
 
-async function fsScanRepos(targetRoot, depth2 = true) {
-  if (!targetRoot) return [];
-  let level1;
+async function safeExists(p) {
   try {
-    level1 = await readdir(targetRoot, { withFileTypes: true });
+    return Boolean(await exists(p));
+  } catch {
+    return false;
+  }
+}
+
+async function safeReaddir(p, opts) {
+  try {
+    return await readdir(p, opts);
   } catch {
     return null;
   }
-  if (!isSupportedDirentList(level1)) return null;
+}
+
+async function fsScanRepos(targetRoot, depth2 = true) {
+  if (!targetRoot) return [];
+  const level1 = await safeReaddir(targetRoot, { withFileTypes: true });
+  if (!level1 || !isSupportedDirentList(level1)) return null;
   const found = [];
-  if (await exists(join(targetRoot, ".git")).catch(() => false)) {
+  if (await safeExists(join(targetRoot, ".git"))) {
     found.push(targetRoot);
   }
   await Promise.all(
     level1.map(async (e1) => {
       if (!direntIsDir(e1) || !e1.name || DISCOVER_SKIP_DIRS.has(e1.name)) return;
       const p1 = join(targetRoot, e1.name);
-      if (await exists(join(p1, ".git")).catch(() => false)) {
+      if (await safeExists(join(p1, ".git"))) {
         found.push(p1);
         return;
       }
       if (!depth2) return;
-      const level2 = await readdir(p1, { withFileTypes: true }).catch(() => []);
-      if (!isSupportedDirentList(level2)) return;
+      const level2 = await safeReaddir(p1, { withFileTypes: true });
+      if (!level2 || !isSupportedDirentList(level2)) return;
       await Promise.all(
         level2.map(async (e2) => {
           if (!direntIsDir(e2) || !e2.name || DISCOVER_SKIP_DIRS.has(e2.name)) return;
           const p2 = join(p1, e2.name);
-          if (await exists(join(p2, ".git")).catch(() => false)) {
+          if (await safeExists(join(p2, ".git"))) {
             found.push(p2);
           }
         })
@@ -354,7 +402,7 @@ async function fsScanRepos(targetRoot, depth2 = true) {
 async function findLocalGitRoot(startDir, maxDepth = 6) {
   let cur = normPathStr(startDir);
   for (let i = 0; i < maxDepth && cur; i++) {
-    if (await exists(join(cur, ".git")).catch(() => false)) return cur;
+    if (await safeExists(join(cur, ".git"))) return cur;
     const idx = cur.lastIndexOf("/");
     if (idx <= 0) break;
     const parent = cur.slice(0, idx);
@@ -512,7 +560,7 @@ async function loadServiceWorkingSnapshot(service, on, includeCommits = true) {
 }
 
 function readFlows() {
-  return readPlainObject(shared("cognivisor.flows"));
+  return safeReadFlows();
 }
 
 function readAllActiveDiffs() {
@@ -1851,8 +1899,8 @@ export default class ChangesReview extends View {
   resetSessionBaseline(cx) {
     const { sessionTabId } = getActiveSpaceAndTab();
     if (!sessionTabId || !this.workspaceRoot) return;
-    const flows = readPlainObject(shared("cognivisor.flows"));
-    const curBaseline = flows[sessionTabId]?.sessionBaseline || null;
+    const flows = safeReadFlows();
+    const curBaseline = SESSION_BASELINE_CACHE.get(sessionTabId) || flows[sessionTabId]?.sessionBaseline || null;
     const repoRoots = Array.from(
       new Set([
         ...(this.lastCandidateRoots || []),
@@ -1982,7 +2030,7 @@ export default class ChangesReview extends View {
       ? Array.from(new Set(allPanesList.filter((p) => p?.cwd && p.tab === sessionTabId).map((p) => p.cwd)))
       : [];
     const tabPaneCwds = extraCwds;
-    const tabFlowObj = sessionTabId && shared("cognivisor.flows")?.[sessionTabId];
+    const tabFlowObj = sessionTabId && safeReadFlows()[sessionTabId];
     const tabTermAddrs = sessionTabId
       ? Array.from(
           new Set([
@@ -2105,7 +2153,7 @@ export default class ChangesReview extends View {
 
         if (sessionTabId && sessionBaseline) {
           const startedAt = sessionBaseline.startedAt || 0;
-          const flowsNow = readPlainObject(shared("cognivisor.flows"));
+          const flowsNow = safeReadFlows();
           const curFlowNow = readPlainObject(flowsNow[sessionTabId]);
           const prevSessionRepos = new Set(
             Array.isArray(curFlowNow.sessionRepos) ? curFlowNow.sessionRepos.map((r) => normPathStr(r)).filter(Boolean) : []

@@ -143,6 +143,7 @@ import {
   resolveSessionStartTime,
   findRecentFlowWorkspaceBaseline,
   findRecentWorkspaceBaseline,
+  compactFlowsMap,
   terminalHasResumeCommand,
   statFileEntry,
   filterSessionDirtyEntries,
@@ -744,35 +745,66 @@ async function repoAheadCount(root, on, branchHint = "") {
   return 0;
 }
 
-async function fsScanRepos(targetRoot, depth2 = true) {
-  if (!targetRoot) return [];
-  let level1;
+async function safeExists(p) {
   try {
-    level1 = await readdir(targetRoot, { withFileTypes: true });
+    return Boolean(await exists(p));
+  } catch {
+    return false;
+  }
+}
+
+async function safeReaddir(p, opts) {
+  try {
+    return await readdir(p, opts);
   } catch {
     return null;
   }
-  if (!isSupportedDirentList(level1)) return null;
+}
+
+const SESSION_BASELINE_CACHE = new Map();
+const MAX_BASELINE_CACHE_ENTRIES = 32;
+
+function cacheSessionBaseline(tabId, baseline) {
+  if (!tabId || !baseline) return;
+  if (SESSION_BASELINE_CACHE.size >= MAX_BASELINE_CACHE_ENTRIES && !SESSION_BASELINE_CACHE.has(tabId)) {
+    const oldest = SESSION_BASELINE_CACHE.keys().next().value;
+    if (oldest !== undefined) SESSION_BASELINE_CACHE.delete(oldest);
+  }
+  SESSION_BASELINE_CACHE.set(tabId, baseline);
+}
+
+function safeReadFlows() {
+  try {
+    return asPlainObject(shared("cognivisor.flows"));
+  } catch {
+    return {};
+  }
+}
+
+async function fsScanRepos(targetRoot, depth2 = true) {
+  if (!targetRoot) return [];
+  const level1 = await safeReaddir(targetRoot, { withFileTypes: true });
+  if (!level1 || !isSupportedDirentList(level1)) return null;
   const found = [];
-  if (await exists(join(targetRoot, ".git")).catch(() => false)) {
+  if (await safeExists(join(targetRoot, ".git"))) {
     found.push(targetRoot);
   }
   await Promise.all(
     level1.map(async e1 => {
       if (!direntIsDir(e1) || !e1.name || DISCOVER_SKIP_DIRS.has(e1.name)) return;
       const p1 = join(targetRoot, e1.name);
-      if (await exists(join(p1, ".git")).catch(() => false)) {
+      if (await safeExists(join(p1, ".git"))) {
         found.push(p1);
         return;
       }
       if (!depth2) return;
-      const level2 = await readdir(p1, { withFileTypes: true }).catch(() => []);
-      if (!isSupportedDirentList(level2)) return;
+      const level2 = await safeReaddir(p1, { withFileTypes: true });
+      if (!level2 || !isSupportedDirentList(level2)) return;
       await Promise.all(
         level2.map(async e2 => {
           if (!direntIsDir(e2) || !e2.name || DISCOVER_SKIP_DIRS.has(e2.name)) return;
           const p2 = join(p1, e2.name);
-          if (await exists(join(p2, ".git")).catch(() => false)) {
+          if (await safeExists(join(p2, ".git"))) {
             found.push(p2);
           }
         })
@@ -785,7 +817,7 @@ async function fsScanRepos(targetRoot, depth2 = true) {
 async function findLocalGitRoot(startDir, maxDepth = 6) {
   let cur = normPathStr(startDir);
   for (let i = 0; i < maxDepth && cur; i++) {
-    if (await exists(join(cur, ".git")).catch(() => false)) return cur;
+    if (await safeExists(join(cur, ".git"))) return cur;
     const idx = cur.lastIndexOf("/");
     if (idx <= 0) break;
     const parent = cur.slice(0, idx);
@@ -1907,9 +1939,10 @@ export default class FilesSearch extends View {
             || null;
           const primaryBranch = primaryStatus?.branch || "";
 
-          const allFlowsNow = asPlainObject(shared("cognivisor.flows"));
+          const allFlowsNow = safeReadFlows();
           const freshFlowObj = allFlowsNow[activeTabId];
-          let sessionBaseline = normalizeSessionBaseline(freshFlowObj?.sessionBaseline);
+          let sessionBaseline = normalizeSessionBaseline(SESSION_BASELINE_CACHE.get(activeTabId))
+            || normalizeSessionBaseline(freshFlowObj?.sessionBaseline);
           if (sessionBaseline && sessionBaseline.workspaceRoot && normCwd && sessionBaseline.workspaceRoot !== normCwd) {
             sessionBaseline = null;
           }
@@ -2100,18 +2133,27 @@ export default class FilesSearch extends View {
             }
           }
 
+          cacheSessionBaseline(activeTabId, sessionBaseline);
           const sessionRepos = enrichedServices.map(s => normPathStr(s.root)).filter(Boolean);
-          const latestFlows = asPlainObject(shared("cognivisor.flows"));
+          const rawLatestFlows = safeReadFlows();
+          const liveTabIdsForCompact = new Set();
+          for (const sp of spaces() || []) {
+            for (const tb of sp?.tabs || []) {
+              if (tb?.id) liveTabIdsForCompact.add(tb.id);
+            }
+          }
+          const latestFlows = compactFlowsMap(rawLatestFlows, liveTabIdsForCompact);
+          const hadLegacyBaseline = Object.values(rawLatestFlows).some(f => f && typeof f === "object" && Boolean(f.sessionBaseline));
+          const prunedTabs = Object.keys(rawLatestFlows).length !== Object.keys(latestFlows).length;
           const curFlow = asPlainObject(latestFlows[activeTabId]);
           const prevRepos = Array.isArray(curFlow.sessionRepos) ? curFlow.sessionRepos.map(r => normPathStr(r)) : [];
           const reposChanged = prevRepos.length !== sessionRepos.length || prevRepos.some((r, idx) => r !== sessionRepos[idx]);
 
-          if (baselineDirtyChanged || reposChanged || !curFlow.sessionBaseline || curFlow.sessionStartedAt !== sessionBaseline.startedAt) {
+          if (hadLegacyBaseline || prunedTabs || reposChanged || curFlow.sessionStartedAt !== sessionBaseline.startedAt) {
             setShared("cognivisor.flows", {
               ...latestFlows,
               [activeTabId]: {
                 ...curFlow,
-                sessionBaseline,
                 sessionStartedAt: sessionBaseline.startedAt,
                 sessionRepos,
                 updatedAt: Date.now(),

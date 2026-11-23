@@ -38,6 +38,7 @@ import {
   findRecentFlowWorkspaceBaseline,
   findRecentWorkspaceBaseline,
   countBaselineDirtyFiles,
+  compactFlowsMap,
   extractResumeKeyFromTranscript,
   filterUnbaselinedRepoEntries,
   isHomeDirectoryRoot,
@@ -1251,5 +1252,33 @@ describe("changes-review review-logic", () => {
     const afterReset = partitionSessionWorkingEntries(files, reset.repos["/ws/ms-card"], reset.startedAt);
     assert.equal(afterReset.hidden.length, 0);
     assert.deepEqual(afterReset.visible.map((f) => f.relFile), ["src/CardB2bApi.java", "src/CardRepository.java"]);
+  });
+
+  test("regression: compactFlowsMap strips bulky sessionBaseline and prunes expired closed tabs to prevent QuickJS OOM", () => {
+    const now = 1795474000000;
+    const day = 24 * 60 * 60 * 1000;
+    const flows = {
+      live_tab: {
+        ticket: "PROJ-1",
+        sessionStartedAt: now - 1000,
+        sessionBaseline: { version: 1, startedAt: now - 1000, repos: { "/ws/a": { dirtyFiles: { "x.js": { status: "M", sig: "1:1" } } } } },
+        updatedAt: now - 1000,
+      },
+      recent_closed: {
+        sessionStartedAt: now - day,
+        sessionBaseline: { version: 1, startedAt: now - day, repos: {} },
+        updatedAt: now - day,
+      },
+      ancient_closed: {
+        sessionStartedAt: now - 30 * day,
+        sessionBaseline: { version: 1, startedAt: now - 30 * day, repos: {} },
+        updatedAt: now - 30 * day,
+      },
+    };
+    const compacted = compactFlowsMap(flows, new Set(["live_tab"]), { maxClosedTabs: 10, maxAgeMs: 7 * day, now });
+    assert.deepEqual(Object.keys(compacted).sort(), ["live_tab", "recent_closed"]);
+    assert.equal(compacted.live_tab.sessionBaseline, undefined);
+    assert.equal(compacted.live_tab.ticket, "PROJ-1");
+    assert.equal(compacted.recent_closed.sessionBaseline, undefined);
   });
 });

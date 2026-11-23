@@ -350,35 +350,46 @@ function direntIsDir(entry) {
   }
 }
 
-async function fsScanRepos(targetRoot, depth2 = true) {
-  if (!targetRoot) return [];
-  let level1;
+async function safeExists(p) {
   try {
-    level1 = await readdir(targetRoot, { withFileTypes: true });
+    return Boolean(await exists(p));
+  } catch {
+    return false;
+  }
+}
+
+async function safeReaddir(p, opts) {
+  try {
+    return await readdir(p, opts);
   } catch {
     return null;
   }
-  if (!isSupportedDirentList(level1)) return null;
+}
+
+async function fsScanRepos(targetRoot, depth2 = true) {
+  if (!targetRoot) return [];
+  const level1 = await safeReaddir(targetRoot, { withFileTypes: true });
+  if (!level1 || !isSupportedDirentList(level1)) return null;
   const found = [];
-  if (await exists(join(targetRoot, ".git")).catch(() => false)) {
+  if (await safeExists(join(targetRoot, ".git"))) {
     found.push(targetRoot);
   }
   await Promise.all(
     level1.map(async (e1) => {
       if (!direntIsDir(e1) || !e1.name || DISCOVER_SKIP_DIRS.has(e1.name)) return;
       const p1 = join(targetRoot, e1.name);
-      if (await exists(join(p1, ".git")).catch(() => false)) {
+      if (await safeExists(join(p1, ".git"))) {
         found.push(p1);
         return;
       }
       if (!depth2) return;
-      const level2 = await readdir(p1, { withFileTypes: true }).catch(() => []);
-      if (!isSupportedDirentList(level2)) return;
+      const level2 = await safeReaddir(p1, { withFileTypes: true });
+      if (!level2 || !isSupportedDirentList(level2)) return;
       await Promise.all(
         level2.map(async (e2) => {
           if (!direntIsDir(e2) || !e2.name || DISCOVER_SKIP_DIRS.has(e2.name)) return;
           const p2 = join(p1, e2.name);
-          if (await exists(join(p2, ".git")).catch(() => false)) {
+          if (await safeExists(join(p2, ".git"))) {
             found.push(p2);
           }
         })
@@ -391,7 +402,7 @@ async function fsScanRepos(targetRoot, depth2 = true) {
 async function findLocalGitRoot(startDir, maxDepth = 6) {
   let cur = normPathStr(startDir);
   for (let i = 0; i < maxDepth && cur; i++) {
-    if (await exists(join(cur, ".git")).catch(() => false)) return cur;
+    if (await safeExists(join(cur, ".git"))) return cur;
     const parent = getParentDir(cur);
     if (!parent || parent === cur) break;
     cur = parent;
@@ -1020,7 +1031,7 @@ export default class GitHistory extends View {
     const repoRoot = normPathStr(repo.root);
     let gitDir = join(repo.root, ".git");
     try {
-      const hasHeadInside = await exists(join(gitDir, "HEAD")).catch(() => false);
+      const hasHeadInside = await safeExists(join(gitDir, "HEAD"));
       if (!hasHeadInside) {
         const res = await exec("git", [...READ_GIT, "rev-parse", "--git-dir"], {
           cwd: repo.root,

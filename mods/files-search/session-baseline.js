@@ -309,6 +309,38 @@ export async function findRecentWorkspaceBaseline(
   return best;
 }
 
+export function compactFlowsMap(
+  flows,
+  liveTabIds = null,
+  { maxClosedTabs = 25, maxAgeMs = 7 * 24 * 60 * 60 * 1000, now = Date.now() } = {},
+) {
+  if (!flows || typeof flows !== "object" || Array.isArray(flows)) return {};
+  const liveSet = liveTabIds ? new Set(Array.from(liveTabIds).filter(Boolean)) : null;
+  const nowMs = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  const ageLimit = Number.isFinite(Number(maxAgeMs)) && Number(maxAgeMs) > 0 ? Number(maxAgeMs) : 7 * 24 * 60 * 60 * 1000;
+  const closedCap = Number.isFinite(Number(maxClosedTabs)) && Number(maxClosedTabs) >= 0 ? Math.trunc(Number(maxClosedTabs)) : 25;
+
+  const liveEntries = [];
+  const closedEntries = [];
+  for (const [tabId, rawFlow] of Object.entries(flows)) {
+    if (!tabId || !rawFlow || typeof rawFlow !== "object" || Array.isArray(rawFlow)) continue;
+    const { sessionBaseline: _droppedBaseline, ...rest } = rawFlow;
+    const updatedAt = Number(rest.updatedAt) || Number(rest.sessionStartedAt) || 0;
+    if (!liveSet || liveSet.has(tabId)) {
+      liveEntries.push([tabId, rest]);
+    } else {
+      if (updatedAt > 0 && (nowMs - updatedAt) > ageLimit) continue;
+      closedEntries.push({ tabId, flow: rest, updatedAt });
+    }
+  }
+
+  closedEntries.sort((a, b) => b.updatedAt - a.updatedAt);
+  const out = {};
+  for (const [tabId, flow] of liveEntries) out[tabId] = flow;
+  for (const item of closedEntries.slice(0, closedCap)) out[item.tabId] = item.flow;
+  return out;
+}
+
 function stripAnsiEscapes(text) {
   return String(text || "")
     .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
