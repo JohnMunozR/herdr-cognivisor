@@ -45,14 +45,14 @@ const LANG_GIT_PATHSPECS = {
   java: ["--", "*.java"],
 };
 
-const MAX_INDEXED_SERVICES = 24;
-const MAX_INDEXED_FILES_PER_SERVICE = 8000;
-const MAX_INDEXED_FILE_BYTES = 512 * 1024;
+const MAX_INDEXED_SERVICES = 4;
+const MAX_INDEXED_FILES_PER_SERVICE = 2500;
+const MAX_INDEXED_FILE_BYTES = 192 * 1024;
 const MAX_GREP_MATCH_FILES = 25;
-const FILE_SUMMARY_CACHE_MAX = 400;
-const SOURCE_PROBE_CACHE_MAX = 600;
+const FILE_SUMMARY_CACHE_MAX = 80;
+const SOURCE_PROBE_CACHE_MAX = 32;
 const SOURCE_PROBE_TTL_MS = 15000;
-const JS_CONFIG_CACHE_MAX = 128;
+const JS_CONFIG_CACHE_MAX = 64;
 const INDEX_CACHE_VERSION = 2;
 
 const KNOWN_BUILTIN_RECEIVERS = {
@@ -974,7 +974,7 @@ export async function warmServiceSymbolIndex({
 
     if (toParse.length > 0) {
       let processed = 0;
-      await runInBatches(toParse, 6, async (relPath) => {
+      await runInBatches(toParse, 2, async (relPath) => {
         const abs = joinFsPath(svc.root, relPath);
         const text = await readTextCached(abs, { on: svc.on, readTextFn, skipCache: true });
         if (typeof text === "string") {
@@ -986,7 +986,7 @@ export async function warmServiceSymbolIndex({
           }
         }
         processed += 1;
-        if (yieldFn && processed % 12 === 0) {
+        if (yieldFn && processed % 6 === 0) {
           await yieldFn();
         }
       });
@@ -1012,14 +1012,18 @@ export async function warmServiceSymbolIndex({
   }
 }
 
-export async function warmAllServiceSymbolIndices({ services = [], currentRoot = "", on = null, ...opts } = {}) {
+export async function warmAllServiceSymbolIndices({ services = [], currentRoot = "", on = null, maxServices = MAX_INDEXED_SERVICES, ...opts } = {}) {
   const normalized = normalizeServiceList(services, currentRoot, "", on);
   if (normalized.length === 0) return;
   const normCurrent = normPathStr(currentRoot);
   if (normCurrent) {
     normalized.sort((a, b) => (a.root === normCurrent ? -1 : b.root === normCurrent ? 1 : 0));
   }
-  await runInBatches(normalized, 3, async (svc) => {
+  const limit = Number.isFinite(Number(maxServices)) && Number(maxServices) > 0
+    ? Math.trunc(Number(maxServices))
+    : MAX_INDEXED_SERVICES;
+  const targets = normalized.slice(0, limit);
+  await runInBatches(targets, 1, async (svc) => {
     await warmServiceSymbolIndex({ service: svc, on: svc.on ?? on, ...opts });
   });
 }

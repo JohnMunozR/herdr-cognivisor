@@ -352,11 +352,12 @@ const RESUME_CMD_LINE_RE =
 
 export function terminalHasResumeCommand(transcriptText) {
   if (typeof transcriptText !== "string" || !transcriptText) return false;
-  const clean = stripAnsiEscapes(transcriptText);
+  const tail = transcriptText.length > 16384 ? transcriptText.slice(-16384) : transcriptText;
+  const clean = stripAnsiEscapes(tail);
   const lines = clean.split(/\r?\n/);
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
-    if (!line) continue;
+    if (!line || line.length > 300) continue;
     if (RESUME_CMD_LINE_RE.test(line)) return true;
   }
   return false;

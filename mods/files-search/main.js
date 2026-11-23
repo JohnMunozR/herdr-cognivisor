@@ -1290,6 +1290,7 @@ export default class FilesSearch extends View {
             services: svcs,
             currentRoot: root,
             on,
+            maxServices: 2,
             indexedFilesByRoot: indexedByRoot,
             appHomeDir: getSafeAppHome(),
             skipIfFreshMs: 15000,
@@ -1829,7 +1830,7 @@ export default class FilesSearch extends View {
     const tabPaneCwds = activeTabId
       ? Array.from(new Set(allPanesList.filter(p => p.tab === activeTabId && p.cwd).map(p => p.cwd)))
       : [];
-    const tabFlowObj = activeTabId && shared("cognivisor.flows")?.[activeTabId];
+    const tabFlowObj = activeTabId && safeReadFlows()[activeTabId];
     const tabTermAddrs = activeTabId
       ? Array.from(
           new Set([

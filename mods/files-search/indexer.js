@@ -19,8 +19,8 @@ export const WATCH_SKIP_DIRS = new Set([
 
 export const WATCH_SKIP_EXTS = [".log", ".tmp", ".swp", ".swo", ".part", ".crdownload"];
 
-export const MAX_OVERLAY_FILES = 20000;
-export const MAX_OVERLAY_DIRS = 5000;
+export const MAX_OVERLAY_FILES = 12000;
+export const MAX_OVERLAY_DIRS = 3000;
 export const OVERLAY_INDEX_FRESH_MS = 8000;
 export const INDEX_WATCHED_TTL_MS = 300000;
 export const INDEX_REBUILD_DEBOUNCE_MS = 1200;
@@ -460,7 +460,7 @@ function getWorkspaceCachePath(root, on, isWindows) {
 function putIndexCache(indexKey, record) {
   if (OVERLAY_INDEX_CACHE.has(indexKey)) {
     OVERLAY_INDEX_CACHE.delete(indexKey);
-  } else if (OVERLAY_INDEX_CACHE.size >= 6) {
+  } else if (OVERLAY_INDEX_CACHE.size >= 2) {
     const oldestKey = OVERLAY_INDEX_CACHE.keys().next().value;
     if (oldestKey !== undefined) OVERLAY_INDEX_CACHE.delete(oldestKey);
   }
@@ -787,12 +787,18 @@ export async function ensureWorkspaceIndex({ root, on = null, isWindows = false,
           markRgAvailable(onKey, Boolean(probe && probe.code === 0));
         }
       } else {
+        const rgLineCap = MAX_OVERLAY_FILES + 1;
+        const psGlobs = COMMON_IGNORE_GLOBS.map(g => `'${g.replace(/'/g, "''")}'`).join(",");
+        const psCmd = `if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { exit 127 }; & rg --files --hidden --path-separator / --threads 4 @(${psGlobs}) 2>$null | Select-Object -First ${rgLineCap}`;
         rgRes = await exec(
-          "rg",
-          ["--files", "--hidden", "--path-separator", "/", "--threads", "4", ...COMMON_IGNORE_GLOBS],
+          "powershell",
+          ["-NoProfile", "-Command", psCmd],
           { cwd: root, on, timeout: 10000 }
         ).catch(() => null);
-        if (rgRes) {
+        if (rgRes && rgRes.code === 127) {
+          markRgAvailable(onKey, false);
+          rgRes = null;
+        } else if (rgRes) {
           markRgAvailable(onKey, true);
         } else {
           const probe = await exec("rg", ["--version"], { on, timeout: 2500 }).catch(() => null);

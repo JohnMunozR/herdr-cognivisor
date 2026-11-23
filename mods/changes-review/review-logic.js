@@ -1104,12 +1104,15 @@ export async function findRecentWorkspaceBaseline(
   const safeLiveSet = toSafeLiveTabSet(liveTabIds);
 
   let best = null;
+  let scanned = 0;
   for (const rawEntry of entries) {
+    if (scanned >= 40) break;
     const name = typeof rawEntry === "string" ? rawEntry : rawEntry?.name;
     if (!name || !name.endsWith(".json")) continue;
     const fileTabId = name.slice(0, -".json".length);
     if (!fileTabId || fileTabId === safeExclude) continue;
     if (safeLiveSet && safeLiveSet.has(fileTabId)) continue;
+    scanned += 1;
     const candidate = await readBaselineJsonFile(join(tabsDir, name), fsDeps);
     if (!candidate || candidate.workspaceRoot !== normWs) continue;
     const age = nowMs - candidate.startedAt;
@@ -1183,12 +1186,14 @@ const RESUME_CMD_LINE_RE =
   /^(?:(?:[^\n]{0,60}?[$%>❯›•]\s+)|Running\s+)?(?:\/resume(?:\s+([a-zA-Z0-9_][a-zA-Z0-9._:/-]*))?|(?:claude|codex|gemini|opencode|antigravity)\s+(?:--)?resume(?:\s+([a-zA-Z0-9_][a-zA-Z0-9._:/-]*))?)\s*$/i;
 
 export function extractResumeKeyFromTranscript(text, workspaceRoot) {
-  const s = stripAnsiEscapes(text);
+  if (typeof text !== "string" || !text) return "";
+  const tail = text.length > 16384 ? text.slice(-16384) : text;
+  const s = stripAnsiEscapes(tail);
   if (!s) return "";
   const lines = s.split(/\r?\n/);
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
-    if (!line) continue;
+    if (!line || line.length > 300) continue;
     const cmdMatch = line.match(RESUME_CMD_LINE_RE);
     if (cmdMatch) {
       const id = (cmdMatch[1] || cmdMatch[2] || "").trim();

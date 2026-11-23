@@ -34,6 +34,14 @@ const PANEL_DEFS = [
 const PROBE_COOLDOWN_MS = 8000;
 const ACTIVE_STATUSES = new Set(["working", "done", "blocked"]);
 
+function safeReadFlows() {
+  try {
+    return asPlainObject(shared("cognivisor.flows"));
+  } catch {
+    return {};
+  }
+}
+
 export default class CognivisorTabs extends View {
   init(_props, cx) {
     this.logger = createModLogger("cognivisor-tabs");
@@ -103,7 +111,7 @@ export default class CognivisorTabs extends View {
     this.editingTabId = null;
 
     const ownerSpace = spaces().find((s) => (s.tabs ?? []).some((t) => t.id === id)) || spaces().find((s) => s.active);
-    const flows = asPlainObject(shared("cognivisor.flows"));
+    const flows = safeReadFlows();
     const existing = asPlainObject(flows[id]);
 
     if (raw) {
@@ -200,7 +208,7 @@ export default class CognivisorTabs extends View {
     const allSpaces = spaces();
     const allPanes = panes();
     const allTerminals = terminals();
-    const flows = asPlainObject(shared("cognivisor.flows"));
+    const flows = safeReadFlows();
     const now = Date.now();
 
     for (const space of allSpaces) {
@@ -295,7 +303,7 @@ export default class CognivisorTabs extends View {
       // Re-validate current tab and flow state after async awaits so manual renames always win.
       const freshSpace = spaces().find((s) => s.id === space.id);
       const freshTab = (freshSpace?.tabs ?? []).find((t) => t.id === tab.id);
-      const freshFlows = asPlainObject(shared("cognivisor.flows"));
+      const freshFlows = safeReadFlows();
       const existing = asPlainObject(freshFlows[tab.id]);
       if (!freshTab || freshTab.named || this.editingTabId === tab.id) return;
       if (existing.manualTitle === true || existing.autoNamed === true) return;

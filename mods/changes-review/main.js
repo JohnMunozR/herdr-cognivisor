@@ -689,6 +689,16 @@ export default class ChangesReview extends View {
     this.isViewer = p?.role === "viewer";
     this.logger = createModLogger("changes-review");
     this.logger.lifecycle("mod.init", { mode: this.isViewer ? "viewer" : "panel" }, cx);
+    safeReadFlows();
+    if (flowsBusOomDetected && cx?.timer?.after) {
+      cx.timer.after(0, () => {
+        if (!flowsBusOomDetected) return;
+        flowsBusOomDetected = false;
+        try {
+          setShared("cognivisor.flows", {});
+        } catch {}
+      });
+    }
 
     this.files = [];
     this.allWorkingFiles = [];
@@ -2069,11 +2079,16 @@ export default class ChangesReview extends View {
           return;
         }
 
-        const serviceResults = await Promise.all(
-          candidateServices.map((service) => loadServiceWorkingSnapshot(service, on, true))
-        );
-
-        if (key() !== context) return;
+        const serviceResults = [];
+        const SNAPSHOT_CONCURRENCY = 4;
+        for (let i = 0; i < candidateServices.length; i += SNAPSHOT_CONCURRENCY) {
+          const batch = candidateServices.slice(i, i + SNAPSHOT_CONCURRENCY);
+          const batchRes = await Promise.all(
+            batch.map((service) => loadServiceWorkingSnapshot(service, on, true))
+          );
+          if (key() !== context) return;
+          for (const item of batchRes) serviceResults.push(item);
+        }
 
         const erroredServiceIds = new Set();
         const headTransitions = [];
