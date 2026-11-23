@@ -1,12 +1,41 @@
 import { View, div, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import { spaces, agents, theme, shared, run, window, keys } from "herdr";
+import { createModLogger } from "./diagnostics.js";
 
 function normPath(p) {
   return String(p || "").replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
 export default class CognivisorStatus extends View {
+  init() {
+    this.logger = createModLogger("cognivisor-status");
+    this.exportingDiagnostics = false;
+  }
+
+  close() {
+    try { this.logger?.dispose?.(); } catch {}
+  }
+
+  exportDiagnostics(cx) {
+    if (this.exportingDiagnostics) return;
+    this.exportingDiagnostics = true;
+    const diag = shared("cognivisor.diagnostics");
+    this.logger?.action("status.exportDiagnostics", {
+      unreadErrors: Number(diag?.errorCount) || 0,
+      lastErrorMod: diag?.lastErrorMod || null,
+    }, cx);
+    cx.spawn(async (cx) => {
+      try {
+        await this.logger?.exportReport({ trigger: "status-bar" });
+      } finally {
+        this.exportingDiagnostics = false;
+        cx.notify();
+      }
+    });
+    cx.notify();
+  }
+
   // Format the actual bound key for app.palette; fall back to "commands" when unbound.
   hint() {
     const mac = window()?.platform === "macos";
@@ -52,6 +81,12 @@ export default class CognivisorStatus extends View {
       .child(svg(`mods/cognivisor-status/icons/${icon}.svg`).size(12.5).flex_none())
       .child(div().truncate().child(text));
 
+    const diag = shared("cognivisor.diagnostics");
+    const diagErrors = Number(diag?.errorCount) || 0;
+    const diagTooltip = diagErrors > 0
+      ? `${diagErrors} diagnostic ${diagErrors === 1 ? "error" : "errors"} (${diag?.lastErrorMod || "mod"}: ${diag?.lastErrorEvent || "error"}). Click to export JSON report.`
+      : "Export Cognivisor diagnostic JSON report";
+
     return h_flex()
       .id("cognivisor-status")
       .size_full()
@@ -79,6 +114,26 @@ export default class CognivisorStatus extends View {
           .when(needsCount > 0, (el) => el.child(div().text_color(t.blocked).child(`· ${needsCount} needs you`)))
       )
       .child(div().flex_1().min_w(0))
+      .child(
+        div()
+          .id("status-diagnostics")
+          .flex_none()
+          .px(6)
+          .py(2)
+          .rounded(4)
+          .text_color(diagErrors > 0 ? t.blocked : t.dim)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover).text_color(diagErrors > 0 ? t.blocked : t.foreground))
+          .tooltip(diagTooltip)
+          .on_click((_e, cx) => this.exportDiagnostics(cx))
+          .child(
+            this.exportingDiagnostics
+              ? "Exporting…"
+              : diagErrors > 0
+                ? `⚠ ${diagErrors} ${diagErrors === 1 ? "error" : "errors"} · Export`
+                : "Logs"
+          )
+      )
       .child(
         div()
           .id("palette")

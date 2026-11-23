@@ -195,6 +195,11 @@ done
 for mod in "${MODS[@]}"; do
   say "Installing $mod mod..."
   copy_mod_clean "$pkg_root/mods/$mod" "$target_mods/$mod"
+  for shared_diag in diagnostics-logic.js diagnostics.js; do
+    if [ -f "$pkg_root/shared/$shared_diag" ]; then
+      cp "$pkg_root/shared/$shared_diag" "$target_mods/$mod/$shared_diag"
+    fi
+  done
   if [ "$mod" = "files-search" ] || [ "$mod" = "changes-review" ] || [ "$mod" = "git-history" ]; then
     for shared_file in code-wrap.js code-syntax.js markdown-syntax.js markdown-view-logic.js markdown-view.js dropdown-logic.js dropdown.js; do
       if [ -f "$pkg_root/shared/$shared_file" ]; then

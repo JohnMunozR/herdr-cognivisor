@@ -114,6 +114,7 @@ Communication between mods occurs exclusively over Herdr's persisted reactive bu
 | `changes-review.focus` | `changes-review` | `changes-review` | `{ path: string, line?: number }` | Jumps to a modified line in the diff viewer. |
 | `git-history.activeDiff` | `git-history` | `git-history` | `Record<spaceId, GitDiffViewerState>` | Coordinates the space's single `#main` `git-history` comparison tab (`commitHash`, `openFileKey`, `files`, `diffMode`, `expanded`, `requestSeq`, `ts`). |
 | `git-history.selectedRepo` | `git-history` | `git-history` | `Record<spaceId, { repoRoot: string, ts: number }>` | Persists the selected repository (clean or dirty) per space in `#git`. |
+| `cognivisor.diagnostics` | All active mods | `cognivisor-status` | `{ errorCount: number, lastErrorAt?: number, lastErrorMod?: string, lastErrorEvent?: string, lastErrorSummary?: string, lastExportPath?: string, lastExportAt?: number, ts: number }` | Tracks unread diagnostic errors across mods and last exported JSON report path for one-click status-bar export. |
 
 All bus keys outside mod-private namespaces MUST carry the `cognivisor.*` prefix.
 

@@ -87,6 +87,26 @@ const SHARED_TARGETS = [
       "mods/files-search/code-nav-java.js",
     ],
   },
+  {
+    source: "shared/diagnostics-logic.js",
+    targets: [
+      "mods/files-search/diagnostics-logic.js",
+      "mods/changes-review/diagnostics-logic.js",
+      "mods/git-history/diagnostics-logic.js",
+      "mods/cognivisor-tabs/diagnostics-logic.js",
+      "mods/cognivisor-status/diagnostics-logic.js",
+    ],
+  },
+  {
+    source: "shared/diagnostics.js",
+    targets: [
+      "mods/files-search/diagnostics.js",
+      "mods/changes-review/diagnostics.js",
+      "mods/git-history/diagnostics.js",
+      "mods/cognivisor-tabs/diagnostics.js",
+      "mods/cognivisor-status/diagnostics.js",
+    ],
+  },
 ];
 
 const checkOnly = process.argv.includes("--check");

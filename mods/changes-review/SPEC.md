@@ -25,6 +25,7 @@ The `submodule-mod-changes-review` provides interactive source control inspectio
     - `mods/changes-review/markdown-view-logic.js` (`isMarkdownFile`, `resolveRelativeMarkdownPath`, `getDiffMarkdownPlan`).
     - `mods/changes-review/markdown-view.js` (`createMarkdownRenderCache`, `renderMarkdownToggleButton`, `renderMarkdownViewer`).
     - `mods/changes-review/dropdown-logic.js` & `mods/changes-review/dropdown.js` (`renderDropdownTrigger` for `#commit-selector-btn`, `renderDropdownPopover` for `#commit-dropdown-floating` with adaptive sizing via `computeDropdownMetrics`).
+    - `mods/changes-review/diagnostics-logic.js` & `mods/changes-review/diagnostics.js` (`createModLogger`, `renderErrorFallbackCard` for non-reentrant render error boundaries, user-action breadcrumbs, and JSON report export).
   - Icon assets: `mods/changes-review/changes.svg`, `mods/changes-review/icons/*.svg`, and `mods/changes-review/icons/file-types/*.svg` (22 vector file-type icons).
   - Type definitions and compiler configuration: `gpui-kit.d.ts`, `jsconfig.json`.
 - **Public surface:**

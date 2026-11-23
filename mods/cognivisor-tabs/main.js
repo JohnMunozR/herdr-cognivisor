@@ -17,6 +17,7 @@ import {
   summarizePrompt,
   cleanBranchSlug,
 } from "./tab-logic.js";
+import { createModLogger, renderErrorFallbackCard } from "./diagnostics.js";
 
 const READ_GIT = [
   "--no-optional-locks",
@@ -35,6 +36,7 @@ const ACTIVE_STATUSES = new Set(["working", "done", "blocked"]);
 
 export default class CognivisorTabs extends View {
   init(_props, cx) {
+    this.logger = createModLogger("cognivisor-tabs");
     this.pressed = null;
     this.scroll = ScrollHandle.new();
     this.probeCache = new Map();
@@ -58,6 +60,7 @@ export default class CognivisorTabs extends View {
   }
 
   close() {
+    try { this.logger?.dispose?.(); } catch {}
     try { this.focusRenameTask?.cancel(); } catch {}
     try { this.pendingPanelSyncTask?.cancel(); } catch {}
     try { this.pendingTabScanTask?.cancel(); } catch {}
@@ -328,6 +331,26 @@ export default class CognivisorTabs extends View {
   }
 
   render(cx) {
+    try {
+      return this.renderInner(cx);
+    } catch (err) {
+      const ser = this.logger?.recordRenderError(err, { selected: this.selected || null }, cx);
+      const summary = ser ? `${ser.name}: ${ser.message}` : String(err || "Render error");
+      return renderErrorFallbackCard({
+        modName: "cognivisor-tabs",
+        errorSummary: summary,
+        t: theme(),
+        onRetry: (retryCx) => retryCx.notify(),
+        onExport: (exportCx) => {
+          exportCx.spawn(async () => {
+            await this.logger?.exportReport({ trigger: "error-card" });
+          });
+        },
+      });
+    }
+  }
+
+  renderInner(cx) {
     const t = theme();
     const space = spaces().find((p) => p.active);
     const shown = space?.tabs ?? [];

@@ -35,6 +35,7 @@ The `submodule-mod-files-search` delivers workspace file tree navigation, ripgre
     - `mods/files-search/markdown-syntax.js` (`isMarkdownExt`, `createMarkdownState`, `advanceMarkdownState`, `getMarkdownStateTag`, `tokenizeMarkdownLine`).
     - `mods/files-search/markdown-view-logic.js` (`isMarkdownFile`, `prepareMarkdownForRender`, `resolveRelativeMarkdownPath`, etc.).
     - `mods/files-search/markdown-view.js` (`createMarkdownRenderCache`, `renderMarkdownToggleButton`, `renderMarkdownViewer`).
+    - `mods/files-search/diagnostics-logic.js` & `mods/files-search/diagnostics.js` (`createModLogger`, `renderErrorFallbackCard` for non-reentrant render error boundaries and JSON report export).
   - Pure tree cascade & subtree filtering helpers: `mods/files-search/tree-logic.js`.
   - Pure session baseline & disk persistence helpers: `mods/files-search/session-baseline.js` (`normalizeGitStatusMark`, `normalizeSessionBaseline`, `readDiskSessionBaseline`, `writeDiskSessionBaseline`, `terminalHasResumeCommand`, `computeFileSig`, `statFileEntry`, `filterSessionDirtyEntries`).
   - Icon assets: `mods/files-search/*.svg` (`file.svg`, `folder.svg`, `spinner.svg`, `search.svg`, `preview.svg`, `grip.svg`, etc.) and `mods/files-search/icons/file-types/*.svg` (22 vector file-type icons for Java, Spring Boot, Python, JS/TS/React, Kotlin, JSON, YAML, settings/env, SQL, HTML/XML, CSS, Docker, Git, build manifests, lockfiles, Markdown, shell, images, generic code, and fallback file).

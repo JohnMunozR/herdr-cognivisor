@@ -82,6 +82,7 @@ import {
   resolveSessionAgentTabId,
 } from "./repo-logic.js";
 import { renderDropdownTrigger, renderDropdownPopover } from "./dropdown.js";
+import { createModLogger, renderErrorFallbackCard } from "./diagnostics.js";
 
 const ROW_HEIGHT = 30;
 const FILE_ROW_HEIGHT = 26;
@@ -658,6 +659,7 @@ export default class GitHistory extends View {
     this.on = null;
     this.repos = [];
     this.selectedRepo = null;
+    this.logger = createModLogger("git-history");
     this.branches = [];
     this.selectedBranch = "__all__";
     this.commits = [];
@@ -822,6 +824,7 @@ export default class GitHistory extends View {
 
   close() {
     this.closed = true;
+    try { this.logger?.dispose?.(); } catch {}
     this.hostCx = null;
     this.repoDiscoverGen += 1;
     this.logGen += 1;
@@ -4443,9 +4446,32 @@ export default class GitHistory extends View {
   }
 
   render(cx) {
-    if (this.isViewerMode()) {
-      return this.renderViewer(cx);
+    try {
+      if (this.isViewerMode()) {
+        return this.renderViewer(cx);
+      }
+      return this.renderPanel(cx);
+    } catch (err) {
+      const ser = this.logger?.recordRenderError(err, {
+        mode: this.isViewerMode() ? "viewer" : "panel",
+        diffMode: this.diffMode,
+        commitsCount: this.commits?.length || 0,
+      }, cx);
+      const summary = ser ? `${ser.name}: ${ser.message}` : String(err || "Render error");
+      return renderErrorFallbackCard({
+        modName: "git-history",
+        errorSummary: summary,
+        t: theme(),
+        onRetry: (retryCx) => {
+          this.error = null;
+          retryCx.notify();
+        },
+        onExport: (exportCx) => {
+          exportCx.spawn(async () => {
+            await this.logger?.exportReport({ trigger: "error-card" });
+          });
+        },
+      });
     }
-    return this.renderPanel(cx);
   }
 }

@@ -57,6 +57,7 @@ import { computeWrapColumns, countWrappedLines, wrapPlainText, wrapStyledSpans }
 import { renderDropdownTrigger, renderDropdownPopover } from "./dropdown.js";
 import { isMarkdownFile, resolveRelativeMarkdownPath } from "./markdown-view-logic.js";
 import { createMarkdownRenderCache, renderMarkdownToggleButton, renderMarkdownViewer } from "./markdown-view.js";
+import { createModLogger, renderErrorFallbackCard } from "./diagnostics.js";
 
 const reviewWrapCache = new WeakMap();
 const REVIEW_ROW_HEIGHT = 20;
@@ -638,6 +639,8 @@ export default class ChangesReview extends View {
     const p = initProps ?? props();
     this.viewerProps = p || null;
     this.isViewer = p?.role === "viewer";
+    this.logger = createModLogger("changes-review");
+    this.logger.lifecycle("mod.init", { mode: this.isViewer ? "viewer" : "panel" }, cx);
 
     this.files = [];
     this.allWorkingFiles = [];
@@ -755,6 +758,7 @@ export default class ChangesReview extends View {
 
   close() {
     this._viewerClosed = true;
+    try { this.logger?.dispose?.(); } catch {}
     this.resetViewerMarkdownState(true);
     try { this.renderRefreshTask?.cancel?.(); } catch {}
     this.renderRefreshTask = null;
@@ -1702,6 +1706,10 @@ export default class ChangesReview extends View {
         this.open = firstFile ? firstFile.key : null;
         this.openReviewTabForFile(firstFile, { create: false, select: false, bumpSeq: true });
       } catch (e) {
+        this.logger?.error("review.loadCommitFilesFailed", e, {
+          workspaceRoot: this.workspaceRoot,
+          viewMode: this.viewMode,
+        }, cx);
         if (key() === context) this.error = String(e.message || e);
       } finally {
         this.loading = false;
@@ -1832,6 +1840,10 @@ export default class ChangesReview extends View {
 
   toggleShowAllWorkingChanges(cx) {
     this.showAllWorkingChanges = !this.showAllWorkingChanges;
+    this.logger?.action("review.toggleShowAll", {
+      showAll: this.showAllWorkingChanges,
+      hiddenPreExistingCount: this.hiddenPreExistingCount,
+    }, cx);
     this.refresh(cx, { force: true });
     cx.notify();
   }
@@ -1848,6 +1860,10 @@ export default class ChangesReview extends View {
         normPathStr(this.workspaceRoot),
       ].filter(Boolean))
     );
+    this.logger?.action("review.resetBaseline", {
+      repoCount: repoRoots.length,
+      previousHiddenCount: this.hiddenPreExistingCount,
+    }, cx);
     const nextBaseline = createResetSessionBaseline(curBaseline, repoRoots, this.workspaceRoot);
     mergeSessionBaselineIntoFlow(sessionTabId, nextBaseline, null, true);
     this.showAllWorkingChanges = false;
@@ -2346,6 +2362,11 @@ export default class ChangesReview extends View {
           }
         }
       } catch (e) {
+        this.logger?.error("review.refreshFailed", e, {
+          workspaceRoot,
+          viewMode: this.viewMode,
+          showAllWorkingChanges: this.showAllWorkingChanges,
+        }, cx);
         if (key() === context) this.error = String(e.message || e);
       } finally {
         this.loading = false;
@@ -3275,10 +3296,43 @@ export default class ChangesReview extends View {
   }
 
   render(cx) {
-    if (this.isViewerMode()) {
-      return this.renderViewer(cx);
+    try {
+      if (this.isViewerMode()) {
+        return this.renderViewer(cx);
+      }
+      return this.renderPanel(cx);
+    } catch (err) {
+      const ser = this.logger?.recordRenderError(err, {
+        mode: this.isViewerMode() ? "viewer" : "panel",
+        viewMode: this.viewMode,
+        filesCount: this.files?.length || 0,
+        hiddenPreExistingCount: this.hiddenPreExistingCount || 0,
+      }, cx);
+      const summary = ser ? `${ser.name}: ${ser.message}` : String(err || "Render error");
+      return renderErrorFallbackCard({
+        modName: "changes-review",
+        errorSummary: summary,
+        t: theme(),
+        onRetry: (retryCx) => {
+          this.error = null;
+          retryCx.notify();
+        },
+        onExport: (exportCx) => {
+          exportCx.spawn(async () => {
+            await this.logger?.exportReport({
+              trigger: "error-card",
+              extraState: {
+                mode: this.isViewerMode() ? "viewer" : "panel",
+                viewMode: this.viewMode,
+                filesCount: this.files?.length || 0,
+                hiddenPreExistingCount: this.hiddenPreExistingCount || 0,
+                showAllWorkingChanges: Boolean(this.showAllWorkingChanges),
+              },
+            });
+          });
+        },
+      });
     }
-    return this.renderPanel(cx);
   }
 
   renderViewer(cx) {

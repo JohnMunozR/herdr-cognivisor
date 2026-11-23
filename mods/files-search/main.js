@@ -148,6 +148,7 @@ import {
   filterSessionDirtyEntries,
   resolveWorkspaceRoot,
 } from "./session-baseline.js";
+import { createModLogger, renderErrorFallbackCard } from "./diagnostics.js";
 
 function asPlainObject(v) {
   return v && typeof v === "object" && !Array.isArray(v) ? v : {};
@@ -1126,6 +1127,10 @@ export default class FilesSearch extends View {
     this.isOverlay = Boolean(roleProps.overlay);
     this.isIndexer = !this.isOverlay && roleProps.role === "indexer";
     this.isViewer = !this.isOverlay && !this.isIndexer && roleProps.role === "viewer";
+    this.logger = createModLogger("files-search");
+    this.logger.lifecycle("mod.init", {
+      mode: this.isOverlay ? "overlay" : this.isIndexer ? "indexer" : this.isViewer ? "viewer" : "panel",
+    }, cx);
     if (this.isOverlay) {
       this.initOverlay(cx);
     } else if (this.isIndexer) {
@@ -2997,6 +3002,7 @@ export default class FilesSearch extends View {
   close(cx) {
     this._overlayClosed = true;
     this._indexerClosed = true;
+    try { this.logger?.dispose?.(); } catch {}
     this.focusInputTask?.cancel();
     this.focusInputTask = null;
     this.watchDebounceTask?.cancel();
@@ -6980,15 +6986,35 @@ export default class FilesSearch extends View {
   }
 
   render(cx) {
-    if (this.isOverlay) {
-      return this.renderOverlay(cx);
+    try {
+      if (this.isOverlay) {
+        return this.renderOverlay(cx);
+      }
+      if (this.isIndexer) {
+        return this.renderIndexer(cx);
+      }
+      if (this.isViewer) {
+        return this.renderViewer(cx);
+      }
+      return this.renderPanel(cx);
+    } catch (err) {
+      const mode = this.isOverlay ? "overlay" : this.isIndexer ? "indexer" : this.isViewer ? "viewer" : "panel";
+      const ser = this.logger?.recordRenderError(err, { mode }, cx);
+      const summary = ser ? `${ser.name}: ${ser.message}` : String(err || "Render error");
+      return renderErrorFallbackCard({
+        modName: "files-search",
+        errorSummary: summary,
+        t: theme(),
+        onRetry: (retryCx) => {
+          this.error = null;
+          retryCx.notify();
+        },
+        onExport: (exportCx) => {
+          exportCx.spawn(async () => {
+            await this.logger?.exportReport({ trigger: "error-card", extraState: { mode } });
+          });
+        },
+      });
     }
-    if (this.isIndexer) {
-      return this.renderIndexer(cx);
-    }
-    if (this.isViewer) {
-      return this.renderViewer(cx);
-    }
-    return this.renderPanel(cx);
   }
 }

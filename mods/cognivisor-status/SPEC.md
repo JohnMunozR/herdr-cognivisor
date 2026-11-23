@@ -61,6 +61,7 @@ The `submodule-mod-cognivisor-status` provides the bottom `28px` workspace telem
 | Key | Role | Expected Shape |
 | :--- | :--- | :--- |
 | `cognivisor.services` | Consumer | `{ workspaceRoot?: string, services: Array<{ id, name, relPath, root, workingCount?, dirty? }> }` |
+| `cognivisor.diagnostics` | Consumer / Reset on Export | `{ errorCount: number, lastErrorMod?: string, lastErrorEvent?: string, lastExportPath?: string, ts: number }` |
 
 ## Invariants
 

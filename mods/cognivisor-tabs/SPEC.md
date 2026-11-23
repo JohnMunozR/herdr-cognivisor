@@ -23,6 +23,7 @@ The `submodule-mod-cognivisor-tabs` implements the top 42px workspace tab strip 
   - Manifest: `mods/cognivisor-tabs/mod.json` (`{ "place": "none", "title": "Cognivisor Tabs" }`).
   - View implementation: `mods/cognivisor-tabs/main.js` (`CognivisorTabs` view).
   - Pure tab-naming, panel-target, viewer-tab classification, & lead-pane helpers: `mods/cognivisor-tabs/tab-logic.js`.
+  - Synced shared diagnostics modules (`[[module-shared]]`): `mods/cognivisor-tabs/diagnostics-logic.js`, `mods/cognivisor-tabs/diagnostics.js`.
   - Self-contained SVG icon assets: `mods/cognivisor-tabs/icons/*.svg` (`files.svg`, `changes.svg`, `git.svg`, `close.svg`, `spinner.svg`, `win-min.svg`, `win-max.svg`, `win-restore.svg`, `win-close.svg`).
 - **Public surface:**
   - Registered mod identifier: `cognivisor-tabs`.
