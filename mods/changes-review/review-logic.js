@@ -661,16 +661,19 @@ export function filterSessionCommits(commits, sessionStartedAt) {
   return commits.filter((c) => c && Number(c.timestamp || 0) >= cutoffSec);
 }
 
-export function filterSessionWorkingEntries(entries, baselineRepo, sessionStartedAt) {
-  if (!Array.isArray(entries)) return [];
+export function partitionSessionWorkingEntries(entries, baselineRepo, sessionStartedAt) {
+  if (!Array.isArray(entries) || entries.length === 0) return { visible: [], hidden: [] };
   const startedAtMs = Number(sessionStartedAt || 0);
   const dirtyFiles =
     baselineRepo && typeof baselineRepo === "object" && baselineRepo.dirtyFiles && typeof baselineRepo.dirtyFiles === "object"
       ? baselineRepo.dirtyFiles
       : null;
 
-  return entries.filter((entry) => {
-    if (!entry) return false;
+  const visible = [];
+  const hidden = [];
+
+  for (const entry of entries) {
+    if (!entry) continue;
     const relFile = entry.relFile ?? entry.path ?? "";
     const status = entry.status ?? "";
     const sig = entry.sig ?? "";
@@ -678,19 +681,30 @@ export function filterSessionWorkingEntries(entries, baselineRepo, sessionStarte
 
     if (dirtyFiles) {
       const base = dirtyFiles[relFile];
-      if (base && typeof base === "object") {
-        if ((base.status ?? "") === status && (base.sig ?? "") === sig) {
-          return false;
-        }
+      if (base && typeof base === "object" && (base.status ?? "") === status && (base.sig ?? "") === sig) {
+        hidden.push(entry);
+        continue;
       }
-      return true;
+      visible.push(entry);
+      continue;
     }
 
     if (startedAtMs > 0) {
-      return !mtimeMs || mtimeMs >= startedAtMs;
+      if (!mtimeMs || mtimeMs >= startedAtMs) {
+        visible.push(entry);
+      } else {
+        hidden.push(entry);
+      }
+      continue;
     }
-    return true;
-  });
+    visible.push(entry);
+  }
+
+  return { visible, hidden };
+}
+
+export function filterSessionWorkingEntries(entries, baselineRepo, sessionStartedAt) {
+  return partitionSessionWorkingEntries(entries, baselineRepo, sessionStartedAt).visible;
 }
 
 function normBaselineRoot(p) {
@@ -954,6 +968,168 @@ export async function writeDiskSessionBaseline(appHomeDir, tabId, workspaceRoot,
     }
   }
   return wrote;
+}
+
+export const DEFAULT_RECENT_BASELINE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+
+export function resolveSessionStartTime(flowObj, now = Date.now()) {
+  const nowMs = Number.isFinite(Number(now)) && Number(now) > 0 ? Number(now) : Date.now();
+  const candidates = [];
+  if (flowObj && typeof flowObj === "object") {
+    for (const raw of [flowObj.sessionStartedAt, flowObj.createdAt, flowObj.updatedAt]) {
+      const n = Number(raw);
+      if (Number.isFinite(n) && n > 0 && n <= nowMs) {
+        candidates.push(n);
+      }
+    }
+  }
+  if (candidates.length > 0) {
+    const earliest = Math.min(...candidates);
+    return { startedAt: earliest, anchored: earliest < nowMs };
+  }
+  return { startedAt: nowMs, anchored: false };
+}
+
+export function buildFreshSessionBaseline(repoSnapshots, { workspaceRoot = "", startedAt = Date.now(), anchored = false } = {}) {
+  const startedAtNum = Number.isFinite(Number(startedAt)) && Number(startedAt) > 0 ? Number(startedAt) : Date.now();
+  const normWs = normBaselineRoot(workspaceRoot || "");
+  const repos = {};
+  for (const res of Array.isArray(repoSnapshots) ? repoSnapshots : []) {
+    const normRoot = normBaselineRoot(res?.service?.root ?? res?.root ?? "");
+    if (!normRoot) continue;
+    const dirtyFiles = {};
+    for (const f of Array.isArray(res?.files) ? res.files : []) {
+      const rel = normBaselineRel(f?.relFile ?? f?.path ?? "");
+      if (!rel) continue;
+      const mtimeMs = Number(f?.mtimeMs || 0);
+      if (anchored && mtimeMs > 0 && mtimeMs >= startedAtNum) {
+        continue;
+      }
+      dirtyFiles[rel] = {
+        status: String(f?.status || "M"),
+        sig: String(f?.sig || ""),
+      };
+    }
+    repos[normRoot] = { dirtyFiles };
+  }
+  return {
+    version: 1,
+    startedAt: startedAtNum,
+    workspaceRoot: normWs,
+    repos,
+  };
+}
+
+export function createResetSessionBaseline(existingBaseline, repoRoots = [], workspaceRoot = "", now = Date.now()) {
+  const nowMs = Number.isFinite(Number(now)) && Number(now) > 0 ? Number(now) : Date.now();
+  const normExisting = normalizeSessionBaseline(existingBaseline);
+  const startedAt = normExisting?.startedAt && normExisting.startedAt > 0 ? normExisting.startedAt : nowMs;
+  const normWs = normBaselineRoot(workspaceRoot || normExisting?.workspaceRoot || "");
+  const repos = {};
+  if (normExisting?.repos) {
+    for (const repoRoot of Object.keys(normExisting.repos)) {
+      const clean = normBaselineRoot(repoRoot);
+      if (clean) repos[clean] = { dirtyFiles: {} };
+    }
+  }
+  for (const repoRoot of Array.isArray(repoRoots) ? repoRoots : []) {
+    const clean = normBaselineRoot(repoRoot);
+    if (clean) repos[clean] = { dirtyFiles: {} };
+  }
+  return {
+    version: 1,
+    startedAt,
+    workspaceRoot: normWs,
+    repos,
+  };
+}
+
+function toSafeLiveTabSet(liveTabIds) {
+  if (!liveTabIds) return null;
+  const set = new Set();
+  for (const id of liveTabIds) {
+    if (id) set.add(safeBaselineTabId(id));
+  }
+  return set;
+}
+
+export function findRecentFlowWorkspaceBaseline(
+  flows,
+  workspaceRoot,
+  { excludeTabId = "", liveTabIds = null, maxAgeMs = DEFAULT_RECENT_BASELINE_MAX_AGE_MS, now = Date.now() } = {},
+) {
+  const normWs = normBaselineRoot(workspaceRoot || "");
+  if (!normWs || !flows || typeof flows !== "object") return null;
+  const nowMs = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  const maxAge = Number.isFinite(Number(maxAgeMs)) && Number(maxAgeMs) > 0 ? Number(maxAgeMs) : DEFAULT_RECENT_BASELINE_MAX_AGE_MS;
+  const liveRawSet = liveTabIds ? new Set(Array.from(liveTabIds).filter(Boolean)) : null;
+
+  let best = null;
+  for (const [tabId, flow] of Object.entries(flows)) {
+    if (!tabId || tabId === excludeTabId) continue;
+    if (liveRawSet && liveRawSet.has(tabId)) continue;
+    const candidate = normalizeSessionBaseline(flow?.sessionBaseline);
+    if (!candidate || candidate.workspaceRoot !== normWs) continue;
+    const age = nowMs - candidate.startedAt;
+    if (age < 0 || age > maxAge) continue;
+    if (!best || candidate.startedAt > best.startedAt) {
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+export async function findRecentWorkspaceBaseline(
+  appHomeDir,
+  workspaceRoot,
+  { excludeTabId = "", liveTabIds = null, maxAgeMs = DEFAULT_RECENT_BASELINE_MAX_AGE_MS, now = Date.now(), fsDeps = fsPromises } = {},
+) {
+  const normWs = normBaselineRoot(workspaceRoot || "");
+  if (!appHomeDir || !normWs) return null;
+  const readerDir = typeof fsDeps?.readdir === "function" ? fsDeps.readdir : fsPromises.readdir;
+  if (typeof readerDir !== "function") return null;
+
+  const tabsDir = join(String(appHomeDir), "cognivisor", "sessions", "tabs");
+  let entries;
+  try {
+    entries = await readerDir(tabsDir);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+
+  const nowMs = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  const maxAge = Number.isFinite(Number(maxAgeMs)) && Number(maxAgeMs) > 0 ? Number(maxAgeMs) : DEFAULT_RECENT_BASELINE_MAX_AGE_MS;
+  const safeExclude = excludeTabId ? safeBaselineTabId(excludeTabId) : "";
+  const safeLiveSet = toSafeLiveTabSet(liveTabIds);
+
+  let best = null;
+  for (const rawEntry of entries) {
+    const name = typeof rawEntry === "string" ? rawEntry : rawEntry?.name;
+    if (!name || !name.endsWith(".json")) continue;
+    const fileTabId = name.slice(0, -".json".length);
+    if (!fileTabId || fileTabId === safeExclude) continue;
+    if (safeLiveSet && safeLiveSet.has(fileTabId)) continue;
+    const candidate = await readBaselineJsonFile(join(tabsDir, name), fsDeps);
+    if (!candidate || candidate.workspaceRoot !== normWs) continue;
+    const age = nowMs - candidate.startedAt;
+    if (age < 0 || age > maxAge) continue;
+    if (!best || candidate.startedAt > best.startedAt) {
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+export function countBaselineDirtyFiles(baseline) {
+  if (!baseline || typeof baseline !== "object" || !baseline.repos || typeof baseline.repos !== "object") return 0;
+  let total = 0;
+  for (const repoVal of Object.values(baseline.repos)) {
+    if (repoVal && typeof repoVal === "object" && repoVal.dirtyFiles && typeof repoVal.dirtyFiles === "object") {
+      total += Object.keys(repoVal.dirtyFiles).length;
+    }
+  }
+  return total;
 }
 
 function stripAnsiEscapes(text) {

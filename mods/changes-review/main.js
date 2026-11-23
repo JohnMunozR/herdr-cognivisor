@@ -27,9 +27,16 @@ import {
   sortServicesDirtyFirst,
   filterSessionCommits,
   filterSessionWorkingEntries,
+  partitionSessionWorkingEntries,
   normalizeSessionBaseline,
   readDiskSessionBaseline,
   writeDiskSessionBaseline,
+  resolveSessionStartTime,
+  buildFreshSessionBaseline,
+  createResetSessionBaseline,
+  findRecentFlowWorkspaceBaseline,
+  findRecentWorkspaceBaseline,
+  countBaselineDirtyFiles,
   extractResumeKeyFromTranscript,
   filterUnbaselinedRepoEntries,
   resolveWorkspaceRoot,
@@ -67,7 +74,7 @@ function getSafeAppHome() {
   }
 }
 
-function mergeSessionBaselineIntoFlow(tabId, baseline, sessionRepos = null) {
+function mergeSessionBaselineIntoFlow(tabId, baseline, sessionRepos = null, force = false) {
   if (!tabId) return;
   const normalized = normalizeSessionBaseline(baseline);
   if (!normalized) return;
@@ -75,14 +82,18 @@ function mergeSessionBaselineIntoFlow(tabId, baseline, sessionRepos = null) {
   const cur = flows[tabId] && typeof flows[tabId] === "object" ? flows[tabId] : {};
   const curReposCount = Object.keys(cur.sessionBaseline?.repos || {}).length;
   const nextReposCount = Object.keys(normalized.repos || {}).length;
+  const curDirtyCount = countBaselineDirtyFiles(cur.sessionBaseline);
+  const nextDirtyCount = countBaselineDirtyFiles(normalized);
   const prevRepos = Array.isArray(cur.sessionRepos) ? cur.sessionRepos.map((r) => normPathStr(r)) : [];
   const nextRepos = Array.isArray(sessionRepos) ? sessionRepos.map((r) => normPathStr(r)).filter(Boolean) : null;
   const reposChanged = Boolean(nextRepos && (prevRepos.length !== nextRepos.length || prevRepos.some((r, idx) => r !== nextRepos[idx])));
   const baselineChanged =
+    force ||
     !cur.sessionBaseline ||
     cur.sessionBaseline.startedAt !== normalized.startedAt ||
     cur.sessionStartedAt !== normalized.startedAt ||
-    curReposCount !== nextReposCount;
+    curReposCount !== nextReposCount ||
+    curDirtyCount !== nextDirtyCount;
   if (!baselineChanged && !reposChanged) return;
   setShared("cognivisor.flows", {
     ...flows,
@@ -96,8 +107,19 @@ function mergeSessionBaselineIntoFlow(tabId, baseline, sessionRepos = null) {
   });
 }
 
+function getLiveTabIdsSet() {
+  const allSpaces = spaces() || [];
+  const ids = new Set();
+  for (const s of allSpaces) {
+    for (const t of s?.tabs || []) {
+      if (t?.id) ids.add(t.id);
+    }
+  }
+  return ids;
+}
+
 async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTermAddrs, workspaceRoot) {
-  if (!sessionTabId) return { baseline: null, isFresh: false, dirtyChanged: false, primaryBranch: "" };
+  if (!sessionTabId) return { baseline: null, isFresh: false, anchored: false, dirtyChanged: false, primaryBranch: "" };
   const normWs = normPathStr(workspaceRoot || "");
   const primaryService = (serviceResults || []).find((r) => normPathStr(r.service?.root) === normWs)
     || (serviceResults || []).find((r) => r.branch)
@@ -108,17 +130,18 @@ async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTer
   );
 
   const flows = readPlainObject(shared("cognivisor.flows"));
-  const rawExisting = flows[sessionTabId]?.sessionBaseline;
+  const curFlow = readPlainObject(flows[sessionTabId]);
+  const rawExisting = curFlow.sessionBaseline;
   const existing = normalizeSessionBaseline(rawExisting);
   if (existing && (!normWs || !existing.workspaceRoot || existing.workspaceRoot === normWs)) {
-    return { baseline: existing, isFresh: false, dirtyChanged: false, primaryBranch };
+    return { baseline: existing, isFresh: false, anchored: false, dirtyChanged: false, primaryBranch };
   }
 
   const appHomeDir = getSafeAppHome();
   if (appHomeDir) {
     const fromTab = await readDiskSessionBaseline(appHomeDir, sessionTabId, workspaceRoot, candidateBranches, false, fsPromises);
     if (fromTab) {
-      return { baseline: fromTab, isFresh: false, dirtyChanged: false, primaryBranch };
+      return { baseline: fromTab, isFresh: false, anchored: false, dirtyChanged: false, primaryBranch };
     }
   }
 
@@ -139,29 +162,39 @@ async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTer
         fsPromises
       );
       if (fromResume) {
-        return { baseline: fromResume, isFresh: false, dirtyChanged: true, primaryBranch, resumeKey };
+        return { baseline: fromResume, isFresh: false, anchored: false, dirtyChanged: true, primaryBranch, resumeKey };
       }
     }
   }
 
-  const startedAt = Date.now();
-  const repos = {};
-  for (const res of serviceResults || []) {
-    const normRoot = normPathStr(res.service?.root);
-    if (!normRoot) continue;
-    const dirtyFiles = {};
-    for (const f of res.files || []) {
-      const rel = f.relFile ?? f.path ?? "";
-      if (!rel) continue;
-      dirtyFiles[rel] = {
-        status: String(f.status || "M"),
-        sig: String(f.sig || ""),
-      };
-    }
-    repos[normRoot] = { dirtyFiles };
+  // Reuse a recent orphaned baseline for the same workspaceRoot (e.g., after tab recreation)
+  // without stealing baselines owned by other currently-open tabs.
+  const liveTabIds = getLiveTabIdsSet();
+  const recentFlowBaseline = findRecentFlowWorkspaceBaseline(flows, workspaceRoot, {
+    excludeTabId: sessionTabId,
+    liveTabIds,
+  });
+  if (recentFlowBaseline) {
+    return { baseline: recentFlowBaseline, isFresh: false, anchored: false, dirtyChanged: true, primaryBranch, resumeKey };
   }
-  const baseline = { version: 1, startedAt, workspaceRoot: normWs, repos };
-  return { baseline, isFresh: true, dirtyChanged: true, primaryBranch, resumeKey };
+  if (appHomeDir) {
+    const recentDiskBaseline = await findRecentWorkspaceBaseline(appHomeDir, workspaceRoot, {
+      excludeTabId: sessionTabId,
+      liveTabIds,
+      fsDeps: fsPromises,
+    });
+    if (recentDiskBaseline) {
+      return { baseline: recentDiskBaseline, isFresh: false, anchored: false, dirtyChanged: true, primaryBranch, resumeKey };
+    }
+  }
+
+  const { startedAt, anchored } = resolveSessionStartTime(curFlow);
+  const baseline = buildFreshSessionBaseline(serviceResults, {
+    workspaceRoot: normWs,
+    startedAt,
+    anchored,
+  });
+  return { baseline, isFresh: true, anchored, dirtyChanged: true, primaryBranch, resumeKey };
 }
 
 function location() {
@@ -683,6 +716,10 @@ export default class ChangesReview extends View {
     this.showCommitMenu = false;
     this.workingFiles = [];
     this.workingFilesCount = 0;
+    this.showAllWorkingChanges = false;
+    this.hiddenPreExistingCount = 0;
+    this.lastCandidateRoots = [];
+    this.lastPrimaryBranch = "";
 
     // Git commit input
     this.message = "";
@@ -1793,6 +1830,43 @@ export default class ChangesReview extends View {
     }
   }
 
+  toggleShowAllWorkingChanges(cx) {
+    this.showAllWorkingChanges = !this.showAllWorkingChanges;
+    this.refresh(cx, { force: true });
+    cx.notify();
+  }
+
+  resetSessionBaseline(cx) {
+    const { sessionTabId } = getActiveSpaceAndTab();
+    if (!sessionTabId || !this.workspaceRoot) return;
+    const flows = readPlainObject(shared("cognivisor.flows"));
+    const curBaseline = flows[sessionTabId]?.sessionBaseline || null;
+    const repoRoots = Array.from(
+      new Set([
+        ...(this.lastCandidateRoots || []),
+        ...(this.services || []).map((s) => normPathStr(s?.root)).filter(Boolean),
+        normPathStr(this.workspaceRoot),
+      ].filter(Boolean))
+    );
+    const nextBaseline = createResetSessionBaseline(curBaseline, repoRoots, this.workspaceRoot);
+    mergeSessionBaselineIntoFlow(sessionTabId, nextBaseline, null, true);
+    this.showAllWorkingChanges = false;
+    this.hiddenPreExistingCount = 0;
+    const appHomeDir = getSafeAppHome();
+    const workspaceRoot = this.workspaceRoot;
+    const primaryBranch = this.lastPrimaryBranch || "";
+    cx.spawn(async (cx) => {
+      if (appHomeDir) {
+        await writeDiskSessionBaseline(appHomeDir, sessionTabId, workspaceRoot, primaryBranch, nextBaseline, "", fsPromises);
+      }
+      try {
+        notify({ title: "Session baseline reset", body: "All current working changes are now included in this session.", level: "info" });
+      } catch {}
+      this.refresh(cx, { force: true });
+    });
+    cx.notify();
+  }
+
   refresh(cx, opts = {}) {
     if (this.isViewerMode() || this.loading || this.busy) return;
     this.recordActiveTerminalTabNow();
@@ -1834,6 +1908,10 @@ export default class ChangesReview extends View {
       this.selectedCommit = null;
       this.workingFiles = [];
       this.workingFilesCount = 0;
+      this.showAllWorkingChanges = false;
+      this.hiddenPreExistingCount = 0;
+      this.lastCandidateRoots = [];
+      this.lastPrimaryBranch = "";
     }
 
     this.isWindows = !on && this.hostIsWindows;
@@ -2005,6 +2083,9 @@ export default class ChangesReview extends View {
         const sessionBaseline = baselineInit.baseline;
         let baselineDirtyChanged = Boolean(baselineInit.dirtyChanged);
         let touchedResults = [];
+        let totalHiddenPreExisting = 0;
+        this.lastCandidateRoots = candidateServices.map((s) => normPathStr(s?.root)).filter(Boolean);
+        this.lastPrimaryBranch = baselineInit.primaryBranch || "";
 
         if (sessionTabId && sessionBaseline) {
           const startedAt = sessionBaseline.startedAt || 0;
@@ -2045,41 +2126,42 @@ export default class ChangesReview extends View {
           for (const res of serviceResults) {
             const normRoot = normPathStr(res.service?.root);
             const baselineRepo = normRoot ? (sessionBaseline.repos?.[normRoot] || null) : null;
-            if (baselineInit.isFresh) {
-              res.files = [];
-              res.commits = [];
-              if (res.service) res.service.workingCount = 0;
-              res.touched = false;
-              continue;
-            }
+            const rawWorkingFiles = Array.isArray(res.files) ? res.files : [];
             const sessionCommits = filterSessionCommits(res.commits, startedAt);
             let sessionFiles = [];
+            let hiddenCount = 0;
             if (baselineRepo) {
-              sessionFiles = filterSessionWorkingEntries(res.files, baselineRepo, startedAt);
+              const partitioned = partitionSessionWorkingEntries(rawWorkingFiles, baselineRepo, startedAt);
+              sessionFiles = partitioned.visible;
+              hiddenCount = partitioned.hidden.length;
             } else {
               const inPaneCwd = normRoot && normPaneCwds.some((c) => c === normRoot || c.startsWith(normRoot + "/"));
               const isAttributed = Boolean(
-                normRoot && (prevSessionRepos.has(normRoot) || inPaneCwd || repoMatchesTranscript(res.service, res.files, unbaselinedTranscript))
+                normRoot && (prevSessionRepos.has(normRoot) || inPaneCwd || repoMatchesTranscript(res.service, rawWorkingFiles, unbaselinedTranscript))
               );
-              const unbaselinedRes = filterUnbaselinedRepoEntries(res.files, startedAt, {
+              const unbaselinedRes = filterUnbaselinedRepoEntries(rawWorkingFiles, startedAt, {
                 isAttributed,
                 hasSessionCommits: sessionCommits.length > 0,
               });
               sessionFiles = unbaselinedRes.sessionFiles;
+              hiddenCount = Math.max(0, rawWorkingFiles.length - sessionFiles.length);
               if (normRoot) {
                 sessionBaseline.repos[normRoot] = { dirtyFiles: unbaselinedRes.backfillDirtyFiles };
                 baselineDirtyChanged = true;
               }
             }
-            res.files = sessionFiles;
+            totalHiddenPreExisting += hiddenCount;
+            const displayFiles = this.showAllWorkingChanges ? rawWorkingFiles : sessionFiles;
+            res.files = displayFiles;
             res.commits = sessionCommits;
             if (res.service) {
-              res.service.workingCount = sessionFiles.length;
+              res.service.workingCount = displayFiles.length;
               res.service.sessionCommitCount = sessionCommits.length;
             }
-            res.touched = sessionFiles.length > 0 || sessionCommits.length > 0;
+            res.touched = displayFiles.length > 0 || sessionCommits.length > 0;
           }
 
+          this.hiddenPreExistingCount = totalHiddenPreExisting;
           touchedResults = serviceResults.filter((r) => r.touched);
           const sessionRepos = touchedResults.map((r) => normPathStr(r.service?.root)).filter(Boolean);
           mergeSessionBaselineIntoFlow(sessionTabId, sessionBaseline, sessionRepos);
@@ -2096,6 +2178,8 @@ export default class ChangesReview extends View {
             );
             if (key() !== context) return;
           }
+        } else {
+          this.hiddenPreExistingCount = 0;
         }
         const services = touchedResults.map((r) => r.service);
 
@@ -3830,6 +3914,73 @@ export default class ChangesReview extends View {
                 .font_medium()
                 .text_color(t.foreground)
                 .child(`${svc.name} · ${branchLabel}`),
+            ),
+        );
+      })
+
+      // Pre-existing hidden files banner + toggle + baseline reset
+      .when(this.viewMode === "working" && (this.hiddenPreExistingCount > 0 || this.showAllWorkingChanges), (el) => {
+        const n = this.hiddenPreExistingCount;
+        const label = this.showAllWorkingChanges
+          ? (n > 0 ? `Showing all working changes (${n} pre-existing)` : "Showing all working changes")
+          : `${n} ${n === 1 ? "file" : "files"} hidden as pre-existing`;
+        return el.child(
+          h_flex()
+            .id("preexisting-baseline-bar")
+            .min_h(28)
+            .flex_none()
+            .px(10)
+            .py(4)
+            .gap(6)
+            .items_center()
+            .border_b(1)
+            .border_color(t.border)
+            .bg(t.raised)
+            .child(
+              div()
+                .flex_1()
+                .min_w(0)
+                .truncate()
+                .text_size(11)
+                .text_color(this.showAllWorkingChanges ? t.foreground : t.muted)
+                .child(label),
+            )
+            .child(
+              div()
+                .id("toggle-preexisting-btn")
+                .flex_none()
+                .px(6)
+                .py(2)
+                .rounded(4)
+                .border_1()
+                .border_color(this.showAllWorkingChanges ? (t.accent || t.border) : t.border)
+                .bg(t.background)
+                .text_size(10.5)
+                .font_medium()
+                .text_color(this.showAllWorkingChanges ? (t.accent || t.foreground) : t.foreground)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover))
+                .tooltip(this.showAllWorkingChanges ? "Show only changes made during this session" : "Show all dirty working-tree files including pre-existing ones")
+                .on_click((_e, cx) => this.toggleShowAllWorkingChanges(cx))
+                .child(this.showAllWorkingChanges ? "Session only" : "Show all"),
+            )
+            .child(
+              div()
+                .id("reset-baseline-btn")
+                .flex_none()
+                .px(6)
+                .py(2)
+                .rounded(4)
+                .border_1()
+                .border_color(t.border)
+                .bg(t.background)
+                .text_size(10.5)
+                .text_color(t.muted)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .tooltip("Clear pre-existing baseline snapshot so all current working changes belong to this session")
+                .on_click((_e, cx) => this.resetSessionBaseline(cx))
+                .child("Reset baseline"),
             ),
         );
       })

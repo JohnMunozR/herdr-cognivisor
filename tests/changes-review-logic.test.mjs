@@ -27,10 +27,17 @@ import {
   reconcileReviewedFiles,
   filterSessionCommits,
   filterSessionWorkingEntries,
+  partitionSessionWorkingEntries,
   normalizeGitStatusMark,
   statFileEntry,
   readDiskSessionBaseline,
   writeDiskSessionBaseline,
+  resolveSessionStartTime,
+  buildFreshSessionBaseline,
+  createResetSessionBaseline,
+  findRecentFlowWorkspaceBaseline,
+  findRecentWorkspaceBaseline,
+  countBaselineDirtyFiles,
   extractResumeKeyFromTranscript,
   filterUnbaselinedRepoEntries,
   isHomeDirectoryRoot,
@@ -1131,5 +1138,118 @@ describe("changes-review review-logic", () => {
     assert.equal(computeDiffContentWidth([{ type: "line", content: "abc" }], { minWidth: 300, charPx: 0 }), 300);
     assert.equal(computeDiffContentWidth([{ type: "line", content: "abc" }], { minWidth: 300, charPx: Number.NaN }), 300);
     assert.equal(computeDiffContentWidth([{ type: "line", content: "abc" }], { minWidth: 300, charPx: -4 }), 300);
+  });
+
+  test("regression: fresh baseline anchored to session start does not hide agent edits made before Review opens", () => {
+    const t0900 = 1795442400000;
+    const t1205 = 1795453500000;
+    const t1211 = 1795453860000;
+    const t1215 = 1795454100000;
+    const t1221 = 1795454460000;
+
+    // Flow already existed since 12:05 before Review created its baseline at 12:21
+    const startInfo = resolveSessionStartTime({ updatedAt: t1205 }, t1221);
+    assert.equal(startInfo.startedAt, t1205);
+    assert.equal(startInfo.anchored, true);
+
+    const files = [
+      { relFile: "src/PreExisting.java", status: "M", sig: "50:1795442400000", mtimeMs: t0900 },
+      { relFile: "src/CardB2bApi.java", status: "M", sig: "120:1795453860000", mtimeMs: t1211 },
+      { relFile: "src/CardRepository.java", status: "M", sig: "240:1795454100000", mtimeMs: t1215 },
+    ];
+
+    const baseline = buildFreshSessionBaseline(
+      [{ service: { root: "/ws/ms-card" }, files }],
+      { workspaceRoot: "/ws/ms-card", startedAt: startInfo.startedAt, anchored: startInfo.anchored },
+    );
+
+    // Only the 09:00 pre-existing file is snapshotted; 12:11 & 12:15 agent edits are excluded from dirtyFiles
+    assert.deepEqual(Object.keys(baseline.repos["/ws/ms-card"].dirtyFiles), ["src/PreExisting.java"]);
+
+    const part = partitionSessionWorkingEntries(files, baseline.repos["/ws/ms-card"], baseline.startedAt);
+    assert.deepEqual(part.visible.map((f) => f.relFile), ["src/CardB2bApi.java", "src/CardRepository.java"]);
+    assert.deepEqual(part.hidden.map((f) => f.relFile), ["src/PreExisting.java"]);
+  });
+
+  test("regression: findRecentWorkspaceBaseline & findRecentFlowWorkspaceBaseline reuse orphaned morning baseline without stealing live tabs", async () => {
+    const t0919 = 1795443593000;
+    const t1221 = 1795454466000;
+    const oldBaseline = {
+      version: 1,
+      startedAt: t0919,
+      workspaceRoot: "/ws/ms-card",
+      repos: { "/ws/ms-card": { dirtyFiles: {} } },
+    };
+    const otherLiveBaseline = {
+      version: 1,
+      startedAt: t0919 + 60000,
+      workspaceRoot: "/ws/ms-card",
+      repos: { "/ws/ms-card": { dirtyFiles: { "src/CardB2bApi.java": { status: "M", sig: "1:1" } } } },
+    };
+
+    const flows = {
+      tbf79e3c: { sessionBaseline: oldBaseline },
+      live_tab_2: { sessionBaseline: otherLiveBaseline },
+    };
+
+    // tbf79e3c is no longer live -> recovered; live_tab_2 is live -> skipped
+    const fromFlows = findRecentFlowWorkspaceBaseline(flows, "/ws/ms-card", {
+      excludeTabId: "tb70b579",
+      liveTabIds: new Set(["tb70b579", "live_tab_2"]),
+      now: t1221,
+    });
+    assert.deepEqual(fromFlows, oldBaseline);
+
+    // Disk scan via mock fsDeps
+    const filesMap = new Map([
+      ["/app/cognivisor/sessions/tabs/tbf79e3c.json", JSON.stringify(oldBaseline)],
+      ["/app/cognivisor/sessions/tabs/live_tab_2.json", JSON.stringify(otherLiveBaseline)],
+    ]);
+    const mockFs = {
+      readdir: async () => ["tbf79e3c.json", "live_tab_2.json"],
+      readFile: async (p) => {
+        const key = String(p).replace(/\\/g, "/");
+        if (!filesMap.has(key)) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        return filesMap.get(key);
+      },
+    };
+    const fromDisk = await findRecentWorkspaceBaseline("/app", "/ws/ms-card", {
+      excludeTabId: "tb70b579",
+      liveTabIds: new Set(["tb70b579", "live_tab_2"]),
+      now: t1221,
+      fsDeps: mockFs,
+    });
+    assert.deepEqual(fromDisk, oldBaseline);
+  });
+
+  test("createResetSessionBaseline clears dirtyFiles across repos so hidden files immediately reappear", () => {
+    const existing = {
+      version: 1,
+      startedAt: 1795454466000,
+      workspaceRoot: "/ws/ms-card",
+      repos: {
+        "/ws/ms-card": {
+          dirtyFiles: {
+            "src/CardB2bApi.java": { status: "M", sig: "120:1795453860000" },
+            "src/CardRepository.java": { status: "M", sig: "240:1795454100000" },
+          },
+        },
+      },
+    };
+    assert.equal(countBaselineDirtyFiles(existing), 2);
+
+    const reset = createResetSessionBaseline(existing, ["/ws/ms-card", "/ws/ms-wallet"], "/ws/ms-card");
+    assert.equal(reset.startedAt, existing.startedAt);
+    assert.equal(countBaselineDirtyFiles(reset), 0);
+    assert.deepEqual(reset.repos["/ws/ms-card"], { dirtyFiles: {} });
+    assert.deepEqual(reset.repos["/ws/ms-wallet"], { dirtyFiles: {} });
+
+    const files = [
+      { relFile: "src/CardB2bApi.java", status: "M", sig: "120:1795453860000", mtimeMs: 1795453860000 },
+      { relFile: "src/CardRepository.java", status: "M", sig: "240:1795454100000", mtimeMs: 1795454100000 },
+    ];
+    const afterReset = partitionSessionWorkingEntries(files, reset.repos["/ws/ms-card"], reset.startedAt);
+    assert.equal(afterReset.hidden.length, 0);
+    assert.deepEqual(afterReset.visible.map((f) => f.relFile), ["src/CardB2bApi.java", "src/CardRepository.java"]);
   });
 });

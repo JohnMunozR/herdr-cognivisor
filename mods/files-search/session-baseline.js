@@ -204,6 +204,111 @@ export async function writeDiskSessionBaseline(appHomeDir, tabId, workspaceRoot,
   return wrote;
 }
 
+export const DEFAULT_RECENT_BASELINE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+
+export function resolveSessionStartTime(flowObj, now = Date.now()) {
+  const nowMs = Number.isFinite(Number(now)) && Number(now) > 0 ? Number(now) : Date.now();
+  const candidates = [];
+  if (flowObj && typeof flowObj === "object") {
+    for (const raw of [flowObj.sessionStartedAt, flowObj.createdAt, flowObj.updatedAt]) {
+      const n = Number(raw);
+      if (Number.isFinite(n) && n > 0 && n <= nowMs) {
+        candidates.push(n);
+      }
+    }
+  }
+  if (candidates.length > 0) {
+    const earliest = Math.min(...candidates);
+    return { startedAt: earliest, anchored: earliest < nowMs };
+  }
+  return { startedAt: nowMs, anchored: false };
+}
+
+export function findRecentFlowWorkspaceBaseline(
+  flows,
+  workspaceRoot,
+  { excludeTabId = "", liveTabIds = null, maxAgeMs = DEFAULT_RECENT_BASELINE_MAX_AGE_MS, now = Date.now() } = {},
+) {
+  const normWs = normPath(workspaceRoot || "");
+  if (!normWs || !flows || typeof flows !== "object") return null;
+  const nowMs = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  const maxAge = Number.isFinite(Number(maxAgeMs)) && Number(maxAgeMs) > 0 ? Number(maxAgeMs) : DEFAULT_RECENT_BASELINE_MAX_AGE_MS;
+  const liveRawSet = liveTabIds ? new Set(Array.from(liveTabIds).filter(Boolean)) : null;
+
+  let best = null;
+  for (const [tabId, flow] of Object.entries(flows)) {
+    if (!tabId || tabId === excludeTabId) continue;
+    if (liveRawSet && liveRawSet.has(tabId)) continue;
+    const candidate = normalizeSessionBaseline(flow?.sessionBaseline);
+    if (!candidate || candidate.workspaceRoot !== normWs) continue;
+    const age = nowMs - candidate.startedAt;
+    if (age < 0 || age > maxAge) continue;
+    if (!best || candidate.startedAt > best.startedAt) {
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+export async function findRecentWorkspaceBaseline(
+  appHomeDir,
+  workspaceRoot,
+  { excludeTabId = "", liveTabIds = null, maxAgeMs = DEFAULT_RECENT_BASELINE_MAX_AGE_MS, now = Date.now(), fsDeps = fsPromises } = {},
+) {
+  const normWs = normPath(workspaceRoot || "");
+  if (!appHomeDir || !normWs) return null;
+  const readerDir = typeof fsDeps?.readdir === "function" ? fsDeps.readdir : fsPromises.readdir;
+  if (typeof readerDir !== "function") return null;
+
+  const tabsDir = join(String(appHomeDir), "cognivisor", "sessions", "tabs");
+  let entries;
+  try {
+    entries = await readerDir(tabsDir);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+
+  const nowMs = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  const maxAge = Number.isFinite(Number(maxAgeMs)) && Number(maxAgeMs) > 0 ? Number(maxAgeMs) : DEFAULT_RECENT_BASELINE_MAX_AGE_MS;
+  const safeExclude = excludeTabId ? safeTabId(excludeTabId) : "";
+  let safeLiveSet = null;
+  if (liveTabIds) {
+    safeLiveSet = new Set();
+    for (const id of liveTabIds) {
+      if (id) safeLiveSet.add(safeTabId(id));
+    }
+  }
+
+  const reader = typeof fsDeps?.readFile === "function" ? fsDeps.readFile : readFile;
+  let best = null;
+  for (const rawEntry of entries) {
+    const name = typeof rawEntry === "string" ? rawEntry : rawEntry?.name;
+    if (!name || !name.endsWith(".json")) continue;
+    const fileTabId = name.slice(0, -".json".length);
+    if (!fileTabId || fileTabId === safeExclude) continue;
+    if (safeLiveSet && safeLiveSet.has(fileTabId)) continue;
+    let candidate = null;
+    try {
+      const text = await reader(join(tabsDir, name), "utf8");
+      const parsed = JSON.parse(text);
+      const payload = parsed && typeof parsed === "object" && !Array.isArray(parsed) && parsed.sessionBaseline && typeof parsed.sessionBaseline === "object"
+        ? parsed.sessionBaseline
+        : parsed;
+      candidate = normalizeSessionBaseline(payload);
+    } catch {
+      candidate = null;
+    }
+    if (!candidate || candidate.workspaceRoot !== normWs) continue;
+    const age = nowMs - candidate.startedAt;
+    if (age < 0 || age > maxAge) continue;
+    if (!best || candidate.startedAt > best.startedAt) {
+      best = candidate;
+    }
+  }
+  return best;
+}
+
 function stripAnsiEscapes(text) {
   return String(text || "")
     .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")

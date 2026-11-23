@@ -140,6 +140,9 @@ import {
   normalizeSessionBaseline,
   readDiskSessionBaseline,
   writeDiskSessionBaseline,
+  resolveSessionStartTime,
+  findRecentFlowWorkspaceBaseline,
+  findRecentWorkspaceBaseline,
   terminalHasResumeCommand,
   statFileEntry,
   filterSessionDirtyEntries,
@@ -1899,12 +1902,14 @@ export default class FilesSearch extends View {
             || null;
           const primaryBranch = primaryStatus?.branch || "";
 
-          const freshFlowObj = asPlainObject(shared("cognivisor.flows"))[activeTabId];
+          const allFlowsNow = asPlainObject(shared("cognivisor.flows"));
+          const freshFlowObj = allFlowsNow[activeTabId];
           let sessionBaseline = normalizeSessionBaseline(freshFlowObj?.sessionBaseline);
           if (sessionBaseline && sessionBaseline.workspaceRoot && normCwd && sessionBaseline.workspaceRoot !== normCwd) {
             sessionBaseline = null;
           }
           let isFreshBaseline = false;
+          let isAnchoredFresh = false;
           let baselineDirtyChanged = false;
 
           if (!sessionBaseline && appHomeDir) {
@@ -1925,13 +1930,42 @@ export default class FilesSearch extends View {
             }
           }
           if (!sessionBaseline) {
+            const liveTabIds = new Set();
+            for (const sp of spaces() || []) {
+              for (const tb of sp?.tabs || []) {
+                if (tb?.id) liveTabIds.add(tb.id);
+              }
+            }
+            const recentFlow = findRecentFlowWorkspaceBaseline(allFlowsNow, cwd, {
+              excludeTabId: activeTabId,
+              liveTabIds,
+            });
+            if (recentFlow) {
+              sessionBaseline = recentFlow;
+              baselineDirtyChanged = true;
+            } else if (appHomeDir) {
+              const recentDisk = await findRecentWorkspaceBaseline(appHomeDir, cwd, {
+                excludeTabId: activeTabId,
+                liveTabIds,
+                fsDeps: fsPromises,
+              });
+              if (!this.current(context)) return;
+              if (recentDisk) {
+                sessionBaseline = recentDisk;
+                baselineDirtyChanged = true;
+              }
+            }
+          }
+          if (!sessionBaseline) {
+            const { startedAt, anchored } = resolveSessionStartTime(freshFlowObj);
             sessionBaseline = {
               version: 1,
-              startedAt: Date.now(),
+              startedAt,
               workspaceRoot: normCwd,
               repos: {},
             };
             isFreshBaseline = true;
+            isAnchoredFresh = anchored;
             baselineDirtyChanged = true;
           }
 
@@ -1983,7 +2017,7 @@ export default class FilesSearch extends View {
                     return { ...item, sig, mtimeMs };
                   })
                 ),
-                isFreshBaseline
+                (isFreshBaseline && !isAnchoredFresh)
                   ? Promise.resolve(null)
                   : exec(
                       "git",
@@ -1992,7 +2026,7 @@ export default class FilesSearch extends View {
                     ).catch(() => null),
               ]);
 
-              const sessionCommitCount = !isFreshBaseline && logRes?.code === 0 && Boolean((logRes.stdout || "").trim()) ? 1 : 0;
+              const sessionCommitCount = !(isFreshBaseline && !isAnchoredFresh) && logRes?.code === 0 && Boolean((logRes.stdout || "").trim()) ? 1 : 0;
               return { service, branch, ahead, parsedEntries, sessionCommitCount };
             })
           );
@@ -2009,11 +2043,16 @@ export default class FilesSearch extends View {
             if (isFreshBaseline) {
               const dirtyFiles = {};
               for (const item of parsedEntries) {
+                if (isAnchoredFresh && item.mtimeMs > 0 && item.mtimeMs >= sessionBaseline.startedAt) {
+                  continue;
+                }
                 dirtyFiles[item.relFile] = { status: item.status, sig: item.sig };
               }
               sessionBaseline.repos[normRoot] = { dirtyFiles };
               baselineDirtyChanged = true;
-              sessionWorkingFiles = [];
+              sessionWorkingFiles = isAnchoredFresh
+                ? filterSessionDirtyEntries(parsedEntries, sessionBaseline.repos[normRoot], sessionBaseline.startedAt, sigMap)
+                : [];
             } else if (!existingBaselineRepo) {
               sessionWorkingFiles = filterSessionDirtyEntries(parsedEntries, null, sessionBaseline.startedAt, sigMap);
               const dirtyFiles = {};

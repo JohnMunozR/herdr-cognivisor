@@ -9,6 +9,9 @@ import {
   normalizeSessionBaseline,
   readDiskSessionBaseline,
   writeDiskSessionBaseline,
+  resolveSessionStartTime,
+  findRecentFlowWorkspaceBaseline,
+  findRecentWorkspaceBaseline,
   terminalHasResumeCommand,
   computeFileSig,
   statFileEntry,
@@ -269,5 +272,51 @@ describe("files-search session-baseline", () => {
       }),
       "C:/Users/dev/Projects/app",
     );
+  });
+
+  it("resolveSessionStartTime anchors to earliest flow timestamp and findRecentWorkspaceBaseline reuses orphaned baselines", async () => {
+    const t0919 = 1795443593000;
+    const t1205 = 1795453500000;
+    const t1221 = 1795454466000;
+
+    assert.deepEqual(resolveSessionStartTime({ updatedAt: t1205 }, t1221), { startedAt: t1205, anchored: true });
+    assert.deepEqual(resolveSessionStartTime(null, t1221), { startedAt: t1221, anchored: false });
+
+    const appHomeDir = await mkdtemp(join(tmpdir(), "herdr-recent-ws-"));
+    try {
+      const ws = "/home/dev/projects/ms-card";
+      const morningBaseline = {
+        version: 1,
+        startedAt: t0919,
+        workspaceRoot: ws,
+        repos: { [ws]: { dirtyFiles: {} } },
+      };
+      await writeDiskSessionBaseline(appHomeDir, "tbf79e3c", ws, "feat/card", morningBaseline);
+
+      // Skipped if tbf79e3c is still a live tab
+      const whileLive = await findRecentWorkspaceBaseline(appHomeDir, ws, {
+        excludeTabId: "tb70b579",
+        liveTabIds: new Set(["tbf79e3c", "tb70b579"]),
+        now: t1221,
+      });
+      assert.equal(whileLive, null);
+
+      // Reused once tbf79e3c is orphaned (no longer in liveTabIds)
+      const whenOrphaned = await findRecentWorkspaceBaseline(appHomeDir, ws, {
+        excludeTabId: "tb70b579",
+        liveTabIds: new Set(["tb70b579"]),
+        now: t1221,
+      });
+      assert.deepEqual(whenOrphaned, morningBaseline);
+
+      const flowMatch = findRecentFlowWorkspaceBaseline(
+        { tbf79e3c: { sessionBaseline: morningBaseline } },
+        ws,
+        { excludeTabId: "tb70b579", liveTabIds: new Set(["tb70b579"]), now: t1221 },
+      );
+      assert.deepEqual(flowMatch, morningBaseline);
+    } finally {
+      await rm(appHomeDir, { recursive: true, force: true });
+    }
   });
 });
