@@ -2384,11 +2384,11 @@ function collectSummaryMatchesForSymbol(summary, absPath, service, context, { ta
 function findEnclosingAbstractDecl(summary, context) {
   if (!summary || !context?.symbol) return null;
   for (const t of summary.types || []) {
-    if (t.name === context.symbol && t.line === context.line && t.isAbstract) {
+    if (t.name === context.symbol && Math.abs((t.line || 0) - context.line) <= 1 && t.isAbstract) {
       return { typeName: t.name, methodName: null };
     }
     for (const m of t.methods || []) {
-      if (m.name === context.symbol && m.line === context.line && (t.isAbstract || m.isAbstract)) {
+      if (m.name === context.symbol && Math.abs((m.line || 0) - context.line) <= 1 && (t.isAbstract || m.isAbstract)) {
         return { typeName: t.name, methodName: m.name };
       }
     }
@@ -2396,9 +2396,10 @@ function findEnclosingAbstractDecl(summary, context) {
   return null;
 }
 
-function buildSubtypeSearchRegex(parentTypeName, lang) {
+function buildSubtypeSearchRegex(parentTypeName, lang, multiline = false) {
   const esc = parentTypeName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   if (lang === "python") return `class\\s+\\w+\\([^)]*\\b${esc}\\b`;
+  if (multiline) return `\\b(?:implements|extends)\\b[^{;]{0,600}\\b${esc}\\b`;
   return `\\b(?:implements|extends)\\b[^{;]*\\b${esc}\\b`;
 }
 
@@ -2415,38 +2416,38 @@ function parseMatchedFilesFromGrep(stdout, service) {
   return out;
 }
 
-async function grepServiceFiles(pattern, lang, service, ioOpts) {
+async function grepServiceFiles(pattern, lang, service, ioOpts, opts = {}) {
   const run = ioOpts.execFn || exec;
   const trackRg = !ioOpts.execFn;
   const on = service?.on ?? ioOpts.on ?? null;
   const onKey = on ?? "local";
   const globs = (LANG_RG_GLOBS[lang] || []).flatMap((g) => ["--glob", g]);
+  const multiline = Boolean(opts?.multiline);
+  const gitFallbackPattern = opts?.gitFallbackPattern || pattern;
 
   if (!trackRg || isRgAvailable(onKey) !== false) {
-    const rgRes = await run(
-      "rg",
-      [
-        "-l",
-        "--no-heading",
-        "--color=never",
-        "--path-separator",
-        "/",
-        "--max-filesize",
-        "512K",
-        "--threads",
-        "4",
-        ...COMMON_IGNORE_GLOBS,
-        "--glob",
-        "!*.min.js",
-        "--glob",
-        "!*.bundle.js",
-        ...globs,
-        "--",
-        pattern,
-        ".",
-      ],
-      { cwd: service.root, on, timeout: 5000 }
-    ).catch(() => null);
+    const rgArgs = ["-l"];
+    if (multiline) rgArgs.push("-U");
+    rgArgs.push(
+      "--no-heading",
+      "--color=never",
+      "--path-separator",
+      "/",
+      "--max-filesize",
+      "512K",
+      "--threads",
+      "4",
+      ...COMMON_IGNORE_GLOBS,
+      "--glob",
+      "!*.min.js",
+      "--glob",
+      "!*.bundle.js",
+      ...globs,
+      "--",
+      pattern,
+      ".",
+    );
+    const rgRes = await run("rg", rgArgs, { cwd: service.root, on, timeout: 5000 }).catch(() => null);
     if (rgRes && rgRes.code === 0) {
       if (trackRg) markRgAvailable(onKey, true);
       return rgRes.stdout ? parseMatchedFilesFromGrep(rgRes.stdout, service) : [];
@@ -2465,7 +2466,7 @@ async function grepServiceFiles(pattern, lang, service, ioOpts) {
   const gitPathspecs = LANG_GIT_PATHSPECS[lang] || [];
   const gitRes = await run(
     "git",
-    [...READ_GIT, "grep", "-l", "-E", "-e", pattern, ...gitPathspecs],
+    [...READ_GIT, "grep", "-l", "-E", "-e", gitFallbackPattern, ...gitPathspecs],
     { cwd: service.root, on, timeout: 5000 }
   ).catch(() => null);
   if (gitRes && gitRes.code === 0 && gitRes.stdout) {
@@ -2479,73 +2480,102 @@ async function resolveSubtypeImplementations({
   methodName,
   lang,
   allServices,
+  currentSummary = null,
+  currentFilePath = "",
+  owningService = null,
   ioOpts,
   context,
   appHomeDir,
 }) {
   const results = [];
-  const visitedFiles = new Set();
+  const visitedTypes = new Set([parentTypeName]);
+  const queue = [{ typeName: parentTypeName, depth: 0 }];
+  const MAX_SUBTYPE_DEPTH = 4;
+  const MAX_SUBTYPE_TYPES = 24;
 
-  await runInBatches(allServices, 4, async (svc) => {
-    const idx = getOrCreateServiceIndex(svc);
-    await loadServiceDiskIndex(idx, appHomeDir);
-
-    const indexedRels = idx.subtypesByParent.get(parentTypeName);
-    if (indexedRels) {
-      for (const rel of indexedRels) {
-        const ent = idx.files.get(rel);
-        const abs = joinFsPath(svc.root, rel);
-        if (!ent || ent.lang !== lang || visitedFiles.has(abs)) continue;
-        visitedFiles.add(abs);
-        for (const t of ent.summary.types || []) {
-          const isChild = [...(t.extends || []), ...(t.implements || [])].some(
-            (p) => String(p).replace(/<.*$/, "").split(".").pop() === parentTypeName
-          );
-          if (!isChild) continue;
-          if (methodName) {
-            for (const c of findMemberInTypeRecord(t, methodName, abs, lang, context)) {
-              results.push(attachServiceMeta({ ...c, score: c.isAbstract ? 110 : 180 }, svc));
-            }
-          } else if (!t.isAbstract) {
-            results.push(
-              attachServiceMeta(
-                { filePath: abs, line: t.line, column: t.column, name: t.name, kind: t.kind || "class", isAbstract: false, lang, score: 170 },
-                svc
-              )
-            );
-          }
+  const inspectSummaryForParent = (summary, abs, svc, targetParent, depth) => {
+    for (const t of summary?.types || []) {
+      const isChild = [...(t.extends || []), ...(t.implements || [])].some(
+        (p) => String(p).replace(/<.*$/, "").split(".").pop() === targetParent
+      );
+      if (!isChild) continue;
+      if (methodName) {
+        const wantArity = Number.isFinite(context?.arity) ? context.arity : null;
+        for (const c of findMemberInTypeRecord(t, methodName, abs, lang, context)) {
+          const arityAdj = wantArity !== null && Number.isFinite(c.arity) ? (c.arity === wantArity ? 30 : -20) : 0;
+          results.push(attachServiceMeta({ ...c, score: (c.isAbstract ? 110 : 180) + arityAdj }, svc));
         }
+      } else if (!t.isAbstract) {
+        results.push(
+          attachServiceMeta(
+            {
+              filePath: abs,
+              line: t.line,
+              column: t.column,
+              name: t.name,
+              kind: t.kind || "class",
+              containerName: summary.packageName || "",
+              signature: `${t.kind || "class"} ${t.name}`,
+              isAbstract: false,
+              lang,
+              score: 180,
+            },
+            svc
+          )
+        );
+      }
+      if (
+        t.name &&
+        !visitedTypes.has(t.name) &&
+        depth + 1 < MAX_SUBTYPE_DEPTH &&
+        visitedTypes.size < MAX_SUBTYPE_TYPES
+      ) {
+        visitedTypes.add(t.name);
+        queue.push({ typeName: t.name, depth: depth + 1 });
       }
     }
+  };
 
-    // Live grep for subtypes in case index hasn't warmed yet or new files were created
-    const pattern = buildSubtypeSearchRegex(parentTypeName, lang);
-    const matchedAbsPaths = await grepServiceFiles(pattern, lang, svc, ioOpts);
-    await runInBatches(matchedAbsPaths, 5, async (abs) => {
-      if (visitedFiles.has(abs)) return;
-      visitedFiles.add(abs);
-      const loaded = await analyzeFileAtPath(abs, svc, ioOpts);
-      if (!loaded || loaded.summary.lang !== lang) return;
-      for (const t of loaded.summary.types || []) {
-        const isChild = [...(t.extends || []), ...(t.implements || [])].some(
-          (p) => String(p).replace(/<.*$/, "").split(".").pop() === parentTypeName
-        );
-        if (!isChild) continue;
-        if (methodName) {
-          for (const c of findMemberInTypeRecord(t, methodName, abs, lang, context)) {
-            results.push(attachServiceMeta({ ...c, score: c.isAbstract ? 110 : 180 }, svc));
-          }
-        } else if (!t.isAbstract) {
-          results.push(
-            attachServiceMeta(
-              { filePath: abs, line: t.line, column: t.column, name: t.name, kind: t.kind || "class", isAbstract: false, lang, score: 170 },
-              svc
-            )
-          );
+  while (queue.length > 0) {
+    const { typeName: curParent, depth } = queue.shift();
+    const visitedFiles = new Set();
+
+    if (currentSummary && currentFilePath && owningService) {
+      visitedFiles.add(normPathStr(currentFilePath));
+      inspectSummaryForParent(currentSummary, normPathStr(currentFilePath), owningService, curParent, depth);
+    }
+
+    await runInBatches(allServices, 4, async (svc) => {
+      const idx = getOrCreateServiceIndex(svc);
+      await loadServiceDiskIndex(idx, appHomeDir);
+
+      const indexedRels = idx.subtypesByParent.get(curParent);
+      if (indexedRels) {
+        for (const rel of indexedRels) {
+          const ent = idx.files.get(rel);
+          const abs = joinFsPath(svc.root, rel);
+          if (!ent || ent.lang !== lang || visitedFiles.has(abs)) continue;
+          visitedFiles.add(abs);
+          inspectSummaryForParent(ent.summary, abs, svc, curParent, depth);
         }
       }
+
+      // Live multiline grep for subtypes (handles Spotless multi-line implements/extends & unwarmed services)
+      const escParent = curParent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const pattern = buildSubtypeSearchRegex(curParent, lang, lang === "java" || lang === "js");
+      const matchedAbsPaths = await grepServiceFiles(pattern, lang, svc, ioOpts, {
+        multiline: lang === "java" || lang === "js",
+        gitFallbackPattern: `\\b${escParent}\\b`,
+      });
+      await runInBatches(matchedAbsPaths, 5, async (abs) => {
+        if (visitedFiles.has(abs)) return;
+        visitedFiles.add(abs);
+        const loaded = await analyzeFileAtPath(abs, svc, ioOpts);
+        if (!loaded || loaded.summary.lang !== lang) return;
+        inspectSummaryForParent(loaded.summary, abs, svc, curParent, depth);
+      });
     });
-  });
+  }
 
   return results;
 }
@@ -2997,15 +3027,20 @@ export async function resolveCrossFileNavigation(params = {}) {
   const localCands = (level1.resolved || []).map((c) => attachServiceMeta(c, owningService));
   const bestLocal = localCands[0] || null;
   const localConcrete = localCands.filter((c) => !c.isAbstract);
+  const currentSummary = summarizeFileCached(normFile, sourceText);
+  const abstractAnchor = findEnclosingAbstractDecl(currentSummary, evalContext);
 
-  // Fast exit when resolved cleanly within the current file (and not an abstract/interface call needing polymorphic fan-out)
-  if (bestLocal && !(evalContext.intent === "implementation" && localConcrete.length === 0 && bestLocal.isAbstract)) {
+  // Fast exit when resolved cleanly within the current file (and not an abstract/interface decl or call needing polymorphic fan-out)
+  if (
+    bestLocal &&
+    !abstractAnchor &&
+    !(evalContext.intent === "implementation" && localConcrete.length === 0 && bestLocal.isAbstract)
+  ) {
     const localResult = finalizeNavigationResult(localCands, evalContext);
     const clickedOwnDeclaration = isCursorAtNavCandidate(localResult.best, normFile, evalContext);
     if (localResult.status !== "already-there" && !clickedOwnDeclaration) {
       return localResult;
     }
-    const currentSummaryLocal = summarizeFileCached(normFile, sourceText);
     const bestKind = String(localResult.best?.kind || "").toLowerCase();
     const scopeSameFileOnly =
       bestKind === "variable" ||
@@ -3017,7 +3052,7 @@ export async function resolveCrossFileNavigation(params = {}) {
       declFilePath: normFile,
       declLine: evalContext.line,
       declCol: evalContext.tokenCol || evalContext.col || 1,
-      currentSummary: currentSummaryLocal,
+      currentSummary,
       currentSourceText: sourceText,
       owningService,
       allServices,
@@ -3040,12 +3075,11 @@ export async function resolveCrossFileNavigation(params = {}) {
     return localResult;
   }
 
-  const currentSummary = summarizeFileCached(normFile, sourceText);
   let externalPackage = null;
   let crossCandidates = [];
 
-  // Level 2: Direct import / module / package resolution
-  const hint = level1.importHint;
+  // Level 2: Direct import / module / package resolution (skip self-type lookup when already anchored on a local interface/abstract decl)
+  const hint = abstractAnchor ? null : level1.importHint;
   if (hint) {
     if (lang === "js" && (hint.specifier || context.importModuleSpec)) {
       const res2 = await resolveJsImportChain({
@@ -3131,11 +3165,13 @@ export async function resolveCrossFileNavigation(params = {}) {
     crossCandidates.push(...res2.candidates);
   }
 
-  // Level 3A: Polymorphic concrete implementations when best match is an interface / abstract class / method
-  const abstractAnchor = findEnclosingAbstractDecl(currentSummary, evalContext);
+  // Level 3A: Polymorphic concrete implementations when anchored on an interface/abstract decl or calling an abstract method
   const resolvedTop = rankNavCandidates([...localCands, ...crossCandidates], evalContext)[0] || null;
-  if (evalContext.intent === "implementation" && (abstractAnchor || (resolvedTop && resolvedTop.isAbstract))) {
-    const parentType = abstractAnchor?.typeName || resolvedTop?.containerName || hint?.typeName || level1.memberTypeHints?.[0] || null;
+  const shouldResolveSubtypes = Boolean(
+    abstractAnchor || (evalContext.intent === "implementation" && resolvedTop && resolvedTop.isAbstract)
+  );
+  if (shouldResolveSubtypes) {
+    const parentType = abstractAnchor?.typeName || resolvedTop?.containerName || level1.importHint?.typeName || level1.memberTypeHints?.[0] || null;
     const targetMethod = abstractAnchor ? abstractAnchor.methodName : evalContext.symbol;
     if (parentType) {
       const subCands = await resolveSubtypeImplementations({
@@ -3143,11 +3179,52 @@ export async function resolveCrossFileNavigation(params = {}) {
         methodName: targetMethod,
         lang,
         allServices,
+        currentSummary,
+        currentFilePath: normFile,
+        owningService,
         ioOpts,
         context: evalContext,
         appHomeDir,
       });
       crossCandidates.push(...subCands);
+    }
+  }
+
+  // When cursor is directly on an interface/abstract declaration, prioritize non-self concrete implementations;
+  // if none exist (e.g., Spring Data JpaRepository proxy), fall back cleanly to workspace references.
+  if (abstractAnchor) {
+    const implContext = { ...evalContext, intent: "implementation" };
+    const concreteImpls = [...localCands, ...crossCandidates].filter(
+      (c) => !c.isAbstract && !isCursorAtNavCandidate(c, normFile, evalContext)
+    );
+    if (concreteImpls.length > 0) {
+      return finalizeNavigationResult(concreteImpls, implContext);
+    }
+    const refs = await findWorkspaceReferences({
+      symbol: evalContext.symbol,
+      lang,
+      declFilePath: normFile,
+      declLine: evalContext.line,
+      declCol: evalContext.tokenCol || evalContext.col || 1,
+      currentSummary,
+      currentSourceText: sourceText,
+      owningService,
+      allServices,
+      ioOpts,
+    });
+    if (refs.length > 0) {
+      return finalizeReferencesResult(refs, evalContext);
+    }
+    const selfBest = localCands.find((c) => isCursorAtNavCandidate(c, normFile, evalContext)) || localCands[0] || null;
+    if (selfBest) {
+      return {
+        status: "already-there",
+        candidates: [selfBest],
+        best: selfBest,
+        context: evalContext,
+        externalPackage: null,
+        message: `No implementations found for ${evalContext.symbol}`,
+      };
     }
   }
 

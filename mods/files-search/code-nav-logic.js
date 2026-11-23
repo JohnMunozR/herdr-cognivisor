@@ -649,6 +649,49 @@ export function countCallArity(maskedLines, line0, openParenCol0, rawLines = nul
   return null;
 }
 
+/**
+ * Count formal parameters in a method/function declaration signature starting at `(`.
+ * Tracks angle brackets `<...>` in addition to `()`, `[]`, `{}` so Java generics like
+ * `Map<String, Object> params` count as a single parameter.
+ */
+export function countDeclarationParamArity(maskedLines, line0, openParenCol0) {
+  if (!Array.isArray(maskedLines) || line0 < 0 || line0 >= maskedLines.length) return null;
+  let depth = 1;
+  let angleDepth = 0;
+  let sawToken = false;
+  let commas = 0;
+  const maxLine = Math.min(maskedLines.length - 1, line0 + 16);
+
+  for (let li = line0; li <= maxLine; li += 1) {
+    const text = maskedLines[li] || "";
+    const startC = li === line0 ? openParenCol0 + 1 : 0;
+    for (let c = startC; c < text.length; c += 1) {
+      const ch = text[c];
+      if (ch === "(" || ch === "[" || ch === "{") {
+        sawToken = true;
+        depth += 1;
+      } else if (ch === ")" || ch === "]" || ch === "}") {
+        depth -= 1;
+        if (depth === 0 && ch === ")") {
+          return sawToken ? commas + 1 : 0;
+        }
+        if (depth < 0) return null;
+      } else if (ch === "<") {
+        sawToken = true;
+        angleDepth += 1;
+      } else if (ch === ">") {
+        if (angleDepth > 0) angleDepth -= 1;
+      } else if (ch === "," && depth === 1 && angleDepth === 0) {
+        commas += 1;
+        sawToken = true;
+      } else if (ch !== " " && ch !== "\t") {
+        sawToken = true;
+      }
+    }
+  }
+  return null;
+}
+
 function extractStringLiteralAt(rawLine, col0) {
   const len = rawLine.length;
   let i = 0;
@@ -690,7 +733,7 @@ const JS_SIDE_EFFECT_IMPORT_RE = /^\s*import\s+(['"`])([^'"`]+)\1/;
 const JAVA_IMPORT_RE = /^\s*import\s+(?:static\s+)?([A-Za-z0-9_.*]+)\s*;/;
 const TRAILING_IDENT_RE = /([A-Za-z_$][A-Za-z0-9_$]*)$/;
 const DECL_SKIP_HEAD_RE = /^(?:if|for|while|switch|catch|return|await|yield|throw|new)\b/;
-const DECL_ALLOW_HEAD_RE = /^[A-Za-z_$@]/;
+const DECL_ALLOW_HEAD_RE = /^[A-Za-z_$@<]/;
 const THROWS_PREFIX_RE = /^throws\b/;
 const CLAUSE_KEYWORDS_RE = /\b(?:implements|extends|permits|throws)\b/;
 const CASE_LINE_RE = /^\s*case\b/;
@@ -1014,7 +1057,14 @@ export function extractNavContext(sourceText, line1Based, col1Based, langOrPath)
       ? detectAnnotationMemberTarget(maskedLines, line0, s0, e0)
       : null;
 
-  const arity = isCall && openParenCol0 >= 0 ? countCallArity(maskedLines, line0, openParenCol0, lines, lang) : null;
+  const arity =
+    openParenCol0 >= 0
+      ? isCall
+        ? countCallArity(maskedLines, line0, openParenCol0, lines, lang)
+        : isDeclarationSignature
+          ? countDeclarationParamArity(maskedLines, line0, openParenCol0)
+          : null
+      : null;
   const intent = isCall || (isDeclarationSignature && openParenCol0 >= 0) ? "implementation" : "declaration";
 
   return {
@@ -1069,8 +1119,8 @@ function hasDeclarationSignatureTail(maskedLines, startLineIdx0, openParenCol0, 
   if (closeLine < 0) return false;
 
   let tail = (maskedLines[closeLine] || "").slice(closeCol + 1).trimStart();
-  if (!tail && closeLine + 1 < maskedLines.length) {
-    tail = (maskedLines[closeLine + 1] || "").trimStart();
+  for (let probeLn = closeLine + 1; !tail && probeLn < Math.min(maskedLines.length, closeLine + 4); probeLn += 1) {
+    tail = (maskedLines[probeLn] || "").trimStart();
   }
   if (tail.startsWith("{") || tail.startsWith("=>") || THROWS_PREFIX_RE.test(tail)) {
     return true;
@@ -1078,8 +1128,21 @@ function hasDeclarationSignatureTail(maskedLines, startLineIdx0, openParenCol0, 
   if (lang === "js" && (tail.startsWith(":") || (tail.endsWith("{") && !beforeIdentTrimmed))) {
     return true;
   }
-  if (lang === "java" && tail.startsWith(";") && beforeIdentTrimmed.length > 0 && !beforeIdentTrimmed.includes(".")) {
-    return true;
+  if (lang === "java" && tail.startsWith(";")) {
+    if (beforeIdentTrimmed.length > 0 && !beforeIdentTrimmed.endsWith(".")) {
+      return true;
+    }
+    if (beforeIdentTrimmed.length === 0) {
+      // Spotless / wrapped Java interface signature where return type is on the preceding line
+      for (let prevLn = startLineIdx0 - 1; prevLn >= Math.max(0, startLineIdx0 - 3); prevLn -= 1) {
+        const prevTxt = (maskedLines[prevLn] || "").trim();
+        if (!prevTxt) continue;
+        if (!/[;{},=]$/.test(prevTxt)) {
+          return true;
+        }
+        break;
+      }
+    }
   }
   return false;
 }

@@ -1262,4 +1262,224 @@ describe("files-search symbol-index cross-file & cross-service navigation", () =
     });
     assert.ok(refs.some((r) => path.normalize(r.filePath) === path.normalize(entryGammaPath)));
   });
+
+  test("Java interface navigation resolves multiline Spotless implements, transitive inheritance, default overrides, overloads, and interface type clicks", async () => {
+    const repoRoot = path.join(tmpRoot, "java-iface-intellij");
+    const pkgDir = path.join(repoRoot, "src/main/java/com/acme/card");
+    await fs.mkdir(pkgDir, { recursive: true });
+
+    const basePortPath = path.join(pkgDir, "BaseCardPort.java");
+    const subPortPath = path.join(pkgDir, "CardPort.java");
+    const absImplPath = path.join(pkgDir, "AbstractCardPort.java");
+    const implAPath = path.join(pkgDir, "VisaCardPortImpl.java");
+    const implBPath = path.join(pkgDir, "MasterCardPortImpl.java");
+    const repoIfacePath = path.join(pkgDir, "UnusedRepo.java");
+    const callerPath = path.join(pkgDir, "CardUseCase.java");
+
+    const basePortSrc = [
+      "package com.acme.card;",
+      "import java.util.Map;",
+      "public interface BaseCardPort {",
+      "  <T> T execute(Class<T> type, Map<String, Object> params);",
+      "  java.util.Optional<String> find(Long id);",
+      "  java.util.Optional<String>",
+      "      find(Long id, String alias);",
+      "  default boolean isEnabled() { return true; }",
+      "}",
+    ].join("\n") + "\n";
+
+    const subPortSrc = [
+      "package com.acme.card;",
+      "public interface CardPort",
+      "    extends BaseCardPort {",
+      "  void freeze(Long id);",
+      "}",
+    ].join("\n") + "\n";
+
+    const absImplSrc = [
+      "package com.acme.card;",
+      "public abstract class AbstractCardPort",
+      "    implements CardPort {",
+      "}",
+    ].join("\n") + "\n";
+
+    const implASrc = [
+      "package com.acme.card;",
+      "import java.util.Map;",
+      "import java.util.Optional;",
+      "public class VisaCardPortImpl",
+      "    extends AbstractCardPort {",
+      "  @Override",
+      "  public <T> T execute(Class<T> type, Map<String, Object> params) { return null; }",
+      "  @Override",
+      "  public Optional<String> find(Long id) { return Optional.empty(); }",
+      "  @Override",
+      "  public Optional<String> find(Long id, String alias) { return Optional.of(alias); }",
+      "  @Override",
+      "  public boolean isEnabled() { return false; }",
+      "  @Override",
+      "  public void freeze(Long id) {}",
+      "}",
+    ].join("\n") + "\n";
+
+    const implBSrc = [
+      "package com.acme.card;",
+      "import java.util.Map;",
+      "import java.util.Optional;",
+      "public class MasterCardPortImpl",
+      "    implements Serializable,",
+      "        CardPort {",
+      "  @Override",
+      "  public <T> T execute(Class<T> type, Map<String, Object> params) { return null; }",
+      "  @Override",
+      "  public Optional<String> find(Long id) { return Optional.empty(); }",
+      "  @Override",
+      "  public void freeze(Long id) {}",
+      "}",
+    ].join("\n") + "\n";
+
+    const repoIfaceSrc = [
+      "package com.acme.card;",
+      "public interface UnusedRepo {",
+      "  String lookup(Long id);",
+      "}",
+    ].join("\n") + "\n";
+
+    const callerSrc = [
+      "package com.acme.card;",
+      "public class CardUseCase {",
+      "  private UnusedRepo repo;",
+      "  String run(Long id) { return repo.lookup(id); }",
+      "}",
+    ].join("\n") + "\n";
+
+    await fs.writeFile(basePortPath, basePortSrc);
+    await fs.writeFile(subPortPath, subPortSrc);
+    await fs.writeFile(absImplPath, absImplSrc);
+    await fs.writeFile(implAPath, implASrc);
+    await fs.writeFile(implBPath, implBSrc);
+    await fs.writeFile(repoIfacePath, repoIfaceSrc);
+    await fs.writeFile(callerPath, callerSrc);
+
+    const svc = { id: "ms-card", name: "ms-card", root: repoRoot };
+    const allRel = [
+      "src/main/java/com/acme/card/BaseCardPort.java",
+      "src/main/java/com/acme/card/CardPort.java",
+      "src/main/java/com/acme/card/AbstractCardPort.java",
+      "src/main/java/com/acme/card/VisaCardPortImpl.java",
+      "src/main/java/com/acme/card/MasterCardPortImpl.java",
+      "src/main/java/com/acme/card/UnusedRepo.java",
+      "src/main/java/com/acme/card/CardUseCase.java",
+    ];
+    const mock = getHerdrMock();
+    mock.readTextFileImpl = async (p) => fs.readFile(p, "utf8");
+    mock.execImpl = async (cmd, args = []) => {
+      if (cmd === "rg") {
+        // Verify multiline `-U` flag is passed for Java subtype discovery
+        const pat = String(args[args.length - 2] || "");
+        const hasMultiline = args.includes("-U");
+        const matched = [];
+        for (const rel of allRel) {
+          const text = await fs.readFile(path.join(repoRoot, rel), "utf8");
+          const re = new RegExp(pat, hasMultiline ? "s" : "");
+          if (re.test(text)) matched.push(rel);
+        }
+        return matched.length > 0
+          ? { code: 0, stdout: matched.join("\n") + "\n", stderr: "" }
+          : { code: 1, stdout: "", stderr: "" };
+      }
+      return { code: 1, stdout: "", stderr: "" };
+    };
+    symIdx.resetSymbolIndexCache();
+
+    // 1. Generic method `<T> T execute(Class<T>, Map<String, Object>)` on BaseCardPort -> transitive BFS finds BOTH Visa + Master impls!
+    const rExec = await symIdx.resolveCrossFileNavigation({
+      sourceText: basePortSrc,
+      filePath: basePortPath,
+      line: 4,
+      col: colOf(basePortSrc, 4, "execute"),
+      currentRoot: repoRoot,
+      services: [svc],
+      appHomeDir,
+    });
+    assert.equal(rExec.status, "ambiguous");
+    assert.deepEqual(
+      rExec.candidates.map((c) => path.basename(c.filePath)).sort(),
+      ["MasterCardPortImpl.java", "VisaCardPortImpl.java"],
+    );
+
+    // 2. Spotless wrapped overload `find(Long id, String alias)` (arity 2) -> jumps directly to VisaCardPortImpl line 11 (only impl with arity 2)!
+    const rFind2 = await symIdx.resolveCrossFileNavigation({
+      sourceText: basePortSrc,
+      filePath: basePortPath,
+      line: 7,
+      col: colOf(basePortSrc, 7, "find"),
+      currentRoot: repoRoot,
+      services: [svc],
+      appHomeDir,
+    });
+    assert.equal(rFind2.status, "ok");
+    assert.equal(path.normalize(rFind2.best.filePath), path.normalize(implAPath));
+    assert.equal(rFind2.best.line, 11);
+
+    // 3. Qualified return type overload `java.util.Optional<String> find(Long id)` (arity 1) -> ambiguous picker with BOTH Visa + Master!
+    const rFind1 = await symIdx.resolveCrossFileNavigation({
+      sourceText: basePortSrc,
+      filePath: basePortPath,
+      line: 5,
+      col: colOf(basePortSrc, 5, "find"),
+      currentRoot: repoRoot,
+      services: [svc],
+      appHomeDir,
+    });
+    assert.equal(rFind1.status, "ambiguous");
+    assert.deepEqual(
+      rFind1.candidates.map((c) => path.basename(c.filePath)).sort(),
+      ["MasterCardPortImpl.java", "VisaCardPortImpl.java"],
+    );
+
+    // 4. `default boolean isEnabled()` on interface -> jumps directly to concrete override in VisaCardPortImpl!
+    const rDefault = await symIdx.resolveCrossFileNavigation({
+      sourceText: basePortSrc,
+      filePath: basePortPath,
+      line: 8,
+      col: colOf(basePortSrc, 8, "isEnabled"),
+      currentRoot: repoRoot,
+      services: [svc],
+      appHomeDir,
+    });
+    assert.equal(rDefault.status, "ok");
+    assert.equal(path.normalize(rDefault.best.filePath), path.normalize(implAPath));
+    assert.equal(rDefault.best.line, 13);
+
+    // 5. Clicking `CardPort` interface name itself -> ambiguous picker listing both implementing classes (Visa + Master)!
+    const rIfaceType = await symIdx.resolveCrossFileNavigation({
+      sourceText: subPortSrc,
+      filePath: subPortPath,
+      line: 2,
+      col: colOf(subPortSrc, 2, "CardPort"),
+      currentRoot: repoRoot,
+      services: [svc],
+      appHomeDir,
+    });
+    assert.equal(rIfaceType.status, "ambiguous");
+    assert.deepEqual(
+      rIfaceType.candidates.map((c) => c.name).sort(),
+      ["MasterCardPortImpl", "VisaCardPortImpl"],
+    );
+
+    // 6. Interface method with zero implementations (like Spring Data JpaRepository) -> falls back to callers/references!
+    const rNoImpl = await symIdx.resolveCrossFileNavigation({
+      sourceText: repoIfaceSrc,
+      filePath: repoIfacePath,
+      line: 3,
+      col: colOf(repoIfaceSrc, 3, "lookup"),
+      currentRoot: repoRoot,
+      services: [svc],
+      appHomeDir,
+    });
+    assert.equal(rNoImpl.status, "ok");
+    assert.equal(rNoImpl.mode, "references");
+    assert.equal(path.normalize(rNoImpl.best.filePath), path.normalize(callerPath));
+  });
 });
