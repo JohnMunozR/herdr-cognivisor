@@ -1702,3 +1702,522 @@ export function formatGitShowMarkdownError(stderr, spec = {}) {
   }
   return firstLine || "Markdown snapshot is unavailable.";
 }
+
+/**
+ * Build cumulative vertical offsets and total height for a variable-height diff row list.
+ */
+export function buildVariableRowLayout(heights) {
+  const src = Array.isArray(heights) ? heights : [];
+  const len = src.length;
+  const normalized = new Array(len);
+  const offsets = new Array(len);
+  let totalHeight = 0;
+  for (let i = 0; i < len; i += 1) {
+    const raw = Number(src[i]);
+    const h = Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 20;
+    normalized[i] = h;
+    offsets[i] = totalHeight;
+    totalHeight += h;
+  }
+  return {
+    heights: normalized,
+    offsets,
+    totalHeight,
+  };
+}
+
+/**
+ * Compute visible row slice `[start, end)` and pixel top shift for a variable-height virtualized diff viewport.
+ */
+export function computeVariableWindowSlice(layout, scrollPx = 0, viewportHeightPx = 560, overscan = 2) {
+  const heights = Array.isArray(layout?.heights) ? layout.heights : [];
+  const offsets = Array.isArray(layout?.offsets) ? layout.offsets : [];
+  const len = heights.length;
+  const totalHeight = Math.max(0, Number(layout?.totalHeight) || 0);
+  const vpH = Math.max(20, Math.round(Number(viewportHeightPx) || 560));
+  const maxScrollPx = Math.max(0, totalHeight - vpH);
+  const clampedScrollPx = Math.max(0, Math.min(maxScrollPx, Math.round(Number(scrollPx) || 0)));
+
+  if (len === 0) {
+    return {
+      start: 0,
+      end: 0,
+      scrollPx: 0,
+      maxScrollPx: 0,
+      totalHeight: 0,
+      viewportHeight: vpH,
+      topOffsetPx: 0,
+    };
+  }
+
+  // Binary search first row whose bottom edge extends below `clampedScrollPx`.
+  let lo = 0;
+  let hi = len - 1;
+  let firstVisible = len;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const bottom = offsets[mid] + heights[mid];
+    if (bottom > clampedScrollPx) {
+      firstVisible = mid;
+      hi = mid - 1;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  if (firstVisible >= len) {
+    firstVisible = len - 1;
+  }
+
+  const viewBottom = clampedScrollPx + vpH;
+  let lastVisible = firstVisible + 1;
+  while (lastVisible < len && offsets[lastVisible] < viewBottom) {
+    lastVisible += 1;
+  }
+
+  const pad = Math.max(0, Math.floor(Number(overscan) || 0));
+  const start = Math.max(0, firstVisible - pad);
+  const end = Math.min(len, lastVisible + pad);
+  const topOffsetPx = offsets[start] - clampedScrollPx;
+
+  return {
+    start,
+    end,
+    scrollPx: clampedScrollPx,
+    maxScrollPx,
+    totalHeight,
+    viewportHeight: vpH,
+    topOffsetPx,
+  };
+}
+
+/**
+ * Compute clamped scroll offset in pixels to bring `rowIndex` into view (`top`, `center`, or `nearest`).
+ */
+export function computeDiffScrollOffsetForRow(
+  layout,
+  rowIndex,
+  viewportHeightPx = 560,
+  strategy = "top",
+  currentScrollPx = 0,
+) {
+  const heights = Array.isArray(layout?.heights) ? layout.heights : [];
+  const offsets = Array.isArray(layout?.offsets) ? layout.offsets : [];
+  const len = heights.length;
+  if (len === 0) return 0;
+
+  const vpH = Math.max(20, Math.round(Number(viewportHeightPx) || 560));
+  const totalHeight = Math.max(0, Number(layout?.totalHeight) || 0);
+  const maxScrollPx = Math.max(0, totalHeight - vpH);
+  const idx = Math.max(0, Math.min(len - 1, Math.floor(Number(rowIndex) || 0)));
+  const rowTop = offsets[idx];
+  const rowBottom = rowTop + heights[idx];
+
+  let target;
+  if (strategy === "center") {
+    target = Math.round(rowTop - vpH * 0.35);
+  } else if (strategy === "nearest") {
+    const cur = Math.max(0, Math.min(maxScrollPx, Math.round(Number(currentScrollPx) || 0)));
+    if (rowTop >= cur && rowBottom <= cur + vpH) {
+      return cur;
+    }
+    target = rowTop < cur ? rowTop : rowBottom - vpH;
+  } else {
+    target = rowTop;
+  }
+
+  return Math.max(0, Math.min(maxScrollPx, Math.round(target)));
+}
+
+/**
+ * Compute proportional scrollbar metrics for the variable-height diff viewport.
+ */
+export function computeDiffScrollbarMetrics(totalHeightPx, scrollPx, viewportHeightPx, trackHeightPx) {
+  const totalHeight = Math.max(0, Math.round(Number(totalHeightPx) || 0));
+  const vpH = Math.max(20, Math.round(Number(viewportHeightPx) || 560));
+  const trackHeight = Math.max(24, Math.round(Number(trackHeightPx) || vpH));
+  if (totalHeight <= vpH) {
+    return {
+      visible: false,
+      trackHeight,
+      thumbHeight: trackHeight,
+      thumbTop: 0,
+      maxScrollPx: 0,
+    };
+  }
+  const rawThumb = Math.round((vpH / totalHeight) * trackHeight);
+  const thumbHeight = Math.max(24, Math.min(trackHeight, rawThumb));
+  const maxScrollPx = Math.max(1, totalHeight - vpH);
+  const clampedScroll = Math.max(0, Math.min(maxScrollPx, Math.round(Number(scrollPx) || 0)));
+  const maxThumbTop = Math.max(0, trackHeight - thumbHeight);
+  const thumbTop = Math.round((clampedScroll / maxScrollPx) * maxThumbTop);
+  return {
+    visible: true,
+    trackHeight,
+    thumbHeight,
+    thumbTop,
+    maxScrollPx,
+  };
+}
+
+/**
+ * Convert GPUI scroll wheel event deltas into pixel scroll deltas (positive deltaY scrolls up -> negative scrollPx delta).
+ */
+export function resolveDiffWheelDeltaPx(deltaY, deltaLinesY = 0, lineHeightPx = 20) {
+  const lh = Math.max(12, Math.round(Number(lineHeightPx) || 20));
+  const linesY = Number(deltaLinesY);
+  if (Number.isFinite(linesY) && linesY !== 0) {
+    const scaled = -Math.round(linesY * lh * 3);
+    return scaled !== 0 ? scaled : (linesY > 0 ? -lh : lh);
+  }
+  const dy = Number(deltaY);
+  if (Number.isFinite(dy) && dy !== 0) {
+    const px = -Math.round(dy);
+    return px !== 0 ? px : (dy > 0 ? -1 : 1);
+  }
+  return 0;
+}
+
+/**
+ * Map a scrollbar thumb top coordinate onto a clamped pixel scroll offset.
+ */
+export function resolveDiffScrollbarDragPx(thumbTopPx, trackHeightPx, thumbHeightPx, maxScrollPx) {
+  const maxScroll = Math.max(0, Math.round(Number(maxScrollPx) || 0));
+  if (maxScroll === 0) return 0;
+  const trackH = Math.max(24, Math.round(Number(trackHeightPx) || 200));
+  const thumbH = Math.max(1, Math.min(trackH, Math.round(Number(thumbHeightPx) || 24)));
+  const maxThumbTop = Math.max(1, trackH - thumbH);
+  const clampedThumbTop = Math.max(0, Math.min(maxThumbTop, Number(thumbTopPx) || 0));
+  return Math.round((clampedThumbTop / maxThumbTop) * maxScroll);
+}
+
+export const DEFAULT_CONTEXT_EXPAND_STEP = 20;
+export const MAX_CONTEXT_SOURCE_BYTES = 600_000;
+
+const DIFF_HUNK_FULL_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+
+/**
+ * Split raw file text into 0-indexed lines without CRs, capping memory for QuickJS safety.
+ */
+export function splitSourceFileLines(text, maxBytes = MAX_CONTEXT_SOURCE_BYTES) {
+  if (typeof text !== "string" || text.includes("\0")) return null;
+  const limit = Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0
+    ? Math.floor(Number(maxBytes))
+    : MAX_CONTEXT_SOURCE_BYTES;
+  const bounded = text.length > limit ? text.slice(0, limit) : text;
+  if (!bounded) return [];
+  const withoutFinalLf = bounded.endsWith("\n") ? bounded.slice(0, -1) : bounded;
+  const raw = withoutFinalLf.split("\n");
+  for (let i = 0; i < raw.length; i += 1) {
+    if (raw[i].endsWith("\r")) raw[i] = raw[i].slice(0, -1);
+  }
+  return raw;
+}
+
+/**
+ * Annotate diff hunk rows (`kind === "@"`) with exact per-gap hidden line ranges
+ * (`top`, `between`, and optional `bottom`) so each collapsed block expands independently.
+ */
+export function annotateDiffGaps(rows, { canExpandBottom = false, totalFileLines = null } = {}) {
+  const src = Array.isArray(rows) ? rows : [];
+  if (src.length === 0) return [];
+
+  const out = new Array(src.length);
+  let hunkCount = 0;
+  let prevNewEnd = 0;
+  let lastOldDelta = 0;
+  let hasTruncationNotice = false;
+  let hasRealHunk = false;
+  let currentHunkNewEnd = 0;
+
+  for (let i = 0; i < src.length; i += 1) {
+    const row = src[i];
+    if (!row || row.kind !== "@") {
+      out[i] = row;
+      if (row && (row.kind === " " || row.kind === "+") && Number.isFinite(row.number)) {
+        if (row.number > currentHunkNewEnd) currentHunkNewEnd = row.number;
+      }
+      continue;
+    }
+
+    const text = String(row.text || "");
+    const m = DIFF_HUNK_FULL_RE.exec(text);
+    if (!m) {
+      out[i] = { ...row, gap: null };
+      continue;
+    }
+
+    const oldStart = Number(m[1]) || 0;
+    const oldCount = m[2] !== undefined ? Number(m[2]) : 1;
+    const newStart = Number(m[3]) || 0;
+    const newCount = m[4] !== undefined ? Number(m[4]) : 1;
+
+    if (oldStart === 0 && newStart === 0 && oldCount === 0 && newCount === 0) {
+      hasTruncationNotice = true;
+      out[i] = { ...row, gap: null };
+      continue;
+    }
+
+    if (hunkCount > 0) {
+      prevNewEnd = Math.max(prevNewEnd, currentHunkNewEnd);
+    }
+
+    let gap = null;
+    if (newCount > 0 && newStart > 0) {
+      hasRealHunk = true;
+      if (hunkCount === 0) {
+        if (newStart > 1) {
+          gap = {
+            id: "gap-top",
+            position: "top",
+            startLine: 1,
+            endLine: newStart - 1,
+            oldDelta: oldStart - newStart,
+          };
+        }
+      } else if (newStart - 1 >= prevNewEnd + 1) {
+        gap = {
+          id: `gap-between-${hunkCount}`,
+          position: "between",
+          startLine: prevNewEnd + 1,
+          endLine: newStart - 1,
+          oldDelta: oldStart - newStart,
+        };
+      }
+      currentHunkNewEnd = newStart + newCount - 1;
+      lastOldDelta = (oldStart + oldCount) - (newStart + newCount);
+      hunkCount += 1;
+    } else if (newStart > 0 && hunkCount > 0 && newStart >= prevNewEnd + 1) {
+      // Pure deletion hunk inside a modified file (newCount === 0, newStart is line immediately preceding deletion).
+      hasRealHunk = true;
+      gap = {
+        id: `gap-between-${hunkCount}`,
+        position: "between",
+        startLine: prevNewEnd + 1,
+        endLine: newStart,
+        oldDelta: oldStart - newStart,
+      };
+      currentHunkNewEnd = newStart;
+      lastOldDelta = (oldStart + oldCount) - newStart;
+      hunkCount += 1;
+    }
+
+    out[i] = { ...row, gap };
+  }
+
+  const finalNewEnd = Math.max(prevNewEnd, currentHunkNewEnd);
+  if (canExpandBottom && hasRealHunk && !hasTruncationNotice && finalNewEnd > 0) {
+    if (Number.isFinite(totalFileLines)) {
+      if (totalFileLines > finalNewEnd) {
+        out.push({
+          kind: "@",
+          text: "",
+          gap: {
+            id: "gap-bottom",
+            position: "bottom",
+            startLine: finalNewEnd + 1,
+            endLine: totalFileLines,
+            oldDelta: lastOldDelta,
+          },
+        });
+      }
+    } else {
+      out.push({
+        kind: "@",
+        text: "",
+        gap: {
+          id: "gap-bottom",
+          position: "bottom",
+          startLine: finalNewEnd + 1,
+          endLine: null,
+          oldDelta: lastOldDelta,
+        },
+      });
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Resolve any open-ended trailing bottom gap once total file line count is known.
+ */
+export function syncBottomGapWithTotalLines(rows, totalFileLines) {
+  if (!Array.isArray(rows) || rows.length === 0 || !Number.isFinite(totalFileLines)) {
+    return rows;
+  }
+  const lastIdx = rows.length - 1;
+  const last = rows[lastIdx];
+  if (!last || last.kind !== "@" || last.gap?.position !== "bottom") {
+    return rows;
+  }
+  if (last.gap.endLine === totalFileLines) {
+    return rows;
+  }
+  if (last.gap.startLine > totalFileLines) {
+    return rows.slice(0, lastIdx);
+  }
+  const next = rows.slice();
+  next[lastIdx] = {
+    ...last,
+    gap: {
+      ...last.gap,
+      endLine: totalFileLines,
+    },
+  };
+  return next;
+}
+
+/**
+ * Expand a single collapsed diff gap (`up`, `down`, or `all`) without touching sibling gaps,
+ * returning exact anchor indices so the caller can preserve visual scroll position pixel-for-pixel.
+ */
+export function expandDiffGapInRows(
+  rows,
+  gapIndex,
+  direction,
+  sourceLines,
+  { step = DEFAULT_CONTEXT_EXPAND_STEP, filePath = "", anchorPreference = "below" } = {},
+) {
+  const src = Array.isArray(rows) ? rows : [];
+  if (!Number.isInteger(gapIndex) || gapIndex < 0 || gapIndex >= src.length) {
+    return { rows: src, changed: false, insertedCount: 0, removedGap: false, oldAnchorIndex: 0, newAnchorIndex: 0, remainingGap: null };
+  }
+  const gapRow = src[gapIndex];
+  const gap = gapRow?.gap;
+  if (!gap || !Array.isArray(sourceLines)) {
+    return { rows: src, changed: false, insertedCount: 0, removedGap: false, oldAnchorIndex: gapIndex, newAnchorIndex: gapIndex, remainingGap: gap || null };
+  }
+
+  const totalLines = sourceLines.length;
+  const startLine = Math.max(1, Math.floor(Number(gap.startLine) || 1));
+  const endLine = gap.endLine != null
+    ? Math.min(Math.floor(Number(gap.endLine)), totalLines)
+    : totalLines;
+
+  if (endLine < startLine) {
+    const nextRows = [...src.slice(0, gapIndex), ...src.slice(gapIndex + 1)];
+    const anchor = Math.max(0, gapIndex - 1);
+    return {
+      rows: nextRows,
+      changed: true,
+      insertedCount: 0,
+      removedGap: true,
+      oldAnchorIndex: anchor,
+      newAnchorIndex: anchor,
+      remainingGap: null,
+    };
+  }
+
+  const safeStep = Math.max(1, Math.floor(Number(step) || DEFAULT_CONTEXT_EXPAND_STEP));
+  const available = endLine - startLine + 1;
+  let effDir;
+  if (gap.position === "top") {
+    effDir = direction === "all" ? "all" : "up";
+  } else if (gap.position === "bottom") {
+    effDir = direction === "all" ? "all" : "down";
+  } else {
+    effDir = direction === "down" || direction === "up" || direction === "all" ? direction : "up";
+  }
+
+  let sliceStart;
+  let sliceEnd;
+  let remainingGap = null;
+  if (effDir === "all" || available <= safeStep) {
+    sliceStart = startLine;
+    sliceEnd = endLine;
+    remainingGap = null;
+  } else if (effDir === "up") {
+    sliceStart = endLine - safeStep + 1;
+    sliceEnd = endLine;
+    remainingGap = { ...gap, startLine, endLine: sliceStart - 1 };
+  } else {
+    sliceStart = startLine;
+    sliceEnd = startLine + safeStep - 1;
+    remainingGap = { ...gap, startLine: sliceEnd + 1, endLine };
+  }
+
+  const ext = getFileExt(filePath);
+  const newContextRows = [];
+  for (let lineNo = sliceStart; lineNo <= sliceEnd; lineNo += 1) {
+    const raw = sourceLines[lineNo - 1] ?? "";
+    const code = expandCodeTabs(raw || " ");
+    newContextRows.push({
+      kind: " ",
+      number: lineNo,
+      text: code,
+      tokens: tokenizeDiffLine(code, ext, null),
+      expandedContext: true,
+    });
+  }
+
+  let nextRows;
+  if (!remainingGap) {
+    nextRows = [...src.slice(0, gapIndex), ...newContextRows, ...src.slice(gapIndex + 1)];
+  } else if (effDir === "up") {
+    const updatedGapRow = { ...gapRow, gap: remainingGap };
+    nextRows = [...src.slice(0, gapIndex), updatedGapRow, ...newContextRows, ...src.slice(gapIndex + 1)];
+  } else {
+    const updatedGapRow = { ...gapRow, gap: remainingGap };
+    nextRows = [...src.slice(0, gapIndex), ...newContextRows, updatedGapRow, ...src.slice(gapIndex + 1)];
+  }
+
+  const hasBelow = gapIndex + 1 < src.length;
+  const hasAbove = gapIndex > 0;
+  let pinBelow;
+  if (gap.position === "top") {
+    pinBelow = hasBelow;
+  } else if (gap.position === "bottom") {
+    pinBelow = false;
+  } else if (effDir === "up") {
+    pinBelow = hasBelow;
+  } else if (effDir === "down") {
+    pinBelow = false;
+  } else {
+    pinBelow = anchorPreference === "below" && hasBelow;
+  }
+
+  let oldAnchorIndex;
+  let newAnchorIndex;
+  if (pinBelow) {
+    oldAnchorIndex = gapIndex + 1;
+    newAnchorIndex = oldAnchorIndex + newContextRows.length - (remainingGap ? 0 : 1);
+  } else if (hasAbove) {
+    oldAnchorIndex = gapIndex - 1;
+    newAnchorIndex = oldAnchorIndex;
+  } else {
+    oldAnchorIndex = 0;
+    newAnchorIndex = 0;
+  }
+
+  return {
+    rows: nextRows,
+    changed: true,
+    insertedCount: newContextRows.length,
+    removedGap: remainingGap === null,
+    oldAnchorIndex,
+    newAnchorIndex,
+    remainingGap,
+  };
+}
+
+/**
+ * Compute new scrollPx that keeps `oldAnchorIndex` -> `newAnchorIndex` at the exact same
+ * screen Y coordinate (`newOffset - newScrollPx === oldOffset - oldScrollPx`).
+ */
+export function computeAnchorPreservedScrollPx(
+  oldLayout,
+  newLayout,
+  oldScrollPx,
+  oldAnchorIndex,
+  newAnchorIndex,
+  viewportHeightPx = 560,
+) {
+  const oldOffset = oldLayout?.offsets?.[oldAnchorIndex] ?? 0;
+  const newOffset = newLayout?.offsets?.[newAnchorIndex] ?? 0;
+  const deltaPx = newOffset - oldOffset;
+  const vpH = Math.max(20, Math.round(Number(viewportHeightPx) || 560));
+  const oldMaxScrollPx = Math.max(0, (Number(oldLayout?.totalHeight) || 0) - vpH);
+  const effectiveOldScrollPx = Math.max(0, Math.min(oldMaxScrollPx, Math.round(Number(oldScrollPx) || 0)));
+  const newMaxScrollPx = Math.max(0, (Number(newLayout?.totalHeight) || 0) - vpH);
+  return Math.max(0, Math.min(newMaxScrollPx, effectiveOldScrollPx + deltaPx));
+}

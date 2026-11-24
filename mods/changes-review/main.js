@@ -1,5 +1,5 @@
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, v_virtual_list, VirtualListScrollHandle, InputState, Input, TextareaState, Textarea, Scrollbar, ScrollHandle } from "gpui-base";
+import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, Scrollbar, ScrollHandle } from "gpui-base";
 import * as fsPromises from "fs/promises";
 import { readdir, exists } from "fs/promises";
 import { join } from "path";
@@ -53,6 +53,18 @@ import {
   buildReviewMarkdownCacheKey,
   validateMarkdownTextContent,
   formatGitShowMarkdownError,
+  buildVariableRowLayout,
+  computeVariableWindowSlice,
+  computeDiffScrollOffsetForRow,
+  computeDiffScrollbarMetrics,
+  resolveDiffWheelDeltaPx,
+  resolveDiffScrollbarDragPx,
+  DEFAULT_CONTEXT_EXPAND_STEP,
+  splitSourceFileLines,
+  annotateDiffGaps,
+  syncBottomGapWithTotalLines,
+  expandDiffGapInRows,
+  computeAnchorPreservedScrollPx,
 } from "./review-logic.js";
 import { computeWrapColumns, countWrappedLines, wrapPlainText, wrapStyledSpans } from "./code-wrap.js";
 import { renderDropdownTrigger, renderDropdownPopover } from "./dropdown.js";
@@ -62,7 +74,8 @@ import { createModLogger, renderErrorFallbackCard } from "./diagnostics.js";
 
 const reviewWrapCache = new WeakMap();
 const REVIEW_ROW_HEIGHT = 20;
-const REVIEW_ACTIVE_COMMENT_H = 134;
+const REVIEW_HUNK_ROW_HEIGHT = 26;
+const REVIEW_COMPOSER_EST_HEIGHT = 156;
 
 function readPlainObject(val) {
   return val && typeof val === "object" && !Array.isArray(val) ? val : {};
@@ -707,6 +720,10 @@ export default class ChangesReview extends View {
     this.panelWidth = 420;
     this.viewerWidth = 900;
     this.diffViewportWidth = 0;
+    this.diffViewportHeight = 0;
+    this.diffScrollPx = 0;
+    this.diffScrollbarDrag = null;
+    this.focusCommentTask = null;
     this.handle = cx.focus_handle();
     this.bottomTab = "review"; // "review" | "commit"
     this.reviews = []; // Cached mirror of shared("cognivisor.reviewNotes")[sessionKey]
@@ -714,7 +731,10 @@ export default class ChangesReview extends View {
     this.commentText = "";
     this.sendingReview = false;
     this.busy = false;
-    this.expandedFiles = new Set();
+    this.viewerSourceLines = null;
+    this.viewerSourceKey = "";
+    this.viewerSourceFilePath = "";
+    this.viewerExpandingGapId = null;
     this.localReviewedFiles = new Set();
     this.localReviewedMeta = {};
     this.lastRepoHeads = new Map();
@@ -765,7 +785,6 @@ export default class ChangesReview extends View {
 
     this.serviceFilterScroll = ScrollHandle.new();
     this.commitDropdownScroll = ScrollHandle.new();
-    this.diffScroll = VirtualListScrollHandle.new();
     this.diffResizeTask = null;
     this._cachedCommitMenu = null;
 
@@ -830,6 +849,13 @@ export default class ChangesReview extends View {
     this.viewerLoadTask = null;
     try { this.diffResizeTask?.cancel?.(); } catch {}
     this.diffResizeTask = null;
+    try { this.focusCommentTask?.cancel?.(); } catch {}
+    this.focusCommentTask = null;
+    this.diffScrollbarDrag = null;
+    this.viewerSourceLines = null;
+    this.viewerSourceKey = "";
+    this.viewerSourceFilePath = "";
+    this.viewerExpandingGapId = null;
     try { this.pollTask?.cancel?.(); } catch {}
     this.pollTask = null;
     this.stopAllWatchers();
@@ -837,7 +863,6 @@ export default class ChangesReview extends View {
     try { this.commentInput?.release(); } catch {}
     try { this.serviceFilterScroll?.release(); } catch {}
     try { this.commitDropdownScroll?.release(); } catch {}
-    try { this.diffScroll?.release(); } catch {}
   }
 
   isViewerMode() {
@@ -1060,12 +1085,46 @@ export default class ChangesReview extends View {
     });
   }
 
+  buildCommentMapForFile(fileKey, ctx = null) {
+    const commentMap = new Map();
+    if (!fileKey) return commentMap;
+    const sessionReviews = this.getSessionReviews(ctx);
+    for (const r of sessionReviews) {
+      if (r.fileKey === fileKey || r.file === fileKey) {
+        commentMap.set(r.line, r);
+      }
+    }
+    return commentMap;
+  }
+
   getComment(fileKey, line, ctx = null) {
     const reviews = this.getSessionReviews(ctx);
     return reviews.find((r) => (r.fileKey === fileKey || r.file === fileKey) && r.line === line);
   }
 
-  openCommentEditor(file, line, snippet, initialText) {
+  cancelFocusCommentTask() {
+    if (this.focusCommentTask) {
+      try { this.focusCommentTask.cancel(); } catch {}
+      this.focusCommentTask = null;
+    }
+  }
+
+  focusCommentInput(cx, expectedFileKey = null, expectedLine = null) {
+    try { this.commentInput?.focus?.(); } catch {}
+    this.cancelFocusCommentTask();
+    if (!cx?.timer) return;
+    const targetKey = expectedFileKey ?? this.activeComment?.fileKey ?? null;
+    const targetLine = expectedLine ?? this.activeComment?.line ?? null;
+    this.focusCommentTask = cx.timer.after(20, () => {
+      this.focusCommentTask = null;
+      if (this._viewerClosed || !this.activeComment) return;
+      if (targetKey !== null && this.activeComment.fileKey !== targetKey) return;
+      if (targetLine !== null && this.activeComment.line !== targetLine) return;
+      try { this.commentInput?.focus?.(); } catch {}
+    });
+  }
+
+  openCommentEditor(file, line, snippet, initialText, cx = null) {
     const text = initialText ?? "";
     const diff = this.isViewerMode() ? readActiveDiff(this.getSessionContext().spaceId) : null;
     const fallbackKey = file?.key || diff?.openFileKey || this.open;
@@ -1082,14 +1141,16 @@ export default class ChangesReview extends View {
     this.commentText = text;
     this.commentInput.set_value(text);
     this.commentInput.set_selected_range({ start: text.length, end: text.length });
-    this.commentInput.focus();
+    this.focusCommentInput(cx, fallbackKey, line);
   }
 
-  startComment(fileKey, line, snippet, cx) {
+  startComment(fileKey, line, snippet, cx, rowIndex = -1) {
     if (this.activeComment && this.activeComment.fileKey === fileKey && this.activeComment.line === line) {
-      this.commentInput.focus();
+      this.focusCommentInput(cx, fileKey, line);
+      cx?.notify();
       return;
     }
+    const hadComposer = Boolean(this.activeComment && this.activeComment.fileKey === fileKey);
     const ctx = this.getSessionContext();
     const diff = this.isViewerMode() ? readActiveDiff(ctx.spaceId) : null;
     const file =
@@ -1098,7 +1159,14 @@ export default class ChangesReview extends View {
       (this.files || []).find((f) => f.key === fileKey) ||
       (this.allWorkingFiles || []).find((f) => f.key === fileKey);
     const existing = this.getComment(fileKey, line, ctx);
-    this.openCommentEditor(file, line, snippet, existing ? existing.text : "");
+    this.openCommentEditor(file, line, snippet, existing ? existing.text : "", cx);
+    if (rowIndex >= 0 && this.rows.length > 0) {
+      const commentMap = this.buildCommentMapForFile(fileKey, ctx);
+      const layout = this.computeDiffRowLayout(commentMap, this.getReviewWrapCols());
+      const baseVpH = this.getDiffViewportHeight();
+      const targetVpH = hadComposer ? baseVpH : Math.max(80, baseVpH - REVIEW_COMPOSER_EST_HEIGHT);
+      this.diffScrollPx = computeDiffScrollOffsetForRow(layout, rowIndex, targetVpH, "nearest", this.diffScrollPx);
+    }
     cx.notify();
   }
 
@@ -1179,6 +1247,7 @@ export default class ChangesReview extends View {
     if (serviceId) {
       this.syncServiceNoteStatus(serviceId, nextReviews.some((r) => r.serviceId === serviceId), ctx);
     }
+    this.cancelFocusCommentTask();
     this.activeComment = null;
     this.commentText = "";
     this.commentInput.set_value("");
@@ -1186,6 +1255,7 @@ export default class ChangesReview extends View {
   }
 
   cancelActiveComment(cx) {
+    this.cancelFocusCommentTask();
     this.activeComment = null;
     this.commentText = "";
     this.commentInput.set_value("");
@@ -1218,6 +1288,7 @@ export default class ChangesReview extends View {
     for (const sId of affectedServices) {
       this.syncServiceNoteStatus(sId, false, ctx);
     }
+    this.cancelFocusCommentTask();
     this.activeComment = null;
     this.commentText = "";
     this.commentInput.set_value("");
@@ -1714,7 +1785,6 @@ export default class ChangesReview extends View {
     this.loading = true;
     this.files = [];
     this.open = null;
-    this.expandedFiles.clear();
     cx.notify();
 
     cx.spawn(async (cx) => {
@@ -1973,7 +2043,6 @@ export default class ChangesReview extends View {
       this.needsRefreshOnShow = false;
       this.closed = false;
       this.limited = false;
-      this.expandedFiles.clear();
       this.localReviewedFiles.clear();
       this.localReviewedMeta = {};
       this.lastRepoHeads.clear();
@@ -2572,7 +2641,7 @@ export default class ChangesReview extends View {
     return committedAfterByKey;
   }
 
-  async fetchFileDiffLines(file, viewMode, selectedCommit, on, isExpanded) {
+  async fetchFileDiffLines(file, viewMode, selectedCommit, on) {
     if (!file || !file.repoRoot) return ["No file selected"];
     const root = file.repoRoot;
     const path = file.path;
@@ -2588,35 +2657,49 @@ export default class ChangesReview extends View {
           lines = [`@@ -0,0 +1,${lineTotal} @@`, ...text.slice(0, 400000).replace(/\n$/, "").split("\n").slice(0, 450).map((l) => `+${l}`)];
         }
       } else {
-        const diffArgs = ["diff", ...(file.hasHead ? ["HEAD"] : []), ...(isExpanded ? ["-U99999"] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--", path];
+        const diffArgs = ["diff", ...(file.hasHead ? ["HEAD"] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--", path];
         const r = await exec("git", [...READ, ...diffArgs], { cwd: root, on });
         if (r.code !== 0) throw new Error(r.stderr || "git diff failed");
         const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
         lines = first < 0 ? [file.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);
       }
     } else if (viewMode === "commit" && selectedCommit) {
-      const diffArgs = ["show", selectedCommit.hash, ...(isExpanded ? ["-U99999"] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--", path];
+      const diffArgs = ["show", selectedCommit.hash, "--no-ext-diff", "--no-textconv", "--no-color", "--", path];
       const r = await exec("git", [...READ, ...diffArgs], { cwd: root, on });
       if (r.code !== 0) throw new Error(r.stderr || "git show failed");
       const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
       lines = first < 0 ? [file.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);
     }
 
-    const maxLines = isExpanded ? 800 : 350;
+    const maxLines = 500;
     let finalLines = lines || [];
     if (finalLines.length > maxLines) {
       const remaining = finalLines.length - maxLines;
       finalLines = finalLines.slice(0, maxLines);
-      finalLines.push(`@@ -0,0 +0,0 @@ [Diff preview truncated: showing first ${maxLines} lines. ${remaining} more lines hidden. ${isExpanded ? "File is very large." : "Click Expand context above for more."}]`);
+      finalLines.push(`@@ -0,0 +0,0 @@ [Diff preview truncated: showing first ${maxLines} lines. ${remaining} more lines hidden.]`);
     }
     return finalLines.map((line) => (line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line));
   }
 
+  async fetchViewerSourceLines(file, viewMode, selectedCommit, on) {
+    if (!file || !file.repoRoot || !file.path || file.binary || file.status === "D") return null;
+    if (viewMode === "commit" && selectedCommit?.hash) {
+      const r = await exec(
+        "git",
+        [...READ, "show", `${selectedCommit.hash}:${file.path}`],
+        { cwd: file.repoRoot, on },
+      ).catch(() => null);
+      if (!r || r.code !== 0 || typeof r.stdout !== "string") return null;
+      return splitSourceFileLines(r.stdout);
+    }
+    const text = await readTextFile(`${file.repoRoot}/${file.path}`, { on }).catch(() => null);
+    return splitSourceFileLines(text);
+  }
+
   computeViewerLoadedKey(diff) {
     if (!diff?.openFileKey) return "empty";
-    const isExpanded = Boolean(this.expandedFiles?.has(diff.openFileKey));
     const commitHash = diff.viewMode === "commit" ? (diff.selectedCommit?.hash || "") : "";
-    return `${diff.requestSeq || 0}::${diff.openFileKey}::${diff.viewMode || "working"}::${commitHash}::${isExpanded ? 1 : 0}`;
+    return `${diff.requestSeq || 0}::${diff.openFileKey}::${diff.viewMode || "working"}::${commitHash}`;
   }
 
   scheduleViewerLoad(diff, cx) {
@@ -2718,7 +2801,9 @@ export default class ChangesReview extends View {
 
     this.viewerMarkdownRendered = true;
     this.viewerMarkdownFileId = fileId;
+    this.diffScrollbarDrag = null;
     if (this.activeComment) {
+      this.cancelFocusCommentTask();
       this.activeComment = null;
       this.commentText = "";
       this.typingComment = false;
@@ -2902,13 +2987,21 @@ export default class ChangesReview extends View {
     }
 
     if (prevOpenKey && prevOpenKey !== this.open && this.activeComment && this.activeComment.fileKey !== this.open) {
+      this.cancelFocusCommentTask();
       this.activeComment = null;
       this.commentText = "";
       this.commentInput.set_value("");
     }
+    if (prevOpenKey !== this.open) {
+      this.diffScrollbarDrag = null;
+    }
+    this.viewerSourceLines = null;
+    this.viewerSourceKey = "";
+    this.viewerExpandingGapId = null;
 
     if (!openFile) {
       this.setLines([]);
+      this.diffScrollPx = 0;
       this.viewerLoading = false;
       cx?.notify();
       return;
@@ -2918,7 +3011,6 @@ export default class ChangesReview extends View {
       this.loadViewerMarkdownNow(diff, cx, { bypassCache: Boolean(opts.forceReload) });
     }
 
-    const isExpanded = Boolean(this.expandedFiles?.has(openFile.key));
     this.viewerLoading = true;
     cx?.notify();
 
@@ -2928,10 +3020,15 @@ export default class ChangesReview extends View {
         diff?.viewMode || "working",
         diff?.selectedCommit || null,
         diff?.on ?? null,
-        isExpanded,
       );
       if (this._viewerClosed || gen !== this.viewerLoadGen) return;
-      this.setLines(lines, openFile.path);
+      const canExpandBottom = Boolean(
+        !openFile.fresh &&
+        !openFile.binary &&
+        openFile.status !== "D" &&
+        !(!openFile.hasHead && openFile.status === "A")
+      );
+      this.setLines(lines, openFile.path, { canExpandBottom });
 
       const shouldConsumeDirectives = Boolean(seq && seq !== this.lastHandledSeq) || Boolean(opts.forceScrollTop);
       if (seq && seq !== this.lastHandledSeq) {
@@ -2941,10 +3038,13 @@ export default class ChangesReview extends View {
       if (shouldConsumeDirectives && diff?.focusLine != null) {
         const rowIdx = this.rows.findIndex((r) => r.number === diff.focusLine);
         if (rowIdx >= 0) {
-          try { this.diffScroll?.scroll_to_item(rowIdx); } catch {}
+          const ctxNow = this.getSessionContext();
+          const cMap = this.buildCommentMapForFile(openFile.key, ctxNow);
+          const layout = this.computeDiffRowLayout(cMap, this.getReviewWrapCols());
+          this.diffScrollPx = computeDiffScrollOffsetForRow(layout, rowIdx, this.getDiffViewportHeight(), "center");
         }
       } else if (prevOpenKey !== openFile.key || opts.forceScrollTop) {
-        try { this.diffScroll?.scroll_to_item(0); } catch {}
+        this.diffScrollPx = 0;
       }
 
       if (diff?.openCommentLine != null && diff?.openCommentLine !== undefined && shouldConsumeDirectives) {
@@ -2956,6 +3056,7 @@ export default class ChangesReview extends View {
           diff.openCommentLine,
           cur?.snippet || row?.text || "",
           cur ? cur.text : "",
+          cx,
         );
       }
     } catch (e) {
@@ -3034,8 +3135,10 @@ export default class ChangesReview extends View {
     cx.notify();
   }
 
-  setLines(lines, filePath = "") {
-    this.rows = diffRows(lines, filePath);
+  setLines(lines, filePath = "", gapOpts = null) {
+    const baseRows = diffRows(lines, filePath);
+    this.rows = gapOpts ? annotateDiffGaps(baseRows, gapOpts) : baseRows;
+    this.viewerSourceFilePath = filePath || "";
     this.diffWidth = computeDiffContentWidth(this.rows);
   }
 
@@ -3055,20 +3158,116 @@ export default class ChangesReview extends View {
     cx.notify();
   }
 
-  toggleExpand(fileKey, cx) {
-    if (!fileKey || this.viewerLoading) return;
-    if (this.expandedFiles.has(fileKey)) {
-      this.expandedFiles.delete(fileKey);
-    } else {
-      this.expandedFiles.add(fileKey);
+  applyGapExpansionWithSource(gapId, direction, sourceLines, activeKey, cx) {
+    const syncedRows = syncBottomGapWithTotalLines(this.rows, sourceLines.length);
+    const liveIdx = syncedRows.findIndex((r) => r?.kind === "@" && r?.gap?.id === gapId);
+    if (liveIdx < 0) {
+      if (syncedRows !== this.rows) {
+        this.rows = syncedRows;
+        this.diffWidth = computeDiffContentWidth(this.rows);
+        cx?.notify();
+      }
+      return;
     }
+
+    const ctx = this.getSessionContext();
+    const commentMap = this.buildCommentMapForFile(activeKey || this.open, ctx);
+    const wrapCols = this.getReviewWrapCols();
+    const vpH = this.getDiffViewportHeight();
+
+    // Measure old layout before splicing (keep pre-sync row positions aligned with current screen).
+    const oldLayout = this.computeDiffRowLayout(commentMap, wrapCols);
+    const oldGapIdx = this.rows.findIndex((r) => r?.kind === "@" && r?.gap?.id === gapId);
+    const oldGapOffset = oldGapIdx >= 0 ? (oldLayout.offsets[oldGapIdx] ?? 0) : 0;
+    const gapScreenY = oldGapOffset - (this.diffScrollPx || 0);
+    const anchorPreference = gapScreenY >= vpH * 0.5 ? "above" : "below";
+
+    const result = expandDiffGapInRows(syncedRows, liveIdx, direction, sourceLines, {
+      step: DEFAULT_CONTEXT_EXPAND_STEP,
+      filePath: this.viewerSourceFilePath || "",
+      anchorPreference,
+    });
+    if (!result.changed) return;
+
+    const oldScrollPx = this.diffScrollPx || 0;
+    this.rows = result.rows;
+    this.diffWidth = computeDiffContentWidth(this.rows);
+    const newLayout = this.computeDiffRowLayout(commentMap, wrapCols);
+    this.diffScrollPx = computeAnchorPreservedScrollPx(
+      oldLayout,
+      newLayout,
+      oldScrollPx,
+      result.oldAnchorIndex,
+      result.newAnchorIndex,
+      vpH,
+    );
+    cx?.notify();
+  }
+
+  expandDiffGap(rowIndex, direction, fallbackOpenKey, cx) {
+    if (this.viewerLoading || this.viewerExpandingGapId) return;
+    if (!Number.isInteger(rowIndex) || rowIndex < 0 || rowIndex >= this.rows.length) return;
+    const rowObj = this.rows[rowIndex];
+    const gap = rowObj?.gap;
+    if (!gap || !gap.id) return;
+
     const ctx = this.getSessionContext();
     const diff = readActiveDiff(ctx.spaceId);
-    if (diff && diff.openFileKey === fileKey) {
-      this.loadViewerDiffNow(diff, cx);
-    } else {
-      cx.notify();
+    const activeKey = diff?.openFileKey || fallbackOpenKey || this.open;
+    const openFile = diff?.openFile || (diff?.files || []).find((f) => f.key === activeKey) || null;
+    if (!openFile) return;
+
+    this.logger?.action("review.expandGap", {
+      gapId: gap.id,
+      position: gap.position,
+      direction,
+      startLine: gap.startLine,
+      endLine: gap.endLine,
+      openKey: activeKey || "",
+    }, cx);
+
+    try { this.handle?.focus?.(); } catch {}
+
+    const loadedKey = this.viewerLoadedKey;
+    if (this.viewerSourceKey === loadedKey && Array.isArray(this.viewerSourceLines)) {
+      this.applyGapExpansionWithSource(gap.id, direction, this.viewerSourceLines, activeKey, cx);
+      return;
     }
+
+    const gen = this.viewerLoadGen;
+    const gapId = gap.id;
+    this.viewerExpandingGapId = gapId;
+    cx?.notify();
+
+    cx.spawn(async (asyncCx) => {
+      try {
+        const sourceLines = await this.fetchViewerSourceLines(
+          openFile,
+          diff?.viewMode || "working",
+          diff?.selectedCommit || null,
+          diff?.on ?? null,
+        );
+        if (this._viewerClosed || gen !== this.viewerLoadGen || loadedKey !== this.viewerLoadedKey) return;
+        this.viewerExpandingGapId = null;
+        if (!Array.isArray(sourceLines)) {
+          this.viewerNote = "Cannot expand context for this file (binary or unreadable).";
+          asyncCx.notify();
+          return;
+        }
+        this.viewerSourceLines = sourceLines;
+        this.viewerSourceKey = loadedKey;
+        this.applyGapExpansionWithSource(gapId, direction, sourceLines, activeKey, asyncCx);
+      } catch (e) {
+        if (this._viewerClosed || gen !== this.viewerLoadGen) return;
+        this.viewerExpandingGapId = null;
+        this.logger?.error("review.expandGapFailed", e, { gapId, openKey: activeKey || "" }, asyncCx);
+        asyncCx.notify();
+      }
+    });
+  }
+
+  getDiffViewportHeight() {
+    return this.diffViewportHeight > 0 ? this.diffViewportHeight : 560;
   }
 
   getReviewWrapCols() {
@@ -3096,10 +3295,9 @@ export default class ChangesReview extends View {
     return out.length > 0 ? out : [" "];
   }
 
-  computeDiffRowHeights(commentMap, wrapCols) {
+  computeDiffRowLayout(commentMap, wrapCols) {
     const rows = this.rows;
     const len = rows.length;
-    const hunkCols = Math.max(12, wrapCols - 16);
 
     let commentSig = "";
     if (commentMap && commentMap.size > 0) {
@@ -3109,11 +3307,11 @@ export default class ChangesReview extends View {
     }
     const cacheSig = `${len}|${wrapCols}|${commentSig}`;
     if (
-      this._rowHeightsCache &&
-      this._rowHeightsCache.rows === rows &&
-      this._rowHeightsCache.sig === cacheSig
+      this._rowLayoutCache &&
+      this._rowLayoutCache.rows === rows &&
+      this._rowLayoutCache.sig === cacheSig
     ) {
-      return this._rowHeightsCache.heights;
+      return this._rowLayoutCache.layout;
     }
 
     const heights = new Array(len);
@@ -3124,8 +3322,7 @@ export default class ChangesReview extends View {
         continue;
       }
       if (r.kind === "@") {
-        const hunkLines = countWrappedLines(r.text || "", hunkCols);
-        heights[i] = Math.max(22, 6 + hunkLines * 16);
+        heights[i] = REVIEW_HUNK_ROW_HEIGHT;
         continue;
       }
       const lineCount = countWrappedLines(r.text || " ", wrapCols);
@@ -3139,60 +3336,258 @@ export default class ChangesReview extends View {
       }
       heights[i] = h;
     }
-    this._rowHeightsCache = { rows, sig: cacheSig, heights };
-    return heights;
+    const layout = buildVariableRowLayout(heights);
+    this._rowLayoutCache = { rows, sig: cacheSig, layout };
+    return layout;
   }
 
-  scheduleDiffResizeReflow(nextW, cx) {
+  scheduleDiffResizeReflow(nextW, nextH, cx) {
     const prevCols = this.getReviewWrapCols();
-    this.diffViewportWidth = nextW;
-    const nextCols = this.getReviewWrapCols();
-    if (nextCols === prevCols) return;
+    const prevH = this.diffViewportHeight || 0;
+    let shouldNotify = false;
+
+    if (nextW > 0 && Math.abs(nextW - (this.diffViewportWidth || 0)) > 4) {
+      this.diffViewportWidth = nextW;
+      if (this.getReviewWrapCols() !== prevCols) {
+        shouldNotify = true;
+      }
+    }
+    if (nextH > 0 && Math.abs(nextH - prevH) > 4) {
+      this.diffViewportHeight = nextH;
+      shouldNotify = true;
+    }
+    if (!shouldNotify) return;
 
     if (this.diffResizeTask) {
       try { this.diffResizeTask.cancel(); } catch {}
       this.diffResizeTask = null;
     }
-    const timer = cx?.timer || this.hostCx?.timer;
+    const timer = cx?.timer;
     if (timer) {
       this.diffResizeTask = timer.after(16, (timerCx) => {
         this.diffResizeTask = null;
-        try { (timerCx || cx || this.hostCx)?.notify(); } catch {}
+        if (this._viewerClosed) return;
+        try { (timerCx || cx)?.notify(); } catch {}
       });
     } else {
       cx?.notify();
     }
   }
 
-  diffRow(rowObj, t, dt, commentMap, activeOpenKey = null, wrapCols = 96) {
-    const { kind, number, text, tokens } = rowObj;
-    const openKey = activeOpenKey || this.open;
-    if (kind === "@") {
-      const isExpanded = Boolean(this.expandedFiles && this.expandedFiles.has(openKey));
-      const hunkCols = Math.max(12, wrapCols - 16);
-      const hCacheKey = `h|${hunkCols}`;
-      let cachedHunk = reviewWrapCache.get(rowObj);
-      if (!cachedHunk || cachedHunk.key !== hCacheKey) {
-        cachedHunk = { key: hCacheKey, segments: wrapPlainText(text || "", hunkCols, { toNbsp: true }) };
-        reviewWrapCache.set(rowObj, cachedHunk);
+  scrollDiffByPx(deltaPx, layout, cx) {
+    if (!deltaPx || !layout) return;
+    const vpH = this.getDiffViewportHeight();
+    const maxScrollPx = Math.max(0, (layout.totalHeight || 0) - vpH);
+    const prev = Math.max(0, Math.min(maxScrollPx, Math.round(this.diffScrollPx || 0)));
+    const next = Math.max(0, Math.min(maxScrollPx, prev + Math.round(deltaPx)));
+    if (next !== this.diffScrollPx) {
+      this.diffScrollPx = next;
+      cx?.notify();
+    }
+  }
+
+  handleDiffRowActivate(rowIndex, fallbackOpenKey, cx) {
+    if (!Number.isInteger(rowIndex) || rowIndex < 0 || rowIndex >= this.rows.length) return;
+    const rowObj = this.rows[rowIndex];
+    if (!rowObj) return;
+    const activeKey = readActiveDiff(this.getSessionContext().spaceId)?.openFileKey || fallbackOpenKey || this.open;
+    this.logger?.action("review.diffRowClick", {
+      rowIndex,
+      kind: rowObj.kind || "",
+      line: rowObj.number ?? null,
+      openKey: activeKey || "",
+    }, cx);
+    if (rowObj.kind === "@") {
+      const gap = rowObj.gap;
+      if (!gap) return;
+      const hiddenCount = gap.endLine != null ? Math.max(0, gap.endLine - gap.startLine + 1) : null;
+      if (gap.position === "top") {
+        this.expandDiffGap(rowIndex, hiddenCount != null && hiddenCount <= DEFAULT_CONTEXT_EXPAND_STEP ? "all" : "up", activeKey, cx);
+      } else if (gap.position === "bottom") {
+        this.expandDiffGap(rowIndex, hiddenCount != null && hiddenCount <= DEFAULT_CONTEXT_EXPAND_STEP ? "all" : "down", activeKey, cx);
+      } else if (hiddenCount != null && hiddenCount <= DEFAULT_CONTEXT_EXPAND_STEP) {
+        this.expandDiffGap(rowIndex, "all", activeKey, cx);
       }
-      const hunkSegments = cachedHunk.segments;
-      const hunkH = Math.max(22, 6 + hunkSegments.length * 16);
-      return h_flex().w_full().h(hunkH).px(12).py(2).flex_none().items_center().gap(10)
+    } else if (rowObj.number !== undefined) {
+      this.startComment(activeKey, rowObj.number, rowObj.text, cx, rowIndex);
+    }
+  }
+
+  diffRow(rowObj, rowIndex, t, dt, commentMap, activeOpenKey = null, wrapCols = 96, expectedHeight = REVIEW_ROW_HEIGHT) {
+    const { kind, number, text, tokens, gap } = rowObj;
+    const openKey = activeOpenKey || this.open || "none";
+    const rowId = `diff-row-${openKey}-${rowIndex}`;
+    if (kind === "@") {
+      const hunkH = expectedHeight || REVIEW_HUNK_ROW_HEIGHT;
+      const hiddenCount = gap && gap.endLine != null ? Math.max(0, gap.endLine - gap.startLine + 1) : null;
+      const isLoadingGap = Boolean(gap && this.viewerExpandingGapId === gap.id);
+      const step = DEFAULT_CONTEXT_EXPAND_STEP;
+      const barClickable = Boolean(
+        gap &&
+        !isLoadingGap &&
+        (gap.position === "top" || gap.position === "bottom" || (hiddenCount != null && hiddenCount <= step))
+      );
+
+      const renderGapBtn = (btnId, label, dir, tipText, subtle = false) =>
+        div()
+          .id(btnId)
+          .flex_none()
+          .px(6)
+          .py(1)
+          .rounded(4)
+          .border_1()
+          .border_color(t.border)
+          .bg(subtle ? t.raised : t.background)
+          .text_size(9.5)
+          .font_medium()
+          .text_color(subtle ? t.dim : t.muted)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+          .tooltip(tipText)
+          .on_mouse_down("left", (_e, stopCx) => stopCx.stop_propagation())
+          .on_click((_e, clickCx) => {
+            clickCx.stop_propagation();
+            this.expandDiffGap(rowIndex, dir, openKey, clickCx);
+          })
+          .child(label);
+
+      const controls = [];
+      if (gap) {
+        if (isLoadingGap) {
+          controls.push(
+            div().flex_none().px(6).py(1).rounded(4).bg(t.background).text_size(9.5).text_color(t.dim).child("Loading…")
+          );
+        } else if (gap.position === "top") {
+          if (hiddenCount != null && hiddenCount <= step) {
+            controls.push(
+              renderGapBtn(
+                `gap-up-${gap.id}`,
+                `↑ Expand ${hiddenCount} ${hiddenCount === 1 ? "line" : "lines"}`,
+                "all",
+                `Show all ${hiddenCount} hidden lines above this block`,
+              )
+            );
+          } else {
+            controls.push(
+              renderGapBtn(
+                `gap-up-${gap.id}`,
+                `↑ +${step}`,
+                "up",
+                `Expand ${step} lines upward above this block`,
+              )
+            );
+            if (hiddenCount != null) {
+              controls.push(
+                renderGapBtn(
+                  `gap-all-${gap.id}`,
+                  `All (${hiddenCount})`,
+                  "all",
+                  `Expand all ${hiddenCount} hidden lines above this block`,
+                  true,
+                )
+              );
+            }
+          }
+        } else if (gap.position === "bottom") {
+          if (hiddenCount == null) {
+            controls.push(
+              renderGapBtn(
+                `gap-down-${gap.id}`,
+                `↓ Expand below`,
+                "down",
+                `Expand ${step} lines below this block`,
+              )
+            );
+          } else if (hiddenCount <= step) {
+            controls.push(
+              renderGapBtn(
+                `gap-down-${gap.id}`,
+                `↓ Expand ${hiddenCount} ${hiddenCount === 1 ? "line" : "lines"}`,
+                "all",
+                `Show all ${hiddenCount} remaining lines below`,
+              )
+            );
+          } else {
+            controls.push(
+              renderGapBtn(
+                `gap-down-${gap.id}`,
+                `↓ +${step}`,
+                "down",
+                `Expand ${step} lines downward below this block`,
+              )
+            );
+            controls.push(
+              renderGapBtn(
+                `gap-all-${gap.id}`,
+                `All (${hiddenCount})`,
+                "all",
+                `Expand all ${hiddenCount} remaining lines below`,
+                true,
+              )
+            );
+          }
+        } else if (gap.position === "between") {
+          if (hiddenCount != null && hiddenCount <= step) {
+            controls.push(
+              renderGapBtn(
+                `gap-all-${gap.id}`,
+                `↕ Expand ${hiddenCount} ${hiddenCount === 1 ? "line" : "lines"}`,
+                "all",
+                `Show all ${hiddenCount} hidden lines between blocks`,
+              )
+            );
+          } else {
+            controls.push(
+              renderGapBtn(
+                `gap-down-${gap.id}`,
+                `↓ +${step}`,
+                "down",
+                `Expand ${step} lines downward below the previous block`,
+              )
+            );
+            controls.push(
+              renderGapBtn(
+                `gap-up-${gap.id}`,
+                `↑ +${step}`,
+                "up",
+                `Expand ${step} lines upward above the next block`,
+              )
+            );
+            if (hiddenCount != null) {
+              controls.push(
+                renderGapBtn(
+                  `gap-all-${gap.id}`,
+                  `All (${hiddenCount})`,
+                  "all",
+                  `Expand all ${hiddenCount} hidden lines in this block`,
+                  true,
+                )
+              );
+            }
+          }
+        }
+      }
+
+      const headerLabel = text || (gap?.position === "bottom" && hiddenCount != null ? `${hiddenCount} lines hidden below` : "");
+      return h_flex().id(rowId).w_full().h(hunkH).px(12).flex_none().items_center().gap(6)
         .bg(t.raised).border_b(1).border_color(t.border)
-        .cursor_pointer()
-        .hover((s) => s.bg(t.hover))
-        .child(
-          div().flex_none().px(5).py(0.5).rounded(3).bg(t.background).text_size(9.5).text_color(t.muted)
-            .child(isExpanded ? "Collapse context" : "Expand context")
+        .when(barClickable, (e) => e
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .on_click((_e, clickCx) => this.handleDiffRowActivate(rowIndex, openKey, clickCx))
         )
-        .child(
-          v_flex().flex_1().min_w(0).overflow_hidden().children(
-            hunkSegments.map((seg) =>
-              div().w_full().h(16).flex_none().whitespace_nowrap().text_size(11).text_color(t.dim).child(seg || "\u00a0")
-            )
-          )
-        );
+        .when(controls.length > 0, (e) => e.children(controls))
+        .when(Boolean(headerLabel), (e) => e.child(
+          div()
+            .flex_1()
+            .min_w(0)
+            .truncate()
+            .pl(controls.length > 0 ? 4 : 0)
+            .text_size(11)
+            .text_color(t.dim)
+            .when(Boolean(text), (lbl) => lbl.tooltip(text))
+            .child(headerLabel)
+        ));
     }
     const isCommentable = number !== undefined;
     const existing = (isCommentable && commentMap) ? commentMap.get(number) : null;
@@ -3240,14 +3635,15 @@ export default class ChangesReview extends View {
       return h_flex().flex_1().min_w(0).overflow_hidden().items_center().children(spanEls);
     };
 
-    const buildVisualSubRow = (seg, isFirstSeg) =>
+    const buildVisualSubRow = (seg, isFirstSeg, applyOuterFrame) =>
       h_flex().w_full().h(REVIEW_ROW_HEIGHT).flex_none().items_center().gap(6).pr(14)
-        .border_l(2)
-        .border_color(diffColor || t.background)
-        .when(isCommentable, (e) => e.cursor_pointer())
-        .when(Boolean(rowBg), (e) => e.bg(rowBg))
-        .when(Boolean(existing) || Boolean(isActive), (e) => e.bg(t.selected))
-        .hover((s) => s.bg(hoverBg))
+        .when(applyOuterFrame, (e) => e
+          .border_l(2)
+          .border_color(diffColor || t.background)
+          .when(Boolean(rowBg), (b) => b.bg(rowBg))
+          .when(Boolean(existing) || Boolean(isActive), (b) => b.bg(t.selected))
+          .hover((s) => s.bg(hoverBg))
+        )
         .child(
           div().w(32).flex_none().text_right()
             .text_color(existing || isActive ? t.foreground : diffColor || t.dim)
@@ -3260,22 +3656,36 @@ export default class ChangesReview extends View {
         )
         .child(renderSegContent(seg));
 
+    const codeHeight = Math.max(1, segments.length) * REVIEW_ROW_HEIGHT;
     const row = segments.length <= 1
-      ? buildVisualSubRow(segments[0], true)
-      : v_flex().w_full().flex_none().children(
-          segments.map((seg, idx) => buildVisualSubRow(seg, idx === 0))
-        );
+      ? buildVisualSubRow(segments[0], true, true)
+      : v_flex().w_full().h(codeHeight).flex_none().overflow_hidden()
+          .border_l(2)
+          .border_color(diffColor || t.background)
+          .when(Boolean(rowBg), (b) => b.bg(rowBg))
+          .when(Boolean(existing) || Boolean(isActive), (b) => b.bg(t.selected))
+          .hover((s) => s.bg(hoverBg))
+          .children(segments.map((seg, idx) => buildVisualSubRow(seg, idx === 0, false)));
 
     if (!existing) {
-      return row;
+      return row
+        .id(rowId)
+        .when(isCommentable, (e) => e
+          .cursor_pointer()
+          .on_click((_e, clickCx) => this.handleDiffRowActivate(rowIndex, openKey, clickCx))
+        );
     }
 
     const commentLines = this.getWrappedCommentLines(existing.text, wrapCols);
+    const commentBoxH = 13 + commentLines.length * 16;
+    const totalRowH = expectedHeight || (codeHeight + commentBoxH);
 
-    return v_flex().w_full().flex_none()
+    return v_flex().id(rowId).w_full().h(totalRowH).flex_none().overflow_hidden()
+      .cursor_pointer()
+      .on_click((_e, clickCx) => this.handleDiffRowActivate(rowIndex, openKey, clickCx))
       .child(row)
       .child(
-        h_flex().w_full().h(13 + commentLines.length * 16).pl(12).pr(16).py(6).bg(t.raised).border_b(1).border_color(t.border)
+        h_flex().w_full().h(commentBoxH).pl(12).pr(16).py(6).bg(t.raised).border_b(1).border_color(t.border)
           .cursor_pointer().hover((s) => s.bg(t.hover))
           .child(
             h_flex().w_full().max_w(460).gap(8).items_start()
@@ -3293,8 +3703,7 @@ export default class ChangesReview extends View {
   }
 
   /**
-   * Renders the docked review-comment composer outside `v_virtual_list` so GPUI
-   * retained Textarea and button handlers never run inside a virtual-list layout callback.
+   * Renders the docked review-comment composer below `#changes-diff-viewport`.
    */
   renderCommentComposer(t, commentMap, openKey) {
     const active = this.activeComment;
@@ -3303,6 +3712,7 @@ export default class ChangesReview extends View {
     const canSave = Boolean(this.commentText.trim());
     return v_flex().id("review-comment-composer").w_full().flex_none()
       .px(12).py(8).bg(t.raised).border_t(1).border_color(t.border)
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .child(
         v_flex().w_full().max_w(520).gap(6)
           .child(
@@ -3436,15 +3846,16 @@ export default class ChangesReview extends View {
     const allFilesReviewed = files.length > 0 && reviewedFilesCount === files.length;
     const fileIdx = openKey ? files.findIndex((f) => f.key === openKey) : -1;
 
-    const sessionReviews = this.getSessionReviews(ctx);
-    const commentMap = new Map();
-    if (openKey && sessionReviews.length > 0) {
-      for (const r of sessionReviews) {
-        if (r.fileKey === openKey || r.file === openKey) {
-          commentMap.set(r.line, r);
-        }
-      }
-    }
+    const commentMap = this.buildCommentMapForFile(openKey, ctx);
+    const wrapCols = markdownActive ? 96 : this.getReviewWrapCols();
+    const diffRowLayout = !markdownActive ? this.computeDiffRowLayout(commentMap, wrapCols) : null;
+    const diffViewportH = this.getDiffViewportHeight();
+    const diffSlice = diffRowLayout
+      ? computeVariableWindowSlice(diffRowLayout, this.diffScrollPx, diffViewportH, 2)
+      : null;
+    const diffScrollbar = diffSlice
+      ? computeDiffScrollbarMetrics(diffSlice.totalHeight, diffSlice.scrollPx, diffSlice.viewportHeight, Math.max(24, diffSlice.viewportHeight - 8))
+      : null;
 
     const canStepFiles = files.length > 1;
     const openIcon = openFile ? resolveDiffFileIcon(openFile.path || openFile.displayPath, t) : null;
@@ -3592,12 +4003,71 @@ export default class ChangesReview extends View {
           }
         }
       })
+      .when(Boolean(this.diffScrollbarDrag), (el) =>
+        el
+          .on_mouse_move((e, moveCx) => {
+            const drag = this.diffScrollbarDrag;
+            if (!drag || !Number.isFinite(e?.position?.y)) return;
+            const thumbTop = (e.position.y - drag.trackTopY) - drag.grabOffsetY;
+            const nextPx = resolveDiffScrollbarDragPx(thumbTop, drag.trackHeight, drag.thumbHeight, drag.maxScrollPx);
+            if (nextPx !== this.diffScrollPx) {
+              this.diffScrollPx = nextPx;
+              moveCx.notify();
+            }
+          })
+          .on_mouse_up("left", (_e, upCx) => {
+            if (this.diffScrollbarDrag) {
+              this.diffScrollbarDrag = null;
+              upCx.notify();
+            }
+          })
+      )
       .on_key_down((e, cx) => {
         if (!markdownActive && e.key === "escape" && (this.typingComment || this.activeComment)) {
           this.cancelActiveComment(cx);
           this.handle.focus();
           cx.stop_propagation();
           cx.notify();
+          return;
+        }
+        if (
+          !markdownActive &&
+          !this.typingComment &&
+          !this.activeComment &&
+          diffRowLayout &&
+          this.rows.length > 0 &&
+          !e.modifiers?.control &&
+          !e.modifiers?.alt &&
+          !e.modifiers?.platform
+        ) {
+          const k = e.key;
+          const pagePx = Math.max(REVIEW_ROW_HEIGHT * 3, diffViewportH - REVIEW_ROW_HEIGHT * 2);
+          if (k === "down" || k === "arrowdown") {
+            this.scrollDiffByPx(REVIEW_ROW_HEIGHT * 2, diffRowLayout, cx);
+            cx.stop_propagation();
+          } else if (k === "up" || k === "arrowup") {
+            this.scrollDiffByPx(-REVIEW_ROW_HEIGHT * 2, diffRowLayout, cx);
+            cx.stop_propagation();
+          } else if (k === "pagedown") {
+            this.scrollDiffByPx(pagePx, diffRowLayout, cx);
+            cx.stop_propagation();
+          } else if (k === "pageup") {
+            this.scrollDiffByPx(-pagePx, diffRowLayout, cx);
+            cx.stop_propagation();
+          } else if (k === "home") {
+            if (this.diffScrollPx !== 0) {
+              this.diffScrollPx = 0;
+              cx.notify();
+            }
+            cx.stop_propagation();
+          } else if (k === "end") {
+            const maxPx = Math.max(0, diffRowLayout.totalHeight - diffViewportH);
+            if (this.diffScrollPx !== maxPx) {
+              this.diffScrollPx = maxPx;
+              cx.notify();
+            }
+            cx.stop_propagation();
+          }
         }
       })
       .when(Boolean(openFile), (el) => el.child(
@@ -3648,50 +4118,100 @@ export default class ChangesReview extends View {
               },
             })
           : (() => {
-              const wrapCols = this.getReviewWrapCols();
-              const rowHeights = this.computeDiffRowHeights(commentMap, wrapCols);
-              return v_flex().flex_1().min_h(0).w_full()
-                .on_size_change((size, cx) => {
+              const visibleRowEls = [];
+              if (diffSlice && diffRowLayout && this.rows.length > 0) {
+                for (let i = diffSlice.start; i < diffSlice.end; i++) {
+                  visibleRowEls.push(
+                    this.diffRow(this.rows[i], i, t, dt, commentMap, openKey, wrapCols, diffRowLayout.heights[i])
+                  );
+                }
+              }
+              return v_flex().id("changes-diff-viewport").flex_1().min_h(0).w_full()
+                .on_size_change((size, sizeCx) => {
                   const w = Math.round(size?.width || 0);
-                  if (w > 0 && Math.abs(w - (this.diffViewportWidth || 0)) > 4) {
-                    this.scheduleDiffResizeReflow(w, cx);
-                  }
+                  const h = Math.round(size?.height || 0);
+                  this.scheduleDiffResizeReflow(w, h, sizeCx);
                 })
+                .when(Boolean(diffRowLayout) && this.rows.length > 0, (el) =>
+                  el.on_scroll_wheel((e, wheelCx) => {
+                    const dx = Math.abs(e.delta?.x || 0);
+                    const dy = Math.abs(e.delta?.y || 0);
+                    const dlY = Number(e.delta_lines?.y || 0);
+                    if (dlY !== 0 || (dy > 0 && dy >= dx && !e.modifiers?.shift)) {
+                      const deltaPx = resolveDiffWheelDeltaPx(e.delta?.y || 0, dlY, REVIEW_ROW_HEIGHT);
+                      if (deltaPx !== 0) {
+                        this.scrollDiffByPx(deltaPx, diffRowLayout, wheelCx);
+                        wheelCx.stop_propagation();
+                      }
+                    }
+                  })
+                )
                 .child(
-                  div().size_full().relative().font_family(mono).text_size(11.5)
-                    .when(this.rows.length > 0, (el) => el
+                  div().id("changes-diff-wrap").size_full().relative().overflow_hidden().font_family(mono).text_size(11.5)
+                    .when(visibleRowEls.length > 0 && Boolean(diffSlice), (el) => el
                       .child(
-                        v_virtual_list(
-                          "changes-diff-lines",
-                          this.rows.length,
-                          rowHeights,
-                          (index) => `${openKey || ""}::${index}`,
-                          (range) => {
-                            const out = [];
-                            for (let i = range.start; i < range.end; i++) {
-                              out.push(this.diffRow(this.rows[i], t, dt, commentMap, openKey, wrapCols));
-                            }
-                            return out;
-                          }
-                        )
-                          .size_full()
-                          .track_scroll(this.diffScroll)
-                          .on_item_click((itemKey, cx) => {
-                            const keyStr = String(itemKey || "");
-                            const sep = keyStr.lastIndexOf("::");
-                            const idx = Number(sep >= 0 ? keyStr.slice(sep + 2) : keyStr);
-                            if (!Number.isInteger(idx) || idx < 0 || idx >= this.rows.length) return;
-                            const rowObj = this.rows[idx];
-                            if (!rowObj) return;
-                            const activeKey = readActiveDiff(this.getSessionContext().spaceId)?.openFileKey || openKey;
-                            if (rowObj.kind === "@") {
-                              this.toggleExpand(activeKey, cx);
-                            } else if (rowObj.number !== undefined) {
-                              this.startComment(activeKey, rowObj.number, rowObj.text, cx);
-                            }
-                          })
+                        v_flex()
+                          .id("changes-diff-lines")
+                          .w_full()
+                          .absolute()
+                          .top(diffSlice.topOffsetPx)
+                          .left_0()
+                          .right_0()
+                          .children(visibleRowEls)
                       )
-                      .child(Scrollbar.vertical("changes-diff-lines").viewport_from_layout().absolute().inset_0())
+                    )
+                    .when(Boolean(diffScrollbar?.visible), (el) => el
+                      .child(
+                        v_flex()
+                          .id("changes-diff-scrollbar-track")
+                          .absolute()
+                          .top(4)
+                          .bottom(4)
+                          .right(2)
+                          .w(10)
+                          .items_center()
+                          .cursor_pointer()
+                          .on_mouse_down("left", (e, dragCx) => {
+                            dragCx.stop_propagation();
+                            const posY = Number(e?.position?.y);
+                            const localY = Number.isFinite(e?.local_position?.y)
+                              ? e.local_position.y
+                              : (Number.isFinite(posY) && Number.isFinite(e?.bounds?.y) ? posY - e.bounds.y : 0);
+                            const trackTopY = Number.isFinite(e?.bounds?.y)
+                              ? e.bounds.y
+                              : (Number.isFinite(posY) ? posY - localY : 0);
+                            const hitThumb = localY >= diffScrollbar.thumbTop && localY <= (diffScrollbar.thumbTop + diffScrollbar.thumbHeight);
+                            const grabOffsetY = hitThumb ? (localY - diffScrollbar.thumbTop) : (diffScrollbar.thumbHeight / 2);
+                            this.diffScrollbarDrag = {
+                              trackTopY,
+                              trackHeight: diffScrollbar.trackHeight,
+                              thumbHeight: diffScrollbar.thumbHeight,
+                              maxScrollPx: diffScrollbar.maxScrollPx,
+                              grabOffsetY,
+                            };
+                            if (!hitThumb) {
+                              this.diffScrollPx = resolveDiffScrollbarDragPx(
+                                localY - grabOffsetY,
+                                diffScrollbar.trackHeight,
+                                diffScrollbar.thumbHeight,
+                                diffScrollbar.maxScrollPx,
+                              );
+                            }
+                            dragCx.notify();
+                          })
+                          .child(div().w_full().h(diffScrollbar.thumbTop).flex_none())
+                          .child(
+                            div()
+                              .id("changes-diff-scrollbar-thumb")
+                              .w(6)
+                              .h(diffScrollbar.thumbHeight)
+                              .flex_none()
+                              .rounded(3)
+                              .bg(this.diffScrollbarDrag ? t.muted : t.border)
+                              .hover((s) => s.bg(t.muted))
+                          )
+                          .child(div().w_full().flex_1().min_h(0))
+                      )
                     )
                     .when(!openFile, (e) => e.child(
                       h_flex().absolute().inset_0().items_center().justify_center()

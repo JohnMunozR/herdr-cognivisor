@@ -53,6 +53,18 @@ import {
   buildReviewMarkdownCacheKey,
   validateMarkdownTextContent,
   formatGitShowMarkdownError,
+  buildVariableRowLayout,
+  computeVariableWindowSlice,
+  computeDiffScrollOffsetForRow,
+  computeDiffScrollbarMetrics,
+  resolveDiffWheelDeltaPx,
+  resolveDiffScrollbarDragPx,
+  DEFAULT_CONTEXT_EXPAND_STEP,
+  splitSourceFileLines,
+  annotateDiffGaps,
+  syncBottomGapWithTotalLines,
+  expandDiffGapInRows,
+  computeAnchorPreservedScrollPx,
 } from "../mods/changes-review/review-logic.js";
 import {
   statFileEntry as filesSearchStatFileEntry,
@@ -1280,5 +1292,219 @@ describe("changes-review review-logic", () => {
     assert.equal(compacted.live_tab.sessionBaseline, undefined);
     assert.equal(compacted.live_tab.ticket, "PROJ-1");
     assert.equal(compacted.recent_closed.sessionBaseline, undefined);
+  });
+
+  test("buildVariableRowLayout and computeVariableWindowSlice virtualize variable-height diff rows accurately", () => {
+    const layout = buildVariableRowLayout([22, 20, 40, 20, 61, 20, 20, 20]);
+    assert.deepEqual(layout.offsets, [0, 22, 42, 82, 102, 163, 183, 203]);
+    assert.equal(layout.totalHeight, 223);
+
+    const topSlice = computeVariableWindowSlice(layout, 0, 80, 1);
+    assert.equal(topSlice.start, 0);
+    assert.equal(topSlice.end, 4);
+    assert.equal(topSlice.scrollPx, 0);
+    assert.equal(topSlice.maxScrollPx, 143);
+    assert.equal(topSlice.topOffsetPx, 0);
+
+    // Mid-row pixel scroll should keep exact negative topOffsetPx for smooth scrolling
+    const midSlice = computeVariableWindowSlice(layout, 50, 80, 1);
+    assert.equal(midSlice.start, 1);
+    assert.equal(midSlice.end, 6);
+    assert.equal(midSlice.topOffsetPx, 22 - 50);
+
+    // Overscrolling clamps cleanly to maxScrollPx
+    const endSlice = computeVariableWindowSlice(layout, 9999, 80, 0);
+    assert.equal(endSlice.scrollPx, 143);
+    assert.equal(endSlice.start, 4);
+    assert.equal(endSlice.end, 8);
+    assert.equal(endSlice.topOffsetPx, 102 - 143);
+
+    // Empty layout stays safe
+    const empty = computeVariableWindowSlice(buildVariableRowLayout([]), 100, 400, 2);
+    assert.equal(empty.start, 0);
+    assert.equal(empty.end, 0);
+    assert.equal(empty.topOffsetPx, 0);
+  });
+
+  test("computeDiffScrollOffsetForRow supports top, center, and nearest visibility clamping", () => {
+    const layout = buildVariableRowLayout(Array.from({ length: 30 }, () => 20)); // total 600px
+    assert.equal(computeDiffScrollOffsetForRow(layout, 10, 200, "top"), 200);
+    assert.equal(computeDiffScrollOffsetForRow(layout, 10, 200, "center"), 130);
+    assert.equal(computeDiffScrollOffsetForRow(layout, 29, 200, "top"), 400);
+
+    // Already visible row stays put under "nearest"
+    assert.equal(computeDiffScrollOffsetForRow(layout, 12, 200, "nearest", 200), 200);
+    // Row below viewport scrolls just enough to reveal bottom edge
+    assert.equal(computeDiffScrollOffsetForRow(layout, 15, 200, "nearest", 100), 120);
+    // Row above viewport scrolls up to row top
+    assert.equal(computeDiffScrollOffsetForRow(layout, 2, 200, "nearest", 200), 40);
+  });
+
+  test("computeDiffScrollbarMetrics, resolveDiffWheelDeltaPx, and resolveDiffScrollbarDragPx behave deterministically", () => {
+    const hidden = computeDiffScrollbarMetrics(200, 0, 400, 392);
+    assert.equal(hidden.visible, false);
+    assert.equal(hidden.maxScrollPx, 0);
+
+    const shown = computeDiffScrollbarMetrics(1000, 300, 400, 400);
+    assert.equal(shown.visible, true);
+    assert.equal(shown.maxScrollPx, 600);
+    assert.equal(shown.thumbHeight, 160);
+    assert.equal(shown.thumbTop, 120);
+
+    // Drag back from thumbTop=120 recovers scrollPx=300
+    assert.equal(resolveDiffScrollbarDragPx(120, 400, 160, 600), 300);
+    assert.equal(resolveDiffScrollbarDragPx(-50, 400, 160, 600), 0);
+    assert.equal(resolveDiffScrollbarDragPx(999, 400, 160, 600), 600);
+
+    // GPUI scroll convention: positive delta scrolls UP (negative scrollPx delta)
+    assert.equal(resolveDiffWheelDeltaPx(0, 1, 20), -60);
+    assert.equal(resolveDiffWheelDeltaPx(0, -1, 20), 60);
+    assert.equal(resolveDiffWheelDeltaPx(24, 0, 20), -24);
+    assert.equal(resolveDiffWheelDeltaPx(-24, 0, 20), 24);
+    assert.equal(resolveDiffWheelDeltaPx(0, 0, 20), 0);
+  });
+
+  test("annotateDiffGaps identifies independent top, between, and bottom gaps while skipping line-1 hunks and truncation banners", () => {
+    const rawDiff = [
+      "@@ -40,3 +40,4 @@ function first() {",
+      " line40",
+      "-old41",
+      "+new41",
+      "+new42",
+      " line43",
+      "@@ -120,2 +121,3 @@ function second() {",
+      " line121",
+      "+added122",
+      " line123",
+    ];
+    const annotated = annotateDiffGaps(diffRows(rawDiff, "src/app.js"), { canExpandBottom: true });
+    assert.deepEqual(annotated[0].gap, { id: "gap-top", position: "top", startLine: 1, endLine: 39, oldDelta: 0 });
+    assert.deepEqual(annotated[6].gap, { id: "gap-between-1", position: "between", startLine: 44, endLine: 120, oldDelta: -1 });
+    assert.deepEqual(annotated[annotated.length - 1].gap, {
+      id: "gap-bottom",
+      position: "bottom",
+      startLine: 124,
+      endLine: null,
+      oldDelta: -2,
+    });
+
+    // Hunk starting at line 1 should NOT show a top expand gap, and truncation banner must not produce a gap
+    const topZeroDiff = [
+      "@@ -1,2 +1,2 @@",
+      " line1",
+      "+line2",
+      "@@ -0,0 +0,0 @@ [Diff preview truncated: showing first 500 lines. 10 more lines hidden.]",
+    ];
+    const topZeroAnnotated = annotateDiffGaps(diffRows(topZeroDiff, "src/app.js"), { canExpandBottom: true });
+    assert.equal(topZeroAnnotated[0].gap, null);
+    assert.equal(topZeroAnnotated[3].gap, null);
+    assert.equal(topZeroAnnotated.length, 4, "truncated diff must not append a trailing bottom gap");
+
+    // syncBottomGapWithTotalLines resolves endLine or prunes bottom gap at EOF
+    const synced = syncBottomGapWithTotalLines(annotated, 150);
+    assert.equal(synced[synced.length - 1].gap.endLine, 150);
+    const atEof = syncBottomGapWithTotalLines(annotated, 123);
+    assert.equal(atEof.length, annotated.length - 1);
+  });
+
+  test("expandDiffGapInRows expands ONLY the targeted block (up/down/all) and computeAnchorPreservedScrollPx keeps visual position intact", () => {
+    const sourceLines = Array.from({ length: 160 }, (_, idx) => `const v${idx + 1} = ${idx + 1};`);
+    const rawDiff = [
+      "@@ -40,2 +40,3 @@ function first() {",
+      " const v40 = 40;",
+      "+const v41 = 41;",
+      " const v42 = 42;",
+      "@@ -120,6 +121,7 @@ function second() {",
+      " const v121 = 121;",
+      "+const v122 = 122;",
+      " const v123 = 123;",
+      " const v124 = 124;",
+      " const v125 = 125;",
+      " const v126 = 126;",
+      " const v127 = 127;",
+    ];
+    const initialRows = annotateDiffGaps(diffRows(rawDiff, "src/app.js"), {
+      canExpandBottom: true,
+      totalFileLines: sourceLines.length,
+    });
+    const hunk2AnchorRowRef = initialRows[5]; // " const v121 = 121;"
+    const topGapRowRef = initialRows[0];
+    const bottomGapRowRef = initialRows[initialRows.length - 1];
+
+    // 1. Expand ONLY between-hunk gap UPWARD by 20 lines (rows[4] is gap-between-1: lines 43..120)
+    const oldLayout = buildVariableRowLayout(initialRows.map((r) => (r.kind === "@" ? 26 : 20)));
+    const vpH = 140;
+    const oldScrollPx = 40;
+    const oldAnchorScreenY = oldLayout.offsets[5] - oldScrollPx; // screen Y of line 121 before expansion
+
+    const upRes = expandDiffGapInRows(initialRows, 4, "up", sourceLines, {
+      step: DEFAULT_CONTEXT_EXPAND_STEP,
+      filePath: "src/app.js",
+    });
+    assert.equal(upRes.changed, true);
+    assert.equal(upRes.insertedCount, 20);
+    assert.equal(upRes.removedGap, false);
+    // Sibling top and bottom gaps MUST remain untouched
+    assert.equal(upRes.rows[0], topGapRowRef);
+    assert.equal(upRes.rows[upRes.rows.length - 1], bottomGapRowRef);
+    assert.deepEqual(upRes.rows[4].gap, { id: "gap-between-1", position: "between", startLine: 43, endLine: 100, oldDelta: -1 });
+    assert.equal(upRes.rows[5].number, 101);
+    assert.equal(upRes.rows[24].number, 120);
+    assert.equal(upRes.rows[upRes.newAnchorIndex], hunk2AnchorRowRef);
+
+    // Visual anchor pixel for line 121 MUST remain identical (zero downward jump!)
+    const newLayout = buildVariableRowLayout(upRes.rows.map((r) => (r.kind === "@" ? 26 : 20)));
+    const nextScrollPx = computeAnchorPreservedScrollPx(
+      oldLayout,
+      newLayout,
+      oldScrollPx,
+      upRes.oldAnchorIndex,
+      upRes.newAnchorIndex,
+      vpH,
+    );
+    assert.equal(newLayout.offsets[upRes.newAnchorIndex] - nextScrollPx, oldAnchorScreenY);
+
+    // 2. Expand same between-hunk gap DOWNWARD by 20 lines: code ABOVE gap stays pinned (scrollPx unchanged!)
+    const hunk1LastRowRef = upRes.rows[3]; // line 42
+    const downRes = expandDiffGapInRows(upRes.rows, 4, "down", sourceLines, {
+      step: DEFAULT_CONTEXT_EXPAND_STEP,
+      filePath: "src/app.js",
+    });
+    assert.equal(downRes.insertedCount, 20);
+    assert.equal(downRes.rows[3], hunk1LastRowRef);
+    assert.equal(downRes.rows[4].number, 43);
+    assert.equal(downRes.rows[23].number, 62);
+    assert.deepEqual(downRes.rows[24].gap, { id: "gap-between-1", position: "between", startLine: 63, endLine: 100, oldDelta: -1 });
+    assert.equal(downRes.oldAnchorIndex, 3);
+    assert.equal(downRes.newAnchorIndex, 3);
+    const downLayout = buildVariableRowLayout(downRes.rows.map((r) => (r.kind === "@" ? 26 : 20)));
+    const downScrollPx = computeAnchorPreservedScrollPx(
+      newLayout,
+      downLayout,
+      nextScrollPx,
+      downRes.oldAnchorIndex,
+      downRes.newAnchorIndex,
+      vpH,
+    );
+    assert.equal(downScrollPx, nextScrollPx);
+
+    // 3. Expand remaining between-hunk gap ("all") closes ONLY that gap bar seamlessly
+    const closeRes = expandDiffGapInRows(downRes.rows, 24, "all", sourceLines, {
+      step: DEFAULT_CONTEXT_EXPAND_STEP,
+      filePath: "src/app.js",
+      anchorPreference: "below",
+    });
+    assert.equal(closeRes.removedGap, true);
+    assert.equal(closeRes.insertedCount, 38); // lines 63..100
+    assert.equal(closeRes.rows.some((r) => r?.gap?.id === "gap-between-1"), false);
+    // Top gap and bottom gap STILL collapsed and untouched!
+    assert.deepEqual(closeRes.rows[0].gap, { id: "gap-top", position: "top", startLine: 1, endLine: 39, oldDelta: 0 });
+    assert.deepEqual(closeRes.rows[closeRes.rows.length - 1].gap, { id: "gap-bottom", position: "bottom", startLine: 128, endLine: 160, oldDelta: -2 });
+  });
+
+  test("splitSourceFileLines strips CRLF, drops single trailing LF, rejects binary NUL, and bounds huge input", () => {
+    assert.deepEqual(splitSourceFileLines("a\r\nb\r\nc\r\n"), ["a", "b", "c"]);
+    assert.equal(splitSourceFileLines("abc\0def"), null);
+    assert.equal(splitSourceFileLines("hello\nworld\n", 5).join("\n"), "hello");
   });
 });
