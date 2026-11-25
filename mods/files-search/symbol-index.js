@@ -587,6 +587,16 @@ async function statLocalFileSafe(absPath) {
   }
 }
 
+function isWindowsPlatform() {
+  try {
+    if (typeof process !== "undefined" && process?.platform === "win32") return true;
+  } catch {}
+  try {
+    if (typeof window === "function" && window()?.platform === "windows") return true;
+  } catch {}
+  return false;
+}
+
 async function batchStatLocalFiles(root, files, execFn = null) {
   const statMap = new Map();
   if (!root || !Array.isArray(files) || files.length === 0) return statMap;
@@ -595,6 +605,9 @@ async function batchStatLocalFiles(root, files, execFn = null) {
       const st = await statLocalFileSafe(joinFsPath(root, rel));
       if (st) statMap.set(rel, st);
     });
+    return statMap;
+  }
+  if (!execFn && isWindowsPlatform()) {
     return statMap;
   }
   // Live QuickJS fallback: batched GNU stat (or BSD stat -f fallback) across local files when fsPromises.stat is unavailable
@@ -783,7 +796,7 @@ export function invalidateIndexedFiles(root, changedPaths = [], on = null) {
   }
 }
 
-async function loadServiceDiskIndex(idx, appHomeDir = null) {
+async function loadServiceDiskIndex(idx, appHomeDir = null, yieldFn = null) {
   if (idx.loadedFromDisk) return false;
   idx.loadedFromDisk = true;
   const cachePath = getSymbolCacheFilePath(idx.root, idx.on ?? null, appHomeDir);
@@ -808,6 +821,9 @@ async function loadServiceDiskIndex(idx, appHomeDir = null) {
           mtimeMs: ent.mtimeMs ?? null,
           size: ent.size ?? null,
         });
+      }
+      if (yieldFn && i > 0 && i % 250 === 0) {
+        await yieldFn();
       }
     }
     return true;
@@ -936,7 +952,7 @@ export async function warmServiceSymbolIndex({
   }
 
   idx.indexingPromise = (async () => {
-    await loadServiceDiskIndex(idx, appHomeDir);
+    await loadServiceDiskIndex(idx, appHomeDir, yieldFn);
     const files = await listServiceIndexableFiles({ root: svc.root, on: svc.on, execFn, maxFiles });
     const presentSet = new Set(files);
     for (const oldRel of Array.from(idx.files.keys())) {
@@ -986,7 +1002,7 @@ export async function warmServiceSymbolIndex({
           }
         }
         processed += 1;
-        if (yieldFn && processed % 6 === 0) {
+        if (yieldFn && processed % 4 === 0) {
           await yieldFn();
         }
       });
