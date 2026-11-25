@@ -275,6 +275,44 @@ export function createRingBuffer(maxEntries = DEFAULT_MAX_RING_ENTRIES) {
 }
 
 /**
+ * Deduplicate and merge an existing per-mod log list (e.g. from disk or a sibling view instance)
+ * with a current in-memory ring buffer so reloads and multi-view mods never wipe prior errors.
+ */
+export function mergeModLogEntries(existingEntries, currentEntries, opts = {}) {
+  const maxEntries = Number.isFinite(Number(opts.maxEntries)) && Number(opts.maxEntries) > 0
+    ? Math.trunc(Number(opts.maxEntries))
+    : DEFAULT_MAX_RING_ENTRIES;
+  const fallbackMod = opts.mod || "";
+  const seen = new Set();
+  const combined = [];
+
+  const pushAll = (list) => {
+    for (const raw of Array.isArray(list) ? list : []) {
+      const norm = normalizeLogEntry(raw, fallbackMod, opts);
+      if (!norm) continue;
+      const errKey = norm.error ? `${norm.error.name || ""}:${norm.error.message || ""}` : "";
+      const dedupeKey = `${norm.ts}|${norm.seq}|${norm.mod}|${norm.level}|${norm.event}|${errKey}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      combined.push(norm);
+    }
+  };
+
+  pushAll(existingEntries);
+  pushAll(currentEntries);
+
+  combined.sort((a, b) => {
+    if (a.ts !== b.ts) return a.ts - b.ts;
+    return a.seq - b.seq;
+  });
+
+  if (combined.length > maxEntries) {
+    return combined.slice(combined.length - maxEntries);
+  }
+  return combined;
+}
+
+/**
  * Merge multiple per-mod entry arrays chronologically by (ts, seq, mod),
  * capping total size to the most recent maxTotalEntries items.
  */

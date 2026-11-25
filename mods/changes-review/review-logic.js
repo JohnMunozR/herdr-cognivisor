@@ -494,7 +494,7 @@ export function resolveSessionAgentTabId(space, allPanes, storedAgentTabs) {
   const isViewerOnlyTab = Boolean(
     activeTab &&
     activePanes.length > 0 &&
-    activePanes.every((p) => !p.terminal && (p.mod === "changes-review" || p.mod === "files-search"))
+    activePanes.every((p) => !p.terminal && (p.mod === "changes-review" || p.mod === "files-search" || p.mod === "git-history"))
   );
 
   if (!activeTab || isViewerOnlyTab) {
@@ -777,23 +777,52 @@ export function partitionSessionUnifiedEntries(entries, baselineRepo, committedP
 
 /**
  * Determine whether a candidate repository has legitimate activity in the current chat session.
- * Prevents untouched sibling repositories (including those on old feature branches) from leaking.
+ * Prevents untouched sibling repositories (including those on old feature branches) from leaking,
+ * while ensuring a Space opened directly on a single repository (`inWorkspaceRoot`) remains attributed
+ * even when Windows ConPTY terminals do not report `pane.cwd`.
  */
 export function evaluateRepoSessionActivity({
   hasNewWorkingEdit = false,
   inPaneCwd = false,
+  inWorkspaceRoot = false,
   inSessionRepos = false,
   startHead = "",
   headHash = "",
   repoMatchesTranscript = false,
 } = {}) {
-  if (hasNewWorkingEdit || inPaneCwd || inSessionRepos) return true;
+  if (hasNewWorkingEdit || inPaneCwd || inWorkspaceRoot || inSessionRepos) return true;
   const headMoved = Boolean(startHead && headHash && startHead !== headHash);
   return Boolean(headMoved && repoMatchesTranscript);
 }
 
 function normBaselineRoot(p) {
   return String(p || "").replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function isWindowsDrivePath(normPath) {
+  return /^[a-zA-Z]:\//.test(String(normPath || "")) || /^[a-zA-Z]:$/.test(String(normPath || ""));
+}
+
+/**
+ * Look up a repository entry inside `baseline.repos`, matching exact normalized paths first
+ * and falling back to case-insensitive matching on Windows (or Windows drive paths).
+ */
+export function findBaselineRepoEntry(reposMap, repoRoot, isWindows = false) {
+  if (!reposMap || typeof reposMap !== "object" || !repoRoot) return null;
+  const norm = normBaselineRoot(repoRoot);
+  if (!norm) return null;
+  if (Object.prototype.hasOwnProperty.call(reposMap, norm) && reposMap[norm]) {
+    return reposMap[norm];
+  }
+  const caseInsensitive = Boolean(isWindows) || isWindowsDrivePath(norm);
+  if (!caseInsensitive) return null;
+  const lowerTarget = norm.toLowerCase();
+  for (const [k, v] of Object.entries(reposMap)) {
+    if (v && normBaselineRoot(k).toLowerCase() === lowerTarget) {
+      return v;
+    }
+  }
+  return null;
 }
 
 function normBaselineRel(p) {
@@ -993,7 +1022,11 @@ export function getDiskSessionBaselinePath(appHomeDir, tabId) {
 function baselineMatchesWorkspace(baseline, workspaceRoot) {
   const normWs = normBaselineRoot(workspaceRoot);
   if (!normWs || !baseline?.workspaceRoot) return true;
-  return baseline.workspaceRoot === normWs;
+  if (baseline.workspaceRoot === normWs) return true;
+  if (isWindowsDrivePath(normWs) && isWindowsDrivePath(baseline.workspaceRoot)) {
+    return baseline.workspaceRoot.toLowerCase() === normWs.toLowerCase();
+  }
+  return false;
 }
 
 async function readBaselineJsonFile(filePath, fsDeps = fsPromises) {
@@ -1301,7 +1334,7 @@ export function filterUnbaselinedRepoEntries(entries, sessionStartedAt, opts = {
 }
 
 export const READ_GIT_FLAGS = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
-export const BASE_BRANCH_NAMES = new Set(["main", "master", "development", "develop", "ci", "HEAD", ""]);
+export const BASE_BRANCH_NAMES = new Set(["main", "master", "development", "develop", "release", "ci", "HEAD", ""]);
 export const MAX_UNTRACKED_COUNT_BYTES = 400_000;
 
 /**
@@ -1479,18 +1512,45 @@ const ORIGIN_BASE_REF_PRIORITY = [
   "origin/develop",
   "origin/main",
   "origin/master",
+  "origin/release",
   "origin/ci",
   "development",
   "develop",
   "main",
   "master",
+  "release",
   "ci",
 ];
 
 /**
+ * Infer preferred target base refs from Gitflow-style branch path segments
+ * (e.g. `user/prod/TICKET` -> `origin/master`/`origin/main`, `user/dev/TICKET` -> `origin/development`,
+ * `user/release/TICKET` -> `origin/release`, `user/ci/TICKET` -> `origin/ci`).
+ */
+export function inferBranchBaseHintRefs(branch) {
+  const clean = String(branch || "").trim();
+  if (!clean || BASE_BRANCH_NAMES.has(clean)) return [];
+  if (/(?:^|\/)(?:prod|production|hotfix|master|main)(?:\/|$)/i.test(clean)) {
+    return ["origin/master", "origin/main", "master", "main"];
+  }
+  if (/(?:^|\/)(?:dev|develop|development)(?:\/|$)/i.test(clean)) {
+    return ["origin/development", "origin/develop", "development", "develop"];
+  }
+  if (/(?:^|\/)(?:release|staging|stage)(?:\/|$)/i.test(clean)) {
+    return ["origin/release", "release"];
+  }
+  if (/(?:^|\/)ci(?:\/|$)/i.test(clean)) {
+    return ["origin/ci", "ci"];
+  }
+  return [];
+}
+
+/**
  * Resolve a repository's lock-free origin/base comparison reference (`merge-base HEAD <baseRef>`),
- * prioritizing `origin/HEAD`, then remote base branches, then local base branches, with automatic
- * fallback to remote upstream or session `startHead` when working directly on a base branch.
+ * prioritizing explicit Gitflow branch hints, `origin/HEAD`, closest ancestor across multi-base
+ * remote branches (`origin/development`, `origin/main`, `origin/master`, `origin/release`, `origin/ci`),
+ * then local base branches, with automatic fallback to remote upstream or session `startHead`
+ * when working directly on a base branch.
  */
 export async function resolveRepoBaseRefWithExec(root, branch, headHash, on, execFn, opts = {}) {
   const readFlags = opts.readFlags || READ_GIT_FLAGS;
@@ -1508,18 +1568,18 @@ export async function resolveRepoBaseRefWithExec(root, branch, headHash, on, exe
     "refs/remotes/origin/develop",
     "refs/remotes/origin/main",
     "refs/remotes/origin/master",
+    "refs/remotes/origin/release",
     "refs/remotes/origin/ci",
     "refs/heads/development",
     "refs/heads/develop",
     "refs/heads/main",
     "refs/heads/master",
+    "refs/heads/release",
     "refs/heads/ci",
   ];
   const cleanBranch = String(branch || "").trim();
-  if (cleanBranch && cleanBranch !== "HEAD" && !BASE_BRANCH_NAMES.has(cleanBranch)) {
-    // Only add origin/<branch> when current branch itself is a base branch — feature branches must
-    // stay anchored to the origin target branch (so pushing a feature branch never hides changes).
-  } else if (cleanBranch && cleanBranch !== "HEAD") {
+  const onBaseBranch = Boolean(cleanBranch && cleanBranch !== "HEAD" && BASE_BRANCH_NAMES.has(cleanBranch));
+  if (onBaseBranch) {
     const remoteSame = `refs/remotes/origin/${cleanBranch}`;
     if (!forEachArgs.includes(remoteSame)) forEachArgs.push(remoteSame);
   }
@@ -1529,15 +1589,6 @@ export async function resolveRepoBaseRefWithExec(root, branch, headHash, on, exe
     git(forEachArgs),
   ]);
 
-  const candidates = [];
-  const seen = new Set();
-  const pushCand = (ref) => {
-    const r = String(ref || "").trim();
-    if (!r || seen.has(r)) return;
-    seen.add(r);
-    candidates.push(r);
-  };
-
   const avail = new Set(
     (refsRes?.code === 0 ? String(refsRes.stdout || "") : "")
       .split(/\r?\n/)
@@ -1545,44 +1596,133 @@ export async function resolveRepoBaseRefWithExec(root, branch, headHash, on, exe
       .filter(Boolean),
   );
 
-  // If currently working directly on a base branch with a matching `origin/<branch>`, check it FIRST
-  // (before `origin/HEAD`), so sessions on `development` never flood with `origin/main..development`.
-  if (cleanBranch && cleanBranch !== "HEAD" && BASE_BRANCH_NAMES.has(cleanBranch)) {
-    const remoteCurrent = `origin/${cleanBranch}`;
-    if (avail.has(remoteCurrent)) pushCand(remoteCurrent);
-  }
-
-  if (symRes?.code === 0 && symRes.stdout) {
+  const symShortRef = (() => {
+    if (symRes?.code !== 0 || !symRes.stdout) return "";
     const fullRef = String(symRes.stdout).trim();
-    const shortRef = fullRef.startsWith("refs/remotes/") ? fullRef.slice("refs/remotes/".length) : fullRef;
-    pushCand(shortRef);
-  }
-
-  for (const ref of ORIGIN_BASE_REF_PRIORITY) {
-    if (ref.startsWith("origin/") && avail.has(ref)) pushCand(ref);
-  }
-
-  // Local-only repo (no matching remote base refs): if directly on a base branch, anchor to it before
-  // other local base branches so e.g. local `main` does not diff against a stale local `development`.
-  if (candidates.length === 0 && cleanBranch && cleanBranch !== "HEAD" && BASE_BRANCH_NAMES.has(cleanBranch)) {
-    if (avail.has(cleanBranch)) pushCand(cleanBranch);
-  }
-  for (const ref of ORIGIN_BASE_REF_PRIORITY) {
-    if (!ref.startsWith("origin/") && avail.has(ref)) pushCand(ref);
-  }
+    return fullRef.startsWith("refs/remotes/") ? fullRef.slice("refs/remotes/".length) : fullRef;
+  })();
 
   let matchedCandidateRef = "";
-  for (const cand of candidates) {
-    const mb = await git(["merge-base", "HEAD", cand]);
-    const mbHash = mb?.code === 0 ? String(mb.stdout || "").trim() : "";
-    if (!mbHash) continue;
-    if (!matchedCandidateRef) matchedCandidateRef = cand;
-    if (mbHash !== cleanHead) {
-      return { hasHead: true, baseRef: cand, baseHash: mbHash, baseSource: "base" };
+
+  if (onBaseBranch) {
+    // Working directly on a base branch: anchor strictly to `origin/<branch>` (or `origin/HEAD` /
+    // local `<branch>`) so working on `development` never floods with `origin/master..development`.
+    const baseCands = [];
+    const seenBase = new Set();
+    const pushBase = (ref) => {
+      const r = String(ref || "").trim();
+      if (!r || seenBase.has(r)) return;
+      seenBase.add(r);
+      baseCands.push(r);
+    };
+    const remoteCurrent = `origin/${cleanBranch}`;
+    if (avail.has(remoteCurrent)) pushBase(remoteCurrent);
+    if (symShortRef) pushBase(symShortRef);
+    for (const ref of ORIGIN_BASE_REF_PRIORITY) {
+      if (ref.startsWith("origin/") && avail.has(ref)) pushBase(ref);
     }
-    // If `cand` resolved to `HEAD` (e.g. freshly created branch or working on base branch matching remote),
-    // keep checking if another preferred remote base differs — otherwise stop on the primary candidate.
-    break;
+    if (baseCands.length === 0 && avail.has(cleanBranch)) pushBase(cleanBranch);
+    for (const ref of ORIGIN_BASE_REF_PRIORITY) {
+      if (!ref.startsWith("origin/") && avail.has(ref)) pushBase(ref);
+    }
+
+    for (const cand of baseCands) {
+      const mb = await git(["merge-base", "HEAD", cand]);
+      const mbHash = mb?.code === 0 ? String(mb.stdout || "").trim() : "";
+      if (!mbHash) continue;
+      if (!matchedCandidateRef) matchedCandidateRef = cand;
+      if (mbHash !== cleanHead) {
+        return { hasHead: true, baseRef: cand, baseHash: mbHash, baseSource: "base" };
+      }
+      break;
+    }
+  } else {
+    // Feature branch: prefer remote base refs when available, else local base refs.
+    const remoteCands = [];
+    const localCands = [];
+    const seen = new Set();
+    const pushCand = (ref, list) => {
+      const r = String(ref || "").trim();
+      if (!r || seen.has(r)) return;
+      seen.add(r);
+      list.push(r);
+    };
+
+    const hintRefs = inferBranchBaseHintRefs(cleanBranch);
+    const hintSet = new Set(hintRefs);
+
+    for (const ref of hintRefs) {
+      if (ref.startsWith("origin/") && (avail.has(ref) || ref === symShortRef)) pushCand(ref, remoteCands);
+    }
+    if (symShortRef) pushCand(symShortRef, remoteCands);
+    for (const ref of ORIGIN_BASE_REF_PRIORITY) {
+      if (ref.startsWith("origin/") && avail.has(ref)) pushCand(ref, remoteCands);
+    }
+
+    for (const ref of hintRefs) {
+      if (!ref.startsWith("origin/") && avail.has(ref)) pushCand(ref, localCands);
+    }
+    for (const ref of ORIGIN_BASE_REF_PRIORITY) {
+      if (!ref.startsWith("origin/") && avail.has(ref)) pushCand(ref, localCands);
+    }
+
+    const activeTier = remoteCands.length > 0 ? remoteCands : localCands;
+    if (activeTier.length > 0) {
+      const mbResults = await Promise.all(
+        activeTier.map(async (cand, idx) => {
+          const mb = await git(["merge-base", "HEAD", cand]);
+          const mbHash = mb?.code === 0 ? String(mb.stdout || "").trim() : "";
+          return { cand, idx, mbHash, hinted: hintSet.has(cand) };
+        }),
+      );
+      const valid = mbResults.filter((r) => Boolean(r.mbHash));
+      if (valid.length > 0) {
+        matchedCandidateRef = valid[0].cand;
+
+        // 1. Explicit Gitflow branch hint (e.g. `user/prod/TICKET` -> `origin/master`):
+        //    Honor the hinted target base even if `HEAD` was already merged into another base branch
+        //    such as `origin/development`.
+        const hintedValid = valid.filter((r) => r.hinted);
+        if (hintedValid.length > 0) {
+          const hintedAhead = hintedValid.find((r) => r.mbHash !== cleanHead);
+          if (hintedAhead) {
+            return { hasHead: true, baseRef: hintedAhead.cand, baseHash: hintedAhead.mbHash, baseSource: "base" };
+          }
+          // Branch is already at/merged into its own hinted target base -> fall through to startHead/HEAD.
+        } else {
+          // 2. Unhinted feature branch: if `HEAD` is already at or an ancestor of any base branch
+          //    (e.g. freshly cut off `origin/development` with 0 commits), do NOT diff against an older base.
+          const mergedIntoBase = valid.find((r) => r.mbHash === cleanHead);
+          if (!mergedIntoBase) {
+            const uniqueHashes = Array.from(new Set(valid.map((r) => r.mbHash)));
+            if (uniqueHashes.length === 1) {
+              return { hasHead: true, baseRef: valid[0].cand, baseHash: valid[0].mbHash, baseSource: "base" };
+            }
+            // Multiple distinct merge-bases (e.g. `origin/development` vs `origin/master`):
+            // pick the closest ancestor (smallest positive commit count in `<mbHash>..HEAD`).
+            const distEntries = await Promise.all(
+              uniqueHashes.map(async (mbHash) => {
+                const cnt = await git(["rev-list", "--count", `${mbHash}..HEAD`]);
+                const n = cnt?.code === 0 ? parseInt(String(cnt.stdout || "").trim(), 10) : NaN;
+                return [mbHash, Number.isFinite(n) && n > 0 ? n : Number.POSITIVE_INFINITY];
+              }),
+            );
+            const distByHash = new Map(distEntries);
+            let best = valid[0];
+            let bestDist = distByHash.get(best.mbHash) ?? Number.POSITIVE_INFINITY;
+            for (let i = 1; i < valid.length; i += 1) {
+              const cand = valid[i];
+              const d = distByHash.get(cand.mbHash) ?? Number.POSITIVE_INFINITY;
+              if (d < bestDist) {
+                best = cand;
+                bestDist = d;
+              }
+            }
+            return { hasHead: true, baseRef: best.cand, baseHash: best.mbHash, baseSource: "base" };
+          }
+        }
+      }
+    }
   }
 
   // Fallback for commits made directly on a base branch (including pushed commits or local-only repos):

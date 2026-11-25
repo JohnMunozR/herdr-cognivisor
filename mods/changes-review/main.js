@@ -29,6 +29,7 @@ import {
   buildReviewedFileKey,
   partitionSessionUnifiedEntries,
   evaluateRepoSessionActivity,
+  findBaselineRepoEntry,
   normalizeSessionBaseline,
   getDiskSessionBaselinePath,
   readDiskSessionBaseline,
@@ -84,6 +85,15 @@ const REVIEW_COMPOSER_EST_HEIGHT = 156;
 
 function readPlainObject(val) {
   return val && typeof val === "object" && !Array.isArray(val) ? val : {};
+}
+
+function safeShared(key, fallback = null) {
+  try {
+    const val = shared(key);
+    return val === undefined ? fallback : val;
+  } catch {
+    return fallback;
+  }
 }
 
 function getSafeAppHome() {
@@ -195,11 +205,14 @@ async function peekExistingSessionBaseline(sessionTabId, workspaceRoot, tabTermA
   const appHomeDir = getSafeAppHome();
   const diskMtime = appHomeDir ? await getDiskBaselineMtimeMs(appHomeDir, sessionTabId) : 0;
 
+  const isWinWs = /^[a-zA-Z]:\//.test(normWs) || /^[a-zA-Z]:$/.test(normWs);
+  const wsMatches = (a, b) => !a || !b || normCmpStr(a, isWinWs) === normCmpStr(b, isWinWs);
+
   const cachedEntry = getCachedSessionBaselineEntry(sessionTabId);
   const cached = normalizeSessionBaseline(cachedEntry?.baseline);
   if (
     cached &&
-    (!normWs || !cached.workspaceRoot || cached.workspaceRoot === normWs) &&
+    wsMatches(cached.workspaceRoot, normWs) &&
     (cached.rev || 0) >= flowRev &&
     (!diskMtime || !cachedEntry?.mtimeMs || diskMtime <= cachedEntry.mtimeMs)
   ) {
@@ -210,7 +223,7 @@ async function peekExistingSessionBaseline(sessionTabId, workspaceRoot, tabTermA
   const existing = normalizeSessionBaseline(rawExisting);
   if (
     existing &&
-    (!normWs || !existing.workspaceRoot || existing.workspaceRoot === normWs) &&
+    wsMatches(existing.workspaceRoot, normWs) &&
     (existing.rev || 0) >= flowRev &&
     !diskMtime
   ) {
@@ -253,7 +266,8 @@ async function peekExistingSessionBaseline(sessionTabId, workspaceRoot, tabTermA
 async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTermAddrs, workspaceRoot, preloaded = null) {
   if (!sessionTabId) return { baseline: null, isFresh: false, anchored: false, dirtyChanged: false, primaryBranch: "" };
   const normWs = normPathStr(workspaceRoot || "");
-  const primaryService = (serviceResults || []).find((r) => normPathStr(r.service?.root) === normWs)
+  const isWinWs = /^[a-zA-Z]:\//.test(normWs) || /^[a-zA-Z]:$/.test(normWs);
+  const primaryService = (serviceResults || []).find((r) => normCmpStr(r.service?.root, isWinWs) === normCmpStr(normWs, isWinWs))
     || (serviceResults || []).find((r) => r.branch)
     || null;
   const primaryBranch = String(primaryService?.branch || "").trim();
@@ -314,7 +328,7 @@ function location() {
   const space = (spaces() || []).find((s) => s.active) || null;
   const f = focused();
   const allPanes = panes() || [];
-  const storedAgentTabs = readPlainObject(shared("cognivisor.spaceAgentTabs"));
+  const storedAgentTabs = readPlainObject(safeShared("cognivisor.spaceAgentTabs", {}));
   const sessionTabId = resolveSessionAgentTabId(space, allPanes, storedAgentTabs);
   const spaceTabs = new Set((space?.tabs ?? []).map((t) => t.id));
   const spacePanes = allPanes.filter((p) => spaceTabs.has(p.tab));
@@ -642,7 +656,7 @@ function readFlows() {
 }
 
 function readAllActiveDiffs() {
-  return readPlainObject(shared("changes-review.activeDiff"));
+  return readPlainObject(safeShared("changes-review.activeDiff", {}));
 }
 
 function readActiveDiff(spaceId) {
@@ -721,7 +735,7 @@ function getActiveSpaceAndTab() {
   const allPanes = panes() || [];
   const activeSpace = allSpaces.find((s) => s.active) || null;
   const activeTab = activeSpace?.tabs?.find((t) => t.active) || null;
-  const storedAgentTabs = readPlainObject(shared("cognivisor.spaceAgentTabs"));
+  const storedAgentTabs = readPlainObject(safeShared("cognivisor.spaceAgentTabs", {}));
   const sessionTabId = resolveSessionAgentTabId(activeSpace, allPanes, storedAgentTabs);
   return { activeSpace, activeTab, activeTabId: activeTab?.id || null, sessionTabId };
 }
@@ -843,6 +857,7 @@ export default class ChangesReview extends View {
     this.hiddenPreExistingCount = 0;
     this.lastCandidateRoots = [];
     this.lastPrimaryBranch = "";
+    this.lastRefreshSummarySig = "";
 
     // Git commit input
     this.message = "";
@@ -915,7 +930,7 @@ export default class ChangesReview extends View {
     const vp = props() || this.viewerProps || {};
     const allSpaces = spaces() || [];
     const allPanes = panes() || [];
-    const storedAgentTabs = readPlainObject(shared("cognivisor.spaceAgentTabs"));
+    const storedAgentTabs = readPlainObject(safeShared("cognivisor.spaceAgentTabs", {}));
 
     if (this.isViewerMode()) {
       const targetSpaceId = vp.spaceId || null;
@@ -958,7 +973,7 @@ export default class ChangesReview extends View {
     if (!activeTab?.id) return;
     const hasTerminal = allPanes.some((p) => p.tab === activeTab.id && Boolean(p.terminal));
     if (!hasTerminal) return;
-    const prev = readPlainObject(shared("cognivisor.spaceAgentTabs"));
+    const prev = readPlainObject(safeShared("cognivisor.spaceAgentTabs", {}));
     if (prev[activeSpace.id] === activeTab.id) return;
     setShared("cognivisor.spaceAgentTabs", { ...prev, [activeSpace.id]: activeTab.id });
   }
@@ -995,14 +1010,14 @@ export default class ChangesReview extends View {
 
   getSessionReviews(ctx = null) {
     const c = ctx || this.getSessionContext();
-    const allNotes = readPlainObject(shared("cognivisor.reviewNotes"));
+    const allNotes = readPlainObject(safeShared("cognivisor.reviewNotes", {}));
     const list = allNotes[c.notesKey];
     return Array.isArray(list) ? list : [];
   }
 
   saveSessionReviews(nextReviews, ctx = null) {
     const c = ctx || this.getSessionContext();
-    const prevAll = readPlainObject(shared("cognivisor.reviewNotes"));
+    const prevAll = readPlainObject(safeShared("cognivisor.reviewNotes", {}));
     const safeList = Array.isArray(nextReviews) ? nextReviews : [];
     this.reviews = safeList;
     setShared("cognivisor.reviewNotes", { ...prevAll, [c.notesKey]: safeList });
@@ -1844,6 +1859,7 @@ export default class ChangesReview extends View {
       this.hiddenPreExistingCount = 0;
       this.lastCandidateRoots = [];
       this.lastPrimaryBranch = "";
+      this.lastRefreshSummarySig = "";
     }
 
     this.isWindows = !on && this.hostIsWindows;
@@ -1856,7 +1872,8 @@ export default class ChangesReview extends View {
     this.hasLoadedOnce = true;
     const { activeSpace, sessionTabId } = getActiveSpaceAndTab();
     const normWs = normPathStr(workspaceRoot);
-    const bus = !force ? shared("cognivisor.services") : null;
+    const cmpWs = normCmpStr(workspaceRoot, this.isWindows);
+    const bus = !force ? safeShared("cognivisor.services", null) : null;
     if (typeof bus?.ts === "number") {
       this.lastConsumedBusTs = bus.ts;
       this.lastConsumedBusSig = bus.sig || String(bus.ts);
@@ -1868,7 +1885,7 @@ export default class ChangesReview extends View {
       bus &&
       typeof bus.ts === "number" &&
       (Date.now() - bus.ts) < BUS_MAX_AGE_MS &&
-      normPathStr(bus.workspaceRoot) === normWs &&
+      normCmpStr(bus.workspaceRoot, this.isWindows) === cmpWs &&
       (bus.tabId || null) === (sessionTabId || null) &&
       (bus.on || null) === (on || null) &&
       Array.isArray(bus.services)
@@ -1945,8 +1962,7 @@ export default class ChangesReview extends View {
           const batch = candidateServices.slice(i, i + SNAPSHOT_CONCURRENCY);
           const batchRes = await Promise.all(
             batch.map((service) => {
-              const normRoot = normPathStr(service?.root);
-              const baselineRepo = normRoot ? (preloadedBaseline?.baseline?.repos?.[normRoot] || null) : null;
+              const baselineRepo = findBaselineRepoEntry(preloadedBaseline?.baseline?.repos, service?.root, isWindows);
               return loadServiceSessionSnapshot(service, on, { baselineRepo });
             })
           );
@@ -1955,10 +1971,20 @@ export default class ChangesReview extends View {
         }
 
         const erroredServiceIds = new Set();
+        let firstSnapshotError = null;
         for (const res of serviceResults) {
-          if (res.error && res.service?.id) {
-            erroredServiceIds.add(res.service.id);
+          if (res.error) {
+            if (!firstSnapshotError) firstSnapshotError = res;
+            if (res.service?.id) erroredServiceIds.add(res.service.id);
           }
+        }
+        if (firstSnapshotError) {
+          this.logger?.error("review.snapshotFailed", firstSnapshotError.error, {
+            serviceId: firstSnapshotError.service?.id || "",
+            serviceName: firstSnapshotError.service?.name || "",
+            erroredCount: erroredServiceIds.size,
+            candidatesCount: serviceResults.length,
+          }, cx);
         }
 
         const baselineInit = sessionTabId
@@ -1978,7 +2004,9 @@ export default class ChangesReview extends View {
           const flowsNow = safeReadFlows();
           const curFlowNow = readPlainObject(flowsNow[sessionTabId]);
           const prevSessionRepos = new Set(
-            Array.isArray(curFlowNow.sessionRepos) ? curFlowNow.sessionRepos.map((r) => normPathStr(r)).filter(Boolean) : []
+            Array.isArray(curFlowNow.sessionRepos)
+              ? curFlowNow.sessionRepos.map((r) => normCmpStr(r, isWindows)).filter(Boolean)
+              : []
           );
           const normPaneCwds = tabPaneCwds.map((c) => normPathStr(c)).filter(Boolean);
 
@@ -1986,10 +2014,12 @@ export default class ChangesReview extends View {
           if (!baselineInit.isFresh) {
             for (const res of serviceResults) {
               const normRoot = normPathStr(res.service?.root);
+              const cmpRoot = normCmpStr(normRoot, isWindows);
               if (!normRoot || res.error) continue;
-              const inPaneCwd = normPaneCwds.some((c) => c === normRoot || c.startsWith(normRoot + "/"));
-              if (prevSessionRepos.has(normRoot) || inPaneCwd) continue;
-              const bRepo = sessionBaseline.repos?.[normRoot] || null;
+              const inPaneCwd = normPaneCwds.some((c) => isSameOrChildPath(c, normRoot, isWindows));
+              const inWorkspaceRoot = Boolean(cmpWs && cmpRoot === cmpWs);
+              if (prevSessionRepos.has(cmpRoot) || inPaneCwd || inWorkspaceRoot) continue;
+              const bRepo = findBaselineRepoEntry(sessionBaseline.repos, normRoot, isWindows);
               const headMoved = Boolean(bRepo?.startHead && res.headHash && bRepo.startHead !== res.headHash);
               const unbaselinedNoMtime = !bRepo && (res.workingFiles || []).some((f) => !Number(f?.mtimeMs || 0));
               if (headMoved || unbaselinedNoMtime) {
@@ -2020,11 +2050,13 @@ export default class ChangesReview extends View {
               continue;
             }
             const normRoot = normPathStr(res.service?.root);
-            let baselineRepo = normRoot ? (sessionBaseline.repos?.[normRoot] || null) : null;
+            const cmpRoot = normCmpStr(normRoot, isWindows);
+            let baselineRepo = findBaselineRepoEntry(sessionBaseline.repos, normRoot, isWindows);
             const rawUnifiedFiles = Array.isArray(res.files) ? res.files : [];
             const rawWorkingFiles = Array.isArray(res.workingFiles) ? res.workingFiles : [];
-            const inPaneCwd = Boolean(normRoot && normPaneCwds.some((c) => c === normRoot || c.startsWith(normRoot + "/")));
-            const inSessionRepos = Boolean(normRoot && prevSessionRepos.has(normRoot));
+            const inPaneCwd = Boolean(normRoot && normPaneCwds.some((c) => isSameOrChildPath(c, normRoot, isWindows)));
+            const inWorkspaceRoot = Boolean(cmpRoot && cmpWs && cmpRoot === cmpWs);
+            const inSessionRepos = Boolean(cmpRoot && prevSessionRepos.has(cmpRoot));
             const matchedTranscript = repoMatchesTranscript(res.service, rawUnifiedFiles, sessionTranscript);
 
             let sessionFiles = [];
@@ -2047,7 +2079,7 @@ export default class ChangesReview extends View {
               const workingPart = partitionSessionUnifiedEntries(rawWorkingFiles, baselineRepo, null, startedAt);
               visibleWorkingFiles = workingPart.visible;
             } else {
-              const isAttributed = Boolean(inPaneCwd || inSessionRepos || matchedTranscript);
+              const isAttributed = Boolean(inPaneCwd || inWorkspaceRoot || inSessionRepos || matchedTranscript);
               const unbaselinedRes = filterUnbaselinedRepoEntries(rawWorkingFiles, startedAt, { isAttributed });
               visibleWorkingFiles = unbaselinedRes.sessionFiles;
               const newBaselineRepo = {
@@ -2069,6 +2101,7 @@ export default class ChangesReview extends View {
             const hasActivity = evaluateRepoSessionActivity({
               hasNewWorkingEdit,
               inPaneCwd,
+              inWorkspaceRoot,
               inSessionRepos,
               startHead: baselineRepo?.startHead || "",
               headHash: res.headHash || "",
@@ -2124,7 +2157,31 @@ export default class ChangesReview extends View {
           }
           mergeSessionBaselineIntoFlow(sessionTabId, sessionBaseline, sessionRepos, false, diskMtime);
         } else {
+          // No terminal session tab resolved yet: still surface non-sibling workspace repository diffs
+          // so opening Review before launching a terminal tab never shows a false empty state.
           this.hiddenPreExistingCount = 0;
+          for (const res of serviceResults) {
+            if (res.error || res.service?.isSibling) {
+              res.touched = false;
+              continue;
+            }
+            const rawUnifiedFiles = Array.isArray(res.files) ? res.files : [];
+            const rawWorkingFiles = Array.isArray(res.workingFiles) ? res.workingFiles : [];
+            const dirtyPaths = rawWorkingFiles.map((w) => w.path).filter(Boolean);
+            const stagePaths = selectPathsToStageForCommit(rawWorkingFiles);
+            res.allUnifiedFiles = rawUnifiedFiles;
+            res.files = rawUnifiedFiles;
+            if (res.service) {
+              res.service.dirtyPaths = dirtyPaths;
+              res.service.stagePaths = stagePaths;
+              res.service.workingCount = dirtyPaths.length;
+              res.service.unifiedCount = rawUnifiedFiles.length;
+            }
+            res.touched = rawUnifiedFiles.length > 0;
+          }
+          touchedResults = serviceResults
+            .filter((r) => r.touched)
+            .sort((a, b) => String(a.service?.name || "").localeCompare(String(b.service?.name || "")));
         }
         const services = touchedResults.map((r) => r.service);
 
@@ -2134,8 +2191,8 @@ export default class ChangesReview extends View {
 
         // Only publish cognivisor.services when sessionTabId is resolved (never wipe bus on null tab).
         if (sessionTabId) {
-          const existingBus = shared("cognivisor.services");
-          const sameBusWorkspace = Boolean(existingBus && normPathStr(existingBus.workspaceRoot) === normWs);
+          const existingBus = safeShared("cognivisor.services", null);
+          const sameBusWorkspace = Boolean(existingBus && normCmpStr(existingBus.workspaceRoot, isWindows) === cmpWs);
           const nextCandidates = (sameBusWorkspace && Array.isArray(existingBus.candidates))
             ? existingBus.candidates
             : candidateServices.map((s) => ({
@@ -2147,7 +2204,7 @@ export default class ChangesReview extends View {
                 branch: s.branch || "",
               }));
           const servicesSig = sessionTabId + "::" + normWs + "::" + nextCandidates.length + "::" + services.map((s) => `${normPathStr(s.root)}@${s.branch || ""}:${s.workingCount || 0}:${s.aheadCount || 0}`).join(",");
-          const existingBusSig = existingBus && normPathStr(existingBus.workspaceRoot) === normWs && (existingBus.tabId || null) === sessionTabId
+          const existingBusSig = existingBus && sameBusWorkspace && (existingBus.tabId || null) === sessionTabId
             ? (existingBus.sig || (sessionTabId + "::" + normWs + "::" + (existingBus.candidates?.length ?? -1) + "::" + (existingBus.services || []).map((s) => `${normPathStr(s.root)}@${s.branch || ""}:${s.workingCount || 0}:${s.aheadCount || 0}`).join(",")))
             : null;
           if ((!usingBusCandidates || force || servicesSig !== existingBusSig) && servicesSig !== this.lastPublishedServicesSig) {
@@ -2220,7 +2277,28 @@ export default class ChangesReview extends View {
         this.watch(candidateServices.length > 0 ? candidateServices : [{ root: workspaceRoot }], cx);
 
         this.limited = this.files.length > 1000;
-        this.error = null;
+        const allReposErrored = Boolean(firstSnapshotError && serviceResults.length > 0 && erroredServiceIds.size === serviceResults.length);
+        this.error = allReposErrored
+          ? `Failed to inspect git changes: ${firstSnapshotError.error?.message || firstSnapshotError.error}`
+          : null;
+        const primarySnap = serviceResults.find((r) => normCmpStr(r.service?.root, isWindows) === cmpWs) || null;
+        const refreshSummarySig = `${candidateServices.length}|${touchedResults.length}|${this.files.length}|${this.hiddenPreExistingCount}|${erroredServiceIds.size}|${Boolean(sessionTabId)}|${primarySnap?.baseRef || ""}|${primarySnap?.baseSource || ""}`;
+        if (refreshSummarySig !== this.lastRefreshSummarySig) {
+          this.lastRefreshSummarySig = refreshSummarySig;
+          this.logger?.info("review.refreshSummary", {
+            candidatesCount: candidateServices.length,
+            touchedCount: touchedResults.length,
+            filesCount: this.files.length,
+            hiddenPreExistingCount: this.hiddenPreExistingCount,
+            erroredCount: erroredServiceIds.size,
+            hasSessionTab: Boolean(sessionTabId),
+            paneCwdCount: tabPaneCwds.length,
+            primaryBranch: primarySnap?.branch || "",
+            primaryBaseRef: primarySnap?.baseRef || "",
+            primaryBaseSource: primarySnap?.baseSource || "",
+            showAllWorkingChanges: Boolean(this.showAllWorkingChanges),
+          }, cx);
+        }
         const spaceId = activeSpace?.id || "default";
         const revTab = findReviewTabInSpace(spaceId);
         const curDiff = revTab ? readActiveDiff(spaceId) : null;
@@ -3875,7 +3953,7 @@ export default class ChangesReview extends View {
 
   renderPanel(cx) {
     const visible = isChangesVisible();
-    const bus = shared("cognivisor.services");
+    const bus = safeShared("cognivisor.services", null);
     const busTs = typeof bus?.ts === "number" ? bus.ts : 0;
     const busSig = bus?.sig || (busTs > 0 ? String(busTs) : "");
     const busChanged = Boolean(busSig && busSig !== this.lastConsumedBusSig);
@@ -3899,7 +3977,7 @@ export default class ChangesReview extends View {
     const curSpace = allSpaces.find((s) => s.active);
     const curTab = (curSpace?.tabs || []).find((t) => t.active);
     if (curSpace?.id && curTab?.id && allPanes.some((p) => p.tab === curTab.id && Boolean(p.terminal))) {
-      const storedAgentTabs = readPlainObject(shared("cognivisor.spaceAgentTabs"));
+      const storedAgentTabs = readPlainObject(safeShared("cognivisor.spaceAgentTabs", {}));
       if (storedAgentTabs[curSpace.id] !== curTab.id) {
         this.scheduleAgentTabSync(cx);
       }

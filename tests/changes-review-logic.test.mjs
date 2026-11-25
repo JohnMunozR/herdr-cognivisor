@@ -35,6 +35,7 @@ import {
   partitionSessionWorkingEntries,
   partitionSessionUnifiedEntries,
   evaluateRepoSessionActivity,
+  findBaselineRepoEntry,
   normalizeGitStatusMark,
   statFileEntry,
   readDiskSessionBaseline,
@@ -53,6 +54,7 @@ import {
   countUntrackedFileLines,
   parseNameStatusZ,
   parseNumstatZ,
+  inferBranchBaseHintRefs,
   resolveRepoBaseRefWithExec,
   collectServiceSessionSnapshot,
   resolveReviewMarkdownSourceSpec,
@@ -1872,5 +1874,130 @@ describe("changes-review review-logic", () => {
     const brandNewUnified = snap.files.find((f) => f.path === "brand-new.ts");
     assert.equal(brandNewUnified?.fresh, true);
     assert.equal(brandNewUnified?.add, 2);
+  });
+
+  test("regression: Windows single-repo workspace attribution without pane.cwd, case-insensitive baseline lookup, and git-history tab preservation", async () => {
+    // 1. Single-repo Space opened on C:\Dev\Global66\ms-beneficiary where Windows ConPTY reports no pane.cwd
+    //    and all changes are committed (workingCount = 0) must still be attributed via inWorkspaceRoot.
+    assert.equal(
+      evaluateRepoSessionActivity({
+        hasNewWorkingEdit: false,
+        inPaneCwd: false,
+        inWorkspaceRoot: true,
+        inSessionRepos: false,
+        startHead: "aaaa",
+        headHash: "aaaa",
+        repoMatchesTranscript: false,
+      }),
+      true,
+    );
+    // Sibling / child repo without pane.cwd or edits remains strictly excluded.
+    assert.equal(
+      evaluateRepoSessionActivity({
+        hasNewWorkingEdit: false,
+        inPaneCwd: false,
+        inWorkspaceRoot: false,
+        inSessionRepos: false,
+        startHead: "aaaa",
+        headHash: "aaaa",
+        repoMatchesTranscript: false,
+      }),
+      false,
+    );
+
+    // 2. Case-insensitive baseline repo lookup and disk workspace matching on Windows drive paths
+    const reposMap = {
+      "C:/Dev/Global66/ms-beneficiary": { startHead: "abc123", dirtyFiles: { "a.java": { status: "M", sig: "10:1" } } },
+    };
+    assert.deepEqual(
+      findBaselineRepoEntry(reposMap, "c:\\dev\\global66\\ms-beneficiary\\", true),
+      reposMap["C:/Dev/Global66/ms-beneficiary"],
+    );
+    assert.equal(findBaselineRepoEntry(reposMap, "/ws/Other", false), null);
+
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const appHomeDir = await fs.mkdtemp(path.join(os.tmpdir(), "herdr-win-case-baseline-"));
+    try {
+      const saved = {
+        version: 1,
+        rev: 1,
+        startedAt: 1700000000000,
+        workspaceRoot: "C:/Dev/Global66/ms-beneficiary",
+        repos: reposMap,
+      };
+      await writeDiskSessionBaseline(appHomeDir, "tab-win", "C:\\Dev\\Global66\\ms-beneficiary", "master", saved, "", fs);
+      const loaded = await readDiskSessionBaseline(appHomeDir, "tab-win", "c:\\dev\\global66\\ms-beneficiary", ["master"], false, fs);
+      assert.ok(loaded, "Windows baseline load must tolerate drive/folder case differences");
+      assert.equal(loaded.workspaceRoot, "C:/Dev/Global66/ms-beneficiary");
+    } finally {
+      await fs.rm(appHomeDir, { recursive: true, force: true });
+    }
+
+    // 3. Viewing a git-history tab preserves the space's agent terminal tab as sessionTabId
+    const space = {
+      id: "sp1",
+      tabs: [
+        { id: "tab-agent", active: false },
+        { id: "tab-git", active: true },
+      ],
+    };
+    const allPanes = [
+      { tab: "tab-agent", terminal: "term-1" },
+      { tab: "tab-git", mod: "git-history" },
+    ];
+    assert.equal(resolveSessionAgentTabId(space, allPanes, { sp1: "tab-agent" }), "tab-agent");
+  });
+
+  test("regression: resolveRepoBaseRefWithExec handles multi-base Gitflow branches (prod/dev/release) and closest merge-base without hiding commits", async () => {
+    const HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const MASTER_BASE = "1111111111111111111111111111111111111111";
+    const DEV_BASE = "2222222222222222222222222222222222222222";
+    const REL_BASE = "3333333333333333333333333333333333333333";
+
+    assert.deepEqual(inferBranchBaseHintRefs("nmunoz/prod/BMB-4364-remove-duplicate-check"), ["origin/master", "origin/main", "master", "main"]);
+    assert.deepEqual(inferBranchBaseHintRefs("nmunoz/dev/BMB-4277-card-limit"), ["origin/development", "origin/develop", "development", "develop"]);
+    assert.deepEqual(inferBranchBaseHintRefs("nmunoz/release/v2.1"), ["origin/release", "release"]);
+    assert.deepEqual(inferBranchBaseHintRefs("feat/PROJ-412"), []);
+
+    // 1. Prod branch (`nmunoz/prod/...`) already merged into `origin/development` (merge-base === HEAD)
+    //    but NOT yet merged into `origin/master` must still diff against `origin/master` (never return 0 files!)
+    const prodExec = async (_cmd, args) => {
+      if (args.includes("symbolic-ref")) return { code: 0, stdout: "refs/remotes/origin/development\n", stderr: "" };
+      if (args.includes("for-each-ref")) return { code: 0, stdout: "origin/development\norigin/master\norigin/release\n", stderr: "" };
+      if (args.includes("merge-base") && args.includes("origin/development")) return { code: 0, stdout: `${HEAD}\n`, stderr: "" };
+      if (args.includes("merge-base") && args.includes("origin/master")) return { code: 0, stdout: `${MASTER_BASE}\n`, stderr: "" };
+      if (args.includes("merge-base") && args.includes("origin/release")) return { code: 0, stdout: `${REL_BASE}\n`, stderr: "" };
+      return { code: 1, stdout: "", stderr: "" };
+    };
+    const prodRes = await resolveRepoBaseRefWithExec("/ws/ms-beneficiary", "nmunoz/prod/BMB-4364-remove-duplicate-check", HEAD, null, prodExec);
+    assert.deepEqual(prodRes, { hasHead: true, baseRef: "origin/master", baseHash: MASTER_BASE, baseSource: "base" });
+
+    // 2. Unhinted feature branch cut from `origin/development` (3 commits ahead) while `origin/HEAD` is `origin/master` (242 commits behind)
+    //    picks the closest ancestor (`origin/development`) instead of flooding 242 commits from `origin/master`.
+    const closestExec = async (_cmd, args) => {
+      if (args.includes("symbolic-ref")) return { code: 0, stdout: "refs/remotes/origin/master\n", stderr: "" };
+      if (args.includes("for-each-ref")) return { code: 0, stdout: "origin/development\norigin/master\n", stderr: "" };
+      if (args.includes("merge-base") && args.includes("origin/master")) return { code: 0, stdout: `${MASTER_BASE}\n`, stderr: "" };
+      if (args.includes("merge-base") && args.includes("origin/development")) return { code: 0, stdout: `${DEV_BASE}\n`, stderr: "" };
+      if (args.includes("rev-list") && args.includes(`${MASTER_BASE}..HEAD`)) return { code: 0, stdout: "242\n", stderr: "" };
+      if (args.includes("rev-list") && args.includes(`${DEV_BASE}..HEAD`)) return { code: 0, stdout: "3\n", stderr: "" };
+      return { code: 1, stdout: "", stderr: "" };
+    };
+    const closestRes = await resolveRepoBaseRefWithExec("/ws/ms-company", "feat/IN-32672-risk-score", HEAD, null, closestExec);
+    assert.deepEqual(closestRes, { hasHead: true, baseRef: "origin/development", baseHash: DEV_BASE, baseSource: "base" });
+
+    // 3. Brand-new empty unhinted branch cut directly off `origin/development` (`merge-base === HEAD`)
+    //    must NOT flood with 242 commits from `origin/master`; falls back cleanly to HEAD.
+    const freshBranchExec = async (_cmd, args) => {
+      if (args.includes("symbolic-ref")) return { code: 0, stdout: "refs/remotes/origin/master\n", stderr: "" };
+      if (args.includes("for-each-ref")) return { code: 0, stdout: "origin/development\norigin/master\n", stderr: "" };
+      if (args.includes("merge-base") && args.includes("origin/development")) return { code: 0, stdout: `${HEAD}\n`, stderr: "" };
+      if (args.includes("merge-base") && args.includes("origin/master")) return { code: 0, stdout: `${MASTER_BASE}\n`, stderr: "" };
+      return { code: 1, stdout: "", stderr: "" };
+    };
+    const freshRes = await resolveRepoBaseRefWithExec("/ws/ms-company", "feat/brand-new", HEAD, null, freshBranchExec);
+    assert.equal(freshRes.baseHash, HEAD);
   });
 });

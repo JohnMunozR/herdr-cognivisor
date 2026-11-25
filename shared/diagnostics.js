@@ -15,6 +15,7 @@ import {
   normalizeLogEntry,
   serializeError,
   sanitizeLogPayload,
+  mergeModLogEntries,
   buildDiagnosticReport,
   formatReportFilename,
   selectReportsToPrune,
@@ -114,11 +115,20 @@ function buildDefaultStateSnapshot(sharedFn, spacesFn) {
             repoCount: baselineRepos.length,
             dirtyFilesCount: baselineDirtyCount,
           }
-        : null,
+        : (activeFlow.sessionStartedAt || activeFlow.baselineRev || Array.isArray(activeFlow.sessionRepos))
+          ? {
+              startedAt: Number(activeFlow.sessionStartedAt) || 0,
+              baselineRev: Number(activeFlow.baselineRev) || 0,
+              sessionReposCount: Array.isArray(activeFlow.sessionRepos) ? activeFlow.sessionRepos.length : 0,
+              storage: "disk",
+            }
+          : null,
       diagnostics: diagBus ? {
         errorCount: Number(diagBus.errorCount) || 0,
         lastErrorMod: diagBus.lastErrorMod || null,
         lastErrorEvent: diagBus.lastErrorEvent || null,
+        ...(diagBus.lastErrorSummary ? { lastErrorSummary: String(diagBus.lastErrorSummary) } : {}),
+        ...(Number(diagBus.lastErrorAt) > 0 ? { lastErrorAt: Number(diagBus.lastErrorAt) } : {}),
       } : null,
     },
   };
@@ -178,19 +188,42 @@ export function createModLogger(modName, opts = {}) {
     const logsDir = getLogsDir();
     if (!logPath || !logsDir) return false;
     flushing = true;
-    dirty = false;
+    const maxEntries = ring.capacity || DEFAULT_MAX_RING_ENTRIES;
+    let wroteAny = false;
     try {
       const mk = typeof fsDeps?.mkdir === "function" ? fsDeps.mkdir : fsPromises.mkdir;
+      const rf = typeof fsDeps?.readFile === "function" ? fsDeps.readFile : fsPromises.readFile;
       const wr = typeof fsDeps?.writeFile === "function" ? fsDeps.writeFile : fsPromises.writeFile;
       await mk(logsDir, { recursive: true });
-      const payload = {
-        schemaVersion: DIAGNOSTICS_SCHEMA_VERSION,
-        mod,
-        updatedAt: Date.now(),
-        entries: ring.toArray(),
-      };
-      await wr(logPath, JSON.stringify(payload), "utf8");
-      return true;
+      // Up to 2 passes so an error recorded mid-flush is never left unflushed.
+      for (let pass = 0; pass < 2 && dirty && !disposed; pass += 1) {
+        dirty = false;
+        let existingEntries = [];
+        if (typeof rf === "function") {
+          try {
+            const rawText = await rf(logPath, "utf8");
+            const parsed = JSON.parse(rawText);
+            if (parsed && Array.isArray(parsed.entries)) {
+              existingEntries = parsed.entries;
+            }
+          } catch {
+            // file may not exist yet or be unreadable
+          }
+        }
+        const mergedEntries = mergeModLogEntries(existingEntries, ring.toArray(), {
+          mod,
+          maxEntries,
+        });
+        const payload = {
+          schemaVersion: DIAGNOSTICS_SCHEMA_VERSION,
+          mod,
+          updatedAt: Date.now(),
+          entries: mergedEntries,
+        };
+        await wr(logPath, JSON.stringify(payload), "utf8");
+        wroteAny = true;
+      }
+      return wroteAny;
     } catch {
       return false;
     } finally {

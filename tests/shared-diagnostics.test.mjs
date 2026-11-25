@@ -11,6 +11,7 @@ import {
   sanitizeLogPayload,
   normalizeLogEntry,
   createRingBuffer,
+  mergeModLogEntries,
   mergeDiagnosticStreams,
   buildDiagnosticReport,
   formatReportFilename,
@@ -183,5 +184,29 @@ describe("shared diagnostics engine & cross-mod sync parity", () => {
       "cognivisor-report-20261123-150000.json",
       "cognivisor-report-20261101-120000.json",
     ]);
+  });
+
+  it("mergeModLogEntries preserves prior render.failed entries across view reloads and deduplicates cleanly", () => {
+    const existingDisk = [
+      normalizeLogEntry({ ts: 1000, seq: 1, level: "lifecycle", event: "mod.init", data: { mode: "viewer" } }, "changes-review"),
+      normalizeLogEntry({ ts: 1500, seq: 2, level: "error", event: "render.failed", error: new TypeError("boom") }, "changes-review"),
+    ];
+    const reloadedPanel = [
+      normalizeLogEntry({ ts: 1500, seq: 2, level: "error", event: "render.failed", error: new TypeError("boom") }, "changes-review"),
+      normalizeLogEntry({ ts: 2000, seq: 1, level: "lifecycle", event: "mod.init", data: { mode: "panel" } }, "changes-review"),
+    ];
+
+    const merged = mergeModLogEntries(existingDisk, reloadedPanel, { mod: "changes-review", maxEntries: 10 });
+    assert.equal(merged.length, 3);
+    assert.deepEqual(
+      merged.map((e) => `${e.ts}:${e.event}`),
+      ["1000:mod.init", "1500:render.failed", "2000:mod.init"],
+    );
+
+    const capped = mergeModLogEntries(existingDisk, reloadedPanel, { mod: "changes-review", maxEntries: 2 });
+    assert.deepEqual(
+      capped.map((e) => `${e.ts}:${e.event}`),
+      ["1500:render.failed", "2000:mod.init"],
+    );
   });
 });
