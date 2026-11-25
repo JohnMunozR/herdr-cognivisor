@@ -51,7 +51,6 @@ const SHARED_TARGETS = [
     source: "shared/dropdown-logic.js",
     targets: [
       "mods/files-search/dropdown-logic.js",
-      "mods/changes-review/dropdown-logic.js",
       "mods/git-history/dropdown-logic.js",
     ],
   },
@@ -59,7 +58,6 @@ const SHARED_TARGETS = [
     source: "shared/dropdown.js",
     targets: [
       "mods/files-search/dropdown.js",
-      "mods/changes-review/dropdown.js",
       "mods/git-history/dropdown.js",
     ],
   },

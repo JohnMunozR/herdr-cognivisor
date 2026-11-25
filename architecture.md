@@ -49,7 +49,7 @@ The root UI topology is defined by `layouts/cognivisor.json` (`[[module-layouts]
 - **`#main`:** Primary terminal workspace hosting feature agents (`claude`, `gemini`, `codex`, `opencode`, `pi`, `antigravity`) and reusable single-tab `role: "viewer"` tabs (`files-search`, `changes-review`, `git-history`).
 - **`#panel` / `#panel-body`:** Collapsible mutually exclusive stack hosting:
   - `#files` (`[[submodule-mod-files-search]]`): Session-scoped multi-repo file tree with git status decorators and Search Everywhere overlay (`files-search-win`).
-  - `#changes` (`[[submodule-mod-changes-review]]`): Per-service branches, diffs, inline review notes, per-file `Approve` / `Approved ✓` review tracking with automatic fingerprint/commit invalidation, and organic service pill status (`pending | has_notes | approved`).
+  - `#changes` (`[[submodule-mod-changes-review]]`): Unified origin-branch session diff across only session-touched repositories (distinguished by per-file `[serviceName]` badges without commit pickers or repo filter bars), side-aware inline review notes, commit-resilient per-file `Approve` / `Approved ✓` tracking, and safe dirty-only batch commits.
   - `#git` (`[[submodule-mod-git-history]]`): All-repo (clean + dirty) commit graph, branch/text filters, and modified files driving a reusable `#main` Before/After comparison tab.
 - **`#status` (`28px`, `cognivisor-status`):** Bottom telemetry bar displaying active host, service/dirty counts, active branch, agent summary, and palette shortcut.
 
@@ -67,7 +67,7 @@ herdr-cognivisor/
 └── mods/                  <- [[module-mods]]: Independent GPUI-kit mod extensions
     ├── SPEC.md
     ├── files-search/      <- [[submodule-mod-files-search]]: Search Everywhere, interactive File Viewer (`indexer.js`, `symbol-index.js`, `code-viewer.js`, `search-logic.js`, `tree-logic.js`, `session-baseline.js`, synced `shared/` modules)
-    ├── changes-review/    <- [[submodule-mod-changes-review]]: Per-service diff review & file approval (`review-logic.js`, `code-wrap.js`, `markdown-syntax.js`, `dropdown-logic.js`, `dropdown.js`)
+    ├── changes-review/    <- [[submodule-mod-changes-review]]: Unified origin-branch session diff review & approval (`review-logic.js`, `code-wrap.js`, `code-syntax.js`, `markdown-syntax.js`, `markdown-view-logic.js`, `markdown-view.js`)
     ├── git-history/       <- [[submodule-mod-git-history]]: Topological commit graph & Before/After diff viewer (`graph-logic.js`, `diff-logic.js`, `repo-logic.js`, `code-wrap.js`, `markdown-syntax.js`, `dropdown-logic.js`, `dropdown.js`)
     ├── cognivisor-tabs/   <- [[submodule-mod-cognivisor-tabs]]: Tab strip, auto-naming, `cognivisor.spacePanels` (`tab-logic.js`)
     └── cognivisor-status/ <- [[submodule-mod-cognivisor-status]]: Telemetry status bar
@@ -87,14 +87,13 @@ herdr-cognivisor/
    - Filters discovered dirty/ahead repos through `attributeSessionServices` / `attributeSessionRepos`, matching active-tab `pane.cwd`, transcript activity (`hc read`), and previously recorded `cognivisor.flows[tabId].sessionRepos` so unrelated repos stay hidden.
 3. **Loop-Free Shared Bus Synchronization (`cognivisor.services`):**
    - `files-search` runs git status once (`--untracked-files=normal`) and publishes `cognivisor.services` with a canonical `sig` and 45s heartbeat; `changes-review` consumes `cognivisor.services` (`BUS_MAX_AGE_MS = 90000`) when fresh instead of re-scanning the filesystem, waking only when `bus.sig` changes.
-   - Synchronizes `cognivisor.activeService` with monotonic timestamp checks (`ts > lastActiveServiceTs`).
+   - `files-search` and `git-history` synchronize `cognivisor.activeService` with monotonic timestamp checks (`ts > lastActiveServiceTs`); `changes-review` renders all session-touched repositories in one unified list without filtering by `cognivisor.activeService`.
 4. **Composite File Disambiguation (`${serviceId}::${path}`):**
-   - Prevents path collisions across microservices for file selection, hunk expansion (`git diff -U99999`), and inline review comments.
+   - Prevents path collisions across microservices for file selection, hunk expansion (`git diff <baseHash>`), and side-aware inline review comments (`buildCommentKey(fileKey, line, side)`).
 5. **Tab-Scoped Lead Agent & Review Dispatch (`findActiveAgent`):**
    - Resolves target agent with `cognivisor.flows[tabId].leadTerminal` first, then focused agent, tab primary agent, and global `agents()[0]` fallback.
-6. **Per-File Review Tracking, Automatic Invalidation & Organic Service Status:**
-   - Tracks per-file review records (`{ reviewed: true, fp, reviewedAt }`) in `cognivisor.flows[tabId].reviewedFiles` using `computeFileReviewFingerprint` (`buildFileDescriptor` preserving `sig`/`mtimeMs`), automatically invalidating stale checks via `reconcileReviewedFiles` when working files change or leave the tree, when `headHash` transitions, or when newer commits touch reviewed files.
-   - Service pill status (`pending | has_notes | approved`) is derived organically from `cognivisor.reviewNotes` (`"has_notes"`) and `reviewedFiles` (`"approved"` only when dirty working files exist and all of them are reviewed), while the Review tab's non-checkbox `Approve` / `Approved ✓` button advances to the next unreviewed file.
+6. **Commit-Resilient Per-File Review Tracking:**
+   - Tracks per-file review records (`{ reviewed: true, fp, reviewedAt }`) in `cognivisor.flows[tabId].reviewedFiles` under `session::<serviceId>::<path>` using `computeFileReviewFingerprint` (`status|add|del|binary|baseHash|sig`), preserving `Approved ✓` across `git commit` when net content is unchanged and automatically invalidating via `reconcileReviewedFiles` when content or `baseHash` changes or the file leaves the unified diff.
 
 ---
 
@@ -105,8 +104,8 @@ Communication between mods occurs exclusively over Herdr's persisted reactive bu
 | Bus Key | Producer | Consumer | Payload Format | Description |
 |---|---|---|---|---|
 | `cognivisor.services` | `files-search`, `changes-review` | `files-search`, `changes-review`, `git-history`, `cognivisor-status` | `{ tabId, workspaceRoot, on, services, candidates, sig, ts }` | Session-attributed touched repositories and candidate cache metadata. |
-| `cognivisor.activeService` | `changes-review`, `files-search`, `git-history` | `changes-review`, `files-search`, `git-history` | `{ workspaceRoot, serviceId, ts }` | Synchronized active service filter (`"all"` or specific `serviceId`; `git-history` updates only for repos present in `cognivisor.services`). |
-| `cognivisor.flows` | `cognivisor-tabs`, `changes-review` | `cognivisor-tabs`, `changes-review`, `files-search` | `Record<tabId, { tabId?, ticket?, derivedTitle?, autoNamed?, manualTitle?, leadTerminal?, reviewedFiles?, sessionRepos?, sessionBaseline?, updatedAt }>` | Tab-scoped metadata: naming state, `leadTerminal`, per-file review checklist (`reviewedFiles`), session baseline, and attributed session repos. |
+| `cognivisor.activeService` | `files-search`, `git-history` | `files-search`, `git-history` | `{ workspaceRoot, serviceId, ts }` | Synchronized active service filter (`"all"` or specific `serviceId`; `git-history` updates only for repos present in `cognivisor.services`). |
+| `cognivisor.flows` | `cognivisor-tabs`, `changes-review`, `files-search` | `cognivisor-tabs`, `changes-review`, `files-search` | `Record<tabId, { tabId?, ticket?, derivedTitle?, autoNamed?, manualTitle?, leadTerminal?, reviewedFiles?, sessionRepos?, sessionStartedAt?, baselineRev?, updatedAt }>` | Tab-scoped metadata: naming state, `leadTerminal`, per-file review checklist (`reviewedFiles`), baseline revision (`baselineRev`), and attributed session repos. |
 | `cognivisor.spacePanels` | `cognivisor-tabs` | `cognivisor-tabs` | `Record<spaceId, "files" \| "changes" \| "git" \| null>` | Persisted active `#panel-body` selection per space (replaces `localStorage`). |
 | `cognivisor.spaceAgentTabs` | `files-search`, `changes-review`, `git-history` | `files-search`, `changes-review`, `git-history` | `Record<spaceId, tabId>` | Preserves each space's active terminal-bearing tab ID while non-terminal `role: "viewer"` tabs are focused. |
 | `files-search.select` | `files-search` | `files-search` | `{ root: string, path: string, line: number\|null, ts: number }` | Triggers tree expansion and file preview jump from Search Everywhere. |

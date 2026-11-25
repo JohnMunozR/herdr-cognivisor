@@ -201,7 +201,14 @@ for mod in "${MODS[@]}"; do
     fi
   done
   if [ "$mod" = "files-search" ] || [ "$mod" = "changes-review" ] || [ "$mod" = "git-history" ]; then
-    for shared_file in code-wrap.js code-syntax.js markdown-syntax.js markdown-view-logic.js markdown-view.js dropdown-logic.js dropdown.js; do
+    for shared_file in code-wrap.js code-syntax.js markdown-syntax.js markdown-view-logic.js markdown-view.js; do
+      if [ -f "$pkg_root/shared/$shared_file" ]; then
+        cp "$pkg_root/shared/$shared_file" "$target_mods/$mod/$shared_file"
+      fi
+    done
+  fi
+  if [ "$mod" = "files-search" ] || [ "$mod" = "git-history" ]; then
+    for shared_file in dropdown-logic.js dropdown.js; do
       if [ -f "$pkg_root/shared/$shared_file" ]; then
         cp "$pkg_root/shared/$shared_file" "$target_mods/$mod/$shared_file"
       fi
