@@ -2221,3 +2221,14 @@ export function computeAnchorPreservedScrollPx(
   const newMaxScrollPx = Math.max(0, (Number(newLayout?.totalHeight) || 0) - vpH);
   return Math.max(0, Math.min(newMaxScrollPx, effectiveOldScrollPx + deltaPx));
 }
+
+/**
+ * Compute monospace wrap columns for saved inline review comment rows.
+ * Reserves extra horizontal chrome for the comment icon, spacing, and Edit label
+ * relative to code rows without imposing an artificial narrow max-width cap.
+ */
+export function computeReviewCommentWrapCols(wrapCols) {
+  const raw = Number(wrapCols);
+  const baseCols = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 80;
+  return Math.max(12, baseCols - 6);
+}
