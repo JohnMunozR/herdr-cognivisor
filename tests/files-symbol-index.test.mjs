@@ -1482,4 +1482,40 @@ describe("files-search symbol-index cross-file & cross-service navigation", () =
     assert.equal(rNoImpl.mode, "references");
     assert.equal(path.normalize(rNoImpl.best.filePath), path.normalize(callerPath));
   });
+
+  test("warmAllServiceSymbolIndices forwards yieldFn cooperatively to avoid blocking the UI event loop", async () => {
+    const repoRoot = path.join(tmpRoot, "yield-repo");
+    const appHomeDir = path.join(tmpRoot, "app-home-yield");
+    await fs.mkdir(path.join(repoRoot, "src"), { recursive: true });
+    await fs.mkdir(appHomeDir, { recursive: true });
+    for (let i = 0; i < 9; i++) {
+      await fs.writeFile(
+        path.join(repoRoot, "src", `mod${i}.js`),
+        `export function fn${i}() { return ${i}; }\n`,
+        "utf8",
+      );
+    }
+
+    const svc = { id: "yield-svc", name: "yield-svc", root: repoRoot };
+    let yieldCalls = 0;
+    await symIdx.warmAllServiceSymbolIndices({
+      services: [svc],
+      currentRoot: repoRoot,
+      appHomeDir,
+      execFn: async (cmd) => {
+        if (cmd === "rg") {
+          return {
+            code: 0,
+            stdout: Array.from({ length: 9 }, (_, i) => `src/mod${i}.js`).join("\n") + "\n",
+            stderr: "",
+          };
+        }
+        return { code: 1, stdout: "", stderr: "" };
+      },
+      yieldFn: async () => {
+        yieldCalls += 1;
+      },
+    });
+    assert.ok(yieldCalls >= 2, `expected cooperative yieldFn calls during parsing, got ${yieldCalls}`);
+  });
 });

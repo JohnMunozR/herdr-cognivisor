@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  MAX_HASH_READ_BYTES,
   normalizeGitStatusMark,
   normalizeSessionBaseline,
   readDiskSessionBaseline,
@@ -12,9 +13,13 @@ import {
   resolveSessionStartTime,
   findRecentFlowWorkspaceBaseline,
   findRecentWorkspaceBaseline,
+  pruneDiskSessionBaselines,
   terminalHasResumeCommand,
   computeFileSig,
   statFileEntry,
+  createFileSigCache,
+  batchStatLocalPaths,
+  resolveFileSigCached,
   filterSessionDirtyEntries,
   isHomeDirectoryRoot,
   resolveWorkspaceRoot,
@@ -315,6 +320,237 @@ describe("files-search session-baseline", () => {
         { excludeTabId: "tb70b579", liveTabIds: new Set(["tb70b579"]), now: t1221 },
       );
       assert.deepEqual(flowMatch, morningBaseline);
+    } finally {
+      await rm(appHomeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("caches file signatures in LRU on no-stat runtimes, skips huge files, and supports batched POSIX stat", async () => {
+    const cache = createFileSigCache(2);
+    cache.set("a", { mtimeSec: 1, size: 1, sig: "1:ba" });
+    cache.set("b", { mtimeSec: 1, size: 1, sig: "1:bb" });
+    assert.ok(cache.get("a")); // refresh LRU order -> "b" is now oldest
+    cache.set("c", { mtimeSec: 1, size: 1, sig: "1:bc" });
+    assert.equal(cache.get("b"), null);
+    assert.ok(cache.get("a"));
+    assert.ok(cache.get("c"));
+
+    let readCount = 0;
+    const noStatFs = {
+      exists: async () => true,
+      readFile: async () => {
+        readCount += 1;
+        return new Uint8Array([1, 2, 3, 4]);
+      },
+    };
+    const sigCache = createFileSigCache(10);
+    const meta1 = { mtimeSec: 1700000100, mtimeMs: 1700000100000, size: 4, isDir: false };
+
+    // First call hashes once and populates cache
+    const first = await resolveFileSigCached("/repo/a.js", "M", { statMeta: meta1, cache: sigCache, fsDeps: noStatFs });
+    assert.equal(first.hashed, true);
+    assert.equal(readCount, 1);
+    assert.match(first.sig, /^4:b[0-9a-f]{8}$/);
+    assert.equal(first.mtimeMs, 1700000100000);
+
+    // Second call with same (mtimeSec, size) hits cache with ZERO readFile calls
+    const second = await resolveFileSigCached("/repo/a.js", "M", { statMeta: meta1, cache: sigCache, fsDeps: noStatFs });
+    assert.equal(second.hashed, false);
+    assert.equal(readCount, 1);
+    assert.equal(second.sig, first.sig);
+
+    // Edited file (new mtimeSec) re-hashes cleanly
+    const metaEdited = { mtimeSec: 1700000200, mtimeMs: 1700000200000, size: 4, isDir: false };
+    const third = await resolveFileSigCached("/repo/a.js", "M", { statMeta: metaEdited, cache: sigCache, fsDeps: noStatFs });
+    assert.equal(third.hashed, true);
+    assert.equal(readCount, 2);
+
+    // Directory skips readFile completely
+    const dirRes = await resolveFileSigCached("/repo/sub", "A", {
+      statMeta: { mtimeSec: 100, mtimeMs: 100000, size: 4096, isDir: true },
+      cache: sigCache,
+      fsDeps: noStatFs,
+    });
+    assert.equal(dirRes.sig, "dir:A");
+    assert.equal(dirRes.hashed, false);
+    assert.equal(readCount, 2);
+
+    // Huge binary exceeding maxHashBytes never calls readFile (prevents QuickJS freeze/OOM)
+    const hugeRes = await resolveFileSigCached("/repo/dump.bin", "A", {
+      statMeta: { mtimeSec: 1700000300, mtimeMs: 1700000300000, size: MAX_HASH_READ_BYTES + 1024, isDir: false },
+      cache: sigCache,
+      fsDeps: noStatFs,
+    });
+    assert.equal(hugeRes.hashed, false);
+    assert.equal(readCount, 2);
+    assert.equal(hugeRes.sig, `${MAX_HASH_READ_BYTES + 1024}:1700000300000`);
+
+    // Batched POSIX stat fallback (when fsDeps.stat is absent) parses path-keyed GNU & BSD stat output
+    // even when a deleted file or broken symlink in the same chunk causes exit code 1, and skips on Windows.
+    const execCalls = [];
+    const statMap = await batchStatLocalPaths("/repo", ["src/a:b.js", "deleted.js", "sub"], {
+      fsDeps: {},
+      isWindows: false,
+      execFn: async (cmd, args) => {
+        execCalls.push({ cmd, args });
+        return {
+          code: 1,
+          stdout: ["1700000100", "42", "regular file", "src/a:b.js", "1700000200", "4096", "directory", "sub", ""].join("\0"),
+          stderr: "stat: cannot statx 'deleted.js': No such file or directory\n",
+        };
+      },
+    });
+    assert.equal(execCalls.length, 1);
+    assert.deepEqual(statMap.get("src/a:b.js"), { size: 42, mtimeSec: 1700000100, mtimeMs: 1700000100000, isDir: false });
+    assert.deepEqual(statMap.get("sub"), { size: 4096, mtimeSec: 1700000200, mtimeMs: 1700000200000, isDir: true });
+    assert.equal(statMap.has("deleted.js"), false);
+
+    // BSD stat fallback parses tab-delimited path-keyed records even with partial ENOENT exit code 1
+    const bsdMap = await batchStatLocalPaths("/repo", ["space file.js", "missing.js", "sub"], {
+      fsDeps: {},
+      isWindows: false,
+      execFn: async (_cmd, args) => {
+        if (args.includes("-f")) {
+          return {
+            code: 1,
+            stdout: "1700000300\t99\tRegular File\tspace file.js\n1700000400\t128\tDirectory\tsub\n",
+            stderr: "stat: missing.js: No such file or directory\n",
+          };
+        }
+        return { code: 1, stdout: "", stderr: "stat: illegal option -- -" };
+      },
+    });
+    assert.deepEqual(bsdMap.get("space file.js"), { size: 99, mtimeSec: 1700000300, mtimeMs: 1700000300000, isDir: false });
+    assert.deepEqual(bsdMap.get("sub"), { size: 128, mtimeSec: 1700000400, mtimeMs: 1700000400000, isDir: true });
+    assert.equal(bsdMap.has("missing.js"), false);
+
+    const winMap = await batchStatLocalPaths("/repo", ["src/a.js"], {
+      fsDeps: {},
+      isWindows: true,
+      execFn: async () => {
+        throw new Error("should not call POSIX stat on Windows");
+      },
+    });
+    assert.equal(winMap.size, 0);
+  });
+
+  it("batchStatLocalPaths survives live POSIX ENOENT and broken symlink in same chunk without reading huge sibling", async () => {
+    if (process.platform === "win32") return;
+    const { mkdir, symlink } = await import("node:fs/promises");
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execFileAsync = promisify(execFile);
+
+    const dir = await mkdtemp(join(tmpdir(), "herdr-stat-batch-"));
+    try {
+      await writeFile(join(dir, "a:b.txt"), "hello", "utf8");
+      await writeFile(join(dir, "space file.txt"), "world!", "utf8");
+      await writeFile(join(dir, "-dash.txt"), "dash", "utf8");
+      await writeFile(join(dir, "huge.bin"), Buffer.alloc(MAX_HASH_READ_BYTES + 256, 0x41));
+      await mkdir(join(dir, "sub-dir"));
+      await symlink(join(dir, "does-not-exist"), join(dir, "broken-link"));
+
+      const execFn = async (cmd, args, opts) => {
+        try {
+          const { stdout, stderr } = await execFileAsync(cmd, args, { cwd: opts?.cwd, timeout: 4000 });
+          return { code: 0, stdout, stderr };
+        } catch (err) {
+          return { code: typeof err.code === "number" ? err.code : 1, stdout: err.stdout || "", stderr: err.stderr || "" };
+        }
+      };
+
+      const rels = ["a:b.txt", "space file.txt", "-dash.txt", "huge.bin", "sub-dir", "deleted.txt", "broken-link"];
+      const map = await batchStatLocalPaths(dir, rels, { fsDeps: {}, isWindows: false, execFn });
+      assert.equal(map.get("a:b.txt")?.size, 5);
+      assert.equal(map.get("space file.txt")?.size, 6);
+      assert.equal(map.get("-dash.txt")?.size, 4);
+      assert.equal(map.get("huge.bin")?.size, MAX_HASH_READ_BYTES + 256);
+      assert.equal(map.get("sub-dir")?.isDir, true);
+      assert.equal(map.has("deleted.txt"), false);
+      assert.equal(map.has("broken-link"), false);
+
+      let hugeReadCount = 0;
+      const hugeRes = await resolveFileSigCached(join(dir, "huge.bin"), "A", {
+        statMeta: map.get("huge.bin"),
+        cache: createFileSigCache(8),
+        fsDeps: {
+          exists: async () => true,
+          readFile: async () => {
+            hugeReadCount += 1;
+            return new Uint8Array([1]);
+          },
+        },
+      });
+      assert.equal(hugeReadCount, 0);
+      assert.equal(hugeRes.hashed, false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("pruneDiskSessionBaselines deletes expired and excess closed tab JSONs while preserving live tabs", async () => {
+    const appHomeDir = await mkdtemp(join(tmpdir(), "herdr-prune-"));
+    const now = 1800000000000;
+    const day = 24 * 60 * 60 * 1000;
+    try {
+      const ws = "/home/dev/proj";
+      // 1 live tab (old, must be preserved because it's live)
+      await writeDiskSessionBaseline(appHomeDir, "tab-live", ws, "main", { version: 1, startedAt: now - 30 * day, workspaceRoot: ws, repos: {} });
+      // 1 expired closed tab (> 7 days)
+      await writeDiskSessionBaseline(appHomeDir, "tab-expired", ws, "main", { version: 1, startedAt: now - 10 * day, workspaceRoot: ws, repos: {} });
+      // 3 recent closed tabs (cap = 2 -> oldest of these 3 pruned)
+      await writeDiskSessionBaseline(appHomeDir, "tab-c1", ws, "main", { version: 1, startedAt: now - 3 * day, workspaceRoot: ws, repos: {} });
+      await writeDiskSessionBaseline(appHomeDir, "tab-c2", ws, "main", { version: 1, startedAt: now - 2 * day, workspaceRoot: ws, repos: {} });
+      await writeDiskSessionBaseline(appHomeDir, "tab-c3", ws, "main", { version: 1, startedAt: now - 1 * day, workspaceRoot: ws, repos: {} });
+
+      const result = await pruneDiskSessionBaselines(appHomeDir, {
+        liveTabIds: new Set(["tab-live"]),
+        maxClosedFiles: 2,
+        maxAgeMs: 7 * day,
+        now,
+      });
+      assert.equal(result.pruned, 2);
+      assert.equal(result.remaining, 3);
+
+      assert.ok(await readDiskSessionBaseline(appHomeDir, "tab-live", ws, "main", false));
+      assert.equal(await readDiskSessionBaseline(appHomeDir, "tab-expired", ws, "main", false), null);
+      assert.equal(await readDiskSessionBaseline(appHomeDir, "tab-c1", ws, "main", false), null);
+      assert.ok(await readDiskSessionBaseline(appHomeDir, "tab-c2", ws, "main", false));
+      assert.ok(await readDiskSessionBaseline(appHomeDir, "tab-c3", ws, "main", false));
+    } finally {
+      await rm(appHomeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves changes-review rev/startHead/startBranch fields and matches deleted:D signatures across mods", async () => {
+    const appHomeDir = await mkdtemp(join(tmpdir(), "herdr-cross-mod-bl-"));
+    try {
+      const ws = "/home/dev/proj";
+      const baseline = {
+        version: 1,
+        rev: 3,
+        startedAt: 1700000000000,
+        workspaceRoot: ws,
+        repos: {
+          [ws]: {
+            startHead: "abcdef1234567890abcdef1234567890abcdef12",
+            startBranch: "feat/unified",
+            dirtyFiles: {
+              "src/removed.ts": { status: "D", sig: "deleted:D" },
+            },
+          },
+        },
+      };
+      await writeDiskSessionBaseline(appHomeDir, "tab-sync", ws, "feat/unified", baseline);
+      const restored = await readDiskSessionBaseline(appHomeDir, "tab-sync", ws, "feat/unified", false);
+      assert.deepEqual(restored, baseline);
+
+      const filtered = filterSessionDirtyEntries(
+        [{ relFile: "src/removed.ts", fullPath: `${ws}/src/removed.ts`, status: "D", sig: "deleted", mtimeMs: 0 }],
+        restored.repos[ws],
+        restored.startedAt,
+      );
+      assert.deepEqual(filtered, [], "deleted:D baseline entry must match deleted status cleanly");
     } finally {
       await rm(appHomeDir, { recursive: true, force: true });
     }

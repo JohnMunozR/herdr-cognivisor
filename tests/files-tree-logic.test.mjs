@@ -6,7 +6,11 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import {
   MAX_CASCADE_DEPTH,
+  POSIX_LIST_SCRIPT,
   POSIX_CASCADE_SCRIPT,
+  computeWorkspaceContextKey,
+  collectMissingAncestorPaths,
+  buildTreeRows,
   sortDirectoryEntries,
   matchesServiceFilter,
   getCascadeChildPath,
@@ -264,5 +268,151 @@ describe("files-search tree-logic", () => {
     });
     assert.equal(bounded.complete, true);
     assert.deepEqual(bounded.stagedFolders, ["src", "src/main"]);
+  });
+
+  test("POSIX_LIST_SCRIPT and POSIX_CASCADE_SCRIPT cap large dirs cleanly without globbing special chars", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "herdr-large-dir-"));
+    try {
+      mkdirSync(join(tmp, ".git"));
+      mkdirSync(join(tmp, ".hidden dir"));
+      writeFileSync(join(tmp, "file with [glob] * chars.txt"), "");
+      for (let i = 0; i < 650; i++) {
+        writeFileSync(join(tmp, `entry-${String(i).padStart(4, "0")}.txt`), "");
+      }
+
+      const listStdout = execFileSync("sh", ["-c", POSIX_LIST_SCRIPT, "files", tmp], { encoding: "utf8" });
+      const fields = listStdout.split("\0");
+      const listEntries = [];
+      for (let i = 0; i + 1 < fields.length; i += 2) {
+        listEntries.push({ name: fields[i + 1], dir: fields[i] === "d" });
+      }
+      assert.equal(listEntries.length, 501);
+      assert.ok(!listEntries.some(e => e.name === ".git" || e.name === "." || e.name === ".."));
+
+      const cascadeStdout = execFileSync("sh", ["-c", POSIX_CASCADE_SCRIPT, "files", tmp, "8"], { encoding: "utf8" });
+      const parsed = parseCascadeStdout(cascadeStdout, "big");
+      assert.deepEqual([...parsed.keys()], ["big"]);
+      assert.equal(parsed.get("big").length, 501);
+      assert.ok(!parsed.get("big").some(e => e.name === ".git"));
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("runStagedCascade stops gracefully when a nested subfolder (depth > 0) fails while still throwing on depth 0", async () => {
+    let singleCalls = 0;
+    const partial = await runStagedCascade({
+      startPath: "src",
+      isCancelled: () => false,
+      fetchCascadeBatch: async curPath => {
+        if (curPath === "src") {
+          return new Map([["src", [{ name: "restricted", dir: true }]]]);
+        }
+        return new Map();
+      },
+      fetchSingleEntries: async () => {
+        singleCalls += 1;
+        throw new Error("EACCES");
+      },
+    });
+    assert.equal(singleCalls, 0);
+    assert.deepEqual(partial.stagedFolders, ["src"]);
+    assert.deepEqual(partial.stagedEntries.get("src"), [{ name: "restricted", dir: true }]);
+
+    await assert.rejects(
+      () =>
+        runStagedCascade({
+          startPath: "unreadable",
+          isCancelled: () => false,
+          fetchCascadeBatch: async () => new Map(),
+          fetchSingleEntries: async () => {
+            throw new Error("EACCES");
+          },
+        }),
+      /EACCES/,
+    );
+  });
+
+  test("computeWorkspaceContextKey stays stable across terminal tab switches inside the same workspace", () => {
+    const k1 = computeWorkspaceContextKey({ cwd: "/home/dev/repo", on: null, space: "sp-1", tabId: "tab-a" });
+    const k2 = computeWorkspaceContextKey({ cwd: "/home/dev/repo", on: null, space: "sp-1", tabId: "tab-b" });
+    const k3 = computeWorkspaceContextKey({ cwd: "/home/dev/other", on: null, space: "sp-1", tabId: "tab-a" });
+    const k4 = computeWorkspaceContextKey({ cwd: "/home/dev/repo", on: "ssh-box", space: "sp-1", tabId: "tab-a" });
+    assert.equal(k1, k2);
+    assert.notEqual(k1, k3);
+    assert.notEqual(k1, k4);
+  });
+
+  test("collectMissingAncestorPaths skips cached folders and respects includeSelf", () => {
+    const entries = new Map([
+      ["", []],
+      ["apps", []],
+    ]);
+    assert.deepEqual(collectMissingAncestorPaths("apps/web/src/components", entries, true), [
+      "apps/web",
+      "apps/web/src",
+      "apps/web/src/components",
+    ]);
+    assert.deepEqual(collectMissingAncestorPaths("apps/web/src/App.tsx", entries, false), [
+      "apps/web",
+      "apps/web/src",
+    ]);
+    assert.deepEqual(collectMissingAncestorPaths("README.md", entries, false), []);
+  });
+
+  test("buildTreeRows fast-paths empty git state and resolves repo pills, dirCounts, marks, Windows casing, and caps", () => {
+    const entries = new Map([
+      ["", [{ name: "svc-a", dir: true }, { name: "README.md", dir: false }]],
+      ["svc-a", [{ name: "src", dir: true }, { name: "index.js", dir: false }]],
+      ["svc-a/src", [{ name: "app.js", dir: false }]],
+    ]);
+    const folders = new Set(["svc-a", "svc-a/src"]);
+    const pending = new Set(["svc-a"]);
+
+    const clean = buildTreeRows({
+      entries,
+      folders,
+      pending,
+      root: "/ws",
+      dirCounts: {},
+      marks: {},
+      repoRoots: new Set(),
+    });
+    assert.deepEqual(clean.rows.map(r => `${r.depth}:${r.kind}:${r.path}`), [
+      "0:dir:svc-a",
+      "1:dir:svc-a/src",
+      "2:file:svc-a/src/app.js",
+      "1:file:svc-a/index.js",
+      "0:file:README.md",
+    ]);
+    assert.equal(clean.rows[0].isLoadingFolder, true);
+    assert.equal(clean.rows[0].isRepo, false);
+    assert.equal(clean.rows[0].dirCount, 0);
+    assert.equal(clean.rows[2].mark, null);
+
+    const dirtyWin = buildTreeRows({
+      entries,
+      folders,
+      pending: new Set(),
+      root: "C:\\WS\\",
+      isWindows: true,
+      repoRoots: new Set(["c:/ws/svc-a"]),
+      dirCounts: { "c:/ws/svc-a": 2, "c:/ws/svc-a/src": 1 },
+      marks: { "c:/ws/svc-a/src/app.js": "M" },
+    });
+    assert.equal(dirtyWin.byKey.get("svc-a").isRepo, true);
+    assert.equal(dirtyWin.byKey.get("svc-a").dirCount, 2);
+    assert.equal(dirtyWin.byKey.get("svc-a/src").dirCount, 1);
+    assert.equal(dirtyWin.byKey.get("svc-a/src/app.js").mark, "M");
+
+    const capped = buildTreeRows({
+      entries,
+      folders,
+      pending: new Set(),
+      root: "/ws",
+      maxTotal: 2,
+    });
+    assert.equal(capped.rows.length, 2);
+    assert.equal(capped.hitVisibleCap, true);
   });
 });
