@@ -28,6 +28,9 @@ import {
   buildCommentKey,
   buildReviewedFileKey,
   partitionSessionUnifiedEntries,
+  collectActiveFeatureBranches,
+  isMatchingFeatureBranch,
+  changedFilesMatchTranscript,
   evaluateRepoSessionActivity,
   findBaselineRepoEntry,
   normalizeSessionBaseline,
@@ -1999,6 +2002,12 @@ export default class ChangesReview extends View {
         this.lastCandidateRoots = candidateServices.map((s) => normPathStr(s?.root)).filter(Boolean);
         this.lastPrimaryBranch = baselineInit.primaryBranch || "";
 
+        const activeFeatureBranches = collectActiveFeatureBranches(serviceResults, {
+          workspaceRoot,
+          paneCwds: tabPaneCwds,
+          isWindows,
+        });
+
         if (sessionTabId && sessionBaseline) {
           const startedAt = sessionBaseline.startedAt || 0;
           const flowsNow = safeReadFlows();
@@ -2011,20 +2020,20 @@ export default class ChangesReview extends View {
           const normPaneCwds = tabPaneCwds.map((c) => normPathStr(c)).filter(Boolean);
 
           const needTranscriptRepos = [];
-          if (!baselineInit.isFresh) {
-            for (const res of serviceResults) {
-              const normRoot = normPathStr(res.service?.root);
-              const cmpRoot = normCmpStr(normRoot, isWindows);
-              if (!normRoot || res.error) continue;
-              const inPaneCwd = normPaneCwds.some((c) => isSameOrChildPath(c, normRoot, isWindows));
-              const inWorkspaceRoot = Boolean(cmpWs && cmpRoot === cmpWs);
-              if (prevSessionRepos.has(cmpRoot) || inPaneCwd || inWorkspaceRoot) continue;
-              const bRepo = findBaselineRepoEntry(sessionBaseline.repos, normRoot, isWindows);
-              const headMoved = Boolean(bRepo?.startHead && res.headHash && bRepo.startHead !== res.headHash);
-              const unbaselinedNoMtime = !bRepo && (res.workingFiles || []).some((f) => !Number(f?.mtimeMs || 0));
-              if (headMoved || unbaselinedNoMtime) {
-                needTranscriptRepos.push(res);
-              }
+          for (const res of serviceResults) {
+            const normRoot = normPathStr(res.service?.root);
+            const cmpRoot = normCmpStr(normRoot, isWindows);
+            if (!normRoot || res.error) continue;
+            const inPaneCwd = normPaneCwds.some((c) => isSameOrChildPath(c, normRoot, isWindows));
+            const inWorkspaceRoot = Boolean(cmpWs && cmpRoot === cmpWs);
+            const sameFeatureBranch = isMatchingFeatureBranch(res.branch || res.service?.branch, activeFeatureBranches);
+            if (prevSessionRepos.has(cmpRoot) || inPaneCwd || inWorkspaceRoot || sameFeatureBranch) continue;
+            const bRepo = findBaselineRepoEntry(sessionBaseline.repos, normRoot, isWindows);
+            const headMoved = Boolean(!baselineInit.isFresh && bRepo?.startHead && res.headHash && bRepo.startHead !== res.headHash);
+            const unbaselinedNoMtime = Boolean(!baselineInit.isFresh && !bRepo && (res.workingFiles || []).some((f) => !Number(f?.mtimeMs || 0)));
+            const hasDiffFiles = Array.isArray(res.files) && res.files.length > 0;
+            if (headMoved || unbaselinedNoMtime || hasDiffFiles) {
+              needTranscriptRepos.push(res);
             }
           }
 
@@ -2056,8 +2065,10 @@ export default class ChangesReview extends View {
             const rawWorkingFiles = Array.isArray(res.workingFiles) ? res.workingFiles : [];
             const inPaneCwd = Boolean(normRoot && normPaneCwds.some((c) => isSameOrChildPath(c, normRoot, isWindows)));
             const inWorkspaceRoot = Boolean(cmpRoot && cmpWs && cmpRoot === cmpWs);
+            const sameFeatureBranch = isMatchingFeatureBranch(res.branch || res.service?.branch, activeFeatureBranches);
             const inSessionRepos = Boolean(cmpRoot && prevSessionRepos.has(cmpRoot));
             const matchedTranscript = repoMatchesTranscript(res.service, rawUnifiedFiles, sessionTranscript);
+            const changedFileMatchedTranscript = changedFilesMatchTranscript(res.service, rawUnifiedFiles, sessionTranscript, isWindows);
 
             let sessionFiles = [];
             let visibleWorkingFiles = [];
@@ -2079,7 +2090,14 @@ export default class ChangesReview extends View {
               const workingPart = partitionSessionUnifiedEntries(rawWorkingFiles, baselineRepo, null, startedAt);
               visibleWorkingFiles = workingPart.visible;
             } else {
-              const isAttributed = Boolean(inPaneCwd || inWorkspaceRoot || inSessionRepos || matchedTranscript);
+              const isAttributed = Boolean(
+                inPaneCwd ||
+                inWorkspaceRoot ||
+                sameFeatureBranch ||
+                inSessionRepos ||
+                matchedTranscript ||
+                changedFileMatchedTranscript
+              );
               const unbaselinedRes = filterUnbaselinedRepoEntries(rawWorkingFiles, startedAt, { isAttributed });
               visibleWorkingFiles = unbaselinedRes.sessionFiles;
               const newBaselineRepo = {
@@ -2102,10 +2120,12 @@ export default class ChangesReview extends View {
               hasNewWorkingEdit,
               inPaneCwd,
               inWorkspaceRoot,
+              sameFeatureBranch,
               inSessionRepos,
               startHead: baselineRepo?.startHead || "",
               headHash: res.headHash || "",
               repoMatchesTranscript: matchedTranscript,
+              changedFileMatchesTranscript: changedFileMatchedTranscript,
             });
 
             if (hasActivity || !res.service?.isSibling) {
@@ -2158,10 +2178,11 @@ export default class ChangesReview extends View {
           mergeSessionBaselineIntoFlow(sessionTabId, sessionBaseline, sessionRepos, false, diskMtime);
         } else {
           // No terminal session tab resolved yet: still surface non-sibling workspace repository diffs
-          // so opening Review before launching a terminal tab never shows a false empty state.
+          // plus any sibling repository checked out on the exact same non-base feature branch.
           this.hiddenPreExistingCount = 0;
           for (const res of serviceResults) {
-            if (res.error || res.service?.isSibling) {
+            const sameFeatureBranch = isMatchingFeatureBranch(res.branch || res.service?.branch, activeFeatureBranches);
+            if (res.error || (res.service?.isSibling && !sameFeatureBranch)) {
               res.touched = false;
               continue;
             }

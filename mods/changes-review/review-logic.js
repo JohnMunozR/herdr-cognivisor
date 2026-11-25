@@ -775,22 +775,155 @@ export function partitionSessionUnifiedEntries(entries, baselineRepo, committedP
   return { visible, hidden };
 }
 
+const GENERIC_TRANSCRIPT_FILENAMES = new Set([
+  "readme.md",
+  "changelog.md",
+  "license",
+  "license.md",
+  "pom.xml",
+  "package.json",
+  "package-lock.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+  "build.gradle",
+  "build.gradle.kts",
+  "settings.gradle",
+  "settings.gradle.kts",
+  "application.yml",
+  "application.yaml",
+  "application.properties",
+  "bootstrap.yml",
+  "bootstrap.yaml",
+  "dockerfile",
+  "makefile",
+  "index.js",
+  "index.ts",
+  "index.jsx",
+  "index.tsx",
+  "main.js",
+  "main.ts",
+  "app.js",
+  "app.ts",
+]);
+
+function escapeRegexLiteral(str) {
+  return String(str || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Collect non-base feature branch names currently checked out on the Space's active
+ * workspace/pane repositories so paired multi-microservice branches (e.g. `ms-wallet`
+ * and `ms-product-gateway` both on `nmunoz/dev/extract-accounts-with-mirror`) review together.
+ * Base branches (`main`, `master`, `development`, `develop`, `release`, `ci`, `HEAD`) are never included.
+ */
+export function collectActiveFeatureBranches(serviceResults, { workspaceRoot = "", paneCwds = [], isWindows = false } = {}) {
+  const active = new Set();
+  const cmpWs = workspaceRoot ? normCmpStr(workspaceRoot, isWindows) : "";
+  const normCwds = (Array.isArray(paneCwds) ? paneCwds : []).map((c) => normPathStr(c)).filter(Boolean);
+  for (const res of Array.isArray(serviceResults) ? serviceResults : []) {
+    if (!res || res.error) continue;
+    const branch = String(res.branch || res.service?.branch || "").trim();
+    if (!branch || BASE_BRANCH_NAMES.has(branch)) continue;
+    const normRoot = normPathStr(res.service?.root);
+    if (!normRoot) continue;
+    const inWs = Boolean(cmpWs && normCmpStr(normRoot, isWindows) === cmpWs);
+    const inCwd = normCwds.some((c) => isSameOrChildPath(c, normRoot, isWindows));
+    if (inWs || inCwd) {
+      active.add(branch);
+    }
+  }
+  return active;
+}
+
+/**
+ * Return true when `branch` is a non-base feature branch present in `activeFeatureBranches`.
+ */
+export function isMatchingFeatureBranch(branch, activeFeatureBranches) {
+  const clean = String(branch || "").trim();
+  if (!clean || BASE_BRANCH_NAMES.has(clean)) return false;
+  if (!activeFeatureBranches || typeof activeFeatureBranches.has !== "function") return false;
+  return activeFeatureBranches.has(clean);
+}
+
+/**
+ * Strict transcript correlation for sibling repositories: requires BOTH the repository
+ * identifier (`root`, `relPath`, or `name`) AND at least one of its actually changed diff files
+ * (full relative path or specific non-generic basename) to appear in the session's agent transcript.
+ * Prevents read-only reference lookups (e.g. reading `../ms-card/pom.xml`) from pulling in unrelated repos.
+ */
+export function changedFilesMatchTranscript(service, changedFiles, transcript, isWindows = false) {
+  if (!service || !transcript || !Array.isArray(changedFiles) || changedFiles.length === 0) return false;
+  const rawTr = String(transcript).replace(/\\/g, "/");
+  if (!rawTr) return false;
+  const tr = isWindows ? rawTr.toLowerCase() : rawTr;
+
+  const normRoot = normPathStr(service.root || "");
+  const cmpRoot = isWindows ? normRoot.toLowerCase() : normRoot;
+  const relPath = normPathStr(service.relPath || "");
+  const cmpRel = isWindows ? relPath.toLowerCase() : relPath;
+  const svcName = String(service.name || "").trim();
+  const cmpName = isWindows ? svcName.toLowerCase() : svcName;
+
+  let repoMentioned = false;
+  if (cmpRoot && tr.includes(cmpRoot)) {
+    repoMentioned = true;
+  } else if (cmpRel && cmpRel.length >= 2) {
+    const relRe = new RegExp(`(?:^|[\\s"'\`(:\\/])${escapeRegexLiteral(cmpRel)}(?:[\\/\\s"'\`),:]|$)`);
+    if (relRe.test(tr)) repoMentioned = true;
+  }
+  if (!repoMentioned && cmpName && cmpName.length >= 3) {
+    const nameRe = new RegExp(`(?:^|[\\s"'\`(:\\/])${escapeRegexLiteral(cmpName)}(?:[\\/\\s"'\`),:]|$)`);
+    if (nameRe.test(tr)) repoMentioned = true;
+  }
+  if (!repoMentioned) return false;
+
+  for (const f of changedFiles) {
+    const rel = normBaselineRel(f?.path || f?.relFile || "");
+    if (!rel) continue;
+    const cmpFile = isWindows ? rel.toLowerCase() : rel;
+    if (cmpFile.length >= 5 && tr.includes(cmpFile)) {
+      return true;
+    }
+    const slashIdx = rel.lastIndexOf("/");
+    const base = slashIdx >= 0 ? rel.slice(slashIdx + 1) : rel;
+    if (base.length >= 8 && !GENERIC_TRANSCRIPT_FILENAMES.has(base.toLowerCase())) {
+      const cmpBase = isWindows ? base.toLowerCase() : base;
+      const baseRe = new RegExp(`(?:^|[\\s"'\`(:\\/])${escapeRegexLiteral(cmpBase)}(?:[\\s"'\`),:?.]|$)`);
+      if (baseRe.test(tr)) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Determine whether a candidate repository has legitimate activity in the current chat session.
- * Prevents untouched sibling repositories (including those on old feature branches) from leaking,
- * while ensuring a Space opened directly on a single repository (`inWorkspaceRoot`) remains attributed
- * even when Windows ConPTY terminals do not report `pane.cwd`.
+ * Prevents untouched sibling repositories (including those on old unrelated feature branches) from leaking,
+ * while attributing:
+ * - the Space's own single-repo root (`inWorkspaceRoot`) even when Windows ConPTY omits `pane.cwd`,
+ * - sibling repositories checked out on the exact same non-base feature branch (`sameFeatureBranch`),
+ * - sibling repositories whose changed files appear alongside the repo name in the session transcript (`changedFileMatchesTranscript`).
  */
 export function evaluateRepoSessionActivity({
   hasNewWorkingEdit = false,
   inPaneCwd = false,
   inWorkspaceRoot = false,
+  sameFeatureBranch = false,
   inSessionRepos = false,
   startHead = "",
   headHash = "",
   repoMatchesTranscript = false,
+  changedFileMatchesTranscript = false,
 } = {}) {
-  if (hasNewWorkingEdit || inPaneCwd || inWorkspaceRoot || inSessionRepos) return true;
+  if (
+    hasNewWorkingEdit ||
+    inPaneCwd ||
+    inWorkspaceRoot ||
+    sameFeatureBranch ||
+    inSessionRepos ||
+    changedFileMatchesTranscript
+  ) {
+    return true;
+  }
   const headMoved = Boolean(startHead && headHash && startHead !== headHash);
   return Boolean(headMoved && repoMatchesTranscript);
 }

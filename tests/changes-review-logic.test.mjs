@@ -34,6 +34,9 @@ import {
   filterSessionWorkingEntries,
   partitionSessionWorkingEntries,
   partitionSessionUnifiedEntries,
+  collectActiveFeatureBranches,
+  isMatchingFeatureBranch,
+  changedFilesMatchTranscript,
   evaluateRepoSessionActivity,
   findBaselineRepoEntry,
   normalizeGitStatusMark,
@@ -1999,5 +2002,97 @@ describe("changes-review review-logic", () => {
     };
     const freshRes = await resolveRepoBaseRefWithExec("/ws/ms-company", "feat/brand-new", HEAD, null, freshBranchExec);
     assert.equal(freshRes.baseHash, HEAD);
+  });
+
+  test("regression: paired multi-microservice feature branch and strict changed-file transcript attribution include sibling repo without leaking unrelated siblings", () => {
+    const walletRes = {
+      service: { id: ".", name: "ms-wallet-extract-mirror", root: "C:/Dev/Global66/ms-wallet-extract-mirror", isSibling: false },
+      branch: "nmunoz/dev/extract-accounts-with-mirror",
+    };
+    const gatewayRes = {
+      service: { id: "../ms-product-gateway-extract-mirror", name: "ms-product-gateway-extract-mirror", root: "C:/Dev/Global66/ms-product-gateway-extract-mirror", isSibling: true },
+      branch: "nmunoz/dev/extract-accounts-with-mirror",
+    };
+    const cardRes = {
+      service: { id: "../ms-card", name: "ms-card", root: "C:/Dev/Global66/ms-card", isSibling: true },
+      branch: "nmunoz/dev/BMB-4277-card-limit-duplicates",
+    };
+    const baseWalletRes = {
+      service: { id: "../ms-wallet", name: "ms-wallet", root: "C:/Dev/Global66/ms-wallet", isSibling: true },
+      branch: "master",
+    };
+
+    const activeBranches = collectActiveFeatureBranches(
+      [walletRes, gatewayRes, cardRes, baseWalletRes],
+      { workspaceRoot: "c:\\dev\\global66\\ms-wallet-extract-mirror", paneCwds: [], isWindows: true },
+    );
+    assert.deepEqual(Array.from(activeBranches), ["nmunoz/dev/extract-accounts-with-mirror"]);
+    assert.equal(isMatchingFeatureBranch(gatewayRes.branch, activeBranches), true);
+    assert.equal(isMatchingFeatureBranch(cardRes.branch, activeBranches), false);
+    assert.equal(isMatchingFeatureBranch("master", activeBranches), false);
+
+    // Base branches on active repo must NEVER populate activeFeatureBranches (no sibling leak when both sit on development/master)
+    const onBaseBranches = collectActiveFeatureBranches(
+      [{ service: { id: ".", name: "ms-wallet", root: "/ws/ms-wallet" }, branch: "development" }],
+      { workspaceRoot: "/ws/ms-wallet" },
+    );
+    assert.equal(onBaseBranches.size, 0);
+    assert.equal(isMatchingFeatureBranch("development", onBaseBranches), false);
+
+    // Paired sibling repo gets attributed even when changes are already committed (hasNewWorkingEdit = false, headMoved = false)
+    assert.equal(
+      evaluateRepoSessionActivity({
+        hasNewWorkingEdit: false,
+        inPaneCwd: false,
+        inWorkspaceRoot: false,
+        sameFeatureBranch: true,
+        inSessionRepos: false,
+        startHead: "aaaa",
+        headHash: "aaaa",
+        repoMatchesTranscript: false,
+      }),
+      true,
+    );
+
+    // Cross-repo edits on DIFFERENT branch names: attributed when transcript mentions BOTH repo name AND an actually changed file
+    const gatewaySvc = { name: "ms-product-gateway", relPath: "", root: "C:/Dev/Global66/ms-product-gateway" };
+    const gatewayFiles = [
+      { path: "src/main/java/com/global/productgateway/service/AccountMirrorServiceImpl.java" },
+    ];
+    const cardSvc = { name: "ms-card", relPath: "", root: "C:/Dev/Global66/ms-card" };
+    const cardOldFiles = [
+      { path: "src/main/java/com/global/card/CardLimitServiceImpl.java" },
+    ];
+    const transcript = [
+      "Read ../ms-card/pom.xml to check dependency version",
+      "Updated ../ms-product-gateway/src/main/java/com/global/productgateway/service/AccountMirrorServiceImpl.java",
+      "Committed mirror endpoint in ms-product-gateway",
+    ].join("\n");
+
+    assert.equal(changedFilesMatchTranscript(gatewaySvc, gatewayFiles, transcript, true), true);
+    assert.equal(
+      changedFilesMatchTranscript(cardSvc, cardOldFiles, transcript, true),
+      false,
+      "reading an unrelated file (pom.xml) in ms-card must NOT attribute ms-card's unrelated diff files",
+    );
+    // Generic filenames (pom.xml, README.md) alone don't trigger false basename matches when full path differs
+    assert.equal(
+      changedFilesMatchTranscript(cardSvc, [{ path: "sub/pom.xml" }], "Read ../ms-card/pom.xml", true),
+      false,
+    );
+    assert.equal(
+      evaluateRepoSessionActivity({
+        hasNewWorkingEdit: false,
+        inPaneCwd: false,
+        inWorkspaceRoot: false,
+        sameFeatureBranch: false,
+        inSessionRepos: false,
+        startHead: "aaaa",
+        headHash: "aaaa",
+        repoMatchesTranscript: true,
+        changedFileMatchesTranscript: true,
+      }),
+      true,
+    );
   });
 });

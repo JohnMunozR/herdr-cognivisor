@@ -129,6 +129,7 @@ export default class CognivisorTabs extends View {
           manualTitle: true,
           leadTerminal: existing.leadTerminal ?? null,
           reviewedServices: existing.reviewedServices || {},
+          createdAt: existing.createdAt || Date.now(),
           updatedAt: Date.now(),
         },
       });
@@ -152,6 +153,7 @@ export default class CognivisorTabs extends View {
           manualTitle: false,
           leadTerminal: existing.leadTerminal ?? null,
           reviewedServices: existing.reviewedServices || {},
+          createdAt: existing.createdAt || Date.now(),
           updatedAt: Date.now(),
         },
       });
@@ -324,6 +326,7 @@ export default class CognivisorTabs extends View {
           manualTitle: Boolean(existing.manualTitle),
           leadTerminal: existing.leadTerminal || terminal,
           reviewedServices: existing.reviewedServices || {},
+          createdAt: existing.createdAt || Date.now(),
           updatedAt: Date.now(),
         },
       });
