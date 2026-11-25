@@ -1,5 +1,8 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   getFileExt,
   tokenizeDiffLine,
@@ -72,6 +75,7 @@ import {
   screenLooksBlockedOrPrompting,
   detectUnsubmittedReviewInScreen,
   decideSendSubmitAction,
+  computeReviewCommentWrapCols,
 } from "../mods/changes-review/review-logic.js";
 import {
   statFileEntry as filesSearchStatFileEntry,
@@ -1643,5 +1647,45 @@ describe("changes-review review-logic", () => {
       }).shouldNudge,
       false,
     );
+  });
+
+  test("regression: computeReviewCommentWrapCols scales to full review width without legacy 56-column cap", () => {
+    // Wide Review tab (~1208px viewport -> ~153 code wrap cols) must not cap comments at 56 cols
+    assert.equal(computeReviewCommentWrapCols(153), 147);
+    assert.equal(computeReviewCommentWrapCols(111), 105);
+    // Narrow split pane reserves chrome cleanly without overflowing
+    assert.equal(computeReviewCommentWrapCols(33), 27);
+    // Ultra-narrow viewport clamps safely to 12 columns
+    assert.equal(computeReviewCommentWrapCols(14), 12);
+    assert.equal(computeReviewCommentWrapCols(6), 12);
+    // Missing/invalid wrapCols falls back cleanly to 74 columns (80 - 6)
+    assert.equal(computeReviewCommentWrapCols(undefined), 74);
+    assert.equal(computeReviewCommentWrapCols(0), 74);
+    assert.equal(computeReviewCommentWrapCols(NaN), 74);
+  });
+
+  test("regression: review comment composer and saved inline comments span full width without fixed max_w cutoff", () => {
+    const repoRoot = join(fileURLToPath(new URL(".", import.meta.url)), "..");
+    const mainSource = readFileSync(join(repoRoot, "mods/changes-review/main.js"), "utf8");
+
+    const composerStart = mainSource.indexOf("renderCommentComposer(");
+    const composerEnd = mainSource.indexOf("render(cx)", composerStart);
+    assert.ok(composerStart > 0 && composerEnd > composerStart, "renderCommentComposer method must exist");
+    const composerSrc = mainSource.slice(composerStart, composerEnd);
+
+    // Must not artificially cut the composer to half-width with a fixed max_w(...) cap
+    assert.equal(/\.max_w\(/.test(composerSrc), false, "renderCommentComposer must not constrain width via max_w(...)");
+    assert.ok(composerSrc.includes('v_flex().id("review-comment-composer").w_full().min_w(0).flex_none()'));
+    assert.ok(composerSrc.includes("Textarea.new(this.commentInput).w_full().min_w(0).h(62)"));
+    assert.ok(composerSrc.includes('id("inline-cancel-btn")') && composerSrc.includes('id("inline-save-btn")'));
+    assert.ok(composerSrc.includes("div().flex_1().min_w(0).truncate().text_size(10.5)"), "shortcut hint must truncate on narrow panes");
+    assert.ok(composerSrc.includes("h_flex().flex_none().gap(6).items_center()"), "action buttons must remain flex_none()");
+
+    // Inline saved comments in diffRow must also span full width without legacy max_w(460)
+    const commentLinesStart = mainSource.indexOf("const commentLines = this.getWrappedCommentLines(");
+    assert.ok(commentLinesStart > 0 && composerStart > commentLinesStart);
+    const inlineSavedCommentSrc = mainSource.slice(commentLinesStart, composerStart);
+    assert.equal(/\.max_w\(/.test(inlineSavedCommentSrc), false, "saved inline comment row must not constrain width via max_w(...)");
+    assert.ok(mainSource.includes("computeReviewCommentWrapCols(wrapCols)"), "getWrappedCommentLines must use computeReviewCommentWrapCols");
   });
 });

@@ -69,6 +69,7 @@ import {
   parseHcJsonOutput,
   formatHcErrorMessage,
   decideSendSubmitAction,
+  computeReviewCommentWrapCols,
 } from "./review-logic.js";
 import { computeWrapColumns, countWrappedLines, wrapPlainText, wrapStyledSpans } from "./code-wrap.js";
 import { renderDropdownTrigger, renderDropdownPopover } from "./dropdown.js";
@@ -3359,7 +3360,7 @@ export default class ChangesReview extends View {
   }
 
   getWrappedCommentLines(text, wrapCols) {
-    const commentCols = Math.max(24, Math.min(56, (wrapCols || 80) - 8));
+    const commentCols = computeReviewCommentWrapCols(wrapCols);
     const rawLines = String(text || "").split(/\r?\n/);
     const out = [];
     for (let i = 0; i < rawLines.length; i++) {
@@ -3761,15 +3762,15 @@ export default class ChangesReview extends View {
       .on_click((_e, clickCx) => this.handleDiffRowActivate(rowIndex, openKey, clickCx))
       .child(row)
       .child(
-        h_flex().w_full().h(commentBoxH).pl(12).pr(16).py(6).bg(t.raised).border_b(1).border_color(t.border)
+        h_flex().w_full().min_w(0).h(commentBoxH).pl(12).pr(16).py(6).bg(t.raised).border_b(1).border_color(t.border)
           .cursor_pointer().hover((s) => s.bg(t.hover))
           .child(
-            h_flex().w_full().max_w(460).gap(8).items_start()
+            h_flex().w_full().min_w(0).gap(8).items_start()
               .child(div().pt(2).flex_none().child(svg("mods/changes-review/icons/comment.svg").size(11).text_color(t.muted)))
               .child(
-                v_flex().flex_1().min_w(0).children(
+                v_flex().flex_1().min_w(0).overflow_hidden().children(
                   commentLines.map((line) =>
-                    div().w_full().h(16).flex_none().whitespace_nowrap().text_size(11.5).text_color(t.foreground).child(line || " ")
+                    div().w_full().h(16).flex_none().overflow_hidden().whitespace_nowrap().text_size(11.5).text_color(t.foreground).child(line || " ")
                   )
                 )
               )
@@ -3786,59 +3787,57 @@ export default class ChangesReview extends View {
     if (!active || active.fileKey !== openKey) return div();
     const existing = commentMap ? commentMap.get(active.line) : null;
     const canSave = Boolean(this.commentText.trim());
-    return v_flex().id("review-comment-composer").w_full().flex_none()
-      .px(12).py(8).bg(t.raised).border_t(1).border_color(t.border)
+    return v_flex().id("review-comment-composer").w_full().min_w(0).flex_none()
+      .px(12).py(8).gap(6).bg(t.raised).border_t(1).border_color(t.border)
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .child(
-        v_flex().w_full().max_w(520).gap(6)
+        h_flex().w_full().min_w(0).items_center().justify_between().gap(8)
           .child(
-            h_flex().w_full().items_center().justify_between().gap(8)
-              .child(
-                h_flex().items_center().gap(6).min_w(0).flex_1()
-                  .child(svg("mods/changes-review/icons/comment.svg").size(11).text_color(t.accent))
-                  .child(div().text_size(11.5).font_semibold().text_color(t.foreground).child(`Line ${active.line}`))
-                  .when(Boolean(active.snippet), (e) =>
-                    e.child(div().flex_1().min_w(0).overflow_hidden().whitespace_nowrap().text_size(11).text_color(t.dim).child(active.snippet))
-                  )
-              )
-              .when(Boolean(existing), (e) =>
-                e.child(
-                  h_flex().id("inline-delete-btn").h(22).px(8).items_center().gap(4).rounded(5)
-                    .border_1().border_color(t.border).bg(t.background)
-                    .text_color(t.muted).text_size(11).cursor_pointer()
-                    .hover((s) => s.text_color(t.foreground).bg(t.hover))
-                    .on_click((_e, cx) => this.removeComment(openKey, active.line, cx))
-                    .child(svg("mods/changes-review/icons/trash.svg").size(10).text_color(t.muted))
-                    .child("Delete")
-                )
+            h_flex().items_center().gap(6).min_w(0).flex_1()
+              .child(svg("mods/changes-review/icons/comment.svg").size(11).flex_none().text_color(t.accent))
+              .child(div().flex_none().whitespace_nowrap().text_size(11.5).font_semibold().text_color(t.foreground).child(`Line ${active.line}`))
+              .when(Boolean(active.snippet), (e) =>
+                e.child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(active.snippet))
               )
           )
-          .child(
-            div().w_full().h(78).p(7).rounded(7).border_1().border_color(this.typingComment ? t.accent : t.border).bg(t.background).cursor_text()
-              .child(Textarea.new(this.commentInput).w_full().h(62).text_size(12).text_color(t.foreground))
+          .when(Boolean(existing), (e) =>
+            e.child(
+              h_flex().id("inline-delete-btn").h(22).px(8).flex_none().items_center().gap(4).rounded(5)
+                .border_1().border_color(t.border).bg(t.background)
+                .text_color(t.muted).text_size(11).cursor_pointer()
+                .hover((s) => s.text_color(t.foreground).bg(t.hover))
+                .on_click((_e, cx) => this.removeComment(openKey, active.line, cx))
+                .child(svg("mods/changes-review/icons/trash.svg").size(10).flex_none().text_color(t.muted))
+                .child("Delete")
+            )
           )
+      )
+      .child(
+        v_flex().id("review-comment-input-box").w_full().min_w(0).h(78).p(7).rounded(7)
+          .border_1().border_color(this.typingComment ? t.accent : t.border).bg(t.background).cursor_text()
+          .child(Textarea.new(this.commentInput).w_full().min_w(0).h(62).text_size(12).text_color(t.foreground))
+      )
+      .child(
+        h_flex().w_full().min_w(0).h(26).gap(8).items_center().justify_between()
+          .child(div().flex_1().min_w(0).truncate().text_size(10.5).text_color(t.dim).child("Esc to cancel · Cmd/Ctrl+Enter to save"))
           .child(
-            h_flex().w_full().h(26).items_center().justify_between()
-              .child(div().text_size(10.5).text_color(t.dim).child("Esc to cancel · Cmd/Ctrl+Enter to save"))
+            h_flex().flex_none().gap(6).items_center()
               .child(
-                h_flex().gap(6).items_center()
-                  .child(
-                    h_flex().id("inline-cancel-btn").h(26).px(10).items_center().rounded(6)
-                      .border_1().border_color(t.border).bg(t.background)
-                      .text_color(t.muted).text_size(11.5).cursor_pointer()
-                      .hover((s) => s.text_color(t.foreground))
-                      .on_click((_e, cx) => this.cancelActiveComment(cx))
-                      .child("Cancel")
-                  )
-                  .child(
-                    h_flex().id("inline-save-btn").h(26).px(12).items_center().rounded(6)
-                      .bg(canSave ? t.solid : t.background)
-                      .text_color(canSave ? t.solid_foreground : t.dim)
-                      .text_size(11.5).font_medium()
-                      .when(canSave, (e) => e.cursor_pointer())
-                      .on_click((_e, cx) => this.saveActiveComment(cx))
-                      .child(existing ? "Update" : "Save")
-                  )
+                h_flex().id("inline-cancel-btn").h(26).px(10).flex_none().items_center().rounded(6)
+                  .border_1().border_color(t.border).bg(t.background)
+                  .text_color(t.muted).text_size(11.5).cursor_pointer()
+                  .hover((s) => s.text_color(t.foreground))
+                  .on_click((_e, cx) => this.cancelActiveComment(cx))
+                  .child("Cancel")
+              )
+              .child(
+                h_flex().id("inline-save-btn").h(26).px(12).flex_none().items_center().rounded(6)
+                  .bg(canSave ? t.solid : t.background)
+                  .text_color(canSave ? t.solid_foreground : t.dim)
+                  .text_size(11.5).font_medium()
+                  .when(canSave, (e) => e.cursor_pointer())
+                  .on_click((_e, cx) => this.saveActiveComment(cx))
+                  .child(existing ? "Update" : "Save")
               )
           )
       );
