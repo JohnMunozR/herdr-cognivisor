@@ -538,10 +538,35 @@ export function sortServicesDirtyFirst(services) {
   });
 }
 
-/** Compute a deterministic fingerprint string for a changed file snapshot. */
+/** Normalize comment diff side (`"old"` for deleted lines, `"new"` for added/context lines). */
+export function normalizeCommentSide(side) {
+  return side === "old" ? "old" : "new";
+}
+
+/** Build a collision-free comment key scoped by fileKey, diff side, and line number. */
+export function buildCommentKey(fileKey, line, side = "new") {
+  return `${String(fileKey || "")}::${normalizeCommentSide(side)}::${Number(line) || 0}`;
+}
+
+/** Build the unified session review approval key (`session::<serviceId>::<path>`). */
+export function buildReviewedFileKey(fileOrKey) {
+  const fileKey = typeof fileOrKey === "string"
+    ? fileOrKey
+    : (fileOrKey?.key || (fileOrKey?.serviceId && fileOrKey?.path ? `${fileOrKey.serviceId}::${fileOrKey.path}` : ""));
+  return fileKey ? `session::${fileKey}` : "";
+}
+
+/**
+ * Compute a commit-resilient fingerprint string for a unified session diff file.
+ * Excludes transient `fresh` state so approving a file persists across `git add` / `git commit`
+ * while invalidating immediately when net diff, content sig, or `baseHash` changes.
+ */
 export function computeFileReviewFingerprint(file) {
   if (!file || typeof file !== "object") return "";
-  return `${file.status || "M"}|${Number(file.add) || 0}|${Number(file.del) || 0}|${file.fresh ? 1 : 0}|${file.binary ? 1 : 0}|${file.sig || ""}|${Number(file.mtimeMs) || 0}`;
+  const status = String(file.status || "M");
+  const baseHash = String(file.baseHash || "");
+  const sig = status === "D" ? "deleted:D" : String(file.sig || "");
+  return `${status}|${Number(file.add) || 0}|${Number(file.del) || 0}|${file.binary ? 1 : 0}|${baseHash}|${sig}`;
 }
 
 /** Normalize a stored reviewedFiles entry (legacy boolean or structured record). */
@@ -563,33 +588,28 @@ function extractFileKeyServiceId(fileKey) {
 }
 
 /**
- * Reconcile persisted file-reviewed records against current working files and new commits.
- * Invalidates checks when a file leaves the working tree, is re-edited, or is modified by a newer commit.
+ * Reconcile persisted `session::` file-reviewed records against current unified session files.
+ * Preserves approvals across `git commit` when net diff & content fingerprint against `baseHash`
+ * are unchanged, and invalidates checks when a file leaves the diff, is edited, or changes base.
  */
 export function reconcileReviewedFiles(
   prevReviewedFiles,
   {
+    sessionFiles,
     workingFiles = [],
-    committedFileKeys = new Set(),
-    committedAfterByKey = new Map(),
     erroredServiceIds = new Set(),
-    scopeMode = "working",
   } = {},
 ) {
-  void scopeMode;
   const prev = prevReviewedFiles && typeof prevReviewedFiles === "object" && !Array.isArray(prevReviewedFiles)
     ? prevReviewedFiles
     : {};
-  const workingByKey = new Map();
-  for (const f of Array.isArray(workingFiles) ? workingFiles : []) {
-    if (f?.key) workingByKey.set(f.key, f);
+  const activeList = Array.isArray(sessionFiles)
+    ? sessionFiles
+    : (Array.isArray(workingFiles) ? workingFiles : []);
+  const fileByKey = new Map();
+  for (const f of activeList) {
+    if (f?.key) fileByKey.set(f.key, f);
   }
-  const committedSet = committedFileKeys instanceof Set
-    ? committedFileKeys
-    : new Set(Array.isArray(committedFileKeys) ? committedFileKeys : []);
-  const afterMap = committedAfterByKey instanceof Map
-    ? committedAfterByKey
-    : new Map(committedAfterByKey && typeof committedAfterByKey === "object" ? Object.entries(committedAfterByKey) : []);
   const erroredSet = erroredServiceIds instanceof Set
     ? erroredServiceIds
     : new Set(Array.isArray(erroredServiceIds) ? erroredServiceIds : []);
@@ -604,15 +624,15 @@ export function reconcileReviewedFiles(
       continue;
     }
 
-    if (rk.startsWith("working::")) {
-      const fileKey = rk.slice("working::".length);
+    if (rk.startsWith("session::")) {
+      const fileKey = rk.slice("session::".length);
       const serviceIdFromKey = extractFileKeyServiceId(fileKey);
       if (erroredSet.has(serviceIdFromKey)) {
         nextMap[rk] = rawVal;
         continue;
       }
-      const curFile = workingByKey.get(fileKey);
-      if (!curFile || committedSet.has(fileKey)) {
+      const curFile = fileByKey.get(fileKey);
+      if (!curFile) {
         changed = true;
         continue;
       }
@@ -625,25 +645,9 @@ export function reconcileReviewedFiles(
       continue;
     }
 
-    if (rk.startsWith("commit:")) {
-      const rest = rk.slice("commit:".length);
-      const hashSep = rest.indexOf("::");
-      const fileKey = hashSep >= 0 ? rest.slice(hashSep + 2) : "";
-      const serviceIdFromKey = fileKey ? extractFileKeyServiceId(fileKey) : "";
-      if (fileKey && erroredSet.has(serviceIdFromKey)) {
-        nextMap[rk] = rawVal;
-        continue;
-      }
-      if (
-        !rec.fp ||
-        (fileKey &&
-          (committedSet.has(fileKey) ||
-            (afterMap.has(fileKey) && Number(afterMap.get(fileKey)) > (rec.reviewedAt || 0))))
-      ) {
-        changed = true;
-        continue;
-      }
-      nextMap[rk] = rawVal;
+    // Drop legacy `working::` and `commit:*` entries cleanly.
+    if (rk.startsWith("working::") || rk.startsWith("commit:")) {
+      changed = true;
       continue;
     }
 
@@ -653,12 +657,22 @@ export function reconcileReviewedFiles(
   return { nextMap, changed };
 }
 
-export function filterSessionCommits(commits, sessionStartedAt) {
-  if (!Array.isArray(commits)) return [];
-  const startedAtMs = Number(sessionStartedAt || 0);
-  if (!startedAtMs || startedAtMs <= 0) return commits;
-  const cutoffSec = Math.floor(startedAtMs / 1000);
-  return commits.filter((c) => c && Number(c.timestamp || 0) >= cutoffSec);
+function baselineEntriesMatch(base, status, sig) {
+  if (!base || typeof base !== "object") return false;
+  const baseStatus = String(base.status ?? "");
+  const curStatus = String(status ?? "");
+  if (baseStatus !== curStatus) return false;
+  const baseSig = String(base.sig ?? "");
+  const curSig = String(sig ?? "");
+  if (baseSig === curSig) return true;
+  if (
+    curStatus === "D" &&
+    (baseSig === "deleted" || baseSig === "deleted:D") &&
+    (curSig === "deleted" || curSig === "deleted:D")
+  ) {
+    return true;
+  }
+  return false;
 }
 
 export function partitionSessionWorkingEntries(entries, baselineRepo, sessionStartedAt) {
@@ -680,8 +694,7 @@ export function partitionSessionWorkingEntries(entries, baselineRepo, sessionSta
     const mtimeMs = Number(entry.mtimeMs || 0);
 
     if (dirtyFiles) {
-      const base = dirtyFiles[relFile];
-      if (base && typeof base === "object" && (base.status ?? "") === status && (base.sig ?? "") === sig) {
+      if (baselineEntriesMatch(dirtyFiles[relFile], status, sig)) {
         hidden.push(entry);
         continue;
       }
@@ -690,7 +703,7 @@ export function partitionSessionWorkingEntries(entries, baselineRepo, sessionSta
     }
 
     if (startedAtMs > 0) {
-      if (!mtimeMs || mtimeMs >= startedAtMs) {
+      if (mtimeMs > 0 && mtimeMs >= startedAtMs) {
         visible.push(entry);
       } else {
         hidden.push(entry);
@@ -705,6 +718,78 @@ export function partitionSessionWorkingEntries(entries, baselineRepo, sessionSta
 
 export function filterSessionWorkingEntries(entries, baselineRepo, sessionStartedAt) {
   return partitionSessionWorkingEntries(entries, baselineRepo, sessionStartedAt).visible;
+}
+
+/**
+ * Partition unified origin-branch diff entries into visible session changes vs hidden pre-existing
+ * uncommitted working-tree entries. Files already modified in `baseHash..HEAD` commits (`committedPaths`)
+ * are always visible; uncommitted files matching `baselineRepo.dirtyFiles` remain hidden.
+ */
+export function partitionSessionUnifiedEntries(entries, baselineRepo, committedPaths = null, sessionStartedAt = 0) {
+  if (!Array.isArray(entries) || entries.length === 0) return { visible: [], hidden: [] };
+  const committedSet = committedPaths instanceof Set
+    ? committedPaths
+    : new Set(Array.isArray(committedPaths) ? committedPaths : []);
+  const startedAtMs = Number(sessionStartedAt || 0);
+  const dirtyFiles =
+    baselineRepo && typeof baselineRepo === "object" && baselineRepo.dirtyFiles && typeof baselineRepo.dirtyFiles === "object"
+      ? baselineRepo.dirtyFiles
+      : null;
+
+  const visible = [];
+  const hidden = [];
+
+  for (const entry of entries) {
+    if (!entry) continue;
+    const relFile = normBaselineRel(entry.relFile ?? entry.path ?? "");
+    if (committedSet.has(relFile)) {
+      visible.push(entry);
+      continue;
+    }
+    if (entry.inWorkingTree === false) {
+      visible.push(entry);
+      continue;
+    }
+    const status = entry.workingStatus || entry.status || "";
+    const sig = entry.sig ?? "";
+    const mtimeMs = Number(entry.mtimeMs || 0);
+    if (dirtyFiles) {
+      if (baselineEntriesMatch(dirtyFiles[relFile], status, sig)) {
+        hidden.push(entry);
+        continue;
+      }
+      visible.push(entry);
+      continue;
+    }
+    if (startedAtMs > 0) {
+      if (mtimeMs > 0 && mtimeMs >= startedAtMs) {
+        visible.push(entry);
+      } else {
+        hidden.push(entry);
+      }
+      continue;
+    }
+    visible.push(entry);
+  }
+
+  return { visible, hidden };
+}
+
+/**
+ * Determine whether a candidate repository has legitimate activity in the current chat session.
+ * Prevents untouched sibling repositories (including those on old feature branches) from leaking.
+ */
+export function evaluateRepoSessionActivity({
+  hasNewWorkingEdit = false,
+  inPaneCwd = false,
+  inSessionRepos = false,
+  startHead = "",
+  headHash = "",
+  repoMatchesTranscript = false,
+} = {}) {
+  if (hasNewWorkingEdit || inPaneCwd || inSessionRepos) return true;
+  const headMoved = Boolean(startHead && headHash && startHead !== headHash);
+  return Boolean(headMoved && repoMatchesTranscript);
 }
 
 function normBaselineRoot(p) {
@@ -807,9 +892,19 @@ export function normalizeGitStatusMark(xy) {
   return "M";
 }
 
-export async function statFileEntry(fullPath, status, on = null, fsDeps = fsPromises) {
-  if (on) return { sig: String(status || ""), mtimeMs: 0 };
-  if (!fullPath) return { sig: "deleted", mtimeMs: 0 };
+export async function statFileEntry(fullPath, status, on = null, fsDeps = fsPromises, opts = null) {
+  if (String(status || "") === "D") return { sig: "deleted:D", mtimeMs: 0 };
+  if (on) {
+    const ds = opts?.diffStat;
+    if (ds && typeof ds === "object") {
+      return {
+        sig: `ssh:${String(status || "M")}:${Number(ds.add) || 0}:${Number(ds.del) || 0}:${ds.binary ? 1 : 0}`,
+        mtimeMs: 0,
+      };
+    }
+    return { sig: String(status || ""), mtimeMs: 0 };
+  }
+  if (!fullPath) return { sig: "deleted:D", mtimeMs: 0 };
   const api = fsDeps || fsPromises;
   if (typeof api.stat === "function") {
     try {
@@ -820,13 +915,13 @@ export async function statFileEntry(fullPath, status, on = null, fsDeps = fsProm
       const mtimeMs = Number.isFinite(st.mtimeMs) ? st.mtimeMs : 0;
       return { sig: `${st.size}:${Math.trunc(mtimeMs)}`, mtimeMs };
     } catch (err) {
-      if (err && err.code === "ENOENT") return { sig: "deleted", mtimeMs: 0 };
+      if (err && err.code === "ENOENT") return { sig: "deleted:D", mtimeMs: 0 };
     }
   }
   if (typeof api.exists === "function") {
     try {
       const ok = await api.exists(fullPath);
-      if (!ok) return { sig: "deleted", mtimeMs: 0 };
+      if (!ok) return { sig: "deleted:D", mtimeMs: 0 };
     } catch {
       // fall through
     }
@@ -838,7 +933,7 @@ export async function statFileEntry(fullPath, status, on = null, fsDeps = fsProm
       const { len, hex } = fnv1aBytes(buf);
       return { sig: `${len}:b${hex}`, mtimeMs: 0 };
     } catch (err) {
-      if (err && err.code === "ENOENT") return { sig: "deleted", mtimeMs: 0 };
+      if (err && err.code === "ENOENT") return { sig: "deleted:D", mtimeMs: 0 };
       return { sig: `dir:${String(status || "")}`, mtimeMs: 0 };
     }
   }
@@ -853,6 +948,8 @@ export function normalizeSessionBaseline(raw) {
   const startedAtNum = Number(payload.startedAt);
   if (!Number.isFinite(startedAtNum) || startedAtNum <= 0) return null;
   const workspaceRoot = normBaselineRoot(payload.workspaceRoot || "");
+  const revNum = Number(payload.rev);
+  const rev = Number.isFinite(revNum) && revNum >= 0 ? Math.trunc(revNum) : 0;
   const repos = {};
   const rawRepos = payload.repos && typeof payload.repos === "object" && !Array.isArray(payload.repos) ? payload.repos : {};
   for (const [repoKey, repoVal] of Object.entries(rawRepos)) {
@@ -870,14 +967,27 @@ export function normalizeSessionBaseline(raw) {
         sig: String(entryVal.sig || ""),
       };
     }
-    repos[normRoot] = { dirtyFiles };
+    const repoOut = { dirtyFiles };
+    if (typeof repoVal.startHead === "string" && repoVal.startHead.trim()) {
+      repoOut.startHead = repoVal.startHead.trim();
+    }
+    if (typeof repoVal.startBranch === "string" && repoVal.startBranch.trim()) {
+      repoOut.startBranch = repoVal.startBranch.trim();
+    }
+    repos[normRoot] = repoOut;
   }
   return {
     version: 1,
+    rev,
     startedAt: startedAtNum,
     workspaceRoot,
     repos,
   };
+}
+
+export function getDiskSessionBaselinePath(appHomeDir, tabId) {
+  if (!appHomeDir || !tabId) return "";
+  return join(String(appHomeDir), "cognivisor", "sessions", "tabs", `${safeBaselineTabId(tabId)}.json`);
 }
 
 function baselineMatchesWorkspace(baseline, workspaceRoot) {
@@ -970,13 +1080,12 @@ export async function writeDiskSessionBaseline(appHomeDir, tabId, workspaceRoot,
   return wrote;
 }
 
-export const DEFAULT_RECENT_BASELINE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
-
 export function resolveSessionStartTime(flowObj, now = Date.now()) {
   const nowMs = Number.isFinite(Number(now)) && Number(now) > 0 ? Number(now) : Date.now();
   const candidates = [];
   if (flowObj && typeof flowObj === "object") {
-    for (const raw of [flowObj.sessionStartedAt, flowObj.createdAt, flowObj.updatedAt]) {
+    // Only trust explicit session start / creation timestamps — never `updatedAt` written by tab naming.
+    for (const raw of [flowObj.sessionStartedAt, flowObj.createdAt]) {
       const n = Number(raw);
       if (Number.isFinite(n) && n > 0 && n <= nowMs) {
         candidates.push(n);
@@ -990,15 +1099,20 @@ export function resolveSessionStartTime(flowObj, now = Date.now()) {
   return { startedAt: nowMs, anchored: false };
 }
 
-export function buildFreshSessionBaseline(repoSnapshots, { workspaceRoot = "", startedAt = Date.now(), anchored = false } = {}) {
+export function buildFreshSessionBaseline(repoSnapshots, { workspaceRoot = "", startedAt = Date.now(), anchored = false, rev = 0 } = {}) {
   const startedAtNum = Number.isFinite(Number(startedAt)) && Number(startedAt) > 0 ? Number(startedAt) : Date.now();
   const normWs = normBaselineRoot(workspaceRoot || "");
+  const revNum = Number.isFinite(Number(rev)) && Number(rev) >= 0 ? Math.trunc(Number(rev)) : 0;
   const repos = {};
   for (const res of Array.isArray(repoSnapshots) ? repoSnapshots : []) {
     const normRoot = normBaselineRoot(res?.service?.root ?? res?.root ?? "");
     if (!normRoot) continue;
     const dirtyFiles = {};
-    for (const f of Array.isArray(res?.files) ? res.files : []) {
+    // Prefer `workingFiles` (working-tree only) so committed branch changes are never baselined as dirty.
+    const workingList = Array.isArray(res?.workingFiles)
+      ? res.workingFiles
+      : (Array.isArray(res?.files) ? res.files : []);
+    for (const f of workingList) {
       const rel = normBaselineRel(f?.relFile ?? f?.path ?? "");
       if (!rel) continue;
       const mtimeMs = Number(f?.mtimeMs || 0);
@@ -1006,14 +1120,20 @@ export function buildFreshSessionBaseline(repoSnapshots, { workspaceRoot = "", s
         continue;
       }
       dirtyFiles[rel] = {
-        status: String(f?.status || "M"),
+        status: String(f?.workingStatus || f?.status || "M"),
         sig: String(f?.sig || ""),
       };
     }
-    repos[normRoot] = { dirtyFiles };
+    const repoEntry = { dirtyFiles };
+    const startHead = String(res?.headHash || "").trim();
+    const startBranch = String(res?.branch || res?.service?.branch || "").trim();
+    if (startHead) repoEntry.startHead = startHead;
+    if (startBranch) repoEntry.startBranch = startBranch;
+    repos[normRoot] = repoEntry;
   }
   return {
     version: 1,
+    rev: revNum,
     startedAt: startedAtNum,
     workspaceRoot: normWs,
     repos,
@@ -1025,103 +1145,30 @@ export function createResetSessionBaseline(existingBaseline, repoRoots = [], wor
   const normExisting = normalizeSessionBaseline(existingBaseline);
   const startedAt = normExisting?.startedAt && normExisting.startedAt > 0 ? normExisting.startedAt : nowMs;
   const normWs = normBaselineRoot(workspaceRoot || normExisting?.workspaceRoot || "");
+  const nextRev = (normExisting?.rev || 0) + 1;
   const repos = {};
   if (normExisting?.repos) {
-    for (const repoRoot of Object.keys(normExisting.repos)) {
+    for (const [repoRoot, prevRepo] of Object.entries(normExisting.repos)) {
       const clean = normBaselineRoot(repoRoot);
-      if (clean) repos[clean] = { dirtyFiles: {} };
+      if (!clean) continue;
+      const entry = { dirtyFiles: {} };
+      if (prevRepo?.startHead) entry.startHead = prevRepo.startHead;
+      if (prevRepo?.startBranch) entry.startBranch = prevRepo.startBranch;
+      repos[clean] = entry;
     }
   }
   for (const repoRoot of Array.isArray(repoRoots) ? repoRoots : []) {
     const clean = normBaselineRoot(repoRoot);
-    if (clean) repos[clean] = { dirtyFiles: {} };
+    if (!clean) continue;
+    if (!repos[clean]) repos[clean] = { dirtyFiles: {} };
   }
   return {
     version: 1,
+    rev: nextRev,
     startedAt,
     workspaceRoot: normWs,
     repos,
   };
-}
-
-function toSafeLiveTabSet(liveTabIds) {
-  if (!liveTabIds) return null;
-  const set = new Set();
-  for (const id of liveTabIds) {
-    if (id) set.add(safeBaselineTabId(id));
-  }
-  return set;
-}
-
-export function findRecentFlowWorkspaceBaseline(
-  flows,
-  workspaceRoot,
-  { excludeTabId = "", liveTabIds = null, maxAgeMs = DEFAULT_RECENT_BASELINE_MAX_AGE_MS, now = Date.now() } = {},
-) {
-  const normWs = normBaselineRoot(workspaceRoot || "");
-  if (!normWs || !flows || typeof flows !== "object") return null;
-  const nowMs = Number.isFinite(Number(now)) ? Number(now) : Date.now();
-  const maxAge = Number.isFinite(Number(maxAgeMs)) && Number(maxAgeMs) > 0 ? Number(maxAgeMs) : DEFAULT_RECENT_BASELINE_MAX_AGE_MS;
-  const liveRawSet = liveTabIds ? new Set(Array.from(liveTabIds).filter(Boolean)) : null;
-
-  let best = null;
-  for (const [tabId, flow] of Object.entries(flows)) {
-    if (!tabId || tabId === excludeTabId) continue;
-    if (liveRawSet && liveRawSet.has(tabId)) continue;
-    const candidate = normalizeSessionBaseline(flow?.sessionBaseline);
-    if (!candidate || candidate.workspaceRoot !== normWs) continue;
-    const age = nowMs - candidate.startedAt;
-    if (age < 0 || age > maxAge) continue;
-    if (!best || candidate.startedAt > best.startedAt) {
-      best = candidate;
-    }
-  }
-  return best;
-}
-
-export async function findRecentWorkspaceBaseline(
-  appHomeDir,
-  workspaceRoot,
-  { excludeTabId = "", liveTabIds = null, maxAgeMs = DEFAULT_RECENT_BASELINE_MAX_AGE_MS, now = Date.now(), fsDeps = fsPromises } = {},
-) {
-  const normWs = normBaselineRoot(workspaceRoot || "");
-  if (!appHomeDir || !normWs) return null;
-  const readerDir = typeof fsDeps?.readdir === "function" ? fsDeps.readdir : fsPromises.readdir;
-  if (typeof readerDir !== "function") return null;
-
-  const tabsDir = join(String(appHomeDir), "cognivisor", "sessions", "tabs");
-  let entries;
-  try {
-    entries = await readerDir(tabsDir);
-  } catch {
-    return null;
-  }
-  if (!Array.isArray(entries) || entries.length === 0) return null;
-
-  const nowMs = Number.isFinite(Number(now)) ? Number(now) : Date.now();
-  const maxAge = Number.isFinite(Number(maxAgeMs)) && Number(maxAgeMs) > 0 ? Number(maxAgeMs) : DEFAULT_RECENT_BASELINE_MAX_AGE_MS;
-  const safeExclude = excludeTabId ? safeBaselineTabId(excludeTabId) : "";
-  const safeLiveSet = toSafeLiveTabSet(liveTabIds);
-
-  let best = null;
-  let scanned = 0;
-  for (const rawEntry of entries) {
-    if (scanned >= 40) break;
-    const name = typeof rawEntry === "string" ? rawEntry : rawEntry?.name;
-    if (!name || !name.endsWith(".json")) continue;
-    const fileTabId = name.slice(0, -".json".length);
-    if (!fileTabId || fileTabId === safeExclude) continue;
-    if (safeLiveSet && safeLiveSet.has(fileTabId)) continue;
-    scanned += 1;
-    const candidate = await readBaselineJsonFile(join(tabsDir, name), fsDeps);
-    if (!candidate || candidate.workspaceRoot !== normWs) continue;
-    const age = nowMs - candidate.startedAt;
-    if (age < 0 || age > maxAge) continue;
-    if (!best || candidate.startedAt > best.startedAt) {
-      best = candidate;
-    }
-  }
-  return best;
 }
 
 export function countBaselineDirtyFiles(baseline) {
@@ -1209,25 +1256,34 @@ export function filterUnbaselinedRepoEntries(entries, sessionStartedAt, opts = {
   }
   const startedAtMs = Number(sessionStartedAt || 0);
   const hasAnyMtime = entries.some((e) => Number(e?.mtimeMs || 0) > 0);
-  const { isAttributed = false, hasSessionCommits = false } = opts || {};
+  const { isAttributed = false } = opts || {};
 
   if (hasAnyMtime) {
-    const sessionFiles = filterSessionWorkingEntries(entries, null, startedAtMs);
+    const sessionFiles = [];
     const backfillDirtyFiles = {};
     for (const item of entries) {
-      const rel = item?.relFile ?? item?.path ?? "";
+      if (!item) continue;
+      const rel = item.relFile ?? item.path ?? "";
       if (!rel) continue;
-      const mtimeMs = Number(item?.mtimeMs || 0);
-      if (mtimeMs > 0 && startedAtMs > 0 && mtimeMs < startedAtMs) {
-        backfillDirtyFiles[rel] = { status: String(item.status || ""), sig: String(item.sig || "") };
+      const mtimeMs = Number(item.mtimeMs || 0);
+      if (startedAtMs > 0 && mtimeMs > 0 && mtimeMs >= startedAtMs) {
+        sessionFiles.push(item);
+      } else if (startedAtMs <= 0 && mtimeMs > 0) {
+        sessionFiles.push(item);
+      } else {
+        // Pre-existing older files AND deleted files (mtimeMs === 0) get backfilled into baseline.
+        backfillDirtyFiles[rel] = {
+          status: String(item.workingStatus || item.status || ""),
+          sig: String(item.sig || ""),
+        };
       }
     }
     return { sessionFiles, backfillDirtyFiles };
   }
 
-  if (isAttributed || hasSessionCommits) {
+  if (isAttributed) {
     return {
-      sessionFiles: filterSessionWorkingEntries(entries, null, startedAtMs),
+      sessionFiles: entries.filter(Boolean),
       backfillDirtyFiles: {},
     };
   }
@@ -1236,36 +1292,21 @@ export function filterUnbaselinedRepoEntries(entries, sessionStartedAt, opts = {
   for (const item of entries) {
     const rel = item?.relFile ?? item?.path ?? "";
     if (!rel) continue;
-    backfillDirtyFiles[rel] = { status: String(item.status || ""), sig: String(item.sig || "") };
+    backfillDirtyFiles[rel] = {
+      status: String(item.workingStatus || item.status || ""),
+      sig: String(item.sig || ""),
+    };
   }
   return { sessionFiles: [], backfillDirtyFiles };
 }
 
 export const READ_GIT_FLAGS = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
 export const BASE_BRANCH_NAMES = new Set(["main", "master", "development", "develop", "ci", "HEAD", ""]);
-
-/** Parse tab-delimited `git log` output into commit selector entries. */
-export function parseCommitLogOutput(stdout, service) {
-  const lines = String(stdout || "").trim().split("\n").filter(Boolean);
-  return lines.map((line) => {
-    const [shortHash, subject, author, date, hash, ts] = line.split("\t");
-    return {
-      shortHash,
-      subject,
-      author,
-      date,
-      hash,
-      timestamp: Number(ts) || 0,
-      serviceId: service?.id || ".",
-      serviceName: service?.name || "root",
-      repoRoot: service?.root || "",
-    };
-  });
-}
+export const MAX_UNTRACKED_COUNT_BYTES = 400_000;
 
 /**
  * Merge `cognivisor.services` candidates with any already-enriched service metadata so
- * clean or recently pushed repositories are still inspected for session commits.
+ * discovered repositories are evaluated uniformly against their origin/base branch.
  */
 export function mergeBusCandidateServices(candidates, busServices = [], isWindows = false) {
   const byRoot = new Map();
@@ -1313,11 +1354,11 @@ export async function repoAheadCountWithExec(root, branch, on, execFn, opts = {}
   if (!branch || baseBranches.has(branch) || typeof execFn !== "function") return 0;
   const refs = await execFn(
     "git",
-    [...readFlags, "for-each-ref", "--format=%(refname:short)", "refs/heads/development", "refs/heads/main", "refs/heads/master", "refs/heads/ci"],
+    [...readFlags, "for-each-ref", "--format=%(refname:short)", "refs/heads/development", "refs/heads/develop", "refs/heads/main", "refs/heads/master", "refs/heads/ci"],
     { cwd: root, on },
   ).catch(() => null);
   const avail = new Set((refs?.code === 0 ? refs.stdout : "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
-  for (const base of ["development", "main", "master", "ci"]) {
+  for (const base of ["development", "develop", "main", "master", "ci"]) {
     if (!avail.has(base)) continue;
     const check = await execFn("git", [...readFlags, "rev-list", "--count", `${base}..HEAD`], { cwd: root, on }).catch(() => null);
     if (check && check.code === 0) {
@@ -1328,32 +1369,285 @@ export async function repoAheadCountWithExec(root, branch, on, execFn, opts = {}
   return 0;
 }
 
-/** Fetch recent commits for `ref` using lock-free Git flags and `--` disambiguation. */
-export async function listCommitsWithExec(root, ref, on, service, execFn, readFlags = READ_GIT_FLAGS) {
-  if (!ref || typeof execFn !== "function") return [];
-  const r = await execFn(
-    "git",
-    [...readFlags, "log", "-n", "30", "--format=%h%x09%s%x09%an%x09%cr%x09%H%x09%ct", ref, "--"],
-    { cwd: root, on },
-  ).catch(() => null);
-  if (!r || r.code !== 0) return [];
-  return parseCommitLogOutput(r.stdout, { ...(service || {}), root: service?.root || root });
+/**
+ * Count lines of a local untracked file safely (bounded at `MAX_UNTRACKED_COUNT_BYTES`,
+ * checking NUL bytes to detect binary files without crashing QuickJS).
+ */
+export async function countUntrackedFileLines(fullPath, on = null, fsDeps = fsPromises, maxBytes = MAX_UNTRACKED_COUNT_BYTES) {
+  if (on || !fullPath) return { add: 0, del: 0, binary: false };
+  const api = fsDeps || fsPromises;
+  const reader = typeof api.readFile === "function" ? api.readFile : fsPromises.readFile;
+  if (typeof reader !== "function") return { add: 0, del: 0, binary: false };
+  try {
+    const raw = await reader(fullPath);
+    if (typeof raw === "string") {
+      const probeLen = Math.min(raw.length, 8192);
+      for (let i = 0; i < probeLen; i += 1) {
+        if (raw.charCodeAt(i) === 0) return { add: 0, del: 0, binary: true };
+      }
+      const len = Math.min(raw.length, maxBytes);
+      if (len === 0) return { add: 0, del: 0, binary: false };
+      let lines = 0;
+      for (let i = 0; i < len; i += 1) {
+        if (raw.charCodeAt(i) === 10) lines += 1;
+      }
+      if (raw.charCodeAt(len - 1) !== 10) lines += 1;
+      return { add: lines, del: 0, binary: false };
+    }
+    const view = raw instanceof ArrayBuffer
+      ? new Uint8Array(raw)
+      : (ArrayBuffer.isView(raw) ? new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength) : null);
+    if (!view) return { add: 0, del: 0, binary: false };
+    const probeLen = Math.min(view.length, 8192);
+    for (let i = 0; i < probeLen; i += 1) {
+      if (view[i] === 0) return { add: 0, del: 0, binary: true };
+    }
+    const len = Math.min(view.length, maxBytes);
+    if (len === 0) return { add: 0, del: 0, binary: false };
+    let lines = 0;
+    for (let i = 0; i < len; i += 1) {
+      if (view[i] === 10) lines += 1;
+    }
+    if (view[len - 1] !== 10) lines += 1;
+    return { add: lines, del: 0, binary: false };
+  } catch {
+    return { add: 0, del: 0, binary: false };
+  }
+}
+
+/** Parse NUL-delimited `git diff --name-status -z --no-renames` output into `Map<path, status>`. */
+export function parseNameStatusZ(stdout) {
+  const map = new Map();
+  const raw = String(stdout || "");
+  if (!raw) return map;
+  const parts = raw.split("\0");
+  let i = 0;
+  while (i < parts.length) {
+    const code = parts[i];
+    if (!code) {
+      i += 1;
+      continue;
+    }
+    const first = code[0];
+    if (first === "R" || first === "C") {
+      const nextPath = parts[i + 2] || "";
+      if (nextPath) map.set(nextPath.replace(/\/+$/, ""), first === "C" ? "A" : "M");
+      i += 3;
+      continue;
+    }
+    const filePath = parts[i + 1] || "";
+    if (filePath) {
+      const normStatus = first === "D" ? "D" : first === "A" ? "A" : first === "U" ? "U" : "M";
+      map.set(filePath.replace(/\/+$/, ""), normStatus);
+    }
+    i += 2;
+  }
+  return map;
+}
+
+/** Parse NUL-delimited `git diff --numstat -z --no-renames` output into `Map<path, { add, del, binary }>`. */
+export function parseNumstatZ(stdout) {
+  const stats = new Map();
+  const out = String(stdout || "");
+  let eStart = 0;
+  while (eStart < out.length) {
+    let eEnd = out.indexOf("\0", eStart);
+    if (eEnd === -1) eEnd = out.length;
+    const entry = out.slice(eStart, eEnd);
+    eStart = eEnd + 1;
+    if (!entry) continue;
+    const t1 = entry.indexOf("\t");
+    const t2 = t1 >= 0 ? entry.indexOf("\t", t1 + 1) : -1;
+    if (t2 < 0) continue;
+    const p = entry.slice(t2 + 1).replace(/\/+$/, "");
+    if (!p) continue;
+    const a = entry.slice(0, t1);
+    const d = entry.slice(t1 + 1, t2);
+    const isBinary = a === "-" || d === "-";
+    const old = stats.get(p) ?? { add: 0, del: 0, binary: false };
+    stats.set(p, {
+      add: old.add + (isBinary ? 0 : (Number(a) || 0)),
+      del: old.del + (isBinary ? 0 : (Number(d) || 0)),
+      binary: old.binary || isBinary,
+    });
+  }
+  return stats;
+}
+
+const ORIGIN_BASE_REF_PRIORITY = [
+  "origin/development",
+  "origin/develop",
+  "origin/main",
+  "origin/master",
+  "origin/ci",
+  "development",
+  "develop",
+  "main",
+  "master",
+  "ci",
+];
+
+/**
+ * Resolve a repository's lock-free origin/base comparison reference (`merge-base HEAD <baseRef>`),
+ * prioritizing `origin/HEAD`, then remote base branches, then local base branches, with automatic
+ * fallback to remote upstream or session `startHead` when working directly on a base branch.
+ */
+export async function resolveRepoBaseRefWithExec(root, branch, headHash, on, execFn, opts = {}) {
+  const readFlags = opts.readFlags || READ_GIT_FLAGS;
+  const startHead = String(opts.startHead || "").trim();
+  const cleanHead = String(headHash || "").trim();
+  if (!cleanHead || typeof execFn !== "function") {
+    return { hasHead: false, baseRef: "", baseHash: "", baseSource: "unborn" };
+  }
+
+  const git = (args) => execFn("git", [...readFlags, ...args], { cwd: root, on }).catch(() => null);
+  const forEachArgs = [
+    "for-each-ref",
+    "--format=%(refname:short)",
+    "refs/remotes/origin/development",
+    "refs/remotes/origin/develop",
+    "refs/remotes/origin/main",
+    "refs/remotes/origin/master",
+    "refs/remotes/origin/ci",
+    "refs/heads/development",
+    "refs/heads/develop",
+    "refs/heads/main",
+    "refs/heads/master",
+    "refs/heads/ci",
+  ];
+  const cleanBranch = String(branch || "").trim();
+  if (cleanBranch && cleanBranch !== "HEAD" && !BASE_BRANCH_NAMES.has(cleanBranch)) {
+    // Only add origin/<branch> when current branch itself is a base branch — feature branches must
+    // stay anchored to the origin target branch (so pushing a feature branch never hides changes).
+  } else if (cleanBranch && cleanBranch !== "HEAD") {
+    const remoteSame = `refs/remotes/origin/${cleanBranch}`;
+    if (!forEachArgs.includes(remoteSame)) forEachArgs.push(remoteSame);
+  }
+
+  const [symRes, refsRes] = await Promise.all([
+    git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]),
+    git(forEachArgs),
+  ]);
+
+  const candidates = [];
+  const seen = new Set();
+  const pushCand = (ref) => {
+    const r = String(ref || "").trim();
+    if (!r || seen.has(r)) return;
+    seen.add(r);
+    candidates.push(r);
+  };
+
+  const avail = new Set(
+    (refsRes?.code === 0 ? String(refsRes.stdout || "") : "")
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+
+  // If currently working directly on a base branch with a matching `origin/<branch>`, check it FIRST
+  // (before `origin/HEAD`), so sessions on `development` never flood with `origin/main..development`.
+  if (cleanBranch && cleanBranch !== "HEAD" && BASE_BRANCH_NAMES.has(cleanBranch)) {
+    const remoteCurrent = `origin/${cleanBranch}`;
+    if (avail.has(remoteCurrent)) pushCand(remoteCurrent);
+  }
+
+  if (symRes?.code === 0 && symRes.stdout) {
+    const fullRef = String(symRes.stdout).trim();
+    const shortRef = fullRef.startsWith("refs/remotes/") ? fullRef.slice("refs/remotes/".length) : fullRef;
+    pushCand(shortRef);
+  }
+
+  for (const ref of ORIGIN_BASE_REF_PRIORITY) {
+    if (ref.startsWith("origin/") && avail.has(ref)) pushCand(ref);
+  }
+
+  // Local-only repo (no matching remote base refs): if directly on a base branch, anchor to it before
+  // other local base branches so e.g. local `main` does not diff against a stale local `development`.
+  if (candidates.length === 0 && cleanBranch && cleanBranch !== "HEAD" && BASE_BRANCH_NAMES.has(cleanBranch)) {
+    if (avail.has(cleanBranch)) pushCand(cleanBranch);
+  }
+  for (const ref of ORIGIN_BASE_REF_PRIORITY) {
+    if (!ref.startsWith("origin/") && avail.has(ref)) pushCand(ref);
+  }
+
+  let matchedCandidateRef = "";
+  for (const cand of candidates) {
+    const mb = await git(["merge-base", "HEAD", cand]);
+    const mbHash = mb?.code === 0 ? String(mb.stdout || "").trim() : "";
+    if (!mbHash) continue;
+    if (!matchedCandidateRef) matchedCandidateRef = cand;
+    if (mbHash !== cleanHead) {
+      return { hasHead: true, baseRef: cand, baseHash: mbHash, baseSource: "base" };
+    }
+    // If `cand` resolved to `HEAD` (e.g. freshly created branch or working on base branch matching remote),
+    // keep checking if another preferred remote base differs — otherwise stop on the primary candidate.
+    break;
+  }
+
+  // Fallback for commits made directly on a base branch (including pushed commits or local-only repos):
+  if (startHead && startHead !== cleanHead) {
+    const anc = await git(["merge-base", "--is-ancestor", startHead, "HEAD"]);
+    if (anc?.code === 0) {
+      return { hasHead: true, baseRef: "session start", baseHash: startHead, baseSource: "session" };
+    }
+  }
+
+  return {
+    hasHead: true,
+    baseRef: matchedCandidateRef || (cleanBranch && cleanBranch !== "HEAD" ? cleanBranch : "HEAD"),
+    baseHash: cleanHead,
+    baseSource: matchedCandidateRef ? "base" : "head",
+  };
 }
 
 /**
- * Inspect working tree status, ahead count, and optional commit history for one repository.
- * Always loads recent commits when `includeCommits` is true, even on clean pushed repos.
+ * Extract stdout text cleanly from a Herdr `hc(["read", ...])` result (`ExecResult` or string).
  */
-export async function collectServiceWorkingSnapshot(service, on, includeCommits = true, deps = {}) {
+export function extractHcReadText(res) {
+  if (typeof res === "string") return res;
+  if (res && res.code === 0 && typeof res.stdout === "string") return res.stdout;
+  return "";
+}
+
+/**
+ * Select visible session working-tree paths that should be passed to `git add -- <paths>`.
+ * Already-staged deletions (`xy === "D "`, e.g. `git rm` or the deleted half of `git mv`)
+ * are omitted because `git add -- <path>` exits 128 when a file exists in neither the index
+ * nor the working tree; the deletion is already staged for `git commit`.
+ */
+export function selectPathsToStageForCommit(workingFiles) {
+  if (!Array.isArray(workingFiles) || workingFiles.length === 0) return [];
+  const seen = new Set();
+  const out = [];
+  for (const entry of workingFiles) {
+    const path = String(entry?.path || entry?.relFile || "").trim();
+    if (!path || seen.has(path)) continue;
+    if (entry?.stagedDeletion === true || entry?.xy === "D ") continue;
+    seen.add(path);
+    out.push(path);
+  }
+  return out;
+}
+
+/**
+ * Inspect a repository's unified session diff against its origin/base branch (`git diff <baseHash>`
+ * merged with untracked `??` files), returning both unified diff files and raw working-tree entries
+ * for baseline tracking and dirty-only commits.
+ */
+export async function collectServiceSessionSnapshot(service, on, opts = {}, deps = {}) {
   const execFn = deps.exec;
   const fsDeps = deps.fsPromises || fsPromises;
   const readFlags = deps.readFlags || READ_GIT_FLAGS;
-  const baseBranches = deps.baseBranches || BASE_BRANCH_NAMES;
+  const baselineRepo = opts?.baselineRepo || null;
 
   try {
     if (typeof execFn !== "function") throw new Error("Missing exec helper");
     const git = (args) => execFn("git", [...readFlags, ...args], { cwd: service.root, on });
-    const status = await git(["status", "--porcelain=v1", "-b", "-z", "--no-renames", "--untracked-files=normal"]);
+    const [status, head] = await Promise.all([
+      git(["status", "--porcelain=v1", "-b", "-z", "--no-renames", "--untracked-files=normal"]),
+      git(["rev-parse", "--verify", "--quiet", "HEAD"]).catch(() => ({ code: 1, stdout: "", stderr: "" })),
+    ]);
     if (status.code !== 0) throw new Error(status.stderr || `status failed on ${service.name}`);
 
     const records = status.stdout.split("\0").filter(Boolean);
@@ -1370,23 +1664,8 @@ export async function collectServiceWorkingSnapshot(service, on, includeCommits 
       }
     }
 
-    const aheadCount = parsedAhead !== null
-      ? parsedAhead
-      : await repoAheadCountWithExec(service.root, branch, on, execFn, { readFlags, baseBranches });
-
-    if (rawEntries.length === 0) {
-      const commits = includeCommits
-        ? await listCommitsWithExec(service.root, branch, on, service, execFn, readFlags)
-        : [];
-      const headHash = commits[0]?.hash || "";
-      service.workingCount = 0;
-      service.aheadCount = aheadCount;
-      service.branch = branch;
-      return { service, files: [], commits, branch, headHash, rawCount: 0, touched: aheadCount > 0 || commits.length > 0 };
-    }
-
     const dirEntries = [];
-    const fileEntries = [];
+    const workingMap = new Map();
     for (const entry of rawEntries) {
       const xy = entry.slice(0, 2);
       const p = entry.slice(3);
@@ -1394,96 +1673,220 @@ export async function collectServiceWorkingSnapshot(service, on, includeCommits 
       if (xy === "??" && p.endsWith("/")) {
         dirEntries.push(p.replace(/\/+$/, ""));
       } else {
-        fileEntries.push({ xy, path: p.replace(/\/+$/, "") });
+        const cleanP = p.replace(/\/+$/, "");
+        workingMap.set(cleanP, { xy, status: normalizeGitStatusMark(xy), fresh: xy === "??" });
       }
     }
     if (dirEntries.length > 0) {
       const ls = await git(["ls-files", "--others", "--exclude-standard", "-z", "--", ...dirEntries]).catch(() => null);
       if (ls?.code === 0 && ls.stdout) {
         for (const expandedPath of ls.stdout.split("\0").filter(Boolean)) {
-          fileEntries.push({ xy: "??", path: expandedPath });
+          const cleanP = expandedPath.replace(/\/+$/, "");
+          if (cleanP && !workingMap.has(cleanP)) {
+            workingMap.set(cleanP, { xy: "??", status: "A", fresh: true });
+          }
         }
       }
     }
 
-    const commits = includeCommits
-      ? await listCommitsWithExec(service.root, branch, on, service, execFn, readFlags)
-      : [];
-    let serviceHasHead = true;
-    let headHash = commits[0]?.hash || "";
-    const stats = {};
-    if (fileEntries.length > 0) {
-      const head = await git(["rev-parse", "--verify", "HEAD"]);
-      serviceHasHead = head.code === 0;
-      if (serviceHasHead && head.stdout) {
-        headHash = String(head.stdout).trim() || headHash;
-      }
-      const results = serviceHasHead
-        ? [await git(["diff", "HEAD", "--numstat", "-z", "--no-renames"])]
-        : await Promise.all([
-            git(["diff", "--cached", "--numstat", "-z", "--no-renames"]),
-            git(["diff", "--numstat", "-z", "--no-renames"]),
-          ]);
+    const serviceHasHead = head?.code === 0 && Boolean(String(head.stdout || "").trim());
+    const headHash = serviceHasHead ? String(head.stdout || "").trim() : "";
 
-      for (const result of results) {
-        if (result.code !== 0) throw new Error(result.stderr || `diff failed on ${service.name}`);
-        const out = result.stdout;
-        let eStart = 0;
-        while (eStart < out.length) {
-          let eEnd = out.indexOf("\0", eStart);
-          if (eEnd === -1) eEnd = out.length;
-          const entry = out.slice(eStart, eEnd);
-          eStart = eEnd + 1;
-          if (!entry) continue;
-          const t1 = entry.indexOf("\t");
-          const t2 = t1 >= 0 ? entry.indexOf("\t", t1 + 1) : -1;
-          if (t2 < 0) continue;
-          const p = entry.slice(t2 + 1);
-          if (!p) continue;
-          const a = entry.slice(0, t1);
-          const d = entry.slice(t1 + 1, t2);
-          const old = stats[p] ?? { add: 0, del: 0 };
-          stats[p] = { add: old.add + (Number(a) || 0), del: old.del + (Number(d) || 0), binary: a === "-" };
-        }
+    const baseInfo = await resolveRepoBaseRefWithExec(
+      service.root,
+      branch,
+      headHash,
+      on,
+      execFn,
+      { readFlags, startHead: baselineRepo?.startHead || "" },
+    );
+
+    const hasBaselineDirty = Boolean(
+      baselineRepo?.dirtyFiles && Object.keys(baselineRepo.dirtyFiles).length > 0,
+    );
+    const needCommittedPaths = Boolean(
+      (hasBaselineDirty || (!baselineRepo && workingMap.size > 0)) &&
+      baseInfo.hasHead &&
+      baseInfo.baseHash &&
+      baseInfo.baseHash !== headHash,
+    );
+    const needRevListCount = Boolean(
+      parsedAhead === null && baseInfo.hasHead && baseInfo.baseHash && baseInfo.baseHash !== headHash,
+    );
+
+    let nameStatusRes;
+    let numstatRes;
+    let committedNamesRes = null;
+    let revListRes = null;
+
+    if (baseInfo.hasHead && baseInfo.baseHash) {
+      const tasks = [
+        git(["diff", baseInfo.baseHash, "--name-status", "-z", "--no-renames"]),
+        git(["diff", baseInfo.baseHash, "--numstat", "-z", "--no-renames"]),
+        needCommittedPaths
+          ? git(["diff", "--name-only", "-z", baseInfo.baseHash, "HEAD"]).catch(() => null)
+          : Promise.resolve(null),
+        needRevListCount
+          ? git(["rev-list", "--count", `${baseInfo.baseHash}..HEAD`]).catch(() => null)
+          : Promise.resolve(null),
+      ];
+      [nameStatusRes, numstatRes, committedNamesRes, revListRes] = await Promise.all(tasks);
+    } else {
+      [nameStatusRes, numstatRes] = await Promise.all([
+        git(["diff", "--cached", "--name-status", "-z", "--no-renames"]),
+        git(["diff", "--cached", "--numstat", "-z", "--no-renames"]),
+      ]);
+    }
+
+    if (nameStatusRes?.code !== 0) {
+      throw new Error(nameStatusRes?.stderr || `diff name-status failed on ${service.name}`);
+    }
+    if (numstatRes?.code !== 0) {
+      throw new Error(numstatRes?.stderr || `diff numstat failed on ${service.name}`);
+    }
+
+    const nameStatusMap = parseNameStatusZ(nameStatusRes.stdout);
+    const numstatMap = parseNumstatZ(numstatRes.stdout);
+    const committedPaths = new Set();
+    if (committedNamesRes?.code === 0 && committedNamesRes.stdout) {
+      for (const p of committedNamesRes.stdout.split("\0").filter(Boolean)) {
+        committedPaths.add(normBaselineRel(p));
       }
     }
 
+    // Deduplicated unified paths: tracked diff vs baseHash + untracked (??) files.
+    const unifiedPaths = new Set(nameStatusMap.keys());
+    for (const [p, info] of workingMap) {
+      if (info.fresh) unifiedPaths.add(p);
+    }
+
+    const statCache = new Map();
+    const getFileStat = async (path, statusForStat, diffStatForSsh) => {
+      const cacheKey = `${path}::${statusForStat}`;
+      if (statCache.has(cacheKey)) return statCache.get(cacheKey);
+      const res = await statFileEntry(
+        join(service.root, path),
+        statusForStat,
+        on,
+        fsDeps,
+        diffStatForSsh ? { diffStat: diffStatForSsh } : null,
+      );
+      statCache.set(cacheKey, res);
+      return res;
+    };
+
+    const sortedPaths = Array.from(unifiedPaths).sort((a, b) => a.localeCompare(b));
     const files = await Promise.all(
-      fileEntries.map(async ({ xy, path }) => {
-        const fresh = xy === "??";
-        const s = normalizeGitStatusMark(xy);
-        const lineStat = stats[path] ?? { add: 0, del: 0 };
-        const { sig, mtimeMs } = s === "D"
-          ? { sig: "deleted", mtimeMs: 0 }
-          : await statFileEntry(join(service.root, path), s, on, fsDeps);
+      sortedPaths.map(async (path) => {
+        const workingInfo = workingMap.get(path) || null;
+        const trackedStatus = nameStatusMap.get(path) || "";
+        // If `path` already exists in `nameStatusMap` (e.g. existed at `baseHash`, deleted in HEAD,
+        // and recreated untracked on disk), `git diff <baseHash>` already compares `<baseHash>` directly
+        // against the working file — treat only brand-new paths absent from `<baseHash>` as `fresh`.
+        const fresh = Boolean(workingInfo?.fresh && !trackedStatus);
+        const status = fresh
+          ? "A"
+          : (trackedStatus || workingInfo?.status || "M");
+        const lineStat = fresh
+          ? await countUntrackedFileLines(join(service.root, path), on, fsDeps)
+          : (numstatMap.get(path) ?? { add: 0, del: 0, binary: false });
+        const { sig, mtimeMs } = await getFileStat(path, status, lineStat);
         return {
           key: `${service.id}::${path}`,
           serviceId: service.id,
           serviceName: service.name,
           relPrefix: service.relPath,
           repoRoot: service.root,
-          hasHead: serviceHasHead,
+          hasHead: baseInfo.hasHead,
+          headHash,
+          baseRef: baseInfo.baseRef,
+          baseHash: baseInfo.baseHash,
+          baseSource: baseInfo.baseSource,
           path,
           relFile: path,
           displayPath: service.relPath ? `${service.relPath}/${path}` : (service.isSibling ? `${service.name}/${path}` : path),
-          status: s,
+          status,
+          workingStatus: workingInfo ? workingInfo.status : "",
+          inWorkingTree: Boolean(workingInfo),
           fresh,
           sig,
           mtimeMs,
-          ...lineStat,
+          add: lineStat.add || 0,
+          del: lineStat.del || 0,
+          binary: Boolean(lineStat.binary),
         };
       }),
     );
 
-    service.workingCount = rawEntries.length;
+    const workingFiles = await Promise.all(
+      Array.from(workingMap.entries()).map(async ([path, info]) => {
+        const lineStat = info.fresh
+          ? (files.find((f) => f.path === path) || { add: 0, del: 0, binary: false })
+          : (numstatMap.get(path) ?? { add: 0, del: 0, binary: false });
+        const { sig, mtimeMs } = await getFileStat(path, info.status, lineStat);
+        return {
+          path,
+          relFile: path,
+          xy: info.xy,
+          stagedDeletion: info.xy === "D ",
+          status: info.status,
+          workingStatus: info.status,
+          fresh: info.fresh,
+          sig,
+          mtimeMs,
+        };
+      }),
+    );
+
+    let aheadCount = 0;
+    if (parsedAhead !== null) {
+      aheadCount = parsedAhead;
+    } else if (revListRes?.code === 0) {
+      const n = parseInt(String(revListRes.stdout || "").trim(), 10);
+      if (!Number.isNaN(n)) aheadCount = n;
+    }
+
+    service.workingCount = workingFiles.length;
     service.aheadCount = aheadCount;
     service.branch = branch;
-    return { service, files, commits, branch, headHash, rawCount: rawEntries.length, touched: true };
+    service.baseRef = baseInfo.baseRef;
+    service.baseHash = baseInfo.baseHash;
+
+    return {
+      service,
+      files,
+      workingFiles,
+      committedPaths,
+      branch,
+      headHash,
+      hasHead: baseInfo.hasHead,
+      baseRef: baseInfo.baseRef,
+      baseHash: baseInfo.baseHash,
+      baseSource: baseInfo.baseSource,
+      rawCount: workingFiles.length,
+      aheadCount,
+      touched: files.length > 0,
+    };
   } catch (e) {
     service.workingCount = 0;
     service.aheadCount = 0;
     service.branch = service.branch || "HEAD";
-    return { service, files: [], commits: [], branch: service.branch, headHash: "", rawCount: 0, touched: false, error: e };
+    return {
+      service,
+      files: [],
+      workingFiles: [],
+      committedPaths: new Set(),
+      branch: service.branch,
+      headHash: "",
+      hasHead: false,
+      baseRef: "",
+      baseHash: "",
+      baseSource: "error",
+      rawCount: 0,
+      aheadCount: 0,
+      touched: false,
+      error: e,
+    };
   }
 }
 
@@ -1501,8 +1904,8 @@ function joinRepoFilePath(repoRoot, relPath) {
 }
 
 /**
- * Resolve how a Markdown file snapshot should be loaded for the changes-review viewer
- * (working-tree file read vs lock-free `git show` for commits and deleted files).
+ * Resolve how a Markdown file snapshot should be loaded for the unified session review viewer
+ * (working-tree file read for existing files, lock-free `git show <baseHash>:<path>` for deletions).
  */
 export function resolveReviewMarkdownSourceSpec(file, opts = {}) {
   const rawStatus = String(file?.status || "M").trim().toUpperCase();
@@ -1549,39 +1952,6 @@ export function resolveReviewMarkdownSourceSpec(file, opts = {}) {
     ? opts.readFlags
     : READ_GIT_FLAGS;
   const on = opts?.on ?? null;
-  const rawCommitHash = String(opts?.commitHash || "").trim();
-  const mode = opts?.viewMode === "working"
-    ? "working"
-    : (opts?.viewMode === "commit" ? "commit" : (rawCommitHash ? "commit" : "working"));
-  const commitHash = mode === "commit" ? rawCommitHash : "";
-
-  if (mode === "commit") {
-    if (!commitHash) {
-      return {
-        kind: "unavailable",
-        mode: plan.mode,
-        isDeleted: plan.isDeleted,
-        notice: plan.notice,
-        targetPath,
-        error: "No commit selected for Markdown preview.",
-      };
-    }
-    const refSpec = plan.isDeleted ? `${commitHash}^:${targetPath}` : `${commitHash}:${targetPath}`;
-    return {
-      kind: "git",
-      mode: plan.mode,
-      isDeleted: plan.isDeleted,
-      notice: plan.notice,
-      cwd: repoRoot,
-      on,
-      refSpec,
-      targetPath,
-      args: [...readFlags, "show", refSpec],
-      unavailableMessage: plan.isDeleted
-        ? "Previous version is unavailable (commit is a root commit or lacks a parent)."
-        : "Markdown snapshot at this commit is unavailable.",
-    };
-  }
 
   if (plan.isDeleted) {
     if (file.fresh === true || file.hasHead === false) {
@@ -1594,7 +1964,8 @@ export function resolveReviewMarkdownSourceSpec(file, opts = {}) {
         error: "Previous version is unavailable (file is untracked or repository has no HEAD commit).",
       };
     }
-    const refSpec = `HEAD:${targetPath}`;
+    const baseRef = String(file.baseHash || opts?.baseHash || "HEAD").trim() || "HEAD";
+    const refSpec = `${baseRef}:${targetPath}`;
     return {
       kind: "git",
       mode: plan.mode,
@@ -1605,7 +1976,7 @@ export function resolveReviewMarkdownSourceSpec(file, opts = {}) {
       refSpec,
       targetPath,
       args: [...readFlags, "show", refSpec],
-      unavailableMessage: "Previous version is unavailable (file is untracked or not present in HEAD).",
+      unavailableMessage: "Previous version is unavailable (file is untracked or not present at comparison base).",
     };
   }
 
@@ -1622,47 +1993,41 @@ export function resolveReviewMarkdownSourceSpec(file, opts = {}) {
   };
 }
 
-/** Build a stable per-file+mode identity key so file/commit switches reset Markdown preview cleanly. */
-export function computeViewerMarkdownFileId(file, viewMode = "working", commitHash = "") {
+/** Build a stable per-file identity key so file/base switches reset Markdown preview cleanly. */
+export function computeViewerMarkdownFileId(file) {
   if (!file || !file.key) return "";
-  const mode = viewMode === "commit" ? "commit" : "working";
-  const hash = mode === "commit" ? String(commitHash || "").trim() : "";
-  return `${file.key}::${mode}::${hash}`;
+  return `${file.key}::${String(file.baseHash || "")}`;
 }
 
 /** Compute a revision token for Markdown snapshot caching and unique GPUI TextView element IDs. */
 export function computeReviewMarkdownLoadToken(
   file,
-  { viewMode = "working", commitHash = "", requestSeq = 0, reloadNonce = 0 } = {},
+  { requestSeq = 0, reloadNonce = 0 } = {},
 ) {
   const rNonce = Number(reloadNonce) || 0;
   if (!file || typeof file !== "object") return `0|r${rNonce}`;
   const status = String(file.status || "M").trim().toUpperCase();
   const oldPath = normalizeMarkdownRelPath(file.oldPath || "");
-  const mode = viewMode === "commit" || (viewMode !== "working" && commitHash) ? "commit" : "working";
-  if (mode === "commit") {
-    return `${status}|${oldPath}|r${rNonce}`;
-  }
+  const baseHash = String(file.baseHash || "");
   const sig = String(file.sig || "");
   const mtimeMs = Number(file.mtimeMs) || 0;
   const needsSeqFallback = !mtimeMs && !/\d/.test(sig);
   const seqPart = needsSeqFallback ? `|q${Number(requestSeq) || 0}` : "";
-  return `${status}|${oldPath}|${file.fresh ? 1 : 0}|${sig}|${mtimeMs}|${Number(file.add) || 0}|${Number(file.del) || 0}${seqPart}|r${rNonce}`;
+  return `${status}|${oldPath}|${baseHash}|${file.fresh ? 1 : 0}|${sig}|${mtimeMs}|${Number(file.add) || 0}|${Number(file.del) || 0}${seqPart}|r${rNonce}`;
 }
 
-/** Build a bounded-cache key scoped by repo, commit/working mode, file paths, status, and load token. */
+/** Build a bounded-cache key scoped by repo, baseHash, file paths, status, and load token. */
 export function buildReviewMarkdownCacheKey(
   file,
-  { viewMode = "working", commitHash = "", loadToken = "" } = {},
+  { loadToken = "" } = {},
 ) {
   if (!file || typeof file !== "object") return "";
   const repo = normPathStr(file.repoRoot || "");
-  const mode = viewMode === "commit" || (viewMode !== "working" && commitHash) ? "commit" : "working";
-  const hash = mode === "commit" ? String(commitHash || "").trim() : "";
+  const baseHash = String(file.baseHash || "");
   const path = normalizeMarkdownRelPath(file.path || file.relFile || "");
   const oldPath = normalizeMarkdownRelPath(file.oldPath || "");
   const status = String(file.status || "M").trim().toUpperCase();
-  return `${repo}|${mode}|${hash}|${path}|${oldPath}|${status}|${String(loadToken || "")}`;
+  return `${repo}|${baseHash}|${path}|${oldPath}|${status}|${String(loadToken || "")}`;
 }
 
 /** Guard raw Markdown content against null reads and binary NUL bytes. */
@@ -1682,18 +2047,12 @@ export function formatGitShowMarkdownError(stderr, spec = {}) {
   const lower = msg.toLowerCase();
   if (spec?.isDeleted) {
     if (
-      spec.refSpec?.includes("^:") &&
-      (lower.includes("bad revision") || lower.includes("unknown revision") || lower.includes("ambiguous argument") || lower.includes("invalid object name"))
-    ) {
-      return "Previous version is unavailable (commit is a root commit or lacks a parent).";
-    }
-    if (
       lower.includes("exists on disk, but not in") ||
       lower.includes("does not exist in") ||
       lower.includes("not in 'head'") ||
-      lower.includes("invalid object name 'head'")
+      lower.includes("invalid object name")
     ) {
-      return "Previous version is unavailable (file is untracked or not present in HEAD).";
+      return "Previous version is unavailable (file is untracked or not present at comparison base).";
     }
   }
   const firstLine = msg ? msg.split(/\r?\n/)[0] : "";
@@ -2137,6 +2496,13 @@ export function expandDiffGapInRows(
   }
 
   const ext = getFileExt(filePath);
+  const mdState = isMarkdownExt(ext) ? createMarkdownState() : null;
+  if (mdState) {
+    for (let priorLine = 1; priorLine < sliceStart; priorLine += 1) {
+      const priorRaw = sourceLines[priorLine - 1] ?? "";
+      advanceMarkdownState(expandCodeTabs(priorRaw || " "), mdState);
+    }
+  }
   const newContextRows = [];
   for (let lineNo = sliceStart; lineNo <= sliceEnd; lineNo += 1) {
     const raw = sourceLines[lineNo - 1] ?? "";
@@ -2145,7 +2511,7 @@ export function expandDiffGapInRows(
       kind: " ",
       number: lineNo,
       text: code,
-      tokens: tokenizeDiffLine(code, ext, null),
+      tokens: tokenizeDiffLine(code, ext, mdState),
       expandedContext: true,
     });
   }
@@ -2223,19 +2589,15 @@ export function computeAnchorPreservedScrollPx(
 }
 
 /**
- * Format session review notes into a clean Markdown payload for agent dispatch
+ * Format unified session review notes into a clean Markdown payload for agent dispatch
  * without trailing blank lines that can disrupt TUI bracketed-paste submission.
  */
 export function formatReviewAgentMessage(
   sessionReviews,
-  { viewMode = "working", selectedCommit = null, workspaceRoot = "", fallbackRoot = "" } = {},
+  { workspaceRoot = "", fallbackRoot = "" } = {},
 ) {
   const list = Array.isArray(sessionReviews) ? sessionReviews : [];
-  let header = "Review comments on uncommitted changes:";
-  if (viewMode === "commit" && selectedCommit) {
-    header = `Review comments on commit ${selectedCommit.shortHash} ("${selectedCommit.subject}"):`;
-  }
-  const parts = [header, ""];
+  const parts = ["Review comments on session changes:", ""];
 
   const byService = new Map();
   for (const r of list) {
@@ -2248,10 +2610,12 @@ export function formatReviewAgentMessage(
   for (const [sId, revs] of byService) {
     const sName = revs[0].serviceName || sId;
     const sRoot = revs[0].repoRoot || workspaceRoot || fallbackRoot || "";
-    parts.push(`### Service: ${sName} (${sRoot})`, "");
+    const baseRef = revs[0].baseRef ? ` [vs ${revs[0].baseRef}]` : "";
+    parts.push(`### Service: ${sName} (${sRoot})${baseRef}`, "");
     for (const r of revs) {
       const filePath = r.displayPath || r.file;
-      parts.push(`- \`${filePath}:${r.line}\`:`);
+      const sideLabel = r.side === "old" ? " (removed line)" : "";
+      parts.push(`- \`${filePath}:${r.line}\`${sideLabel}:`);
       const normalizedText = String(r.text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
       for (const line of normalizedText.split("\n")) {
         parts.push(`  ${line}`);

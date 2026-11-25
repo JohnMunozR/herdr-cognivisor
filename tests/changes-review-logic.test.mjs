@@ -25,12 +25,16 @@ import {
   resolveSessionAgentTabId,
   pickNextUnreviewedFile,
   sortServicesDirtyFirst,
+  normalizeCommentSide,
+  buildCommentKey,
+  buildReviewedFileKey,
   computeFileReviewFingerprint,
   parseReviewedFileRecord,
   reconcileReviewedFiles,
-  filterSessionCommits,
   filterSessionWorkingEntries,
   partitionSessionWorkingEntries,
+  partitionSessionUnifiedEntries,
+  evaluateRepoSessionActivity,
   normalizeGitStatusMark,
   statFileEntry,
   readDiskSessionBaseline,
@@ -38,8 +42,6 @@ import {
   resolveSessionStartTime,
   buildFreshSessionBaseline,
   createResetSessionBaseline,
-  findRecentFlowWorkspaceBaseline,
-  findRecentWorkspaceBaseline,
   countBaselineDirtyFiles,
   compactFlowsMap,
   extractResumeKeyFromTranscript,
@@ -47,9 +49,12 @@ import {
   isHomeDirectoryRoot,
   resolveWorkspaceRoot,
   READ_GIT_FLAGS,
-  parseCommitLogOutput,
   mergeBusCandidateServices,
-  collectServiceWorkingSnapshot,
+  countUntrackedFileLines,
+  parseNameStatusZ,
+  parseNumstatZ,
+  resolveRepoBaseRefWithExec,
+  collectServiceSessionSnapshot,
   resolveReviewMarkdownSourceSpec,
   computeViewerMarkdownFileId,
   computeReviewMarkdownLoadToken,
@@ -76,6 +81,8 @@ import {
   detectUnsubmittedReviewInScreen,
   decideSendSubmitAction,
   computeReviewCommentWrapCols,
+  extractHcReadText,
+  selectPathsToStageForCommit,
 } from "../mods/changes-review/review-logic.js";
 import {
   statFileEntry as filesSearchStatFileEntry,
@@ -381,33 +388,28 @@ describe("changes-review review-logic", () => {
     assert.deepEqual(sortServicesDirtyFirst(null), []);
   });
 
-  test("filterSessionCommits excludes pre-session commits and keeps session commits", () => {
-    const startedAtMs = 1700000100500; // floor(/1000) === 1700000100
-    const commits = [
-      { hash: "c3", timestamp: 1700000200, subject: "after" },
-      { hash: "c2", timestamp: 1700000100, subject: "exact boundary" },
-      { hash: "c1", timestamp: 1700000099, subject: "before" },
-      { hash: "c0", timestamp: 0, subject: "missing ts" },
-    ];
+  test("normalizeCommentSide and buildCommentKey disambiguate deleted vs added lines sharing a line number", () => {
+    assert.equal(normalizeCommentSide("old"), "old");
+    assert.equal(normalizeCommentSide("new"), "new");
+    assert.equal(normalizeCommentSide(undefined), "new");
+    assert.equal(normalizeCommentSide("other"), "new");
 
-    assert.deepEqual(
-      filterSessionCommits(commits, startedAtMs).map((c) => c.hash),
-      ["c3", "c2"],
-    );
-
-    // When sessionStartedAt is falsy, returns commits unchanged
-    assert.equal(filterSessionCommits(commits, 0).length, 4);
-    assert.equal(filterSessionCommits(commits, null).length, 4);
-    assert.deepEqual(filterSessionCommits(null, startedAtMs), []);
+    const oldKey = buildCommentKey("auth::src/a.ts", 14, "old");
+    const newKey = buildCommentKey("auth::src/a.ts", 14, "new");
+    assert.notEqual(oldKey, newKey);
+    assert.equal(oldKey, "auth::src/a.ts::old::14");
+    assert.equal(newKey, "auth::src/a.ts::new::14");
+    assert.equal(buildCommentKey("auth::src/a.ts", 14), newKey);
   });
 
-  test("filterSessionWorkingEntries excludes unchanged baseline files, includes re-edited files, and handles missing baselineRepo", () => {
+  test("filterSessionWorkingEntries excludes unchanged baseline files, detects re-edits, and blocks deleted-file mtimeMs=0 leaks", () => {
     const startedAt = 1700000100000;
     const baselineRepo = {
       dirtyFiles: {
         "src/unchanged.js": { status: "M", sig: "120:1700000050000" },
         "src/re-edited.js": { status: "M", sig: "200:1700000050000" },
         "src/status-changed.js": { status: "A", sig: "50:1700000050000" },
+        "src/old-deleted.js": { status: "D", sig: "deleted" },
       },
     };
 
@@ -415,6 +417,7 @@ describe("changes-review review-logic", () => {
       { relFile: "src/unchanged.js", status: "M", sig: "120:1700000050000", mtimeMs: 1700000050000 },
       { relFile: "src/re-edited.js", status: "M", sig: "245:1700000200000", mtimeMs: 1700000200000 },
       { relFile: "src/status-changed.js", status: "M", sig: "50:1700000050000", mtimeMs: 1700000050000 },
+      { relFile: "src/old-deleted.js", status: "D", sig: "deleted:D", mtimeMs: 0 },
       { relFile: "src/new-session.js", status: "A", sig: "99:1700000150000", mtimeMs: 1700000150000 },
     ];
 
@@ -423,15 +426,15 @@ describe("changes-review review-logic", () => {
       ["src/re-edited.js", "src/status-changed.js", "src/new-session.js"],
     );
 
-    // When baselineRepo is missing and sessionStartedAt > 0, filter by mtimeMs >= sessionStartedAt (or !mtimeMs fallback)
+    // When baselineRepo is missing and sessionStartedAt > 0, mtimeMs === 0 (e.g. pre-existing deleted file) MUST stay hidden
     const fallbackEntries = [
       { relFile: "old.js", status: "M", sig: "10:1700000000000", mtimeMs: 1700000000000 },
       { relFile: "fresh.js", status: "M", sig: "10:1700000100000", mtimeMs: 1700000100000 },
-      { relFile: "remote-no-stat.js", status: "M", sig: "", mtimeMs: 0 },
+      { relFile: "preexisting-deleted.js", status: "D", sig: "deleted:D", mtimeMs: 0 },
     ];
     assert.deepEqual(
       filterSessionWorkingEntries(fallbackEntries, null, startedAt).map((e) => e.relFile),
-      ["fresh.js", "remote-no-stat.js"],
+      ["fresh.js"],
     );
   });
 
@@ -486,14 +489,17 @@ describe("changes-review review-logic", () => {
 
       const crMissing = await statFileEntry(path.join(dir, "nope.txt"), "D", null, noStatFs);
       const fsMissing = await filesSearchStatFileEntry(path.join(dir, "nope.txt"), "D", null, noStatFs);
-      assert.deepEqual(crMissing, fsMissing);
-      assert.equal(crMissing.sig, "deleted");
+      assert.equal(crMissing.sig, "deleted:D");
+      assert.equal(fsMissing.sig, "deleted");
 
-      // 3. SSH remote mode
+      // 3. SSH remote mode (and diffStat-backed signature detection for SSH re-edits)
       assert.deepEqual(
         await statFileEntry(textFile, "M", "dev@host"),
         await filesSearchStatFileEntry(textFile, "M", "dev@host"),
       );
+      const sshStatA = await statFileEntry(textFile, "M", "dev@host", noStatFs, { diffStat: { add: 3, del: 1, binary: false } });
+      const sshStatB = await statFileEntry(textFile, "M", "dev@host", noStatFs, { diffStat: { add: 8, del: 1, binary: false } });
+      assert.notEqual(sshStatA.sig, sshStatB.sig);
 
       // 4. Git status normalization parity
       for (const xy of ["??", " M", "M ", "MM", "A ", "AD", "UD", "UU", "AA", "DD", " D"]) {
@@ -538,23 +544,32 @@ describe("changes-review review-logic", () => {
     );
   });
 
-  test("filterUnbaselinedRepoEntries blocks un-attributed mtimeMs=0 sibling leaks and backfills baseline", () => {
+  test("filterUnbaselinedRepoEntries blocks un-attributed mtimeMs=0 sibling leaks and pre-existing deleted files", () => {
     const entries = [
       { relFile: "manifest.json", status: "M", sig: "100:b1234567", mtimeMs: 0 },
       { relFile: ".agent/SKILL.md", status: "A", sig: "200:babcdef0", mtimeMs: 0 },
     ];
 
     // Un-attributed sibling repo (e.g. mypass/scaffold) with mtimeMs=0 -> 0 session changes, backfilled
-    const unattr = filterUnbaselinedRepoEntries(entries, 1700000000000, { isAttributed: false, hasSessionCommits: false });
+    const unattr = filterUnbaselinedRepoEntries(entries, 1700000000000, { isAttributed: false });
     assert.equal(unattr.sessionFiles.length, 0);
     assert.deepEqual(Object.keys(unattr.backfillDirtyFiles).sort(), [".agent/SKILL.md", "manifest.json"]);
 
     // Attributed repo (active-tab pane cwd / transcript / sessionRepos) -> surfaces entries
-    const attr = filterUnbaselinedRepoEntries(entries, 1700000000000, { isAttributed: true, hasSessionCommits: false });
+    const attr = filterUnbaselinedRepoEntries(entries, 1700000000000, { isAttributed: true });
     assert.equal(attr.sessionFiles.length, 2);
+
+    // Regression: when some entries have real mtimeMs, deleted file (mtimeMs=0) MUST be backfilled, not leaked
+    const mixedEntries = [
+      { relFile: "src/fresh.ts", status: "M", sig: "50:1700000005000", mtimeMs: 1700000005000 },
+      { relFile: "src/old-deleted.ts", status: "D", sig: "deleted:D", mtimeMs: 0 },
+    ];
+    const mixed = filterUnbaselinedRepoEntries(mixedEntries, 1700000001000, { isAttributed: false });
+    assert.deepEqual(mixed.sessionFiles.map((e) => e.relFile), ["src/fresh.ts"]);
+    assert.deepEqual(Object.keys(mixed.backfillDirtyFiles), ["src/old-deleted.ts"]);
   });
 
-  test("extractResumeKeyFromTranscript and readDiskSessionBaseline prevent false /resume & cross-workspace collisions", async () => {
+  test("extractResumeKeyFromTranscript and readDiskSessionBaseline preserve rev/startHead and prevent cross-workspace collisions", async () => {
     assert.equal(extractResumeKeyFromTranscript("/home/nmr/.config/herdr-app/cognivisor/sessions/resume", "/ws"), "");
     assert.equal(extractResumeKeyFromTranscript("Use /resume to restore a session\n  /resume   Resume chat", "/ws"), "");
     assert.equal(extractResumeKeyFromTranscript("\x1b[36m❯\x1b[0m /resume sess-42", "/ws"), "resume:sess-42");
@@ -568,10 +583,15 @@ describe("changes-review review-logic", () => {
       const ws = "/home/nmr/Projects/herdr-cognivisor";
       const baseline = {
         version: 1,
+        rev: 2,
         startedAt: 1700000000000,
         workspaceRoot: ws,
         repos: {
-          "/home/nmr/Projects/mypass": { dirtyFiles: { "manifest.json": { status: "M", sig: "10:b01020304" } } },
+          "/home/nmr/Projects/mypass": {
+            startHead: "1111111111111111111111111111111111111111",
+            startBranch: "feat/pay",
+            dirtyFiles: { "manifest.json": { status: "M", sig: "10:b01020304" } },
+          },
         },
       };
       await writeDiskSessionBaseline(appHomeDir, "tab-1", ws, "main", baseline);
@@ -608,27 +628,7 @@ describe("changes-review review-logic", () => {
     assert.equal(resolveWorkspaceRoot(cases[6]), "C:\\Users\\nmr\\work\\app");
   });
 
-  test("parseCommitLogOutput and mergeBusCandidateServices retain clean pushed repos and enrich metadata", () => {
-    const svc = { id: ".", name: "herdr-cognivisor", root: "/ws/herdr-cognivisor" };
-    const logOut = [
-      "845bbd4\tfeat(git-history): wave transitions\tJohnMunozR\t2 minutes ago\t845bbd44c7b586209dacee3c495946a6116b3edf\t1794625047",
-      "2283aba\tfix(files-search): session baseline\tJohnMunozR\t2 hours ago\t2283abaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1794615446",
-    ].join("\n");
-    const commits = parseCommitLogOutput(logOut, svc);
-    assert.equal(commits.length, 2);
-    assert.deepEqual(commits[0], {
-      shortHash: "845bbd4",
-      subject: "feat(git-history): wave transitions",
-      author: "JohnMunozR",
-      date: "2 minutes ago",
-      hash: "845bbd44c7b586209dacee3c495946a6116b3edf",
-      timestamp: 1794625047,
-      serviceId: ".",
-      serviceName: "herdr-cognivisor",
-      repoRoot: "/ws/herdr-cognivisor",
-    });
-    assert.deepEqual(parseCommitLogOutput("", svc), []);
-
+  test("mergeBusCandidateServices, parseNameStatusZ, and parseNumstatZ parse lock-free git outputs cleanly", () => {
     const candidates = [
       { id: ".", name: "herdr-cognivisor", relPath: "", root: "/ws/herdr-cognivisor", isSibling: false, branch: "" },
       { id: "../mypass", name: "mypass", relPath: "", root: "/ws/mypass", isSibling: true, branch: "dev" },
@@ -646,225 +646,312 @@ describe("changes-review review-logic", () => {
         { root: "/ws/extra", workingCount: 1, branch: "feat/x" },
       ],
     );
+
+    const statusMap = parseNameStatusZ("M\0src/a.ts\0A\0src/new.ts\0D\0src/old.ts\0T\0src/link.ts\0");
+    assert.deepEqual(Object.fromEntries(statusMap), {
+      "src/a.ts": "M",
+      "src/new.ts": "A",
+      "src/old.ts": "D",
+      "src/link.ts": "M",
+    });
+
+    const numMap = parseNumstatZ("12\t3\tsrc/a.ts\0-\t-\tassets/logo.png\0");
+    assert.deepEqual(numMap.get("src/a.ts"), { add: 12, del: 3, binary: false });
+    assert.deepEqual(numMap.get("assets/logo.png"), { add: 0, del: 0, binary: true });
   });
 
-  test("collectServiceWorkingSnapshot loads session commits even when working tree is clean and pushed", async () => {
-    const calls = [];
-    const sessionStartMs = 1794615367673;
-    const mockExec = async (cmd, args) => {
-      calls.push({ cmd, args });
-      if (args.includes("status")) {
-        return { code: 0, stdout: "## main...origin/main\0", stderr: "" };
-      }
-      if (args.includes("log")) {
-        return {
-          code: 0,
-          stdout: [
-            "845bbd4\tfeat(git-history): wave transitions\tJohnMunozR\t2 mins ago\t845bbd44c7b586209dacee3c495946a6116b3edf\t1794625047",
-            "ba0ca0a\told commit\tJohnMunozR\t10 hours ago\tba0ca0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1794590000",
-          ].join("\n"),
-          stderr: "",
-        };
-      }
-      throw new Error(`Unexpected git args: ${args.join(" ")}`);
+  test("resolveRepoBaseRefWithExec anchors feature branches to origin base and falls back to startHead on base branches", async () => {
+    const HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BASE = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const START = "cccccccccccccccccccccccccccccccccccccccc";
+
+    // 1. Feature branch with origin/HEAD -> origin/main returns merge-base hash (never origin/<feature>)
+    const featureExec = async (_cmd, args) => {
+      assert.ok(READ_GIT_FLAGS.every((f) => args.includes(f)));
+      if (args.includes("symbolic-ref")) return { code: 0, stdout: "refs/remotes/origin/main\n", stderr: "" };
+      if (args.includes("for-each-ref")) return { code: 0, stdout: "origin/main\nmain\n", stderr: "" };
+      if (args.includes("merge-base") && args.includes("origin/main")) return { code: 0, stdout: `${BASE}\n`, stderr: "" };
+      return { code: 1, stdout: "", stderr: "" };
     };
+    const featRes = await resolveRepoBaseRefWithExec("/ws/auth", "feat/PROJ-412", HEAD, null, featureExec);
+    assert.deepEqual(featRes, { hasHead: true, baseRef: "origin/main", baseHash: BASE, baseSource: "base" });
 
-    const service = { id: ".", name: "herdr-cognivisor", relPath: "", root: "/ws/herdr-cognivisor", isSibling: false };
-    const snap = await collectServiceWorkingSnapshot({ ...service }, null, true, { exec: mockExec });
-    assert.equal(snap.rawCount, 0);
-    assert.equal(snap.files.length, 0);
-    assert.equal(snap.touched, true);
-    assert.equal(snap.branch, "main");
-    assert.equal(snap.headHash, "845bbd44c7b586209dacee3c495946a6116b3edf");
-    assert.equal(snap.commits.length, 2);
-    assert.equal(calls.length, 2);
-    assert.ok(calls.every((c) => READ_GIT_FLAGS.every((flag) => c.args.includes(flag))));
-    const logCall = calls.find((c) => c.args.includes("log"));
-    assert.deepEqual(logCall.args.slice(-2), ["main", "--"]);
-
-    // Session filter retains only post-session commit alongside clean working tree
-    const sessionCommits = filterSessionCommits(snap.commits, sessionStartMs);
-    assert.deepEqual(sessionCommits.map((c) => c.shortHash), ["845bbd4"]);
-
-    // Respects includeCommits = false for clean pushed repos without invoking git log
-    const beforeCalls = calls.length;
-    const noCommitSnap = await collectServiceWorkingSnapshot({ ...service }, null, false, { exec: mockExec });
-    assert.equal(noCommitSnap.commits.length, 0);
-    assert.equal(noCommitSnap.headHash, "");
-    assert.equal(noCommitSnap.touched, false);
-    assert.equal(calls.length, beforeCalls + 1);
-
-    // Dirty repository attaches headHash from git rev-parse --verify HEAD
-    const dirtyExec = async (cmd, args) => {
-      if (args.includes("status")) {
-        return { code: 0, stdout: "## feat/auth...origin/feat/auth\0 M src/a.js\0", stderr: "" };
+    // 2. Working directly on `main` after pushing (merge-base === HEAD) falls back to session `startHead`
+    const pushedMainExec = async (_cmd, args) => {
+      if (args.includes("symbolic-ref")) return { code: 0, stdout: "refs/remotes/origin/main\n", stderr: "" };
+      if (args.includes("for-each-ref")) return { code: 0, stdout: "origin/main\nmain\n", stderr: "" };
+      if (args.includes("merge-base") && args.includes("--is-ancestor") && args.includes(START)) {
+        return { code: 0, stdout: "", stderr: "" };
       }
-      if (args.includes("rev-parse")) {
-        return { code: 0, stdout: "deadbeef1234567890abcdef1234567890abcdef\n", stderr: "" };
-      }
-      if (args.includes("diff")) {
-        return { code: 0, stdout: "3\t1\tsrc/a.js\0", stderr: "" };
-      }
-      throw new Error(`Unexpected git args: ${args.join(" ")}`);
+      if (args.includes("merge-base")) return { code: 0, stdout: `${HEAD}\n`, stderr: "" };
+      return { code: 1, stdout: "", stderr: "" };
     };
-    const dirtySnap = await collectServiceWorkingSnapshot(
-      { id: "auth", name: "auth-api", relPath: "auth", root: "/ws/auth", isSibling: false },
-      "dev@host",
+    const pushedMainRes = await resolveRepoBaseRefWithExec("/ws/auth", "main", HEAD, null, pushedMainExec, { startHead: START });
+    assert.deepEqual(pushedMainRes, { hasHead: true, baseRef: "session start", baseHash: START, baseSource: "session" });
+
+    // 3. Local-only repo without remotes falls back to local `development`
+    const localOnlyExec = async (_cmd, args) => {
+      if (args.includes("symbolic-ref")) return { code: 1, stdout: "", stderr: "" };
+      if (args.includes("for-each-ref")) return { code: 0, stdout: "development\nmain\n", stderr: "" };
+      if (args.includes("merge-base") && args.includes("development")) return { code: 0, stdout: `${BASE}\n`, stderr: "" };
+      return { code: 1, stdout: "", stderr: "" };
+    };
+    const localRes = await resolveRepoBaseRefWithExec("/ws/auth", "feat/x", HEAD, null, localOnlyExec);
+    assert.deepEqual(localRes, { hasHead: true, baseRef: "development", baseHash: BASE, baseSource: "base" });
+
+    // 4. Unborn repo (empty headHash)
+    const unbornRes = await resolveRepoBaseRefWithExec("/ws/new", "main", "", null, localOnlyExec);
+    assert.deepEqual(unbornRes, { hasHead: false, baseRef: "", baseHash: "", baseSource: "unborn" });
+  });
+
+  test("collectServiceSessionSnapshot merges committed + working-tree edits into one deduplicated list and counts untracked lines", async () => {
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const tmpRepo = await fs.mkdtemp(path.join(os.tmpdir(), "herdr-unified-snap-"));
+    try {
+      await fs.mkdir(path.join(tmpRepo, "src"), { recursive: true });
+      await fs.writeFile(path.join(tmpRepo, "src/shared.ts"), "export const v = 2;\n", "utf8");
+      await fs.writeFile(path.join(tmpRepo, "src/new-untracked.ts"), "line 1\nline 2\nline 3\n", "utf8");
+      await fs.writeFile(path.join(tmpRepo, "src/blob.bin"), new Uint8Array([0x00, 0x01, 0x02, 0x03]));
+
+      const BASE = "1111111111111111111111111111111111111111";
+      const HEAD = "2222222222222222222222222222222222222222";
+      const calls = [];
+      const mockExec = async (_cmd, args) => {
+        calls.push(args);
+        if (args.includes("status")) {
+          return { code: 0, stdout: "## feat/unified...origin/feat/unified\0 M src/shared.ts\0?? src/new-untracked.ts\0?? src/blob.bin\0", stderr: "" };
+        }
+        if (args.includes("rev-parse")) return { code: 0, stdout: `${HEAD}\n`, stderr: "" };
+        if (args.includes("symbolic-ref")) return { code: 0, stdout: "refs/remotes/origin/main\n", stderr: "" };
+        if (args.includes("for-each-ref")) return { code: 0, stdout: "origin/main\n", stderr: "" };
+        if (args.includes("merge-base")) return { code: 0, stdout: `${BASE}\n`, stderr: "" };
+        if (args.includes("diff") && args.includes("--name-status")) {
+          return { code: 0, stdout: "M\0src/shared.ts\0D\0src/removed-in-commit.ts\0", stderr: "" };
+        }
+        if (args.includes("diff") && args.includes("--numstat")) {
+          return { code: 0, stdout: "15\t4\tsrc/shared.ts\x000\t20\tsrc/removed-in-commit.ts\x00", stderr: "" };
+        }
+        if (args.includes("diff") && args.includes("--name-only")) {
+          return { code: 0, stdout: "src/shared.ts\0src/removed-in-commit.ts\0", stderr: "" };
+        }
+        throw new Error(`Unexpected git args: ${args.join(" ")}`);
+      };
+
+      const service = { id: "auth", name: "auth-api", relPath: "auth", root: tmpRepo, isSibling: false };
+      const snap = await collectServiceSessionSnapshot(
+        { ...service },
+        null,
+        { baselineRepo: { startHead: BASE, dirtyFiles: { "src/shared.ts": { status: "M", sig: "old" } } } },
+        { exec: mockExec, fsPromises: fs },
+      );
+
+      assert.ok(calls.every((a) => READ_GIT_FLAGS.every((flag) => a.includes(flag))));
+      assert.equal(snap.baseRef, "origin/main");
+      assert.equal(snap.baseHash, BASE);
+      assert.equal(snap.headHash, HEAD);
+      assert.equal(snap.committedPaths.has("src/shared.ts"), true);
+      assert.equal(snap.committedPaths.has("src/removed-in-commit.ts"), true);
+
+      // Deduplicated unified files: src/shared.ts appears ONCE combining commits + working tree!
+      assert.deepEqual(snap.files.map((f) => f.path), [
+        "src/blob.bin",
+        "src/new-untracked.ts",
+        "src/removed-in-commit.ts",
+        "src/shared.ts",
+      ]);
+
+      const untrackedText = snap.files.find((f) => f.path === "src/new-untracked.ts");
+      assert.equal(untrackedText.add, 3, "untracked text file must count real lines instead of +0");
+      assert.equal(untrackedText.binary, false);
+      assert.equal(untrackedText.fresh, true);
+
+      const untrackedBin = snap.files.find((f) => f.path === "src/blob.bin");
+      assert.equal(untrackedBin.binary, true);
+      assert.equal(untrackedBin.add, 0);
+
+      const deletedCommitFile = snap.files.find((f) => f.path === "src/removed-in-commit.ts");
+      assert.equal(deletedCommitFile.status, "D");
+      assert.equal(deletedCommitFile.sig, "deleted:D");
+      assert.equal(deletedCommitFile.inWorkingTree, false);
+      assert.equal(deletedCommitFile.baseHash, BASE);
+
+      // Untracked line counter handles no-trailing-LF and empty files cleanly
+      const noLfPath = path.join(tmpRepo, "src/no-lf.txt");
+      await fs.writeFile(noLfPath, "a\nb", "utf8");
+      assert.deepEqual(await countUntrackedFileLines(noLfPath, null, fs), { add: 2, del: 0, binary: false });
+    } finally {
+      await fs.rm(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  test("partitionSessionUnifiedEntries & evaluateRepoSessionActivity exclude untouched sibling repos while preserving committed branch changes", () => {
+    const baselineRepo = {
+      startHead: "1111",
+      dirtyFiles: {
+        "src/preexisting-dirty.ts": { status: "M", sig: "50:1000" },
+        "src/in-both-commit-and-dirty.ts": { status: "M", sig: "80:1000" },
+      },
+    };
+    const unifiedFiles = [
+      { path: "src/preexisting-dirty.ts", status: "M", workingStatus: "M", inWorkingTree: true, sig: "50:1000", mtimeMs: 1000 },
+      { path: "src/in-both-commit-and-dirty.ts", status: "M", workingStatus: "M", inWorkingTree: true, sig: "80:1000", mtimeMs: 1000 },
+      { path: "src/committed-only.ts", status: "A", workingStatus: "", inWorkingTree: false, sig: "90:2000", mtimeMs: 2000 },
+    ];
+    const committedPaths = new Set(["src/in-both-commit-and-dirty.ts", "src/committed-only.ts"]);
+
+    const part = partitionSessionUnifiedEntries(unifiedFiles, baselineRepo, committedPaths, 1500);
+    assert.deepEqual(part.visible.map((f) => f.path), ["src/in-both-commit-and-dirty.ts", "src/committed-only.ts"]);
+    assert.deepEqual(part.hidden.map((f) => f.path), ["src/preexisting-dirty.ts"]);
+
+    // Untouched sibling repo on old feature branch -> excluded (false)
+    assert.equal(
+      evaluateRepoSessionActivity({
+        hasNewWorkingEdit: false,
+        inPaneCwd: false,
+        inSessionRepos: false,
+        startHead: "aaaa",
+        headHash: "aaaa",
+        repoMatchesTranscript: false,
+      }),
       false,
-      { exec: dirtyExec },
     );
-    assert.equal(dirtySnap.headHash, "deadbeef1234567890abcdef1234567890abcdef");
-    assert.equal(dirtySnap.files.length, 1);
-    assert.equal(dirtySnap.files[0].add, 3);
-    assert.equal(dirtySnap.files[0].del, 1);
+    // Active chat repo on existing feature branch -> included (true)
+    assert.equal(
+      evaluateRepoSessionActivity({
+        hasNewWorkingEdit: false,
+        inPaneCwd: true,
+        inSessionRepos: false,
+        startHead: "aaaa",
+        headHash: "aaaa",
+        repoMatchesTranscript: false,
+      }),
+      true,
+    );
+    // Sibling repo committed by another unrelated terminal (no transcript match) -> excluded (false)
+    assert.equal(
+      evaluateRepoSessionActivity({
+        hasNewWorkingEdit: false,
+        inPaneCwd: false,
+        inSessionRepos: false,
+        startHead: "aaaa",
+        headHash: "bbbb",
+        repoMatchesTranscript: false,
+      }),
+      false,
+    );
+    // Sibling repo committed by THIS session's agent (transcript match) -> included (true)
+    assert.equal(
+      evaluateRepoSessionActivity({
+        hasNewWorkingEdit: false,
+        inPaneCwd: false,
+        inSessionRepos: false,
+        startHead: "aaaa",
+        headHash: "bbbb",
+        repoMatchesTranscript: true,
+      }),
+      true,
+    );
   });
 
-  test("computeFileReviewFingerprint and parseReviewedFileRecord capture file metadata accurately", () => {
+  test("computeFileReviewFingerprint and reconcileReviewedFiles survive git commit unchanged and invalidate on edit or baseHash move", () => {
     assert.equal(computeFileReviewFingerprint(null), "");
     assert.equal(computeFileReviewFingerprint(undefined), "");
+    assert.equal(buildReviewedFileKey({ key: "auth::src/jwt.ts" }), "session::auth::src/jwt.ts");
 
-    const base = {
+    const untrackedBeforeCommit = {
       key: "auth::src/jwt.ts",
-      status: "M",
-      add: 12,
-      del: 3,
-      fresh: false,
-      binary: false,
-      sig: "420:1700000000123",
-      mtimeMs: 1700000000123,
-    };
-    const baseFp = computeFileReviewFingerprint(base);
-    assert.equal(baseFp, "M|12|3|0|0|420:1700000000123|1700000000123");
-
-    assert.notEqual(computeFileReviewFingerprint({ ...base, status: "A" }), baseFp);
-    assert.notEqual(computeFileReviewFingerprint({ ...base, add: 13 }), baseFp);
-    assert.notEqual(computeFileReviewFingerprint({ ...base, del: 4 }), baseFp);
-    assert.notEqual(computeFileReviewFingerprint({ ...base, fresh: true }), baseFp);
-    assert.notEqual(computeFileReviewFingerprint({ ...base, binary: true }), baseFp);
-    assert.notEqual(computeFileReviewFingerprint({ ...base, sig: "425:1700000000123" }), baseFp);
-    assert.notEqual(computeFileReviewFingerprint({ ...base, mtimeMs: 1700000009999 }), baseFp);
-
-    assert.deepEqual(parseReviewedFileRecord(true), { reviewed: true, fp: "", reviewedAt: 0 });
-    assert.deepEqual(
-      parseReviewedFileRecord({ reviewed: true, fp: baseFp, reviewedAt: 1700000001000 }),
-      { reviewed: true, fp: baseFp, reviewedAt: 1700000001000 },
-    );
-    assert.equal(parseReviewedFileRecord(false), null);
-    assert.equal(parseReviewedFileRecord(null), null);
-    assert.equal(parseReviewedFileRecord({ reviewed: false, fp: baseFp }), null);
-  });
-
-  test("reconcileReviewedFiles retains unchanged checks and invalidates on edits, commits, and working-tree removal", () => {
-    const fileA = {
-      key: "auth::src/a.js",
-      status: "M",
-      add: 5,
-      del: 2,
-      fresh: false,
-      binary: false,
-      sig: "100:1700000100000",
-      mtimeMs: 1700000100000,
-    };
-    const fileB = {
-      key: "auth::src/b.js",
       status: "A",
-      add: 0,
+      add: 12,
       del: 0,
       fresh: true,
       binary: false,
-      sig: "200:1700000100000",
-      mtimeMs: 1700000100000,
+      baseHash: "base111",
+      sig: "420:1700000000123",
+      mtimeMs: 1700000000123,
     };
-    const fpA = computeFileReviewFingerprint(fileA);
+    const trackedAfterCommit = {
+      ...untrackedBeforeCommit,
+      fresh: false,
+    };
+    const fpBefore = computeFileReviewFingerprint(untrackedBeforeCommit);
+    const fpAfter = computeFileReviewFingerprint(trackedAfterCommit);
+    assert.equal(fpBefore, fpAfter, "approving an added file must survive git add + git commit unchanged");
+
+    // Edits or baseHash changes MUST invalidate the fingerprint
+    assert.notEqual(computeFileReviewFingerprint({ ...trackedAfterCommit, add: 13 }), fpAfter);
+    assert.notEqual(computeFileReviewFingerprint({ ...trackedAfterCommit, sig: "425:1700000009999" }), fpAfter);
+    assert.notEqual(computeFileReviewFingerprint({ ...trackedAfterCommit, baseHash: "base222" }), fpAfter);
+    assert.notEqual(computeFileReviewFingerprint({ ...trackedAfterCommit, binary: true }), fpAfter);
+
+    const fileB = {
+      key: "auth::src/b.js",
+      status: "D",
+      add: 0,
+      del: 5,
+      fresh: false,
+      binary: false,
+      baseHash: "base111",
+      sig: "deleted:D",
+      mtimeMs: 0,
+    };
     const fpB = computeFileReviewFingerprint(fileB);
 
-    // 1. Retains unchanged working & commit checks
-    const initial = {
-      "working::auth::src/a.js": { reviewed: true, fp: fpA, reviewedAt: 1700000200000 },
-      "working::auth::src/b.js": { reviewed: true, fp: fpB, reviewedAt: 1700000200000 },
-      "commit:c1::auth::src/c.js": { reviewed: true, fp: "M|1|0|0|0||0", reviewedAt: 1700000200000 },
+    // 1. Retains unchanged session:: checks across commit and drops legacy working::/commit: keys
+    const prevMap = {
+      "session::auth::src/jwt.ts": { reviewed: true, fp: fpBefore, reviewedAt: 1700000200000 },
+      "session::auth::src/b.js": { reviewed: true, fp: fpB, reviewedAt: 1700000200000 },
+      "working::auth::src/old.js": { reviewed: true, fp: "legacy", reviewedAt: 1700000200000 },
+      "commit:c1::auth::src/c.js": { reviewed: true, fp: "legacy", reviewedAt: 1700000200000 },
     };
-    const unchangedRes = reconcileReviewedFiles(initial, { workingFiles: [fileA, fileB] });
-    assert.equal(unchangedRes.changed, false);
-    assert.deepEqual(unchangedRes.nextMap, initial);
+    const reconciled = reconcileReviewedFiles(prevMap, { sessionFiles: [trackedAfterCommit, fileB] });
+    assert.equal(reconciled.changed, true);
+    assert.deepEqual(Object.keys(reconciled.nextMap).sort(), [
+      "session::auth::src/b.js",
+      "session::auth::src/jwt.ts",
+    ]);
 
-    // 2. Drops legacy un-fingerprinted boolean entries so files modified before migration require re-review
-    const legacyRes = reconcileReviewedFiles(
-      { "working::auth::src/a.js": true, "commit:c1::auth::src/c.js": true },
-      { workingFiles: [fileA] },
-    );
-    assert.equal(legacyRes.changed, true);
-    assert.deepEqual(legacyRes.nextMap, {});
+    // 2. Clean steady-state has changed === false
+    const steady = reconcileReviewedFiles(reconciled.nextMap, { sessionFiles: [trackedAfterCommit, fileB] });
+    assert.equal(steady.changed, false);
 
-    // 3. Removes working check when agent edits file (sig/mtimeMs or add/del changes), keeps untouched fileB
-    const editedA = { ...fileA, sig: "110:1700000300000", mtimeMs: 1700000300000 };
-    const editedRes = reconcileReviewedFiles(initial, { workingFiles: [editedA, fileB] });
-    assert.equal(editedRes.changed, true);
-    assert.equal("working::auth::src/a.js" in editedRes.nextMap, false);
-    assert.equal("working::auth::src/b.js" in editedRes.nextMap, true);
+    // 3. Editing a file invalidates ONLY that file
+    const editedJwt = { ...trackedAfterCommit, sig: "430:1700000999999" };
+    const afterEdit = reconcileReviewedFiles(reconciled.nextMap, { sessionFiles: [editedJwt, fileB] });
+    assert.equal(afterEdit.changed, true);
+    assert.deepEqual(Object.keys(afterEdit.nextMap), ["session::auth::src/b.js"]);
 
-    const lineCountChangedB = { ...fileB, add: 10 };
-    const lineCountRes = reconcileReviewedFiles(initial, { workingFiles: [fileA, lineCountChangedB] });
-    assert.equal(lineCountRes.changed, true);
-    assert.equal("working::auth::src/b.js" in lineCountRes.nextMap, false);
-    assert.equal("working::auth::src/a.js" in lineCountRes.nextMap, true);
-
-    // 4. Removes working check when file leaves working tree (committed externally in terminal)
-    const committedOutRes = reconcileReviewedFiles(initial, { workingFiles: [fileB] });
-    assert.equal(committedOutRes.changed, true);
-    assert.equal("working::auth::src/a.js" in committedOutRes.nextMap, false);
-    assert.equal("working::auth::src/b.js" in committedOutRes.nextMap, true);
-
-    // Subsequent re-edit starts unreviewed because working::auth::src/a.js was cleared
-    assert.equal("working::auth::src/a.js" in committedOutRes.nextMap, false);
-
-    // 5. Removes working & commit checks when another commit touches the same file
-    const byCommittedSet = reconcileReviewedFiles(initial, {
-      workingFiles: [fileA, fileB],
-      committedFileKeys: new Set(["auth::src/a.js", "auth::src/c.js"]),
-    });
-    assert.equal(byCommittedSet.changed, true);
-    assert.equal("working::auth::src/a.js" in byCommittedSet.nextMap, false);
-    assert.equal("commit:c1::auth::src/c.js" in byCommittedSet.nextMap, false);
-    assert.equal("working::auth::src/b.js" in byCommittedSet.nextMap, true);
-
-    const byNewerCommitTs = reconcileReviewedFiles(initial, {
-      workingFiles: [fileA, fileB],
-      committedAfterByKey: new Map([
-        ["auth::src/c.js", 1700000250000], // newer than 1700000200000
-        ["auth::src/d.js", 1700000100000], // older than review
-      ]),
-    });
-    assert.equal(byNewerCommitTs.changed, true);
-    assert.equal("commit:c1::auth::src/c.js" in byNewerCommitTs.nextMap, false);
-    assert.equal("working::auth::src/a.js" in byNewerCommitTs.nextMap, true);
-
-    // 6. Preserves checks for services in erroredServiceIds even when workingFiles omits them
-    const erroredInitial = {
-      "working::billing::src/pay.js": { reviewed: true, fp: "M|1|1|0|0|10:1|1", reviewedAt: 1700000200000 },
-      "commit:c2::billing::src/pay.js": { reviewed: true, fp: "M|1|1|0|0||0", reviewedAt: 1700000200000 },
-      "working::auth::src/a.js": { reviewed: true, fp: fpA, reviewedAt: 1700000200000 },
+    // 4. Preserves checks for services in erroredServiceIds
+    const withErrored = {
+      "session::billing::src/pay.js": { reviewed: true, fp: "M|1|1|0|b1|10:1", reviewedAt: 1700000200000 },
+      "session::auth::src/b.js": { reviewed: true, fp: fpB, reviewedAt: 1700000200000 },
     };
-    const erroredRes = reconcileReviewedFiles(erroredInitial, {
-      workingFiles: [fileA],
-      committedFileKeys: new Set(["billing::src/pay.js"]),
+    const errRes = reconcileReviewedFiles(withErrored, {
+      sessionFiles: [fileB],
       erroredServiceIds: new Set(["billing"]),
     });
-    assert.equal(erroredRes.changed, false);
-    assert.deepEqual(erroredRes.nextMap, erroredInitial);
+    assert.equal(errRes.changed, false);
+    assert.deepEqual(errRes.nextMap, withErrored);
+
+    assert.deepEqual(parseReviewedFileRecord(true), { reviewed: true, fp: "", reviewedAt: 0 });
+    assert.equal(parseReviewedFileRecord(false), null);
+    assert.equal(parseReviewedFileRecord(null), null);
   });
 
-  test("mods/changes-review copies of dropdown-logic.js, dropdown.js, and markdown-syntax.js stay byte-identical to shared/", async () => {
-    const { readFileSync } = await import("node:fs");
+  test("mods/changes-review synced shared modules match shared/ verbatim and dropdown files are removed", async () => {
+    const { readFileSync, existsSync } = await import("node:fs");
     const { resolve, dirname } = await import("node:path");
     const { fileURLToPath } = await import("node:url");
     const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-    for (const file of ["dropdown-logic.js", "dropdown.js", "markdown-syntax.js"]) {
+    for (const file of ["code-wrap.js", "code-syntax.js", "markdown-syntax.js", "markdown-view-logic.js", "markdown-view.js"]) {
       const canonical = readFileSync(resolve(repoRoot, "shared", file), "utf8");
       const modCopy = readFileSync(resolve(repoRoot, "mods/changes-review", file), "utf8");
       assert.equal(modCopy, canonical, `mods/changes-review/${file} must match shared/${file} verbatim`);
     }
+    assert.equal(existsSync(resolve(repoRoot, "mods/changes-review/dropdown.js")), false);
+    assert.equal(existsSync(resolve(repoRoot, "mods/changes-review/dropdown-logic.js")), false);
   });
 
   test("tokenizeDiffLine delegates md and mdx prose to shared markdown syntax without code-keyword rainbow noise", () => {
@@ -988,110 +1075,66 @@ describe("changes-review review-logic", () => {
     ]);
   });
 
-  test("resolveReviewMarkdownSourceSpec resolves working tree, commit, renamed R, deleted D, untracked ??, and lock-free git flags", () => {
-    // 1. Working tree modified/added/untracked/renamed -> fast readTextFile path with no deleted notice
-    const workingMod = resolveReviewMarkdownSourceSpec(
-      { repoRoot: "/ws/repo/", path: "docs/README.md", status: "M", hasHead: true },
-      { viewMode: "working" },
+  test("resolveReviewMarkdownSourceSpec resolves unified working reads, baseHash deletions, untracked ??, and lock-free git flags", () => {
+    // 1. Modified/added/untracked/renamed -> fast readTextFile path with no deleted notice
+    const modSpec = resolveReviewMarkdownSourceSpec(
+      { repoRoot: "/ws/repo/", path: "docs/README.md", status: "M", hasHead: true, baseHash: "base111" },
     );
-    assert.equal(workingMod.kind, "file");
-    assert.equal(workingMod.mode, "after");
-    assert.equal(workingMod.isDeleted, false);
-    assert.equal(workingMod.notice, "");
-    assert.equal(workingMod.absPath, "/ws/repo/docs/README.md");
+    assert.equal(modSpec.kind, "file");
+    assert.equal(modSpec.mode, "after");
+    assert.equal(modSpec.isDeleted, false);
+    assert.equal(modSpec.notice, "");
+    assert.equal(modSpec.absPath, "/ws/repo/docs/README.md");
 
-    const workingUntracked = resolveReviewMarkdownSourceSpec(
+    const untrackedSpec = resolveReviewMarkdownSourceSpec(
       { repoRoot: "/ws/repo", path: "notes/TODO.mdx", status: "??", fresh: true, hasHead: false },
     );
-    assert.equal(workingUntracked.kind, "file");
-    assert.equal(workingUntracked.isDeleted, false);
-    assert.equal(workingUntracked.absPath, "/ws/repo/notes/TODO.mdx");
+    assert.equal(untrackedSpec.kind, "file");
+    assert.equal(untrackedSpec.isDeleted, false);
+    assert.equal(untrackedSpec.absPath, "/ws/repo/notes/TODO.mdx");
 
-    const workingRenamed = resolveReviewMarkdownSourceSpec(
-      { repoRoot: "/ws/repo", path: "docs/new-guide.md", oldPath: "docs/old-guide.md", status: "R", hasHead: true },
-      { viewMode: "working" },
+    // 2. Deleted file (including committed deletions!) -> lock-free git show <baseHash>:<oldPath || path>
+    const deletedAtBase = resolveReviewMarkdownSourceSpec(
+      { repoRoot: "/ws/repo", path: "docs/removed.md", oldPath: "docs/prev-removed.md", status: "D", hasHead: true, baseHash: "base999" },
+      { on: "dev@host" },
     );
-    assert.equal(workingRenamed.kind, "file");
-    assert.equal(workingRenamed.isDeleted, false);
-    assert.equal(workingRenamed.notice, "");
-    assert.equal(workingRenamed.absPath, "/ws/repo/docs/new-guide.md");
+    assert.equal(deletedAtBase.kind, "git");
+    assert.equal(deletedAtBase.mode, "before");
+    assert.equal(deletedAtBase.isDeleted, true);
+    assert.equal(deletedAtBase.notice, "Deleted in this change — showing previous version");
+    assert.equal(deletedAtBase.refSpec, "base999:docs/prev-removed.md");
+    assert.equal(deletedAtBase.on, "dev@host");
+    assert.deepEqual(deletedAtBase.args, [...READ_GIT_FLAGS, "show", "base999:docs/prev-removed.md"]);
 
-    // 2. Working tree deleted -> lock-free git show HEAD:<oldPath || path> with notice banner
-    const workingDeleted = resolveReviewMarkdownSourceSpec(
-      { repoRoot: "/ws/repo", path: "docs/removed.md", oldPath: "docs/prev-removed.md", status: "D", hasHead: true },
-      { viewMode: "working", on: "dev@host" },
-    );
-    assert.equal(workingDeleted.kind, "git");
-    assert.equal(workingDeleted.mode, "before");
-    assert.equal(workingDeleted.isDeleted, true);
-    assert.equal(workingDeleted.notice, "Deleted in this change — showing previous version");
-    assert.equal(workingDeleted.refSpec, "HEAD:docs/prev-removed.md");
-    assert.equal(workingDeleted.on, "dev@host");
-    assert.deepEqual(workingDeleted.args, [...READ_GIT_FLAGS, "show", "HEAD:docs/prev-removed.md"]);
-
-    const workingDeletedFallbackPath = resolveReviewMarkdownSourceSpec(
+    const deletedFallbackHead = resolveReviewMarkdownSourceSpec(
       { repoRoot: "/ws/repo", path: "CHANGELOG.md", status: "D" },
     );
-    assert.equal(workingDeletedFallbackPath.kind, "git");
-    assert.equal(workingDeletedFallbackPath.refSpec, "HEAD:CHANGELOG.md");
+    assert.equal(deletedFallbackHead.kind, "git");
+    assert.equal(deletedFallbackHead.refSpec, "HEAD:CHANGELOG.md");
 
-    // Working tree deleted when untracked / repo has no HEAD -> clear unavailable spec
-    const workingDeletedNoHead = resolveReviewMarkdownSourceSpec(
+    // Deleted when untracked / repo has no HEAD -> clear unavailable spec
+    const deletedNoHead = resolveReviewMarkdownSourceSpec(
       { repoRoot: "/ws/repo", path: "draft.md", status: "D", hasHead: false },
     );
-    assert.equal(workingDeletedNoHead.kind, "unavailable");
-    assert.equal(workingDeletedNoHead.isDeleted, true);
-    assert.match(workingDeletedNoHead.error, /untracked|HEAD/i);
+    assert.equal(deletedNoHead.kind, "unavailable");
+    assert.equal(deletedNoHead.isDeleted, true);
+    assert.match(deletedNoHead.error, /untracked|HEAD/i);
 
-    // 3. Commit mode non-deleted (M, R) -> lock-free git show <hash>:<path>
-    const commitHash = "845bbd44c7b586209dacee3c495946a6116b3edf";
-    const commitRenamed = resolveReviewMarkdownSourceSpec(
-      { repoRoot: "/ws/repo", path: "docs/renamed.md", oldPath: "docs/before.md", status: "R" },
-      { viewMode: "commit", commitHash },
-    );
-    assert.equal(commitRenamed.kind, "git");
-    assert.equal(commitRenamed.mode, "after");
-    assert.equal(commitRenamed.isDeleted, false);
-    assert.equal(commitRenamed.notice, "");
-    assert.equal(commitRenamed.refSpec, `${commitHash}:docs/renamed.md`);
-    assert.deepEqual(commitRenamed.args, [...READ_GIT_FLAGS, "show", `${commitHash}:docs/renamed.md`]);
-
-    // 4. Commit mode deleted -> lock-free git show <hash>^:<oldPath || path> with deleted notice
-    const commitDeleted = resolveReviewMarkdownSourceSpec(
-      { repoRoot: "/ws/repo", path: "docs/old.md", status: "D" },
-      { commitHash },
-    );
-    assert.equal(commitDeleted.kind, "git");
-    assert.equal(commitDeleted.mode, "before");
-    assert.equal(commitDeleted.isDeleted, true);
-    assert.equal(commitDeleted.notice, "Deleted in this change — showing previous version");
-    assert.equal(commitDeleted.refSpec, `${commitHash}^:docs/old.md`);
-    assert.deepEqual(commitDeleted.args, [...READ_GIT_FLAGS, "show", `${commitHash}^:docs/old.md`]);
-
-    const commitDeletedWithOldPath = resolveReviewMarkdownSourceSpec(
-      { repoRoot: "/ws/repo", path: "docs/new.md", oldPath: "docs/orig.md", status: "D" },
-      { viewMode: "commit", commitHash },
-    );
-    assert.equal(commitDeletedWithOldPath.refSpec, `${commitHash}^:docs/orig.md`);
-
-    // 5. Guards: binary flag, missing commit hash in commit mode, missing file
+    // Guards: binary flag, missing file
     assert.equal(
       resolveReviewMarkdownSourceSpec({ repoRoot: "/ws/repo", path: "docs/bin.md", status: "M", binary: true }).kind,
-      "unavailable",
-    );
-    assert.equal(
-      resolveReviewMarkdownSourceSpec({ repoRoot: "/ws/repo", path: "docs/a.md", status: "M" }, { viewMode: "commit", commitHash: "" }).kind,
       "unavailable",
     );
     assert.equal(resolveReviewMarkdownSourceSpec(null).kind, "unavailable");
   });
 
-  test("Markdown cache keying, binary NUL guard, and git-show error formatting handle edge cases", () => {
+  test("Markdown cache keying, binary NUL guard, and git-show error formatting handle baseHash changes cleanly", () => {
     const file = {
       key: "svc::docs/guide.md",
       repoRoot: "/ws/repo",
       path: "docs/guide.md",
       status: "M",
+      baseHash: "base111",
       fresh: false,
       sig: "120:1700000000000",
       mtimeMs: 1700000000000,
@@ -1099,25 +1142,25 @@ describe("changes-review review-logic", () => {
       del: 1,
     };
 
-    const workingId = computeViewerMarkdownFileId(file, "working", "");
-    const commitId = computeViewerMarkdownFileId(file, "commit", "abc123");
-    assert.notEqual(workingId, commitId);
+    const id1 = computeViewerMarkdownFileId(file);
+    const id2 = computeViewerMarkdownFileId({ ...file, baseHash: "base222" });
+    assert.notEqual(id1, id2);
     assert.equal(computeViewerMarkdownFileId(null), "");
 
-    const tok0 = computeReviewMarkdownLoadToken(file, { viewMode: "working", reloadNonce: 0 });
-    const tok1 = computeReviewMarkdownLoadToken(file, { viewMode: "working", reloadNonce: 1 });
+    const tok0 = computeReviewMarkdownLoadToken(file, { reloadNonce: 0 });
+    const tok1 = computeReviewMarkdownLoadToken(file, { reloadNonce: 1 });
     const tokEdited = computeReviewMarkdownLoadToken(
       { ...file, sig: "140:1700000005000", mtimeMs: 1700000005000 },
-      { viewMode: "working", reloadNonce: 0 },
+      { reloadNonce: 0 },
     );
     assert.notEqual(tok0, tok1);
     assert.notEqual(tok0, tokEdited);
 
-    const k0 = buildReviewMarkdownCacheKey(file, { viewMode: "working", loadToken: tok0 });
-    const k1 = buildReviewMarkdownCacheKey(file, { viewMode: "working", loadToken: tok1 });
-    const kCommit = buildReviewMarkdownCacheKey(file, { viewMode: "commit", commitHash: "abc123", loadToken: "M||r0" });
+    const k0 = buildReviewMarkdownCacheKey(file, { loadToken: tok0 });
+    const k1 = buildReviewMarkdownCacheKey(file, { loadToken: tok1 });
+    const kOtherBase = buildReviewMarkdownCacheKey({ ...file, baseHash: "base222" }, { loadToken: tok0 });
     assert.notEqual(k0, k1);
-    assert.notEqual(k0, kCommit);
+    assert.notEqual(k0, kOtherBase);
 
     // Binary content NUL byte guard
     assert.deepEqual(validateMarkdownTextContent("# Hello\n"), { ok: true, text: "# Hello\n" });
@@ -1126,14 +1169,10 @@ describe("changes-review review-logic", () => {
     assert.match(binRes.error, /binary/i);
     assert.equal(validateMarkdownTextContent(null, "Missing file").error, "Missing file");
 
-    // Git show error translations (root commit parent missing vs missing from HEAD)
+    // Git show error translation for missing deleted file at comparison base
     assert.match(
-      formatGitShowMarkdownError("fatal: bad revision 'abc^:docs/old.md'", { isDeleted: true, refSpec: "abc^:docs/old.md" }),
-      /root commit|parent/i,
-    );
-    assert.match(
-      formatGitShowMarkdownError("fatal: path 'docs/new.md' exists on disk, but not in 'HEAD'", { isDeleted: true, refSpec: "HEAD:docs/new.md" }),
-      /HEAD|untracked/i,
+      formatGitShowMarkdownError("fatal: path 'docs/new.md' exists on disk, but not in 'base111'", { isDeleted: true, refSpec: "base111:docs/new.md" }),
+      /comparison base|untracked/i,
     );
   });
 
@@ -1164,95 +1203,51 @@ describe("changes-review review-logic", () => {
     assert.equal(computeDiffContentWidth([{ type: "line", content: "abc" }], { minWidth: 300, charPx: -4 }), 300);
   });
 
-  test("regression: fresh baseline anchored to session start does not hide agent edits made before Review opens", () => {
+  test("regression: resolveSessionStartTime ignores tab-naming updatedAt and fresh baseline preserves startHead + workingFiles only", () => {
     const t0900 = 1795442400000;
     const t1205 = 1795453500000;
     const t1211 = 1795453860000;
     const t1215 = 1795454100000;
     const t1221 = 1795454460000;
 
-    // Flow already existed since 12:05 before Review created its baseline at 12:21
-    const startInfo = resolveSessionStartTime({ updatedAt: t1205 }, t1221);
+    // `updatedAt` written by cognivisor-tabs must NOT falsely anchor session start backward
+    assert.deepEqual(resolveSessionStartTime({ updatedAt: t1205 }, t1221), { startedAt: t1221, anchored: false });
+
+    // Explicit `sessionStartedAt` DOES anchor session start so agent edits before Review opens remain visible
+    const startInfo = resolveSessionStartTime({ sessionStartedAt: t1205 }, t1221);
     assert.equal(startInfo.startedAt, t1205);
     assert.equal(startInfo.anchored, true);
 
-    const files = [
+    const workingFiles = [
       { relFile: "src/PreExisting.java", status: "M", sig: "50:1795442400000", mtimeMs: t0900 },
       { relFile: "src/CardB2bApi.java", status: "M", sig: "120:1795453860000", mtimeMs: t1211 },
       { relFile: "src/CardRepository.java", status: "M", sig: "240:1795454100000", mtimeMs: t1215 },
     ];
 
     const baseline = buildFreshSessionBaseline(
-      [{ service: { root: "/ws/ms-card" }, files }],
+      [{ service: { root: "/ws/ms-card" }, headHash: "deadbeef", branch: "feat/card", workingFiles }],
       { workspaceRoot: "/ws/ms-card", startedAt: startInfo.startedAt, anchored: startInfo.anchored },
     );
 
-    // Only the 09:00 pre-existing file is snapshotted; 12:11 & 12:15 agent edits are excluded from dirtyFiles
+    assert.equal(baseline.repos["/ws/ms-card"].startHead, "deadbeef");
+    assert.equal(baseline.repos["/ws/ms-card"].startBranch, "feat/card");
     assert.deepEqual(Object.keys(baseline.repos["/ws/ms-card"].dirtyFiles), ["src/PreExisting.java"]);
 
-    const part = partitionSessionWorkingEntries(files, baseline.repos["/ws/ms-card"], baseline.startedAt);
+    const part = partitionSessionWorkingEntries(workingFiles, baseline.repos["/ws/ms-card"], baseline.startedAt);
     assert.deepEqual(part.visible.map((f) => f.relFile), ["src/CardB2bApi.java", "src/CardRepository.java"]);
     assert.deepEqual(part.hidden.map((f) => f.relFile), ["src/PreExisting.java"]);
   });
 
-  test("regression: findRecentWorkspaceBaseline & findRecentFlowWorkspaceBaseline reuse orphaned morning baseline without stealing live tabs", async () => {
-    const t0919 = 1795443593000;
-    const t1221 = 1795454466000;
-    const oldBaseline = {
-      version: 1,
-      startedAt: t0919,
-      workspaceRoot: "/ws/ms-card",
-      repos: { "/ws/ms-card": { dirtyFiles: {} } },
-    };
-    const otherLiveBaseline = {
-      version: 1,
-      startedAt: t0919 + 60000,
-      workspaceRoot: "/ws/ms-card",
-      repos: { "/ws/ms-card": { dirtyFiles: { "src/CardB2bApi.java": { status: "M", sig: "1:1" } } } },
-    };
-
-    const flows = {
-      tbf79e3c: { sessionBaseline: oldBaseline },
-      live_tab_2: { sessionBaseline: otherLiveBaseline },
-    };
-
-    // tbf79e3c is no longer live -> recovered; live_tab_2 is live -> skipped
-    const fromFlows = findRecentFlowWorkspaceBaseline(flows, "/ws/ms-card", {
-      excludeTabId: "tb70b579",
-      liveTabIds: new Set(["tb70b579", "live_tab_2"]),
-      now: t1221,
-    });
-    assert.deepEqual(fromFlows, oldBaseline);
-
-    // Disk scan via mock fsDeps
-    const filesMap = new Map([
-      ["/app/cognivisor/sessions/tabs/tbf79e3c.json", JSON.stringify(oldBaseline)],
-      ["/app/cognivisor/sessions/tabs/live_tab_2.json", JSON.stringify(otherLiveBaseline)],
-    ]);
-    const mockFs = {
-      readdir: async () => ["tbf79e3c.json", "live_tab_2.json"],
-      readFile: async (p) => {
-        const key = String(p).replace(/\\/g, "/");
-        if (!filesMap.has(key)) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
-        return filesMap.get(key);
-      },
-    };
-    const fromDisk = await findRecentWorkspaceBaseline("/app", "/ws/ms-card", {
-      excludeTabId: "tb70b579",
-      liveTabIds: new Set(["tb70b579", "live_tab_2"]),
-      now: t1221,
-      fsDeps: mockFs,
-    });
-    assert.deepEqual(fromDisk, oldBaseline);
-  });
-
-  test("createResetSessionBaseline clears dirtyFiles across repos so hidden files immediately reappear", () => {
+  test("createResetSessionBaseline increments rev, preserves startHead/startBranch, and clears dirtyFiles", () => {
     const existing = {
       version: 1,
+      rev: 1,
       startedAt: 1795454466000,
       workspaceRoot: "/ws/ms-card",
       repos: {
         "/ws/ms-card": {
+          startHead: "aaaa1111",
+          startBranch: "feat/card",
           dirtyFiles: {
             "src/CardB2bApi.java": { status: "M", sig: "120:1795453860000" },
             "src/CardRepository.java": { status: "M", sig: "240:1795454100000" },
@@ -1264,8 +1259,13 @@ describe("changes-review review-logic", () => {
 
     const reset = createResetSessionBaseline(existing, ["/ws/ms-card", "/ws/ms-wallet"], "/ws/ms-card");
     assert.equal(reset.startedAt, existing.startedAt);
+    assert.equal(reset.rev, 2);
     assert.equal(countBaselineDirtyFiles(reset), 0);
-    assert.deepEqual(reset.repos["/ws/ms-card"], { dirtyFiles: {} });
+    assert.deepEqual(reset.repos["/ws/ms-card"], {
+      startHead: "aaaa1111",
+      startBranch: "feat/card",
+      dirtyFiles: {},
+    });
     assert.deepEqual(reset.repos["/ws/ms-wallet"], { dirtyFiles: {} });
 
     const files = [
@@ -1519,23 +1519,36 @@ describe("changes-review review-logic", () => {
     assert.equal(splitSourceFileLines("hello\nworld\n", 5).join("\n"), "hello");
   });
 
-  test("formatReviewAgentMessage strips trailing newlines and groups comments cleanly by service", () => {
+  test("formatReviewAgentMessage formats unified session notes with baseRef, removed-line side marker, and no trailing newline", () => {
     const msg = formatReviewAgentMessage(
       [
         {
           serviceId: "ms-card",
           serviceName: "ms-card",
           repoRoot: "C:\\Dev\\ms-card",
+          baseRef: "origin/main",
           displayPath: "src/CardLimit.java",
           line: 22,
+          side: "new",
           text: "Add unique index\r\nand verify rollback",
           snippet: "@Entity\npublic class CardLimit",
         },
+        {
+          serviceId: "ms-card",
+          serviceName: "ms-card",
+          repoRoot: "C:\\Dev\\ms-card",
+          baseRef: "origin/main",
+          displayPath: "src/CardLimit.java",
+          line: 22,
+          side: "old",
+          text: "Why remove this constraint?",
+          snippet: "@Column(unique = true)",
+        },
       ],
-      { viewMode: "working" },
     );
-    assert.ok(msg.startsWith("Review comments on uncommitted changes:\n\n### Service: ms-card (C:\\Dev\\ms-card)"));
+    assert.ok(msg.startsWith("Review comments on session changes:\n\n### Service: ms-card (C:\\Dev\\ms-card) [vs origin/main]"));
     assert.ok(msg.includes("- `src/CardLimit.java:22`:\n  Add unique index\n  and verify rollback\n  > @Entity public class CardLimit"));
+    assert.ok(msg.includes("- `src/CardLimit.java:22` (removed line):\n  Why remove this constraint?\n  > @Column(unique = true)"));
     assert.equal(msg.endsWith("\n"), false, "message must not end with trailing blank newline");
     assert.equal(msg.includes("\r"), false, "message must normalize CRLF to LF");
   });
@@ -1687,5 +1700,177 @@ describe("changes-review review-logic", () => {
     const inlineSavedCommentSrc = mainSource.slice(commentLinesStart, composerStart);
     assert.equal(/\.max_w\(/.test(inlineSavedCommentSrc), false, "saved inline comment row must not constrain width via max_w(...)");
     assert.ok(mainSource.includes("computeReviewCommentWrapCols(wrapCols)"), "getWrappedCommentLines must use computeReviewCommentWrapCols");
+  });
+
+  test("regression: expandDiffGapInRows preserves Markdown fenced code state inside expanded gaps", () => {
+    const sourceLines = [
+      "# Guide",
+      "```js",
+      "const inside = 42;",
+      "const alsoInside = true;",
+      "```",
+      "Trailing prose with and or is.",
+    ];
+    const rows = annotateDiffGaps(
+      diffRows(["@@ -6,1 +6,1 @@", "+Trailing prose with and or is."], "docs/guide.md"),
+      { canExpandBottom: false },
+    );
+    // Gap at index 0 covers lines 1..5; expanding lines 3..5 upward starts inside open ```js fence at line 2!
+    const expanded = expandDiffGapInRows(rows, 0, "up", sourceLines, {
+      step: 3,
+      filePath: "docs/guide.md",
+    });
+    const line3 = expanded.rows.find((r) => r.number === 3);
+    assert.ok(line3 && Array.isArray(line3.tokens));
+    assert.ok(line3.tokens.some(([k, v]) => k === "keyword" && v === "const"), "line 3 inside ```js fence must receive JS syntax tokens");
+    assert.ok(line3.tokens.some(([k, v]) => k === "number" && v === "42"));
+  });
+
+  test("regression: changes-review/main.js removes commit dropdown & repo selector bars, short-circuits hidden panel, and avoids git add -A", () => {
+    const repoRoot = join(fileURLToPath(new URL(".", import.meta.url)), "..");
+    const mainSource = readFileSync(join(repoRoot, "mods/changes-review/main.js"), "utf8");
+
+    assert.equal(mainSource.includes("commit-selector-btn"), false, "commit selector button must be removed");
+    assert.equal(mainSource.includes("commit-dropdown-floating"), false, "commit dropdown overlay must be removed");
+    assert.equal(mainSource.includes("service-filter-bar"), false, "service filter pill bar must be removed");
+    assert.equal(mainSource.includes("microservice-review-bar"), false, "sole repo bar must be removed");
+    assert.equal(mainSource.includes("cognivisor.activeService"), false, "changes-review must not filter by activeService");
+    assert.equal(mainSource.includes("./dropdown.js"), false, "changes-review must not import dropdown.js");
+    assert.equal(mainSource.includes('["add", "-A"]'), false, "commit drawer must not run git add -A");
+    assert.ok(mainSource.includes('["add", "--", ...slice]'), "commit drawer must stage only explicit visible dirty paths");
+    assert.ok(mainSource.includes('if (!visible) {\n      return div().id("changes");\n    }'), "renderPanel must short-circuit when hidden");
+    assert.ok(mainSource.includes("this.pendingRefresh = true"), "refresh must queue pending watch events during loading");
+    assert.ok(mainSource.includes("this.pendingRefreshForce = true"), "refresh must preserve force flag on queued refreshes");
+    assert.ok(mainSource.includes("reads.map(extractHcReadText)"), "hc read transcripts must extract ExecResult stdout cleanly");
+    assert.ok(mainSource.includes("selectPathsToStageForCommit"), "commit drawer must omit already-staged git rm deletions from git add");
+    assert.ok(mainSource.includes("sessionBaseline.rev = Math.max("), "baseline mutations must bump rev so files-search cache invalidates");
+  });
+
+  test("regression: extractHcReadText handles ExecResult objects, strings, and errors without [object Object]", () => {
+    assert.equal(extractHcReadText({ code: 0, stdout: "edited apps/billing/a.ts\n", stderr: "" }), "edited apps/billing/a.ts\n");
+    assert.equal(extractHcReadText({ code: 1, stdout: "ignored", stderr: "err" }), "");
+    assert.equal(extractHcReadText("raw transcript"), "raw transcript");
+    assert.equal(extractHcReadText(null), "");
+    assert.equal(extractHcReadText(undefined), "");
+  });
+
+  test("regression: selectPathsToStageForCommit omits already-staged git rm deletions (xy === 'D ') while keeping unstaged deletes and edits", () => {
+    const workingFiles = [
+      { path: "gone-staged.ts", xy: "D ", stagedDeletion: true, status: "D" },
+      { path: "gone-unstaged.ts", xy: " D", stagedDeletion: false, status: "D" },
+      { path: "edited.ts", xy: " M", stagedDeletion: false, status: "M" },
+      { path: "added.ts", xy: "??", stagedDeletion: false, status: "A" },
+      { path: "staged-mod.ts", xy: "M ", stagedDeletion: false, status: "M" },
+      { path: "edited.ts", xy: " M", stagedDeletion: false, status: "M" }, // duplicate
+    ];
+    assert.deepEqual(selectPathsToStageForCommit(workingFiles), [
+      "gone-unstaged.ts",
+      "edited.ts",
+      "added.ts",
+      "staged-mod.ts",
+    ]);
+    // Repo with ONLY a git-rm staged deletion still has dirtyPaths.length === 1, but stagePaths === []
+    assert.deepEqual(selectPathsToStageForCommit([{ path: "only-rm.ts", xy: "D ", stagedDeletion: true }]), []);
+  });
+
+  test("regression: resolveRepoBaseRefWithExec anchors directly on origin/development before origin/HEAD (origin/main)", async () => {
+    const devHead = "dddd2222";
+    const startHead = "dddd1111";
+    const mainHead = "mmmm0000";
+    const fakeExec = async (_cmd, args) => {
+      if (args.includes("symbolic-ref")) return { code: 0, stdout: "refs/remotes/origin/main\n", stderr: "" };
+      if (args.includes("for-each-ref")) return { code: 0, stdout: "origin/development\norigin/main\ndevelopment\nmain\n", stderr: "" };
+      if (args.includes("merge-base") && args.includes("origin/development")) return { code: 0, stdout: `${devHead}\n`, stderr: "" };
+      if (args.includes("merge-base") && args.includes("origin/main")) return { code: 0, stdout: `${mainHead}\n`, stderr: "" };
+      if (args.includes("--is-ancestor") && args.includes(startHead)) return { code: 0, stdout: "", stderr: "" };
+      return { code: 1, stdout: "", stderr: "" };
+    };
+
+    // Synced with origin/development and no startHead -> must anchor at origin/development (HEAD), NOT origin/main!
+    const synced = await resolveRepoBaseRefWithExec("/repo", "development", devHead, null, fakeExec);
+    assert.equal(synced.baseRef, "origin/development");
+    assert.equal(synced.baseHash, devHead);
+
+    // Pushed commit on development (startHead != devHead) -> falls back to session startHead, NOT origin/main!
+    const pushed = await resolveRepoBaseRefWithExec("/repo", "development", devHead, null, fakeExec, { startHead });
+    assert.equal(pushed.baseRef, "session start");
+    assert.equal(pushed.baseHash, startHead);
+    assert.equal(pushed.baseSource, "session");
+
+    // Local-only repo on main with a stale local development branch must anchor to main, not development
+    const localOnlyExec = async (_cmd, args) => {
+      if (args.includes("symbolic-ref")) return { code: 1, stdout: "", stderr: "" };
+      if (args.includes("for-each-ref")) return { code: 0, stdout: "development\nmain\n", stderr: "" };
+      if (args.includes("merge-base") && args.includes("main")) return { code: 0, stdout: `${devHead}\n`, stderr: "" };
+      if (args.includes("merge-base") && args.includes("development")) return { code: 0, stdout: `${mainHead}\n`, stderr: "" };
+      return { code: 1, stdout: "", stderr: "" };
+    };
+    const localMain = await resolveRepoBaseRefWithExec("/repo", "main", devHead, null, localOnlyExec);
+    assert.equal(localMain.baseRef, "main");
+    assert.equal(localMain.baseHash, devHead);
+  });
+
+  test("regression: collectServiceSessionSnapshot queries committedPaths on first unbaselined refresh, marks xy==='D ', and handles delete-commit-recreate untracked files", async () => {
+    const fakeExec = async (_cmd, args) => {
+      if (args.includes("status")) {
+        return {
+          code: 0,
+          stdout: "## feat/overlap\x00 M both.ts\x00D  gone.ts\x00?? rec.ts\x00?? brand-new.ts\x00",
+          stderr: "",
+        };
+      }
+      if (args.includes("rev-parse")) return { code: 0, stdout: "head2222\n", stderr: "" };
+      if (args.includes("symbolic-ref")) return { code: 0, stdout: "refs/remotes/origin/main\n", stderr: "" };
+      if (args.includes("for-each-ref")) return { code: 0, stdout: "origin/main\n", stderr: "" };
+      if (args.includes("merge-base")) return { code: 0, stdout: "base1111\n", stderr: "" };
+      if (args.includes("--name-status")) {
+        return { code: 0, stdout: "M\x00both.ts\x00D\x00gone.ts\x00M\x00rec.ts\x00", stderr: "" };
+      }
+      if (args.includes("--numstat")) {
+        return { code: 0, stdout: "4\t1\tboth.ts\x000\t7\tgone.ts\x002\t5\trec.ts\x00", stderr: "" };
+      }
+      if (args.includes("--name-only")) {
+        return { code: 0, stdout: "both.ts\x00rec.ts\x00", stderr: "" };
+      }
+      if (args.includes("rev-list")) return { code: 0, stdout: "1\n", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const fakeFs = {
+      stat: async (p) => {
+        if (String(p).endsWith("gone.ts")) throw new Error("ENOENT");
+        return { size: 42, mtimeMs: 1_700_000_000_000 };
+      },
+      readFile: async (p) => Buffer.from(String(p).endsWith("brand-new.ts") ? "l1\nl2\n" : "new1\nnew2\n"),
+    };
+
+    const snap = await collectServiceSessionSnapshot(
+      { id: "svc", name: "svc", root: "/ws/svc", relPath: "", isSibling: false },
+      null,
+      { baselineRepo: null },
+      { exec: fakeExec, fsPromises: fakeFs },
+    );
+
+    // 1) Even with baselineRepo === null, committedPaths was fetched so overlapping committed+dirty `both.ts` stays visible!
+    assert.equal(snap.committedPaths.has("both.ts"), true);
+    const baseline = buildFreshSessionBaseline([snap], { workspaceRoot: "/ws/svc", startedAt: 1_700_000_100_000, anchored: false });
+    const part = partitionSessionUnifiedEntries(snap.files, baseline.repos["/ws/svc"], snap.committedPaths, 1_700_000_100_000);
+    assert.equal(part.visible.some((f) => f.path === "both.ts"), true, "committed file with pre-existing dirty edit must remain visible on first refresh");
+    assert.equal(part.hidden.some((f) => f.path === "brand-new.ts"), true, "pre-existing untracked file outside base..HEAD stays hidden");
+
+    // 2) `gone.ts` carries xy === "D " and stagedDeletion === true so commit omits it from `git add --`
+    const goneWorking = snap.workingFiles.find((w) => w.path === "gone.ts");
+    assert.equal(goneWorking?.xy, "D ");
+    assert.equal(goneWorking?.stagedDeletion, true);
+    assert.equal(selectPathsToStageForCommit(snap.workingFiles).includes("gone.ts"), false);
+
+    // 3) `rec.ts` existed at baseHash, deleted in HEAD, recreated untracked -> uses git diff <baseHash> stats (add:2, del:5), fresh: false!
+    const recUnified = snap.files.find((f) => f.path === "rec.ts");
+    assert.equal(recUnified?.fresh, false);
+    assert.equal(recUnified?.status, "M");
+    assert.equal(recUnified?.add, 2);
+    assert.equal(recUnified?.del, 5);
+    const brandNewUnified = snap.files.find((f) => f.path === "brand-new.ts");
+    assert.equal(brandNewUnified?.fresh, true);
+    assert.equal(brandNewUnified?.add, 2);
   });
 });

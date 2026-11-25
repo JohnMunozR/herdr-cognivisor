@@ -24,26 +24,25 @@ import {
   getSessionNotesKey,
   resolveSessionAgentTabId,
   pickNextUnreviewedFile,
-  sortServicesDirtyFirst,
-  filterSessionCommits,
-  filterSessionWorkingEntries,
-  partitionSessionWorkingEntries,
+  normalizeCommentSide,
+  buildCommentKey,
+  buildReviewedFileKey,
+  partitionSessionUnifiedEntries,
+  evaluateRepoSessionActivity,
   normalizeSessionBaseline,
+  getDiskSessionBaselinePath,
   readDiskSessionBaseline,
   writeDiskSessionBaseline,
   resolveSessionStartTime,
   buildFreshSessionBaseline,
   createResetSessionBaseline,
-  findRecentFlowWorkspaceBaseline,
-  findRecentWorkspaceBaseline,
-  countBaselineDirtyFiles,
   compactFlowsMap,
   extractResumeKeyFromTranscript,
   filterUnbaselinedRepoEntries,
   resolveWorkspaceRoot,
   READ_GIT_FLAGS,
   mergeBusCandidateServices,
-  collectServiceWorkingSnapshot,
+  collectServiceSessionSnapshot,
   computeFileReviewFingerprint,
   parseReviewedFileRecord,
   reconcileReviewedFiles,
@@ -70,9 +69,10 @@ import {
   formatHcErrorMessage,
   decideSendSubmitAction,
   computeReviewCommentWrapCols,
+  extractHcReadText,
+  selectPathsToStageForCommit,
 } from "./review-logic.js";
 import { computeWrapColumns, countWrappedLines, wrapPlainText, wrapStyledSpans } from "./code-wrap.js";
-import { renderDropdownTrigger, renderDropdownPopover } from "./dropdown.js";
 import { isMarkdownFile, resolveRelativeMarkdownPath } from "./markdown-view-logic.js";
 import { createMarkdownRenderCache, renderMarkdownToggleButton, renderMarkdownViewer } from "./markdown-view.js";
 import { createModLogger, renderErrorFallbackCard } from "./diagnostics.js";
@@ -94,17 +94,37 @@ function getSafeAppHome() {
   }
 }
 
-const SESSION_BASELINE_CACHE = new Map();
+const SESSION_BASELINE_CACHE = new Map(); // tabId -> { baseline, mtimeMs }
 const MAX_BASELINE_CACHE_ENTRIES = 32;
 let flowsBusOomDetected = false;
 
-function cacheSessionBaseline(tabId, baseline) {
+function cacheSessionBaseline(tabId, baseline, mtimeMs = 0) {
   if (!tabId || !baseline) return;
   if (SESSION_BASELINE_CACHE.size >= MAX_BASELINE_CACHE_ENTRIES && !SESSION_BASELINE_CACHE.has(tabId)) {
     const oldest = SESSION_BASELINE_CACHE.keys().next().value;
     if (oldest !== undefined) SESSION_BASELINE_CACHE.delete(oldest);
   }
-  SESSION_BASELINE_CACHE.set(tabId, baseline);
+  const prev = SESSION_BASELINE_CACHE.get(tabId);
+  const nextMtime = Number(mtimeMs) > 0 ? Number(mtimeMs) : (Number(prev?.mtimeMs) || 0);
+  SESSION_BASELINE_CACHE.set(tabId, { baseline, mtimeMs: nextMtime });
+}
+
+function getCachedSessionBaselineEntry(tabId) {
+  const entry = SESSION_BASELINE_CACHE.get(tabId);
+  if (!entry) return null;
+  if (entry.baseline) return entry;
+  return { baseline: entry, mtimeMs: 0 };
+}
+
+async function getDiskBaselineMtimeMs(appHomeDir, tabId) {
+  const diskPath = getDiskSessionBaselinePath(appHomeDir, tabId);
+  if (!diskPath || typeof fsPromises?.stat !== "function") return 0;
+  try {
+    const st = await fsPromises.stat(diskPath);
+    return Number.isFinite(st?.mtimeMs) ? st.mtimeMs : 0;
+  } catch {
+    return 0;
+  }
 }
 
 function safeReadFlows() {
@@ -119,11 +139,11 @@ function safeReadFlows() {
   }
 }
 
-function mergeSessionBaselineIntoFlow(tabId, baseline, sessionRepos = null, force = false) {
+function mergeSessionBaselineIntoFlow(tabId, baseline, sessionRepos = null, force = false, diskMtimeMs = 0) {
   if (!tabId) return;
   const normalized = normalizeSessionBaseline(baseline);
   if (!normalized) return;
-  cacheSessionBaseline(tabId, normalized);
+  cacheSessionBaseline(tabId, normalized, diskMtimeMs);
   const rawFlows = safeReadFlows();
   const liveTabIds = getLiveTabIdsSet();
   const flows = compactFlowsMap(rawFlows, liveTabIds);
@@ -133,12 +153,14 @@ function mergeSessionBaselineIntoFlow(tabId, baseline, sessionRepos = null, forc
   const prevRepos = Array.isArray(cur.sessionRepos) ? cur.sessionRepos.map((r) => normPathStr(r)) : [];
   const nextRepos = Array.isArray(sessionRepos) ? sessionRepos.map((r) => normPathStr(r)).filter(Boolean) : null;
   const reposChanged = Boolean(nextRepos && (prevRepos.length !== nextRepos.length || prevRepos.some((r, idx) => r !== nextRepos[idx])));
+  const nextRev = Number(normalized.rev) || 0;
   const metaChanged =
     force ||
     flowsBusOomDetected ||
     hadLegacyBaseline ||
     prunedCount ||
-    cur.sessionStartedAt !== normalized.startedAt;
+    cur.sessionStartedAt !== normalized.startedAt ||
+    (Number(cur.baselineRev) || 0) !== nextRev;
   if (!metaChanged && !reposChanged) return;
   flowsBusOomDetected = false;
   setShared("cognivisor.flows", {
@@ -146,6 +168,7 @@ function mergeSessionBaselineIntoFlow(tabId, baseline, sessionRepos = null, forc
     [tabId]: {
       ...cur,
       sessionStartedAt: normalized.startedAt,
+      baselineRev: nextRev,
       ...(nextRepos ? { sessionRepos: nextRepos } : {}),
       updatedAt: Date.now(),
     },
@@ -163,7 +186,71 @@ function getLiveTabIdsSet() {
   return ids;
 }
 
-async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTermAddrs, workspaceRoot) {
+async function peekExistingSessionBaseline(sessionTabId, workspaceRoot, tabTermAddrs = []) {
+  if (!sessionTabId) return null;
+  const normWs = normPathStr(workspaceRoot || "");
+  const flows = safeReadFlows();
+  const curFlow = readPlainObject(flows[sessionTabId]);
+  const flowRev = Number(curFlow.baselineRev) || 0;
+  const appHomeDir = getSafeAppHome();
+  const diskMtime = appHomeDir ? await getDiskBaselineMtimeMs(appHomeDir, sessionTabId) : 0;
+
+  const cachedEntry = getCachedSessionBaselineEntry(sessionTabId);
+  const cached = normalizeSessionBaseline(cachedEntry?.baseline);
+  if (
+    cached &&
+    (!normWs || !cached.workspaceRoot || cached.workspaceRoot === normWs) &&
+    (cached.rev || 0) >= flowRev &&
+    (!diskMtime || !cachedEntry?.mtimeMs || diskMtime <= cachedEntry.mtimeMs)
+  ) {
+    return { baseline: cached, dirtyChanged: false };
+  }
+
+  const rawExisting = curFlow.sessionBaseline;
+  const existing = normalizeSessionBaseline(rawExisting);
+  if (
+    existing &&
+    (!normWs || !existing.workspaceRoot || existing.workspaceRoot === normWs) &&
+    (existing.rev || 0) >= flowRev &&
+    !diskMtime
+  ) {
+    cacheSessionBaseline(sessionTabId, existing, 0);
+    return { baseline: existing, dirtyChanged: true };
+  }
+
+  if (appHomeDir) {
+    const fromTab = await readDiskSessionBaseline(appHomeDir, sessionTabId, workspaceRoot, [], false, fsPromises);
+    if (fromTab) {
+      cacheSessionBaseline(sessionTabId, fromTab, diskMtime);
+      return { baseline: fromTab, dirtyChanged: false };
+    }
+    if (Array.isArray(tabTermAddrs) && tabTermAddrs.length > 0) {
+      const reads = await Promise.all(
+        tabTermAddrs.slice(0, 2).map((addr) => hc(["read", "--lines", "100", addr]).catch(() => null))
+      );
+      const transcript = reads.map(extractHcReadText).filter(Boolean).join("\n");
+      const resumeKey = extractResumeKeyFromTranscript(transcript, workspaceRoot);
+      if (resumeKey) {
+        const fromResume = await readDiskSessionBaseline(
+          appHomeDir,
+          sessionTabId,
+          workspaceRoot,
+          [],
+          { resumeKey, hasResumeCommand: true },
+          fsPromises
+        );
+        if (fromResume) {
+          cacheSessionBaseline(sessionTabId, fromResume, 0);
+          return { baseline: fromResume, dirtyChanged: true, resumeKey };
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTermAddrs, workspaceRoot, preloaded = null) {
   if (!sessionTabId) return { baseline: null, isFresh: false, anchored: false, dirtyChanged: false, primaryBranch: "" };
   const normWs = normPathStr(workspaceRoot || "");
   const primaryService = (serviceResults || []).find((r) => normPathStr(r.service?.root) === normWs)
@@ -174,35 +261,25 @@ async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTer
     new Set((serviceResults || []).map((r) => String(r.branch || r.service?.branch || "").trim()).filter(Boolean))
   );
 
-  const cached = normalizeSessionBaseline(SESSION_BASELINE_CACHE.get(sessionTabId));
-  if (cached && (!normWs || !cached.workspaceRoot || cached.workspaceRoot === normWs)) {
-    return { baseline: cached, isFresh: false, anchored: false, dirtyChanged: false, primaryBranch };
-  }
-
-  const flows = safeReadFlows();
-  const curFlow = readPlainObject(flows[sessionTabId]);
-  const rawExisting = curFlow.sessionBaseline;
-  const existing = normalizeSessionBaseline(rawExisting);
-  if (existing && (!normWs || !existing.workspaceRoot || existing.workspaceRoot === normWs)) {
-    cacheSessionBaseline(sessionTabId, existing);
-    return { baseline: existing, isFresh: false, anchored: false, dirtyChanged: true, primaryBranch };
+  const existingHit = preloaded || await peekExistingSessionBaseline(sessionTabId, workspaceRoot, tabTermAddrs);
+  if (existingHit?.baseline) {
+    return {
+      baseline: existingHit.baseline,
+      isFresh: false,
+      anchored: false,
+      dirtyChanged: Boolean(existingHit.dirtyChanged),
+      primaryBranch,
+      resumeKey: existingHit.resumeKey || "",
+    };
   }
 
   const appHomeDir = getSafeAppHome();
-  if (appHomeDir) {
-    const fromTab = await readDiskSessionBaseline(appHomeDir, sessionTabId, workspaceRoot, candidateBranches, false, fsPromises);
-    if (fromTab) {
-      cacheSessionBaseline(sessionTabId, fromTab);
-      return { baseline: fromTab, isFresh: false, anchored: false, dirtyChanged: false, primaryBranch };
-    }
-  }
-
   let resumeKey = "";
   if (appHomeDir && Array.isArray(tabTermAddrs) && tabTermAddrs.length > 0) {
     const reads = await Promise.all(
-      tabTermAddrs.slice(0, 2).map((addr) => hc(["read", "--lines", "100", addr]).catch(() => ""))
+      tabTermAddrs.slice(0, 2).map((addr) => hc(["read", "--lines", "100", addr]).catch(() => null))
     );
-    const transcript = reads.filter(Boolean).join("\n");
+    const transcript = reads.map(extractHcReadText).filter(Boolean).join("\n");
     resumeKey = extractResumeKeyFromTranscript(transcript, workspaceRoot);
     if (resumeKey) {
       const fromResume = await readDiskSessionBaseline(
@@ -214,42 +291,22 @@ async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTer
         fsPromises
       );
       if (fromResume) {
-        cacheSessionBaseline(sessionTabId, fromResume);
+        cacheSessionBaseline(sessionTabId, fromResume, 0);
         return { baseline: fromResume, isFresh: false, anchored: false, dirtyChanged: true, primaryBranch, resumeKey };
       }
     }
   }
 
-  // Reuse a recent orphaned baseline for the same workspaceRoot (e.g., after tab recreation)
-  // without stealing baselines owned by other currently-open tabs.
-  const liveTabIds = getLiveTabIdsSet();
-  const recentFlowBaseline = findRecentFlowWorkspaceBaseline(flows, workspaceRoot, {
-    excludeTabId: sessionTabId,
-    liveTabIds,
-  });
-  if (recentFlowBaseline) {
-    cacheSessionBaseline(sessionTabId, recentFlowBaseline);
-    return { baseline: recentFlowBaseline, isFresh: false, anchored: false, dirtyChanged: true, primaryBranch, resumeKey };
-  }
-  if (appHomeDir) {
-    const recentDiskBaseline = await findRecentWorkspaceBaseline(appHomeDir, workspaceRoot, {
-      excludeTabId: sessionTabId,
-      liveTabIds,
-      fsDeps: fsPromises,
-    });
-    if (recentDiskBaseline) {
-      cacheSessionBaseline(sessionTabId, recentDiskBaseline);
-      return { baseline: recentDiskBaseline, isFresh: false, anchored: false, dirtyChanged: true, primaryBranch, resumeKey };
-    }
-  }
-
+  const flows = safeReadFlows();
+  const curFlow = readPlainObject(flows[sessionTabId]);
   const { startedAt, anchored } = resolveSessionStartTime(curFlow);
   const baseline = buildFreshSessionBaseline(serviceResults, {
     workspaceRoot: normWs,
     startedAt,
     anchored,
+    rev: Number(curFlow.baselineRev) || 0,
   });
-  cacheSessionBaseline(sessionTabId, baseline);
+  cacheSessionBaseline(sessionTabId, baseline, 0);
   return { baseline, isFresh: true, anchored, dirtyChanged: true, primaryBranch, resumeKey };
 }
 
@@ -262,9 +319,12 @@ function location() {
   const spaceTabs = new Set((space?.tabs ?? []).map((t) => t.id));
   const spacePanes = allPanes.filter((p) => spaceTabs.has(p.tab));
   const focusedPane = f?.pane ? spacePanes.find((p) => p.pane === f.pane) : null;
+  // Anchor to sessionTabId's primary pane before focused split-pane cwd so focusing an auxiliary
+  // split terminal in another directory never flips key() and wipes review state.
+  const sessionTabPane = sessionTabId ? spacePanes.find((p) => p.tab === sessionTabId && p.cwd) : null;
   const pane =
+    sessionTabPane ||
     (focusedPane?.cwd ? focusedPane : null) ||
-    (sessionTabId ? spacePanes.find((p) => p.tab === sessionTabId && p.cwd) : null) ||
     spacePanes.find((p) => p.cwd) ||
     focusedPane ||
     null;
@@ -573,8 +633,8 @@ function repoMatchesTranscript(service, files, transcript) {
   return false;
 }
 
-async function loadServiceWorkingSnapshot(service, on, includeCommits = true) {
-  return collectServiceWorkingSnapshot(service, on, includeCommits, { exec, fsPromises });
+async function loadServiceSessionSnapshot(service, on, opts = {}) {
+  return collectServiceSessionSnapshot(service, on, opts, { exec, fsPromises });
 }
 
 function readFlows() {
@@ -611,7 +671,13 @@ function buildFileDescriptor(f) {
     serviceName: f.serviceName || "root",
     relPrefix: f.relPrefix || "",
     status: f.status || "M",
+    workingStatus: f.workingStatus || "",
+    inWorkingTree: Boolean(f.inWorkingTree),
     hasHead: Boolean(f.hasHead),
+    headHash: f.headHash || "",
+    baseRef: f.baseRef || "",
+    baseHash: f.baseHash || "",
+    baseSource: f.baseSource || "",
     fresh: Boolean(f.fresh),
     binary: Boolean(f.binary),
     add: Number(f.add) || 0,
@@ -631,23 +697,11 @@ function buildServiceSummary(s) {
     root: s.root || "",
     isSibling: Boolean(s.isSibling),
     branch: s.branch || "",
+    baseRef: s.baseRef || "",
+    baseHash: s.baseHash || "",
     workingCount,
     aheadCount: Number(s.aheadCount) || 0,
     dirty: workingCount > 0,
-  };
-}
-
-function buildCommitSummary(c) {
-  if (!c) return null;
-  return {
-    hash: c.hash,
-    shortHash: c.shortHash,
-    subject: c.subject,
-    author: c.author || "",
-    date: c.date || "",
-    repoRoot: c.repoRoot || "",
-    serviceId: c.serviceId || ".",
-    serviceName: c.serviceName || "root",
   };
 }
 
@@ -683,7 +737,6 @@ function updateTabFlow(tabId, mutator, workspaceRoot = "") {
     derivedTitle: null,
     manualTitle: false,
     leadTerminal: null,
-    reviewedServices: {},
     reviewedFiles: {},
     updatedAt: 0,
   };
@@ -719,7 +772,7 @@ export default class ChangesReview extends View {
     }
 
     this.files = [];
-    this.allWorkingFiles = [];
+    this.allSessionFiles = [];
     this.rows = [];
     this.diffWidth = 300;
     this.panelWidth = 420;
@@ -732,25 +785,23 @@ export default class ChangesReview extends View {
     this.handle = cx.focus_handle();
     this.bottomTab = "review"; // "review" | "commit"
     this.reviews = []; // Cached mirror of shared("cognivisor.reviewNotes")[sessionKey]
-    this.activeComment = null; // { fileKey, serviceId, serviceName, repoRoot, file, displayPath, line, snippet }
+    this.activeComment = null; // { fileKey, serviceId, serviceName, repoRoot, file, displayPath, line, side, baseRef, snippet }
     this.commentText = "";
     this.sendingReview = false;
     this.busy = false;
+    this.pendingRefresh = false;
+    this.pendingRefreshForce = false;
     this.viewerSourceLines = null;
     this.viewerSourceKey = "";
     this.viewerSourceFilePath = "";
     this.viewerExpandingGapId = null;
     this.localReviewedFiles = new Set();
     this.localReviewedMeta = {};
-    this.lastRepoHeads = new Map();
-    this.commitFilesCache = new Map();
 
     // Multi-repository & Git inspection state
     this.workspaceRoot = null;
     this.services = [];
-    this.activeService = "all"; // "all" | service.id
     this.lastPublishedServicesSig = null;
-    this.lastActiveServiceTs = 0;
     this.hostIsWindows = window()?.platform === "windows";
     this.watchedRoots = new Map();
     this.watchDebounceTask = null;
@@ -787,20 +838,7 @@ export default class ChangesReview extends View {
     this.wasVisible = !this.isViewer && isChangesVisible();
     this.hasLoadedOnce = false;
     this.needsRefreshOnShow = false;
-
-    this.serviceFilterScroll = ScrollHandle.new();
-    this.commitDropdownScroll = ScrollHandle.new();
     this.diffResizeTask = null;
-    this._cachedCommitMenu = null;
-
-    this.viewMode = "working"; // "working" | "commit"
-    this.commits = [];
-    this.allCommits = [];
-    this.serviceCommitsMap = new Map();
-    this.selectedCommit = null;
-    this.showCommitMenu = false;
-    this.workingFiles = [];
-    this.workingFilesCount = 0;
     this.showAllWorkingChanges = false;
     this.hiddenPreExistingCount = 0;
     this.lastCandidateRoots = [];
@@ -866,8 +904,6 @@ export default class ChangesReview extends View {
     this.stopAllWatchers();
     try { this.input?.release(); } catch {}
     try { this.commentInput?.release(); } catch {}
-    try { this.serviceFilterScroll?.release(); } catch {}
-    try { this.commitDropdownScroll?.release(); } catch {}
   }
 
   isViewerMode() {
@@ -943,28 +979,9 @@ export default class ChangesReview extends View {
       const ctx = this.getSessionContext();
       const diff = readActiveDiff(ctx.spaceId);
       const revTab = findReviewTabInSpace(ctx.spaceId);
-      const sharedActive = shared("cognivisor.activeService");
       let changed = false;
 
-      if (sharedActive && normPathStr(sharedActive.workspaceRoot) === normPathStr(this.workspaceRoot) && typeof sharedActive.ts === "number") {
-        if (!this.lastActiveServiceTs || sharedActive.ts > this.lastActiveServiceTs) {
-          this.lastActiveServiceTs = sharedActive.ts;
-          if (sharedActive.serviceId && (sharedActive.serviceId === "all" || this.services.some((s) => s.id === sharedActive.serviceId))) {
-            if (this.activeService !== sharedActive.serviceId) {
-              this.activeService = sharedActive.serviceId;
-              this.applyServiceFilter(null, { broadcast: false, syncReviewTab: false });
-              changed = true;
-            }
-          }
-        }
-      }
-
       if (revTab && diff && diff.sourceTabId === ctx.sourceTabId) {
-        if (diff.activeService && diff.activeService !== this.activeService && (diff.activeService === "all" || this.services.some((s) => s.id === diff.activeService))) {
-          this.activeService = diff.activeService;
-          this.applyServiceFilter(null, { broadcast: false, syncReviewTab: false });
-          changed = true;
-        }
         if (diff.openFileKey !== this.open) {
           this.open = diff.openFileKey || null;
           this.closed = !this.open;
@@ -998,7 +1015,7 @@ export default class ChangesReview extends View {
     const k = String(fileOrKey);
     const found =
       (this.files || []).find((f) => f.key === k) ||
-      (this.allWorkingFiles || []).find((f) => f.key === k) ||
+      (this.allSessionFiles || []).find((f) => f.key === k) ||
       (Array.isArray(fallbackFiles) ? fallbackFiles.find((f) => f.key === k) : null);
     return found ? buildFileDescriptor(found) : null;
   }
@@ -1006,14 +1023,8 @@ export default class ChangesReview extends View {
   buildActiveDiffPayload(file, overrides = {}) {
     const ctx = this.getSessionContext();
     const prev = readActiveDiff(ctx.spaceId);
-    const viewMode = overrides.viewMode ?? this.viewMode ?? prev?.viewMode ?? "working";
     const rawFiles = overrides.files ?? (this.isViewerMode() ? (prev?.files || []) : this.files);
-    const rawAllFiles = overrides.allFiles ?? (this.isViewerMode() ? (prev?.allFiles || prev?.files || []) : (viewMode === "working" ? this.allWorkingFiles : rawFiles));
     const rawServices = overrides.services ?? (this.isViewerMode() ? (prev?.services || []) : this.services);
-    const selectedCommit = overrides.selectedCommit !== undefined
-      ? overrides.selectedCommit
-      : (viewMode === "commit" ? (this.selectedCommit ? buildCommitSummary(this.selectedCommit) : prev?.selectedCommit || null) : null);
-    const activeService = overrides.activeService ?? (this.isViewerMode() ? (prev?.activeService || "all") : this.activeService);
     const openFileDesc = file ? buildFileDescriptor(file) : null;
     const bumpSeq = overrides.bumpSeq !== false;
     const nextSeq = bumpSeq
@@ -1026,17 +1037,15 @@ export default class ChangesReview extends View {
       sourceTabId: ctx.sourceTabId,
       workspaceRoot: ctx.workspaceRoot || prev?.workspaceRoot || "",
       on: overrides.on !== undefined ? overrides.on : (this.isViewerMode() ? (prev?.on ?? this.on ?? null) : (this.on ?? null)),
-      viewMode,
-      selectedCommit,
-      activeService,
       openFileKey: openFileDesc ? openFileDesc.key : null,
       openFile: openFileDesc,
       files: (rawFiles || []).map(buildFileDescriptor).filter(Boolean),
-      allFiles: (rawAllFiles || []).map(buildFileDescriptor).filter(Boolean),
       services: (rawServices || []).map(buildServiceSummary).filter(Boolean),
       requestSeq: nextSeq,
       focusLine: overrides.focusLine !== undefined ? overrides.focusLine : null,
+      focusSide: overrides.focusSide !== undefined ? overrides.focusSide : null,
       openCommentLine: overrides.openCommentLine !== undefined ? overrides.openCommentLine : null,
+      openCommentSide: overrides.openCommentSide !== undefined ? overrides.openCommentSide : null,
       ts: Date.now(),
     };
   }
@@ -1055,7 +1064,9 @@ export default class ChangesReview extends View {
     const payload = this.buildActiveDiffPayload(fileDesc, {
       bumpSeq: opts.bumpSeq !== false,
       focusLine: opts.focusLine ?? null,
+      focusSide: opts.focusSide ?? null,
       openCommentLine: opts.openCommentLine ?? null,
+      openCommentSide: opts.openCommentSide ?? null,
     });
     writeActiveDiff(ctx.spaceId, payload);
 
@@ -1095,16 +1106,23 @@ export default class ChangesReview extends View {
     if (!fileKey) return commentMap;
     const sessionReviews = this.getSessionReviews(ctx);
     for (const r of sessionReviews) {
-      if (r.fileKey === fileKey || r.file === fileKey) {
-        commentMap.set(r.line, r);
+      if (r && (r.fileKey === fileKey || r.file === fileKey)) {
+        commentMap.set(buildCommentKey(fileKey, r.line, r.side), r);
       }
     }
     return commentMap;
   }
 
-  getComment(fileKey, line, ctx = null) {
+  getComment(fileKey, line, side = "new", ctx = null) {
+    const targetSide = normalizeCommentSide(side);
     const reviews = this.getSessionReviews(ctx);
-    return reviews.find((r) => (r.fileKey === fileKey || r.file === fileKey) && r.line === line);
+    return reviews.find(
+      (r) =>
+        r &&
+        (r.fileKey === fileKey || r.file === fileKey) &&
+        r.line === line &&
+        normalizeCommentSide(r.side) === targetSide,
+    );
   }
 
   cancelFocusCommentTask() {
@@ -1114,23 +1132,26 @@ export default class ChangesReview extends View {
     }
   }
 
-  focusCommentInput(cx, expectedFileKey = null, expectedLine = null) {
+  focusCommentInput(cx, expectedFileKey = null, expectedLine = null, expectedSide = null) {
     try { this.commentInput?.focus?.(); } catch {}
     this.cancelFocusCommentTask();
     if (!cx?.timer) return;
     const targetKey = expectedFileKey ?? this.activeComment?.fileKey ?? null;
     const targetLine = expectedLine ?? this.activeComment?.line ?? null;
+    const targetSide = expectedSide ?? this.activeComment?.side ?? null;
     this.focusCommentTask = cx.timer.after(20, () => {
       this.focusCommentTask = null;
       if (this._viewerClosed || !this.activeComment) return;
       if (targetKey !== null && this.activeComment.fileKey !== targetKey) return;
       if (targetLine !== null && this.activeComment.line !== targetLine) return;
+      if (targetSide !== null && normalizeCommentSide(this.activeComment.side) !== normalizeCommentSide(targetSide)) return;
       try { this.commentInput?.focus?.(); } catch {}
     });
   }
 
-  openCommentEditor(file, line, snippet, initialText, cx = null) {
+  openCommentEditor(file, line, side, snippet, initialText, cx = null) {
     const text = initialText ?? "";
+    const normSide = normalizeCommentSide(side);
     const diff = this.isViewerMode() ? readActiveDiff(this.getSessionContext().spaceId) : null;
     const fallbackKey = file?.key || diff?.openFileKey || this.open;
     this.activeComment = {
@@ -1140,18 +1161,26 @@ export default class ChangesReview extends View {
       repoRoot: file?.repoRoot || this.root || "",
       file: file?.path || fallbackKey,
       displayPath: file?.displayPath || file?.path || fallbackKey,
+      baseRef: file?.baseRef || "",
       line,
+      side: normSide,
       snippet: (snippet || "").trim(),
     };
     this.commentText = text;
     this.commentInput.set_value(text);
     this.commentInput.set_selected_range({ start: text.length, end: text.length });
-    this.focusCommentInput(cx, fallbackKey, line);
+    this.focusCommentInput(cx, fallbackKey, line, normSide);
   }
 
-  startComment(fileKey, line, snippet, cx, rowIndex = -1) {
-    if (this.activeComment && this.activeComment.fileKey === fileKey && this.activeComment.line === line) {
-      this.focusCommentInput(cx, fileKey, line);
+  startComment(fileKey, line, side, snippet, cx, rowIndex = -1) {
+    const normSide = normalizeCommentSide(side);
+    if (
+      this.activeComment &&
+      this.activeComment.fileKey === fileKey &&
+      this.activeComment.line === line &&
+      normalizeCommentSide(this.activeComment.side) === normSide
+    ) {
+      this.focusCommentInput(cx, fileKey, line, normSide);
       cx?.notify();
       return;
     }
@@ -1162,54 +1191,17 @@ export default class ChangesReview extends View {
       (diff?.openFile?.key === fileKey ? diff.openFile : null) ||
       (diff?.files || []).find((f) => f.key === fileKey) ||
       (this.files || []).find((f) => f.key === fileKey) ||
-      (this.allWorkingFiles || []).find((f) => f.key === fileKey);
-    const existing = this.getComment(fileKey, line, ctx);
-    this.openCommentEditor(file, line, snippet, existing ? existing.text : "", cx);
+      (this.allSessionFiles || []).find((f) => f.key === fileKey);
+    const existing = this.getComment(fileKey, line, normSide, ctx);
+    this.openCommentEditor(file, line, normSide, snippet, existing ? existing.text : "", cx);
     if (rowIndex >= 0 && this.rows.length > 0) {
       const commentMap = this.buildCommentMapForFile(fileKey, ctx);
-      const layout = this.computeDiffRowLayout(commentMap, this.getReviewWrapCols());
+      const layout = this.computeDiffRowLayout(commentMap, this.getReviewWrapCols(), fileKey);
       const baseVpH = this.getDiffViewportHeight();
       const targetVpH = hadComposer ? baseVpH : Math.max(80, baseVpH - REVIEW_COMPOSER_EST_HEIGHT);
       this.diffScrollPx = computeDiffScrollOffsetForRow(layout, rowIndex, targetVpH, "nearest", this.diffScrollPx);
     }
     cx.notify();
-  }
-
-  syncServiceNoteStatus(serviceId, hasNotes, ctx = null) {
-    if (!serviceId) return;
-    const c = ctx || this.getSessionContext();
-    if (!c.sourceTabId) return;
-    const flows = readFlows();
-    const flow = flows[c.sourceTabId];
-    const currentStatus = flow?.reviewedServices?.[serviceId]?.status;
-    const diff = this.isViewerMode() ? readActiveDiff(c.spaceId) : null;
-    const servicesList = (diff?.services?.length ? diff.services : this.services) || [];
-    const svc = servicesList.find((s) => s.id === serviceId);
-    const branch = svc?.branch || "";
-
-    if (hasNotes && currentStatus !== "has_notes") {
-      updateTabFlow(
-        c.sourceTabId,
-        (prev) => ({
-          reviewedServices: {
-            ...(prev.reviewedServices || {}),
-            [serviceId]: { status: "has_notes", branch, updatedAt: Date.now() },
-          },
-        }),
-        c.workspaceRoot,
-      );
-    } else if (!hasNotes && currentStatus && currentStatus !== "pending") {
-      updateTabFlow(
-        c.sourceTabId,
-        (prev) => ({
-          reviewedServices: {
-            ...(prev.reviewedServices || {}),
-            [serviceId]: { status: "pending", branch, updatedAt: Date.now() },
-          },
-        }),
-        c.workspaceRoot,
-      );
-    }
   }
 
   saveActiveComment(cx) {
@@ -1218,15 +1210,17 @@ export default class ChangesReview extends View {
     const curReviews = this.getSessionReviews(ctx);
     const raw = (this.commentInput.value() ?? "").replace(/\r\n/g, "\n");
     const text = raw.trim();
-    const { fileKey, serviceId, serviceName, repoRoot, file, displayPath, line, snippet } = this.activeComment;
-    const activeDiff = this.isViewerMode() ? readActiveDiff(ctx.spaceId) : null;
-    const noteViewMode = this.isViewerMode() ? (activeDiff?.viewMode || "working") : (this.viewMode || "working");
-    const noteCommitHash = noteViewMode === "commit"
-      ? (this.isViewerMode() ? (activeDiff?.selectedCommit?.hash || null) : (this.selectedCommit?.hash || null))
-      : null;
+    const { fileKey, serviceId, serviceName, repoRoot, file, displayPath, baseRef, line, side, snippet } = this.activeComment;
+    const normSide = normalizeCommentSide(side);
+    const matchesTarget = (r) =>
+      r &&
+      (r.fileKey === fileKey || r.file === fileKey) &&
+      r.line === line &&
+      normalizeCommentSide(r.side) === normSide;
+
     let nextReviews;
     if (text) {
-      const idx = curReviews.findIndex((r) => (r.fileKey === fileKey || r.file === fileKey) && r.line === line);
+      const idx = curReviews.findIndex(matchesTarget);
       const item = {
         fileKey,
         serviceId,
@@ -1234,11 +1228,11 @@ export default class ChangesReview extends View {
         repoRoot,
         file,
         displayPath,
+        baseRef: baseRef || "",
         line,
+        side: normSide,
         text,
         snippet,
-        viewMode: noteViewMode,
-        commitHash: noteCommitHash,
       };
       if (idx >= 0) {
         nextReviews = curReviews.map((r, i) => (i === idx ? item : r));
@@ -1246,12 +1240,9 @@ export default class ChangesReview extends View {
         nextReviews = [...curReviews, item];
       }
     } else {
-      nextReviews = curReviews.filter((r) => !((r.fileKey === fileKey || r.file === fileKey) && r.line === line));
+      nextReviews = curReviews.filter((r) => !matchesTarget(r));
     }
     this.saveSessionReviews(nextReviews, ctx);
-    if (serviceId) {
-      this.syncServiceNoteStatus(serviceId, nextReviews.some((r) => r.serviceId === serviceId), ctx);
-    }
     this.cancelFocusCommentTask();
     this.activeComment = null;
     this.commentText = "";
@@ -1267,74 +1258,44 @@ export default class ChangesReview extends View {
     cx.notify();
   }
 
-  removeComment(fileKey, line, cx) {
+  removeComment(fileKey, line, side = "new", cx = null) {
+    const normSide = normalizeCommentSide(side);
     const ctx = this.getSessionContext();
     const curReviews = this.getSessionReviews(ctx);
-    const removed = curReviews.filter((r) => (r.fileKey === fileKey || r.file === fileKey) && r.line === line);
-    const nextReviews = curReviews.filter((r) => !((r.fileKey === fileKey || r.file === fileKey) && r.line === line));
+    const nextReviews = curReviews.filter(
+      (r) => !(r && (r.fileKey === fileKey || r.file === fileKey) && r.line === line && normalizeCommentSide(r.side) === normSide),
+    );
     this.saveSessionReviews(nextReviews, ctx);
-    for (const r of removed) {
-      if (r.serviceId) {
-        this.syncServiceNoteStatus(r.serviceId, nextReviews.some((item) => item.serviceId === r.serviceId), ctx);
-      }
-    }
-    if (this.activeComment && this.activeComment.fileKey === fileKey && this.activeComment.line === line) {
+    if (
+      this.activeComment &&
+      this.activeComment.fileKey === fileKey &&
+      this.activeComment.line === line &&
+      normalizeCommentSide(this.activeComment.side) === normSide
+    ) {
       this.cancelActiveComment(cx);
     } else {
-      cx.notify();
+      cx?.notify();
     }
   }
 
   clearComments(cx) {
     const ctx = this.getSessionContext();
-    const curReviews = this.getSessionReviews(ctx);
-    const affectedServices = Array.from(new Set(curReviews.map((r) => r.serviceId).filter(Boolean)));
     this.saveSessionReviews([], ctx);
-    for (const sId of affectedServices) {
-      this.syncServiceNoteStatus(sId, false, ctx);
-    }
     this.cancelFocusCommentTask();
     this.activeComment = null;
     this.commentText = "";
     this.commentInput.set_value("");
-    cx.notify();
+    cx?.notify();
   }
 
   jumpToComment(comment, cx) {
     this.recordActiveTerminalTabNow();
     const ctx = this.getSessionContext();
-    const latest = this.getComment(comment.fileKey || comment.file, comment.line, ctx) || comment;
+    const commentSide = normalizeCommentSide(comment?.side);
+    const latest = this.getComment(comment.fileKey || comment.file, comment.line, commentSide, ctx) || comment;
     this.bottomTab = "review";
 
     const targetKey = latest.fileKey || latest.file;
-    const targetMode = latest.viewMode || "working";
-    if (targetMode === "working" && this.viewMode !== "working") {
-      this.viewMode = "working";
-      this.selectedCommit = null;
-    } else if (targetMode === "commit" && latest.commitHash && (this.viewMode !== "commit" || this.selectedCommit?.hash !== latest.commitHash)) {
-      const matchedCommit = (this.allCommits || this.commits || []).find((c) => c.hash === latest.commitHash) || null;
-      if (matchedCommit) {
-        this.viewMode = "commit";
-        this.selectedCommit = matchedCommit;
-      }
-    }
-
-    if (latest.serviceId && this.activeService !== "all" && this.activeService !== latest.serviceId) {
-      this.activeService = latest.serviceId;
-      const now = Date.now();
-      this.lastActiveServiceTs = now;
-      if (this.workspaceRoot) {
-        setShared("cognivisor.activeService", {
-          workspaceRoot: this.workspaceRoot,
-          serviceId: this.activeService,
-          ts: now,
-        });
-      }
-      this.applyServiceFilter(null, { broadcast: false, syncReviewTab: false });
-    } else {
-      this.applyServiceFilter(null, { broadcast: false, syncReviewTab: false });
-    }
-
     const targetFile = this.resolveFileDescriptor(targetKey) || buildFileDescriptor({
       key: targetKey,
       path: latest.file || targetKey,
@@ -1342,6 +1303,7 @@ export default class ChangesReview extends View {
       repoRoot: latest.repoRoot || this.root || "",
       serviceId: latest.serviceId || "",
       serviceName: latest.serviceName || "",
+      baseRef: latest.baseRef || "",
       status: "M",
       hasHead: true,
       fresh: false,
@@ -1351,12 +1313,15 @@ export default class ChangesReview extends View {
     this.open = targetFile?.key || targetKey;
     this.closed = false;
     this.panelNote = null;
+    const focusSide = normalizeCommentSide(latest.side);
     this.openReviewTabForFile(targetFile, {
       create: true,
       select: true,
       bumpSeq: true,
       focusLine: latest.line,
+      focusSide,
       openCommentLine: latest.line,
+      openCommentSide: focusSide,
     });
     cx.notify();
   }
@@ -1448,12 +1413,7 @@ export default class ChangesReview extends View {
       return;
     }
 
-    const diff = this.isViewerMode() ? readActiveDiff(ctx.spaceId) : null;
-    const curViewMode = diff?.viewMode || this.viewMode;
-    const curCommit = diff?.selectedCommit || this.selectedCommit;
     const message = formatReviewAgentMessage(sessionReviews, {
-      viewMode: curViewMode,
-      selectedCommit: curCommit,
       workspaceRoot: ctx.workspaceRoot,
       fallbackRoot: this.root,
     });
@@ -1465,7 +1425,6 @@ export default class ChangesReview extends View {
       agentAddress: agent.address,
       reviewCount,
       messageLength: message.length,
-      viewMode: curViewMode,
     }, cx);
     cx?.notify();
 
@@ -1559,48 +1518,12 @@ export default class ChangesReview extends View {
     }
   }
 
-  getSortedServices(servicesList = null) {
-    return sortServicesDirtyFirst(servicesList ?? this.services ?? []);
+  fileReviewKey(file) {
+    return buildReviewedFileKey(file) || null;
   }
 
-  getServiceReviewStatus(serviceId, flow, reviewsOverride = null, workingFilesOverride = null) {
-    if (!serviceId) return "pending";
-    const reviews = reviewsOverride ?? this.getSessionReviews();
-    if (reviews.some((r) => r.serviceId === serviceId)) return "has_notes";
-    let workingFiles;
-    if (Array.isArray(workingFilesOverride)) {
-      workingFiles = workingFilesOverride;
-    } else if (this.isViewerMode()) {
-      const diff = readActiveDiff(this.getSessionContext().spaceId);
-      workingFiles = diff?.viewMode === "working" ? (diff?.allFiles || diff?.files || []) : [];
-    } else {
-      workingFiles = this.allWorkingFiles || [];
-    }
-    const svcFiles = workingFiles.filter((f) => f && f.serviceId === serviceId);
-    if (svcFiles.length > 0 && svcFiles.every((f) => this.isFileReviewed(f, flow, "working"))) {
-      return "approved";
-    }
-    return "pending";
-  }
-
-  fileReviewScope(viewModeOverride = null, commitOverride = null) {
-    const vm = viewModeOverride ?? this.viewMode;
-    const cm = commitOverride !== undefined ? commitOverride : this.selectedCommit;
-    if (vm === "commit" && cm?.hash) {
-      return `commit:${cm.hash}`;
-    }
-    return "working";
-  }
-
-  fileReviewKey(file, scopeOverride = null) {
-    const fileKey = typeof file === "string" ? file : file?.key;
-    if (!fileKey) return null;
-    const scope = scopeOverride ?? this.fileReviewScope();
-    return `${scope}::${fileKey}`;
-  }
-
-  isFileReviewed(file, flow, scopeOverride = null) {
-    const rk = this.fileReviewKey(file, scopeOverride);
+  isFileReviewed(file, flow) {
+    const rk = this.fileReviewKey(file);
     if (!rk) return false;
     const flowEntry = flow?.reviewedFiles?.[rk];
     if (flowEntry !== undefined) {
@@ -1634,13 +1557,13 @@ export default class ChangesReview extends View {
     }
   }
 
-  applyFileReviewToggle(fileObj, fileKey, scope, ctx) {
-    const rk = this.fileReviewKey(fileKey, scope);
+  applyFileReviewToggle(fileObj, fileKey, ctx) {
+    const rk = this.fileReviewKey(fileKey);
     if (!rk || !fileKey) return { nextReviewed: false, updatedFlow: null };
 
     const flows = readFlows();
     const curFlow = ctx.sourceTabId ? (flows[ctx.sourceTabId] || {}) : {};
-    const nextReviewed = !this.isFileReviewed(fileKey, curFlow, scope);
+    const nextReviewed = !this.isFileReviewed(fileKey, curFlow);
     const record = nextReviewed
       ? {
           reviewed: true,
@@ -1674,75 +1597,15 @@ export default class ChangesReview extends View {
     return { nextReviewed, updatedFlow };
   }
 
-  toggleFileReviewed(file, cx, _advanceToNext = false, scopeOverride = null) {
+  toggleFileReviewed(file, cx) {
     const fileKey = typeof file === "string" ? file : file?.key;
-    const scope = scopeOverride ?? this.fileReviewScope();
-    const rk = this.fileReviewKey(fileKey, scope);
+    const rk = this.fileReviewKey(fileKey);
     if (!rk || !fileKey) return;
 
     const fileObj = typeof file === "object" && file ? file : this.resolveFileDescriptor(fileKey);
     const ctx = this.getSessionContext();
-    this.applyFileReviewToggle(fileObj, fileKey, scope, ctx);
+    this.applyFileReviewToggle(fileObj, fileKey, ctx);
     cx.notify();
-  }
-
-  clearCommittedReviewedFiles(serviceIds) {
-    if (!Array.isArray(serviceIds) || serviceIds.length === 0) return;
-    const prefixes = serviceIds.map((id) => `working::${id}::`);
-    for (const rk of [...this.localReviewedFiles]) {
-      if (prefixes.some((p) => rk.startsWith(p))) {
-        this.localReviewedFiles.delete(rk);
-      }
-    }
-    for (const rk of Object.keys(this.localReviewedMeta || {})) {
-      if (prefixes.some((p) => rk.startsWith(p))) {
-        delete this.localReviewedMeta[rk];
-      }
-    }
-    const ctx = this.getSessionContext();
-    if (!ctx.sourceTabId) return;
-    updateTabFlow(
-      ctx.sourceTabId,
-      (prev) => {
-        const prevMap = prev.reviewedFiles || {};
-        const nextMap = {};
-        let changed = false;
-        for (const [k, v] of Object.entries(prevMap)) {
-          if (prefixes.some((p) => k.startsWith(p))) {
-            changed = true;
-          } else {
-            nextMap[k] = v;
-          }
-        }
-        return changed ? { reviewedFiles: nextMap } : null;
-      },
-      ctx.workspaceRoot,
-    );
-  }
-
-  selectService(serviceId, cx, opts = {}) {
-    if (this.activeService === serviceId && !opts.force) return;
-    this.activeService = serviceId;
-    const now = Date.now();
-    this.lastActiveServiceTs = now;
-    if (this.workspaceRoot && opts.broadcast !== false) {
-      setShared("cognivisor.activeService", {
-        workspaceRoot: this.workspaceRoot,
-        serviceId: this.activeService,
-        ts: now,
-      });
-    }
-    if (this.viewMode === "commit" && this.selectedCommit) {
-      if (this.activeService !== "all" && this.selectedCommit.serviceId !== this.activeService) {
-        this.switchMode("working", null, cx);
-        return;
-      }
-    }
-    this.applyServiceFilter(cx, {
-      preferUnreviewed: opts.preferUnreviewed !== false,
-      syncReviewTab: opts.syncReviewTab !== false,
-      selectTab: Boolean(opts.selectTab),
-    });
   }
 
   pickPreferredFileForCurrentList(preferUnreviewed = false) {
@@ -1755,166 +1618,16 @@ export default class ChangesReview extends View {
     const ctx = this.getSessionContext();
     const flows = readFlows();
     const flow = ctx.sourceTabId ? (flows[ctx.sourceTabId] || {}) : {};
-    const scope = this.fileReviewScope();
     return (
-      pickNextUnreviewedFile(files, null, (f) => this.isFileReviewed(f, flow, scope)) ||
+      pickNextUnreviewedFile(files, null, (f) => this.isFileReviewed(f, flow)) ||
       files[0] ||
       null
     );
   }
 
-  applyServiceFilter(cx, opts = {}) {
-    if (this.viewMode === "working") {
-      if (this.activeService === "all") {
-        this.files = this.allWorkingFiles;
-      } else {
-        this.files = this.allWorkingFiles.filter((f) => f.serviceId === this.activeService);
-      }
-
-      const shouldPickNew = Boolean(opts.preferUnreviewed) || !this.open || !this.files.some((f) => f.key === this.open);
-      if (shouldPickNew) {
-        const nextFile = this.pickPreferredFileForCurrentList(Boolean(opts.preferUnreviewed));
-        this.open = nextFile ? nextFile.key : null;
-        this.closed = !this.open;
-        if (opts.syncReviewTab !== false) {
-          this.openReviewTabForFile(nextFile, {
-            create: false,
-            select: Boolean(opts.selectTab),
-            bumpSeq: true,
-          });
-        }
-      } else if (opts.syncReviewTab === true) {
-        const curFile = this.files.find((f) => f.key === this.open) || null;
-        this.openReviewTabForFile(curFile, {
-          create: false,
-          select: Boolean(opts.selectTab),
-          bumpSeq: false,
-        });
-      }
-    }
-
-    if (this.activeService === "all") {
-      this.commits = this.allCommits.slice(0, 30);
-    } else {
-      this.commits = (this.serviceCommitsMap.get(this.activeService) || []).slice(0, 30);
-    }
-
-    if (cx) cx.notify();
-  }
-
-  switchMode(mode, target, cx) {
-    this.showCommitMenu = false;
-    this.viewMode = mode;
-    this.panelNote = null;
-    this.error = null;
-
-    if (mode === "working") {
-      this.selectedCommit = null;
-      this.files = this.activeService === "all"
-        ? (this.allWorkingFiles || [])
-        : (this.allWorkingFiles || []).filter((f) => f.serviceId === this.activeService);
-      const nextFile = this.pickPreferredFileForCurrentList(true);
-      this.open = nextFile ? nextFile.key : null;
-      this.closed = !this.open;
-      this.openReviewTabForFile(nextFile, { create: false, select: false, bumpSeq: true });
-      cx.notify();
-      return;
-    }
-
-    if (mode === "commit" && target) {
-      this.selectedCommit = target;
-      this.loadCommitFiles(target, cx);
-      return;
-    }
-
-    cx.notify();
-  }
-
-  loadCommitFiles(target, cx) {
-    let c = target;
-    if (typeof target === "string") {
-      c = this.commits.find((x) => x.hash === target) || {
-        hash: target,
-        repoRoot: this.services[0]?.root || this.root,
-        serviceId: this.services[0]?.id || ".",
-        serviceName: this.services[0]?.name || "root",
-      };
-    }
-    const hash = c?.hash, repoRoot = c?.repoRoot, serviceId = c?.serviceId, serviceName = c?.serviceName;
-    const on = this.on, context = this.context;
-    if (!repoRoot || !hash) return;
-    this.loading = true;
-    this.files = [];
-    this.open = null;
-    cx.notify();
-
-    cx.spawn(async (cx) => {
-      try {
-        const git = (args) => exec("git", [...READ, ...args], { cwd: repoRoot, on });
-        const numResult = await git(["diff-tree", "-r", "--no-commit-id", "--root", "--no-renames", "--numstat", "-z", hash]);
-        const statResult = await git(["diff-tree", "-r", "--no-commit-id", "--root", "--no-renames", "--name-status", "-z", hash]);
-        if (numResult.code !== 0) throw new Error(numResult.stderr || "Failed to load commit stats");
-
-        const stats = {};
-        for (const entry of (numResult.stdout || "").split("\0")) {
-          const [a, d, ...parts] = entry.split("\t");
-          if (!parts.length) continue;
-          const path = parts.join("\t");
-          stats[path] = { add: Number(a) || 0, del: Number(d) || 0, binary: a === "-" };
-        }
-
-        const service = (this.services || []).find((s) => s.id === serviceId);
-        const relPrefix = service?.relPath || "";
-        const files = [];
-        const statEntries = (statResult.stdout || "").split("\0").filter(Boolean);
-        for (let i = 0; i < statEntries.length; i += 2) {
-          const status = statEntries[i]?.charAt(0) || "M";
-          const path = statEntries[i + 1];
-          if (!path) continue;
-          const stat = stats[path] ?? { add: 0, del: 0 };
-          const fileKey = `${serviceId}::${path}`;
-          const displayPath = relPrefix ? `${relPrefix}/${path}` : path;
-          files.push({
-            key: fileKey,
-            serviceId,
-            serviceName: serviceName || service?.name || "root",
-            relPrefix,
-            repoRoot,
-            hasHead: true,
-            path,
-            displayPath,
-            status,
-            fresh: false,
-            ...stat,
-          });
-        }
-
-        if (key() !== context) return;
-        this.files = files;
-        const firstFile = this.pickPreferredFileForCurrentList(true);
-        this.open = firstFile ? firstFile.key : null;
-        this.openReviewTabForFile(firstFile, { create: false, select: false, bumpSeq: true });
-      } catch (e) {
-        this.logger?.error("review.loadCommitFilesFailed", e, {
-          workspaceRoot: this.workspaceRoot,
-          viewMode: this.viewMode,
-        }, cx);
-        if (key() === context) this.error = String(e.message || e);
-      } finally {
-        this.loading = false;
-        cx.notify();
-      }
-    });
-  }
-
   getTargetRepos() {
     if (!this.services || this.services.length === 0) return [];
-    if (this.activeService === "all") {
-      return this.services.filter((s) => (s.workingCount || 0) > 0);
-    }
-    const s = this.services.find((s) => s.id === this.activeService);
-    if (s && (s.workingCount || 0) > 0) return [s];
-    return s ? [s] : [];
+    return this.services.filter((s) => Array.isArray(s.dirtyPaths) && s.dirtyPaths.length > 0);
   }
 
   commit(cx) {
@@ -1925,23 +1638,30 @@ export default class ChangesReview extends View {
     this.panelNote = null;
     cx.spawn(async (cx) => {
       const errors = [];
-      const committedIds = [];
       try {
         for (const repo of targetRepos) {
           const root = repo.root;
+          const dirtyPaths = Array.isArray(repo.dirtyPaths) ? repo.dirtyPaths.filter(Boolean) : [];
+          if (dirtyPaths.length === 0) continue;
+          const stagePaths = Array.isArray(repo.stagePaths) ? repo.stagePaths.filter(Boolean) : dirtyPaths;
           let repoOk = true;
-          for (const args of [["add", "-A"], ["commit", "-m", message]]) {
-            const r = await exec("git", args, { cwd: root, on });
-            if (r.code !== 0) {
-              errors.push(`[${repo.name}]: ${(r.stderr || r.stdout).trim()}`);
+          // Stage ONLY visible session dirty paths needing staging (skipping already-staged `git rm`
+          // deletions where `git add -- <path>` would exit 128; never `git add -A`).
+          const CHUNK = 100;
+          for (let i = 0; i < stagePaths.length; i += CHUNK) {
+            const slice = stagePaths.slice(i, i + CHUNK);
+            const addRes = await exec("git", ["add", "--", ...slice], { cwd: root, on });
+            if (addRes.code !== 0) {
+              errors.push(`[${repo.name}]: ${(addRes.stderr || addRes.stdout).trim()}`);
               repoOk = false;
               break;
             }
           }
-          if (repoOk && repo.id) committedIds.push(repo.id);
-        }
-        if (committedIds.length > 0) {
-          this.clearCommittedReviewedFiles(committedIds);
+          if (!repoOk) continue;
+          const commitRes = await exec("git", ["commit", "-m", message], { cwd: root, on });
+          if (commitRes.code !== 0) {
+            errors.push(`[${repo.name}]: ${(commitRes.stderr || commitRes.stdout).trim()}`);
+          }
         }
         if (errors.length > 0) {
           throw new Error(errors.join("\n"));
@@ -1993,8 +1713,12 @@ export default class ChangesReview extends View {
       this.stopAllWatchers();
       return;
     }
+    const MAX_WATCHED_REPOS = 24;
+    const targets = services.length <= MAX_WATCHED_REPOS
+      ? services
+      : (this.workspaceRoot ? [{ root: this.workspaceRoot }] : services.slice(0, MAX_WATCHED_REPOS));
     const desired = new Map();
-    for (const s of services) {
+    for (const s of targets) {
       if (!s?.root) continue;
       const norm = normPathStr(s.root);
       if (norm && !desired.has(norm)) desired.set(norm, s.root);
@@ -2041,7 +1765,8 @@ export default class ChangesReview extends View {
     const { sessionTabId } = getActiveSpaceAndTab();
     if (!sessionTabId || !this.workspaceRoot) return;
     const flows = safeReadFlows();
-    const curBaseline = SESSION_BASELINE_CACHE.get(sessionTabId) || flows[sessionTabId]?.sessionBaseline || null;
+    const cachedEntry = getCachedSessionBaselineEntry(sessionTabId);
+    const curBaseline = cachedEntry?.baseline || flows[sessionTabId]?.sessionBaseline || null;
     const repoRoots = Array.from(
       new Set([
         ...(this.lastCandidateRoots || []),
@@ -2054,16 +1779,18 @@ export default class ChangesReview extends View {
       previousHiddenCount: this.hiddenPreExistingCount,
     }, cx);
     const nextBaseline = createResetSessionBaseline(curBaseline, repoRoots, this.workspaceRoot);
-    mergeSessionBaselineIntoFlow(sessionTabId, nextBaseline, null, true);
     this.showAllWorkingChanges = false;
     this.hiddenPreExistingCount = 0;
     const appHomeDir = getSafeAppHome();
     const workspaceRoot = this.workspaceRoot;
     const primaryBranch = this.lastPrimaryBranch || "";
     cx.spawn(async (cx) => {
+      let diskMtime = 0;
       if (appHomeDir) {
         await writeDiskSessionBaseline(appHomeDir, sessionTabId, workspaceRoot, primaryBranch, nextBaseline, "", fsPromises);
+        diskMtime = await getDiskBaselineMtimeMs(appHomeDir, sessionTabId);
       }
+      mergeSessionBaselineIntoFlow(sessionTabId, nextBaseline, null, true, diskMtime);
       try {
         notify({ title: "Session baseline reset", body: "All current working changes are now included in this session.", level: "info" });
       } catch {}
@@ -2073,7 +1800,14 @@ export default class ChangesReview extends View {
   }
 
   refresh(cx, opts = {}) {
-    if (this.isViewerMode() || this.loading || this.busy) return;
+    if (this.isViewerMode() || this.busy) return;
+    if (this.loading) {
+      this.pendingRefresh = true;
+      if (opts?.force) this.pendingRefreshForce = true;
+      return;
+    }
+    this.pendingRefresh = false;
+    this.pendingRefreshForce = false;
     this.recordActiveTerminalTabNow();
     const loc = location(), context = key();
     const workspaceRoot = loc.cwd;
@@ -2086,9 +1820,7 @@ export default class ChangesReview extends View {
       this.root = workspaceRoot;
       this.on = on;
       this.services = [];
-      this.allWorkingFiles = [];
-      this.serviceCommitsMap.clear();
-      this.allCommits = [];
+      this.allSessionFiles = [];
       this.files = [];
       this.open = null;
       this.message = "";
@@ -2102,16 +1834,12 @@ export default class ChangesReview extends View {
       this.lastConsumedBusSig = "";
       this.hasLoadedOnce = false;
       this.needsRefreshOnShow = false;
+      this.pendingRefresh = false;
+      this.pendingRefreshForce = false;
       this.closed = false;
       this.limited = false;
       this.localReviewedFiles.clear();
       this.localReviewedMeta = {};
-      this.lastRepoHeads.clear();
-      this.viewMode = "working";
-      this.showCommitMenu = false;
-      this.selectedCommit = null;
-      this.workingFiles = [];
-      this.workingFilesCount = 0;
       this.showAllWorkingChanges = false;
       this.hiddenPreExistingCount = 0;
       this.lastCandidateRoots = [];
@@ -2150,11 +1878,7 @@ export default class ChangesReview extends View {
       this.workspaceRoot = workspaceRoot;
       this.services = [];
       this.root = workspaceRoot;
-      this.allWorkingFiles = [];
-      this.workingFiles = [];
-      this.workingFilesCount = 0;
-      this.allCommits = [];
-      this.serviceCommitsMap.clear();
+      this.allSessionFiles = [];
       this.files = [];
       this.open = null;
       this.stopAllWatchers();
@@ -2201,7 +1925,7 @@ export default class ChangesReview extends View {
 
         if (!candidateServices || candidateServices.length === 0) {
           this.services = [];
-          this.allWorkingFiles = [];
+          this.allSessionFiles = [];
           this.files = [];
           this.open = null;
           this.stopAllWatchers();
@@ -2209,83 +1933,36 @@ export default class ChangesReview extends View {
           return;
         }
 
+        // Pre-load existing session baseline so snapshots receive startHead & dirtyFiles upfront.
+        const preloadedBaseline = sessionTabId
+          ? await peekExistingSessionBaseline(sessionTabId, workspaceRoot, tabTermAddrs)
+          : null;
+        if (key() !== context) return;
+
         const serviceResults = [];
         const SNAPSHOT_CONCURRENCY = 4;
         for (let i = 0; i < candidateServices.length; i += SNAPSHOT_CONCURRENCY) {
           const batch = candidateServices.slice(i, i + SNAPSHOT_CONCURRENCY);
           const batchRes = await Promise.all(
-            batch.map((service) => loadServiceWorkingSnapshot(service, on, true))
+            batch.map((service) => {
+              const normRoot = normPathStr(service?.root);
+              const baselineRepo = normRoot ? (preloadedBaseline?.baseline?.repos?.[normRoot] || null) : null;
+              return loadServiceSessionSnapshot(service, on, { baselineRepo });
+            })
           );
           if (key() !== context) return;
           for (const item of batchRes) serviceResults.push(item);
         }
 
         const erroredServiceIds = new Set();
-        const headTransitions = [];
-        const prevHeadsByServiceId = new Map();
-        const nextRepoHeads = [];
-        const persistedHeads = sessionTabId ? readPlainObject(readFlows()?.[sessionTabId]?.repoHeads) : {};
-
         for (const res of serviceResults) {
-          const svcId = res.service?.id;
-          if (res.error) {
-            if (svcId) erroredServiceIds.add(svcId);
-            continue;
-          }
-          const normRoot = normPathStr(res.service?.root);
-          const newHead = String(res.headHash || "").trim();
-          const persistedPrevHead = normRoot && typeof persistedHeads[normRoot] === "string"
-            ? persistedHeads[normRoot]
-            : "";
-          const prevHead = normRoot ? (this.lastRepoHeads.get(normRoot) || persistedPrevHead) : "";
-          if (svcId) prevHeadsByServiceId.set(svcId, prevHead);
-          if (prevHead && newHead && prevHead !== newHead) {
-            headTransitions.push({ service: res.service, prevHead, newHead });
-          }
-          if (normRoot && newHead) {
-            nextRepoHeads.push([normRoot, newHead]);
-          }
-        }
-
-        const committedFileKeys = new Set();
-        if (headTransitions.length > 0) {
-          await Promise.all(
-            headTransitions.map(async ({ service, prevHead, newHead }) => {
-              let r = await exec(
-                "git",
-                [...READ, "diff", "--name-only", "--no-renames", prevHead, newHead],
-                { cwd: service.root, on },
-              ).catch(() => null);
-              if (!r || r.code !== 0) {
-                r = await exec(
-                  "git",
-                  [...READ, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "--no-renames", newHead],
-                  { cwd: service.root, on },
-                ).catch(() => null);
-              }
-              if (r && r.code === 0 && r.stdout) {
-                for (const line of r.stdout.split(/\r?\n/)) {
-                  const p = line.trim();
-                  if (p) committedFileKeys.add(`${service.id}::${p}`);
-                }
-              }
-            })
-          );
-          if (key() !== context) return;
-        }
-
-        const nextRepoHeadsObj = { ...persistedHeads };
-        let headsChanged = false;
-        for (const [normRoot, newHead] of nextRepoHeads) {
-          this.lastRepoHeads.set(normRoot, newHead);
-          if (nextRepoHeadsObj[normRoot] !== newHead) {
-            nextRepoHeadsObj[normRoot] = newHead;
-            headsChanged = true;
+          if (res.error && res.service?.id) {
+            erroredServiceIds.add(res.service.id);
           }
         }
 
         const baselineInit = sessionTabId
-          ? await resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTermAddrs, workspaceRoot)
+          ? await resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTermAddrs, workspaceRoot, preloadedBaseline)
           : { baseline: null, isFresh: false, dirtyChanged: false, primaryBranch: "" };
         if (key() !== context) return;
 
@@ -2305,76 +1982,132 @@ export default class ChangesReview extends View {
           );
           const normPaneCwds = tabPaneCwds.map((c) => normPathStr(c)).filter(Boolean);
 
-          const unbaselinedNeedTranscript = [];
+          const needTranscriptRepos = [];
           if (!baselineInit.isFresh) {
             for (const res of serviceResults) {
               const normRoot = normPathStr(res.service?.root);
-              if (!normRoot || sessionBaseline.repos?.[normRoot]) continue;
+              if (!normRoot || res.error) continue;
               const inPaneCwd = normPaneCwds.some((c) => c === normRoot || c.startsWith(normRoot + "/"));
-              if (!prevSessionRepos.has(normRoot) && !inPaneCwd && (res.files || []).some((f) => !Number(f?.mtimeMs || 0))) {
-                unbaselinedNeedTranscript.push(res);
+              if (prevSessionRepos.has(normRoot) || inPaneCwd) continue;
+              const bRepo = sessionBaseline.repos?.[normRoot] || null;
+              const headMoved = Boolean(bRepo?.startHead && res.headHash && bRepo.startHead !== res.headHash);
+              const unbaselinedNoMtime = !bRepo && (res.workingFiles || []).some((f) => !Number(f?.mtimeMs || 0));
+              if (headMoved || unbaselinedNoMtime) {
+                needTranscriptRepos.push(res);
               }
             }
           }
-          let unbaselinedTranscript = "";
-          if (unbaselinedNeedTranscript.length > 0 && tabTermAddrs.length > 0) {
-            const unattrSig = "unbaselined::" + unbaselinedNeedTranscript.map((r) => r.service?.root || "").sort().join("|") + "::" + tabTermAddrs.join(",");
+
+          let sessionTranscript = "";
+          if (needTranscriptRepos.length > 0 && tabTermAddrs.length > 0) {
+            const trSig = "session::" + needTranscriptRepos.map((r) => r.service?.root || "").sort().join("|") + "::" + tabTermAddrs.join(",");
             const nowTs = Date.now();
-            if (this.lastTranscriptScan && this.lastTranscriptScan.sig === unattrSig && (nowTs - this.lastTranscriptScan.ts) < TRANSCRIPT_THROTTLE_MS) {
-              unbaselinedTranscript = this.lastTranscriptScan.text;
+            if (this.lastTranscriptScan && this.lastTranscriptScan.sig === trSig && (nowTs - this.lastTranscriptScan.ts) < TRANSCRIPT_THROTTLE_MS) {
+              sessionTranscript = this.lastTranscriptScan.text;
             } else {
               const reads = await Promise.all(
-                tabTermAddrs.map((addr) => hc(["read", "--lines", "150", addr]).catch(() => ""))
+                tabTermAddrs.map((addr) => hc(["read", "--lines", "150", addr]).catch(() => null))
               );
               if (key() !== context) return;
-              unbaselinedTranscript = reads.filter(Boolean).join("\n").replace(/\\/g, "/");
-              this.lastTranscriptScan = { sig: unattrSig, ts: nowTs, text: unbaselinedTranscript };
+              sessionTranscript = reads.map(extractHcReadText).filter(Boolean).join("\n").replace(/\\/g, "/");
+              this.lastTranscriptScan = { sig: trSig, ts: nowTs, text: sessionTranscript };
             }
           }
 
           for (const res of serviceResults) {
+            if (res.error) {
+              res.touched = false;
+              continue;
+            }
             const normRoot = normPathStr(res.service?.root);
-            const baselineRepo = normRoot ? (sessionBaseline.repos?.[normRoot] || null) : null;
-            const rawWorkingFiles = Array.isArray(res.files) ? res.files : [];
-            const sessionCommits = filterSessionCommits(res.commits, startedAt);
+            let baselineRepo = normRoot ? (sessionBaseline.repos?.[normRoot] || null) : null;
+            const rawUnifiedFiles = Array.isArray(res.files) ? res.files : [];
+            const rawWorkingFiles = Array.isArray(res.workingFiles) ? res.workingFiles : [];
+            const inPaneCwd = Boolean(normRoot && normPaneCwds.some((c) => c === normRoot || c.startsWith(normRoot + "/")));
+            const inSessionRepos = Boolean(normRoot && prevSessionRepos.has(normRoot));
+            const matchedTranscript = repoMatchesTranscript(res.service, rawUnifiedFiles, sessionTranscript);
+
             let sessionFiles = [];
+            let visibleWorkingFiles = [];
             let hiddenCount = 0;
+
             if (baselineRepo) {
-              const partitioned = partitionSessionWorkingEntries(rawWorkingFiles, baselineRepo, startedAt);
-              sessionFiles = partitioned.visible;
-              hiddenCount = partitioned.hidden.length;
-            } else {
-              const inPaneCwd = normRoot && normPaneCwds.some((c) => c === normRoot || c.startsWith(normRoot + "/"));
-              const isAttributed = Boolean(
-                normRoot && (prevSessionRepos.has(normRoot) || inPaneCwd || repoMatchesTranscript(res.service, rawWorkingFiles, unbaselinedTranscript))
-              );
-              const unbaselinedRes = filterUnbaselinedRepoEntries(rawWorkingFiles, startedAt, {
-                isAttributed,
-                hasSessionCommits: sessionCommits.length > 0,
-              });
-              sessionFiles = unbaselinedRes.sessionFiles;
-              hiddenCount = Math.max(0, rawWorkingFiles.length - sessionFiles.length);
-              if (normRoot) {
-                sessionBaseline.repos[normRoot] = { dirtyFiles: unbaselinedRes.backfillDirtyFiles };
+              // Backfill missing startHead/startBranch for pre-upgrade disk baselines.
+              if (res.headHash && !baselineRepo.startHead) {
+                baselineRepo.startHead = res.headHash;
                 baselineDirtyChanged = true;
               }
+              if (res.branch && !baselineRepo.startBranch) {
+                baselineRepo.startBranch = res.branch;
+                baselineDirtyChanged = true;
+              }
+              const unifiedPart = partitionSessionUnifiedEntries(rawUnifiedFiles, baselineRepo, res.committedPaths, startedAt);
+              sessionFiles = unifiedPart.visible;
+              hiddenCount = unifiedPart.hidden.length;
+              const workingPart = partitionSessionUnifiedEntries(rawWorkingFiles, baselineRepo, null, startedAt);
+              visibleWorkingFiles = workingPart.visible;
+            } else {
+              const isAttributed = Boolean(inPaneCwd || inSessionRepos || matchedTranscript);
+              const unbaselinedRes = filterUnbaselinedRepoEntries(rawWorkingFiles, startedAt, { isAttributed });
+              visibleWorkingFiles = unbaselinedRes.sessionFiles;
+              const newBaselineRepo = {
+                dirtyFiles: unbaselinedRes.backfillDirtyFiles,
+                ...(res.headHash ? { startHead: res.headHash } : {}),
+                ...(res.branch ? { startBranch: res.branch } : {}),
+              };
+              if (normRoot) {
+                sessionBaseline.repos[normRoot] = newBaselineRepo;
+                baselineDirtyChanged = true;
+              }
+              baselineRepo = newBaselineRepo;
+              const unifiedPart = partitionSessionUnifiedEntries(rawUnifiedFiles, baselineRepo, res.committedPaths, startedAt);
+              sessionFiles = unifiedPart.visible;
+              hiddenCount = unifiedPart.hidden.length;
             }
-            totalHiddenPreExisting += hiddenCount;
-            const displayFiles = this.showAllWorkingChanges ? rawWorkingFiles : sessionFiles;
+
+            const hasNewWorkingEdit = visibleWorkingFiles.length > 0;
+            const hasActivity = evaluateRepoSessionActivity({
+              hasNewWorkingEdit,
+              inPaneCwd,
+              inSessionRepos,
+              startHead: baselineRepo?.startHead || "",
+              headHash: res.headHash || "",
+              repoMatchesTranscript: matchedTranscript,
+            });
+
+            if (hasActivity || !res.service?.isSibling) {
+              totalHiddenPreExisting += hiddenCount;
+            }
+
+            const displayFiles = this.showAllWorkingChanges ? rawUnifiedFiles : sessionFiles;
+            const displayDirtyFiles = this.showAllWorkingChanges ? rawWorkingFiles : visibleWorkingFiles;
+            const dirtyPaths = displayDirtyFiles.map((w) => w.path).filter(Boolean);
+            const stagePaths = selectPathsToStageForCommit(displayDirtyFiles);
+
+            res.allUnifiedFiles = rawUnifiedFiles;
             res.files = displayFiles;
-            res.commits = sessionCommits;
             if (res.service) {
-              res.service.workingCount = displayFiles.length;
-              res.service.sessionCommitCount = sessionCommits.length;
+              res.service.dirtyPaths = dirtyPaths;
+              res.service.stagePaths = stagePaths;
+              res.service.workingCount = dirtyPaths.length;
+              res.service.unifiedCount = displayFiles.length;
             }
-            res.touched = displayFiles.length > 0 || sessionCommits.length > 0;
+            const showForPreExistingRecovery = Boolean(this.showAllWorkingChanges && !res.service?.isSibling && hiddenCount > 0);
+            res.touched = Boolean((hasActivity || showForPreExistingRecovery) && displayFiles.length > 0);
           }
 
           this.hiddenPreExistingCount = totalHiddenPreExisting;
-          touchedResults = serviceResults.filter((r) => r.touched);
+          touchedResults = serviceResults
+            .filter((r) => r.touched)
+            .sort((a, b) => String(a.service?.name || "").localeCompare(String(b.service?.name || "")));
+
           const sessionRepos = touchedResults.map((r) => normPathStr(r.service?.root)).filter(Boolean);
-          mergeSessionBaselineIntoFlow(sessionTabId, sessionBaseline, sessionRepos);
           const appHomeDir = getSafeAppHome();
+          let diskMtime = 0;
+          if (baselineDirtyChanged) {
+            const curFlowRev = Number(curFlowNow?.baselineRev) || 0;
+            sessionBaseline.rev = Math.max(Number(sessionBaseline.rev) || 0, curFlowRev) + 1;
+          }
           if (appHomeDir && baselineDirtyChanged) {
             await writeDiskSessionBaseline(
               appHomeDir,
@@ -2386,7 +2119,10 @@ export default class ChangesReview extends View {
               fsPromises
             );
             if (key() !== context) return;
+            diskMtime = await getDiskBaselineMtimeMs(appHomeDir, sessionTabId);
+            if (key() !== context) return;
           }
+          mergeSessionBaselineIntoFlow(sessionTabId, sessionBaseline, sessionRepos, false, diskMtime);
         } else {
           this.hiddenPreExistingCount = 0;
         }
@@ -2396,115 +2132,82 @@ export default class ChangesReview extends View {
         this.services = services;
         this.root = services[0]?.root || workspaceRoot;
 
-        // Check external cognivisor.activeService
-        const sharedActive = shared("cognivisor.activeService");
-        if (sharedActive && normPathStr(sharedActive.workspaceRoot) === normWs && typeof sharedActive.ts === "number") {
-          if (!this.lastActiveServiceTs || sharedActive.ts > this.lastActiveServiceTs) {
-            this.lastActiveServiceTs = sharedActive.ts;
-            if (sharedActive.serviceId && (sharedActive.serviceId === "all" || services.some((s) => s.id === sharedActive.serviceId))) {
-              this.activeService = sharedActive.serviceId;
-            }
+        // Only publish cognivisor.services when sessionTabId is resolved (never wipe bus on null tab).
+        if (sessionTabId) {
+          const existingBus = shared("cognivisor.services");
+          const sameBusWorkspace = Boolean(existingBus && normPathStr(existingBus.workspaceRoot) === normWs);
+          const nextCandidates = (sameBusWorkspace && Array.isArray(existingBus.candidates))
+            ? existingBus.candidates
+            : candidateServices.map((s) => ({
+                id: s.id,
+                name: s.name,
+                relPath: s.relPath || "",
+                root: s.root,
+                isSibling: Boolean(s.isSibling),
+                branch: s.branch || "",
+              }));
+          const servicesSig = sessionTabId + "::" + normWs + "::" + nextCandidates.length + "::" + services.map((s) => `${normPathStr(s.root)}@${s.branch || ""}:${s.workingCount || 0}:${s.aheadCount || 0}`).join(",");
+          const existingBusSig = existingBus && normPathStr(existingBus.workspaceRoot) === normWs && (existingBus.tabId || null) === sessionTabId
+            ? (existingBus.sig || (sessionTabId + "::" + normWs + "::" + (existingBus.candidates?.length ?? -1) + "::" + (existingBus.services || []).map((s) => `${normPathStr(s.root)}@${s.branch || ""}:${s.workingCount || 0}:${s.aheadCount || 0}`).join(",")))
+            : null;
+          if ((!usingBusCandidates || force || servicesSig !== existingBusSig) && servicesSig !== this.lastPublishedServicesSig) {
+            this.lastPublishedServicesSig = servicesSig;
+            const pubTs = Date.now();
+            this.lastConsumedBusTs = pubTs;
+            this.lastConsumedBusSig = servicesSig;
+            setShared("cognivisor.services", {
+              tabId: sessionTabId,
+              workspaceRoot,
+              on,
+              services: services.map((s) => ({
+                id: s.id,
+                name: s.name,
+                relPath: s.relPath,
+                root: s.root,
+                isSibling: Boolean(s.isSibling),
+                branch: s.branch || "",
+                baseRef: s.baseRef || "",
+                workingCount: s.workingCount || 0,
+                aheadCount: s.aheadCount || 0,
+              })),
+              candidates: nextCandidates,
+              sig: servicesSig,
+              ts: pubTs,
+            });
+          } else {
+            this.lastPublishedServicesSig = servicesSig;
+            if (existingBusSig) this.lastConsumedBusSig = existingBusSig;
           }
         }
-        if (this.activeService !== "all" && !services.some((s) => s.id === this.activeService)) {
-          this.activeService = "all";
-        }
 
-        const existingBus = shared("cognivisor.services");
-        const sameBusWorkspace = Boolean(existingBus && normPathStr(existingBus.workspaceRoot) === normWs);
-        const nextCandidates = (sameBusWorkspace && Array.isArray(existingBus.candidates))
-          ? existingBus.candidates
-          : candidateServices.map((s) => ({
-              id: s.id,
-              name: s.name,
-              relPath: s.relPath || "",
-              root: s.root,
-              isSibling: Boolean(s.isSibling),
-              branch: s.branch || "",
-            }));
-        const servicesSig = (sessionTabId || "") + "::" + normWs + "::" + nextCandidates.length + "::" + services.map((s) => `${normPathStr(s.root)}@${s.branch || ""}:${s.workingCount || 0}:${s.aheadCount || 0}`).join(",");
-        const existingBusSig = existingBus && normPathStr(existingBus.workspaceRoot) === normWs && (existingBus.tabId || null) === (sessionTabId || null)
-          ? (existingBus.sig || ((sessionTabId || "") + "::" + normWs + "::" + (existingBus.candidates?.length ?? -1) + "::" + (existingBus.services || []).map((s) => `${normPathStr(s.root)}@${s.branch || ""}:${s.workingCount || 0}:${s.aheadCount || 0}`).join(",")))
-          : null;
-        if ((!usingBusCandidates || force || servicesSig !== existingBusSig) && servicesSig !== this.lastPublishedServicesSig) {
-          this.lastPublishedServicesSig = servicesSig;
-          const pubTs = Date.now();
-          this.lastConsumedBusTs = pubTs;
-          this.lastConsumedBusSig = servicesSig;
-          setShared("cognivisor.services", {
-            tabId: sessionTabId || null,
-            workspaceRoot,
-            on,
-            services: services.map((s) => ({
-              id: s.id,
-              name: s.name,
-              relPath: s.relPath,
-              root: s.root,
-              isSibling: Boolean(s.isSibling),
-              branch: s.branch || "",
-              workingCount: s.workingCount || 0,
-              aheadCount: s.aheadCount || 0,
-              sessionCommitCount: Number(s.sessionCommitCount) || 0,
-            })),
-            candidates: nextCandidates,
-            sig: servicesSig,
-            ts: pubTs,
-          });
-        } else {
-          this.lastPublishedServicesSig = servicesSig;
-          if (existingBusSig) this.lastConsumedBusSig = existingBusSig;
-        }
-
-        const allFiles = [];
-        const allCommits = [];
-        this.serviceCommitsMap.clear();
-
+        const allVisibleFiles = [];
+        const allUnifiedFiles = [];
         for (const res of touchedResults) {
-          allFiles.push(...res.files);
-          allCommits.push(...res.commits);
-          this.serviceCommitsMap.set(res.service.id, res.commits);
+          allVisibleFiles.push(...res.files);
+          allUnifiedFiles.push(...(res.allUnifiedFiles || res.files));
+        }
+        const allReconcileFiles = [];
+        for (const res of serviceResults) {
+          if (res.error) continue;
+          allReconcileFiles.push(...(res.allUnifiedFiles || res.files || []));
         }
 
-        allCommits.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-        this.allCommits = allCommits;
-        this.allWorkingFiles = allFiles;
-        this.workingFiles = allFiles;
-        this.workingFilesCount = allFiles.length;
-
-        const snapshotReviewedFiles = sessionTabId
-          ? (readFlows()?.[sessionTabId]?.reviewedFiles || {})
-          : this.buildLocalReviewedSnapshot();
-        const committedAfterByKey = await this.collectCommitInvalidations(
-          snapshotReviewedFiles,
-          allCommits,
-          prevHeadsByServiceId,
-          erroredServiceIds,
-          on,
-          committedFileKeys,
-        );
-        if (key() !== context) return;
+        this.files = allVisibleFiles;
+        this.allSessionFiles = allUnifiedFiles;
 
         const latestReviewedFiles = sessionTabId
           ? (readFlows()?.[sessionTabId]?.reviewedFiles || {})
           : this.buildLocalReviewedSnapshot();
         const reconciled = reconcileReviewedFiles(latestReviewedFiles, {
-          workingFiles: allFiles,
-          committedFileKeys,
-          committedAfterByKey,
+          sessionFiles: allReconcileFiles,
           erroredServiceIds,
-          scopeMode: "working",
         });
 
         if (sessionTabId) {
-          if (reconciled.changed || headsChanged) {
+          if (reconciled.changed) {
             updateTabFlow(
               sessionTabId,
-              () => {
-                const patch = {};
-                if (reconciled.changed) patch.reviewedFiles = reconciled.nextMap;
-                if (headsChanged) patch.repoHeads = nextRepoHeadsObj;
-                return patch;
-              },
+              () => ({ reviewedFiles: reconciled.nextMap }),
               workspaceRoot,
             );
           }
@@ -2513,221 +2216,95 @@ export default class ChangesReview extends View {
           this.syncLocalReviewedFromMap(reconciled.nextMap);
         }
 
-        this.watch(services, cx);
-        this.applyServiceFilter(null, { preferUnreviewed: false, syncReviewTab: false });
+        // Watch all discovered candidate repos even when session starts clean so edits appear immediately.
+        this.watch(candidateServices.length > 0 ? candidateServices : [{ root: workspaceRoot }], cx);
 
-        if (this.viewMode === "working") {
-          this.limited = this.files.length > 1000;
-          this.error = null;
-          const spaceId = activeSpace?.id || "default";
-          const revTab = findReviewTabInSpace(spaceId);
-          const curDiff = revTab ? readActiveDiff(spaceId) : null;
-          if (revTab && curDiff && curDiff.sourceTabId === sessionTabId && curDiff.openFileKey && this.files.some((f) => f.key === curDiff.openFileKey)) {
-            this.open = curDiff.openFileKey;
-          }
-          const prevOpen = this.open;
-          if (this.open && !this.files.some((f) => f.key === this.open)) {
-            this.open = null;
-          }
-          if (!this.open && !this.closed && this.files.length) {
-            const preferred = this.pickPreferredFileForCurrentList(false);
-            this.open = preferred ? preferred.key : null;
-          }
-          if (revTab) {
-            if (!curDiff || curDiff.sourceTabId === sessionTabId) {
-              const openFile = this.open ? (this.files.find((f) => f.key === this.open) || null) : null;
-              const fileChanged = prevOpen !== this.open || (curDiff && curDiff.openFileKey !== this.open);
-              const openFpChanged = Boolean(
-                openFile &&
-                curDiff?.openFile &&
-                computeFileReviewFingerprint(curDiff.openFile) !== computeFileReviewFingerprint(openFile)
-              );
-              const payload = this.buildActiveDiffPayload(openFile, {
-                bumpSeq: Boolean(fileChanged || openFpChanged || force),
-                focusLine: fileChanged ? null : (curDiff?.focusLine ?? null),
-                openCommentLine: fileChanged ? null : (curDiff?.openCommentLine ?? null),
-              });
-              writeActiveDiff(spaceId, payload);
-              if (fileChanged) {
-                run("tab.rename", { id: revTab.tabId, name: formatReviewTabTitle(openFile) });
-              }
+        this.limited = this.files.length > 1000;
+        this.error = null;
+        const spaceId = activeSpace?.id || "default";
+        const revTab = findReviewTabInSpace(spaceId);
+        const curDiff = revTab ? readActiveDiff(spaceId) : null;
+        if (revTab && curDiff && curDiff.sourceTabId === sessionTabId && curDiff.openFileKey && this.files.some((f) => f.key === curDiff.openFileKey)) {
+          this.open = curDiff.openFileKey;
+        }
+        const prevOpen = this.open;
+        if (this.open && !this.files.some((f) => f.key === this.open)) {
+          this.open = null;
+        }
+        if (!this.open && !this.closed && this.files.length) {
+          const preferred = this.pickPreferredFileForCurrentList(false);
+          this.open = preferred ? preferred.key : null;
+        }
+        if (revTab) {
+          if (!curDiff || curDiff.sourceTabId === sessionTabId) {
+            const openFile = this.open ? (this.files.find((f) => f.key === this.open) || null) : null;
+            const fileChanged = prevOpen !== this.open || (curDiff && curDiff.openFileKey !== this.open);
+            const openFpChanged = Boolean(
+              openFile &&
+              curDiff?.openFile &&
+              computeFileReviewFingerprint(curDiff.openFile) !== computeFileReviewFingerprint(openFile)
+            );
+            const payload = this.buildActiveDiffPayload(openFile, {
+              bumpSeq: Boolean(fileChanged || openFpChanged || force),
+              focusLine: fileChanged ? null : (curDiff?.focusLine ?? null),
+              focusSide: fileChanged ? null : (curDiff?.focusSide ?? null),
+              openCommentLine: fileChanged ? null : (curDiff?.openCommentLine ?? null),
+              openCommentSide: fileChanged ? null : (curDiff?.openCommentSide ?? null),
+            });
+            writeActiveDiff(spaceId, payload);
+            if (fileChanged) {
+              run("tab.rename", { id: revTab.tabId, name: formatReviewTabTitle(openFile) });
             }
           }
         }
       } catch (e) {
         this.logger?.error("review.refreshFailed", e, {
           workspaceRoot,
-          viewMode: this.viewMode,
           showAllWorkingChanges: this.showAllWorkingChanges,
         }, cx);
         if (key() === context) this.error = String(e.message || e);
       } finally {
         this.loading = false;
         cx.notify();
+        if (this.pendingRefresh && !this._viewerClosed && key() === context) {
+          const nextForce = Boolean(this.pendingRefreshForce);
+          this.pendingRefresh = false;
+          this.pendingRefreshForce = false;
+          cx.timer.after(0, (nextCx) => {
+            if (!this._viewerClosed && key() === context) {
+              this.refresh(nextCx, nextForce ? { force: true } : { fromWatch: true });
+            }
+          });
+        }
       }
     });
   }
 
-  async getCommitChangedFiles(commit, on) {
-    if (!commit?.hash || !commit?.repoRoot) return [];
-    const cacheKey = `${normPathStr(commit.repoRoot)}::${commit.hash}`;
-    if (this.commitFilesCache.has(cacheKey)) {
-      return this.commitFilesCache.get(cacheKey);
-    }
-    const r = await exec(
-      "git",
-      [...READ, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "--no-renames", commit.hash],
-      { cwd: commit.repoRoot, on },
-    ).catch(() => null);
-    const paths = r && r.code === 0 && r.stdout
-      ? r.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
-      : [];
-    if (this.commitFilesCache.size > 250) {
-      this.commitFilesCache.clear();
-    }
-    this.commitFilesCache.set(cacheKey, paths);
-    return paths;
-  }
-
-  async collectCommitInvalidations(snapshotReviewedFiles, allCommits, prevHeadsByServiceId, erroredServiceIds, on, committedFileKeys) {
-    const committedAfterByKey = new Map();
-    const entries = Object.entries(snapshotReviewedFiles || {});
-    if (entries.length === 0 || !Array.isArray(allCommits) || allCommits.length === 0) {
-      return committedAfterByKey;
-    }
-
-    const commitReviewsBySvc = new Map();
-    const workingReviewedAtByKey = new Map();
-    const workingSvcsCold = new Set();
-
-    for (const [rk, rawVal] of entries) {
-      const rec = parseReviewedFileRecord(rawVal);
-      if (!rec) continue;
-      if (rk.startsWith("commit:")) {
-        const rest = rk.slice("commit:".length);
-        const hashSep = rest.indexOf("::");
-        if (hashSep <= 0) continue;
-        const cHash = rest.slice(0, hashSep);
-        const fileKey = rest.slice(hashSep + 2);
-        const svcSep = fileKey.indexOf("::");
-        const svcId = svcSep >= 0 ? fileKey.slice(0, svcSep) : "";
-        if (!svcId || erroredServiceIds.has(svcId)) continue;
-        if (!commitReviewsBySvc.has(svcId)) commitReviewsBySvc.set(svcId, []);
-        commitReviewsBySvc.get(svcId).push({ hash: cHash, reviewedAt: rec.reviewedAt || 0 });
-      } else if (rk.startsWith("working::")) {
-        const fileKey = rk.slice("working::".length);
-        const svcSep = fileKey.indexOf("::");
-        const svcId = svcSep >= 0 ? fileKey.slice(0, svcSep) : "";
-        if (!svcId || erroredServiceIds.has(svcId) || !rec.reviewedAt || prevHeadsByServiceId.get(svcId)) continue;
-        workingSvcsCold.add(svcId);
-        const prevTs = workingReviewedAtByKey.get(fileKey);
-        if (prevTs === undefined || rec.reviewedAt < prevTs) {
-          workingReviewedAtByKey.set(fileKey, rec.reviewedAt);
-        }
-      }
-    }
-
-    if (commitReviewsBySvc.size === 0 && workingSvcsCold.size === 0) {
-      return committedAfterByKey;
-    }
-
-    const commitsByService = new Map();
-    for (const c of allCommits) {
-      if (!c?.serviceId || !c?.hash) continue;
-      if (!commitReviewsBySvc.has(c.serviceId) && !workingSvcsCold.has(c.serviceId)) continue;
-      if (!commitsByService.has(c.serviceId)) commitsByService.set(c.serviceId, []);
-      commitsByService.get(c.serviceId).push(c);
-    }
-
-    const commitsToInspect = [];
-    for (const [svcId, svcCommits] of commitsByService.entries()) {
-      const commitReviews = commitReviewsBySvc.get(svcId) || [];
-      let minWorkingTs = Infinity;
-      if (workingSvcsCold.has(svcId)) {
-        for (const [fk, ts] of workingReviewedAtByKey.entries()) {
-          if (fk.startsWith(`${svcId}::`) && ts < minWorkingTs) {
-            minWorkingTs = ts;
-          }
-        }
-      }
-
-      const hashToIdx = new Map();
-      for (let i = 0; i < svcCommits.length; i++) {
-        if (svcCommits[i]?.hash && !hashToIdx.has(svcCommits[i].hash)) {
-          hashToIdx.set(svcCommits[i].hash, i);
-        }
-      }
-
-      for (let idx = 0; idx < svcCommits.length; idx++) {
-        const c = svcCommits[idx];
-        const commitMs = (Number(c.timestamp) || 0) * 1000;
-        const forCommitReview = commitReviews.some((entry) => {
-          if (entry.hash === c.hash) return false;
-          if (entry.reviewedAt > 0) return commitMs > entry.reviewedAt;
-          const entryIdx = hashToIdx.get(entry.hash);
-          return entryIdx !== undefined && idx < entryIdx;
-        });
-        const forWorkingReview = workingSvcsCold.has(svcId) && commitMs > minWorkingTs;
-        if (forCommitReview || forWorkingReview) {
-          commitsToInspect.push({ commit: c, commitMs, forCommitReview, forWorkingReview });
-        }
-      }
-    }
-
-    if (commitsToInspect.length === 0) return committedAfterByKey;
-
-    const inspected = await Promise.all(
-      commitsToInspect.map(async (item) => ({
-        ...item,
-        paths: await this.getCommitChangedFiles(item.commit, on),
-      }))
-    );
-
-    for (const { commit, commitMs, forCommitReview, forWorkingReview, paths } of inspected) {
-      for (const p of paths) {
-        const fk = `${commit.serviceId}::${p}`;
-        if (forCommitReview) {
-          const prevTs = committedAfterByKey.get(fk) || 0;
-          if (commitMs > prevTs) committedAfterByKey.set(fk, commitMs);
-        }
-        if (forWorkingReview) {
-          const reviewedAt = workingReviewedAtByKey.get(fk);
-          if (reviewedAt !== undefined && commitMs > reviewedAt) {
-            committedFileKeys.add(fk);
-          }
-        }
-      }
-    }
-
-    return committedAfterByKey;
-  }
-
-  async fetchFileDiffLines(file, viewMode, selectedCommit, on) {
+  async fetchFileDiffLines(file, on) {
     if (!file || !file.repoRoot) return ["No file selected"];
     const root = file.repoRoot;
     const path = file.path;
     let lines;
 
-    if (viewMode === "working") {
-      if (file.fresh || (!file.hasHead && file.status === "A")) {
-        const text = await readTextFile(`${root}/${path}`, { on }).catch(() => null);
-        if (text === null) lines = ["Cannot preview this file (binary, too large, or unreadable)"];
-        else if (text.includes("\0")) lines = ["Binary file · no text diff"];
-        else {
-          const lineTotal = countLines(text);
-          lines = [`@@ -0,0 +1,${lineTotal} @@`, ...text.slice(0, 400000).replace(/\n$/, "").split("\n").slice(0, 450).map((l) => `+${l}`)];
-        }
-      } else {
-        const diffArgs = ["diff", ...(file.hasHead ? ["HEAD"] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--", path];
-        const r = await exec("git", [...READ, ...diffArgs], { cwd: root, on });
-        if (r.code !== 0) throw new Error(r.stderr || "git diff failed");
-        const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
-        lines = first < 0 ? [file.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);
+    if (file.fresh) {
+      const text = await readTextFile(`${root}/${path}`, { on }).catch(() => null);
+      if (text === null) lines = ["Cannot preview this file (binary, too large, or unreadable)"];
+      else if (text.includes("\0")) lines = ["Binary file · no text diff"];
+      else {
+        const lineTotal = countLines(text);
+        lines = [`@@ -0,0 +1,${lineTotal} @@`, ...text.slice(0, 400000).replace(/\n$/, "").split("\n").slice(0, 450).map((l) => `+${l}`)];
       }
-    } else if (viewMode === "commit" && selectedCommit) {
-      const diffArgs = ["show", selectedCommit.hash, "--no-ext-diff", "--no-textconv", "--no-color", "--", path];
+    } else if (!file.hasHead) {
+      const diffArgs = ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color", "--", path];
       const r = await exec("git", [...READ, ...diffArgs], { cwd: root, on });
-      if (r.code !== 0) throw new Error(r.stderr || "git show failed");
+      if (r.code !== 0) throw new Error(r.stderr || "git diff --cached failed");
+      const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
+      lines = first < 0 ? [file.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);
+    } else {
+      const baseTarget = file.baseHash || "HEAD";
+      const diffArgs = ["diff", baseTarget, "--no-ext-diff", "--no-textconv", "--no-color", "--", path];
+      const r = await exec("git", [...READ, ...diffArgs], { cwd: root, on });
+      if (r.code !== 0) throw new Error(r.stderr || "git diff failed");
       const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
       lines = first < 0 ? [file.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);
     }
@@ -2742,25 +2319,15 @@ export default class ChangesReview extends View {
     return finalLines.map((line) => (line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line));
   }
 
-  async fetchViewerSourceLines(file, viewMode, selectedCommit, on) {
+  async fetchViewerSourceLines(file, on) {
     if (!file || !file.repoRoot || !file.path || file.binary || file.status === "D") return null;
-    if (viewMode === "commit" && selectedCommit?.hash) {
-      const r = await exec(
-        "git",
-        [...READ, "show", `${selectedCommit.hash}:${file.path}`],
-        { cwd: file.repoRoot, on },
-      ).catch(() => null);
-      if (!r || r.code !== 0 || typeof r.stdout !== "string") return null;
-      return splitSourceFileLines(r.stdout);
-    }
     const text = await readTextFile(`${file.repoRoot}/${file.path}`, { on }).catch(() => null);
     return splitSourceFileLines(text);
   }
 
   computeViewerLoadedKey(diff) {
     if (!diff?.openFileKey) return "empty";
-    const commitHash = diff.viewMode === "commit" ? (diff.selectedCommit?.hash || "") : "";
-    return `${diff.requestSeq || 0}::${diff.openFileKey}::${diff.viewMode || "working"}::${commitHash}`;
+    return `${diff.requestSeq || 0}::${diff.openFileKey}::${diff.openFile?.baseHash || ""}`;
   }
 
   scheduleViewerLoad(diff, cx) {
@@ -2847,9 +2414,7 @@ export default class ChangesReview extends View {
     const openFilePath = openFile?.path || openFile?.displayPath || "";
     if (!openFile || !isMarkdownFile(openFilePath)) return;
 
-    const viewMode = activeDiff?.viewMode || "working";
-    const commitHash = viewMode === "commit" ? (activeDiff?.selectedCommit?.hash || "") : "";
-    const fileId = computeViewerMarkdownFileId(openFile, viewMode, commitHash);
+    const fileId = computeViewerMarkdownFileId(openFile);
     const isCurrentlyActive = Boolean(this.viewerMarkdownRendered && this.viewerMarkdownFileId === fileId);
 
     if (isCurrentlyActive) {
@@ -2878,9 +2443,7 @@ export default class ChangesReview extends View {
     if (!this.viewerMarkdownRendered || this.viewerMarkdownFileId !== fileId) return false;
     const curDiff = readActiveDiff(spaceId);
     const curOpen = curDiff?.openFile || (curDiff?.files || []).find((f) => f.key === curDiff?.openFileKey) || null;
-    const curMode = curDiff?.viewMode || "working";
-    const curHash = curMode === "commit" ? (curDiff?.selectedCommit?.hash || "") : "";
-    return computeViewerMarkdownFileId(curOpen, curMode, curHash) === fileId;
+    return computeViewerMarkdownFileId(curOpen) === fileId;
   }
 
   loadViewerMarkdownNow(diff, cx, opts = {}) {
@@ -2889,8 +2452,6 @@ export default class ChangesReview extends View {
     const latestDiff = diff || readActiveDiff(ctx.spaceId);
     const files = latestDiff?.files || [];
     const openFile = latestDiff?.openFile || files.find((f) => f.key === latestDiff?.openFileKey) || null;
-    const viewMode = latestDiff?.viewMode || "working";
-    const commitHash = viewMode === "commit" ? (latestDiff?.selectedCommit?.hash || "") : "";
     const filePath = openFile?.path || openFile?.displayPath || "";
 
     if (!openFile || !isMarkdownFile(filePath)) {
@@ -2899,7 +2460,7 @@ export default class ChangesReview extends View {
       return;
     }
 
-    const fileId = computeViewerMarkdownFileId(openFile, viewMode, commitHash);
+    const fileId = computeViewerMarkdownFileId(openFile);
     if (!this.viewerMarkdownRendered || this.viewerMarkdownFileId !== fileId) {
       return;
     }
@@ -2910,14 +2471,10 @@ export default class ChangesReview extends View {
 
     const reloadNonce = this.getMarkdownReloadNonce(fileId);
     const loadToken = computeReviewMarkdownLoadToken(openFile, {
-      viewMode,
-      commitHash,
       requestSeq: latestDiff?.requestSeq || 0,
       reloadNonce,
     });
     const cacheKey = buildReviewMarkdownCacheKey(openFile, {
-      viewMode,
-      commitHash,
       loadToken,
     });
 
@@ -2943,8 +2500,6 @@ export default class ChangesReview extends View {
     }
 
     const spec = resolveReviewMarkdownSourceSpec(openFile, {
-      viewMode,
-      commitHash,
       on: latestDiff?.on ?? null,
     });
 
@@ -3040,11 +2595,9 @@ export default class ChangesReview extends View {
     this.open = openFile ? openFile.key : null;
     this.viewerNote = null;
 
-    const viewMode = diff?.viewMode || "working";
-    const commitHash = viewMode === "commit" ? (diff?.selectedCommit?.hash || "") : "";
     const openFilePath = openFile?.path || openFile?.displayPath || "";
     const isMdFile = Boolean(openFile && isMarkdownFile(openFilePath));
-    const nextFileId = isMdFile ? computeViewerMarkdownFileId(openFile, viewMode, commitHash) : "";
+    const nextFileId = isMdFile ? computeViewerMarkdownFileId(openFile) : "";
     const seq = diff?.requestSeq || 0;
     const isCommentJump = Boolean(diff?.openCommentLine != null && seq && seq !== this.lastHandledSeq);
 
@@ -3085,12 +2638,7 @@ export default class ChangesReview extends View {
 
     const runLoad = async (asyncCx) => {
       try {
-        const lines = await this.fetchFileDiffLines(
-          openFile,
-          diff?.viewMode || "working",
-          diff?.selectedCommit || null,
-          diff?.on ?? null,
-        );
+        const lines = await this.fetchFileDiffLines(openFile, diff?.on ?? null);
         if (this._viewerClosed || gen !== this.viewerLoadGen) return;
         const canExpandBottom = Boolean(
           !openFile.fresh &&
@@ -3105,12 +2653,23 @@ export default class ChangesReview extends View {
           this.lastHandledSeq = seq;
         }
 
+        const findRowForTarget = (targetLine, targetSide) => {
+          if (targetSide) {
+            const normSide = normalizeCommentSide(targetSide);
+            const exact = this.rows.findIndex(
+              (r) => r.number === targetLine && (r.kind === "-" ? "old" : "new") === normSide,
+            );
+            if (exact >= 0) return exact;
+          }
+          return this.rows.findIndex((r) => r.number === targetLine);
+        };
+
         if (shouldConsumeDirectives && diff?.focusLine != null) {
-          const rowIdx = this.rows.findIndex((r) => r.number === diff.focusLine);
+          const rowIdx = findRowForTarget(diff.focusLine, diff.focusSide);
           if (rowIdx >= 0) {
             const ctxNow = this.getSessionContext();
             const cMap = this.buildCommentMapForFile(openFile.key, ctxNow);
-            const layout = this.computeDiffRowLayout(cMap, this.getReviewWrapCols());
+            const layout = this.computeDiffRowLayout(cMap, this.getReviewWrapCols(), openFile.key);
             this.diffScrollPx = computeDiffScrollOffsetForRow(layout, rowIdx, this.getDiffViewportHeight(), "center");
           }
         } else if (prevOpenKey !== openFile.key || opts.forceScrollTop) {
@@ -3118,12 +2677,15 @@ export default class ChangesReview extends View {
         }
 
         if (diff?.openCommentLine != null && diff?.openCommentLine !== undefined && shouldConsumeDirectives) {
-          const row = this.rows.find((r) => r.number === diff.openCommentLine);
+          const commentSide = normalizeCommentSide(diff.openCommentSide);
+          const rowIdx = findRowForTarget(diff.openCommentLine, commentSide);
+          const row = rowIdx >= 0 ? this.rows[rowIdx] : null;
           const ctxNow = this.getSessionContext();
-          const cur = this.getComment(openFile.key, diff.openCommentLine, ctxNow);
+          const cur = this.getComment(openFile.key, diff.openCommentLine, commentSide, ctxNow);
           this.openCommentEditor(
             openFile,
             diff.openCommentLine,
+            commentSide,
             cur?.snippet || row?.text || "",
             cur ? cur.text : "",
             asyncCx,
@@ -3152,15 +2714,13 @@ export default class ChangesReview extends View {
     const payload = this.buildActiveDiffPayload(nextFile, {
       ...overrides,
       files: overrides.files ?? diff?.files ?? [],
-      allFiles: overrides.allFiles ?? diff?.allFiles ?? diff?.files ?? [],
       services: overrides.services ?? diff?.services ?? [],
-      viewMode: overrides.viewMode ?? diff?.viewMode ?? "working",
-      selectedCommit: overrides.selectedCommit !== undefined ? overrides.selectedCommit : (diff?.selectedCommit ?? null),
-      activeService: overrides.activeService ?? diff?.activeService ?? "all",
       on: overrides.on !== undefined ? overrides.on : (diff?.on ?? null),
       bumpSeq: true,
       focusLine: null,
+      focusSide: null,
       openCommentLine: null,
+      openCommentSide: null,
     });
     writeActiveDiff(ctx.spaceId, payload);
     const revTab = findReviewTabInSpace(ctx.spaceId);
@@ -3191,17 +2751,16 @@ export default class ChangesReview extends View {
     const curFile = diff?.openFile || files.find((f) => f.key === diff?.openFileKey) || null;
     if (!curFile) return;
 
-    const scope = this.fileReviewScope(diff?.viewMode, diff?.selectedCommit);
-    const rk = this.fileReviewKey(curFile, scope);
+    const rk = this.fileReviewKey(curFile);
     if (!rk) return;
 
-    const { nextReviewed, updatedFlow } = this.applyFileReviewToggle(curFile, curFile.key, scope, ctx);
+    const { nextReviewed, updatedFlow } = this.applyFileReviewToggle(curFile, curFile.key, ctx);
 
     if (nextReviewed) {
       const nextFile = pickNextUnreviewedFile(
         files,
         curFile.key,
-        (cand) => this.isFileReviewed(cand, updatedFlow, scope),
+        (cand) => this.isFileReviewed(cand, updatedFlow),
       );
       if (nextFile) {
         this.openViewerFile(nextFile, diff, ctx, cx);
@@ -3230,7 +2789,9 @@ export default class ChangesReview extends View {
       select: true,
       bumpSeq: true,
       focusLine: null,
+      focusSide: null,
       openCommentLine: null,
+      openCommentSide: null,
     });
     cx.notify();
   }
@@ -3248,12 +2809,13 @@ export default class ChangesReview extends View {
     }
 
     const ctx = this.getSessionContext();
-    const commentMap = this.buildCommentMapForFile(activeKey || this.open, ctx);
+    const openKey = activeKey || this.open;
+    const commentMap = this.buildCommentMapForFile(openKey, ctx);
     const wrapCols = this.getReviewWrapCols();
     const vpH = this.getDiffViewportHeight();
 
     // Measure old layout before splicing (keep pre-sync row positions aligned with current screen).
-    const oldLayout = this.computeDiffRowLayout(commentMap, wrapCols);
+    const oldLayout = this.computeDiffRowLayout(commentMap, wrapCols, openKey);
     const oldGapIdx = this.rows.findIndex((r) => r?.kind === "@" && r?.gap?.id === gapId);
     const oldGapOffset = oldGapIdx >= 0 ? (oldLayout.offsets[oldGapIdx] ?? 0) : 0;
     const gapScreenY = oldGapOffset - (this.diffScrollPx || 0);
@@ -3269,7 +2831,7 @@ export default class ChangesReview extends View {
     const oldScrollPx = this.diffScrollPx || 0;
     this.rows = result.rows;
     this.diffWidth = computeDiffContentWidth(this.rows);
-    const newLayout = this.computeDiffRowLayout(commentMap, wrapCols);
+    const newLayout = this.computeDiffRowLayout(commentMap, wrapCols, openKey);
     this.diffScrollPx = computeAnchorPreservedScrollPx(
       oldLayout,
       newLayout,
@@ -3318,12 +2880,7 @@ export default class ChangesReview extends View {
 
     cx.spawn(async (asyncCx) => {
       try {
-        const sourceLines = await this.fetchViewerSourceLines(
-          openFile,
-          diff?.viewMode || "working",
-          diff?.selectedCommit || null,
-          diff?.on ?? null,
-        );
+        const sourceLines = await this.fetchViewerSourceLines(openFile, diff?.on ?? null);
         if (this._viewerClosed || gen !== this.viewerLoadGen || loadedKey !== this.viewerLoadedKey) return;
         this.viewerExpandingGapId = null;
         if (!Array.isArray(sourceLines)) {
@@ -3372,17 +2929,18 @@ export default class ChangesReview extends View {
     return out.length > 0 ? out : [" "];
   }
 
-  computeDiffRowLayout(commentMap, wrapCols) {
+  computeDiffRowLayout(commentMap, wrapCols, openKey = null) {
     const rows = this.rows;
     const len = rows.length;
+    const activeOpenKey = openKey || this.open || "";
 
     let commentSig = "";
     if (commentMap && commentMap.size > 0) {
-      commentMap.forEach((rec, lineNo) => {
-        commentSig += `${lineNo}:${rec?.text?.length || 0};`;
+      commentMap.forEach((rec, cKey) => {
+        commentSig += `${cKey}:${rec?.text?.length || 0};`;
       });
     }
-    const cacheSig = `${len}|${wrapCols}|${commentSig}`;
+    const cacheSig = `${len}|${wrapCols}|${activeOpenKey}|${commentSig}`;
     if (
       this._rowLayoutCache &&
       this._rowLayoutCache.rows === rows &&
@@ -3405,7 +2963,8 @@ export default class ChangesReview extends View {
       const lineCount = countWrappedLines(r.text || " ", wrapCols);
       let h = Math.max(1, lineCount) * REVIEW_ROW_HEIGHT;
       if (r.number !== undefined) {
-        const existing = commentMap ? commentMap.get(r.number) : null;
+        const rowSide = r.kind === "-" ? "old" : "new";
+        const existing = commentMap ? commentMap.get(buildCommentKey(activeOpenKey, r.number, rowSide)) : null;
         if (existing) {
           const cLines = this.getWrappedCommentLines(existing.text, wrapCols);
           h += 13 + cLines.length * 16;
@@ -3468,10 +3027,12 @@ export default class ChangesReview extends View {
     const rowObj = this.rows[rowIndex];
     if (!rowObj) return;
     const activeKey = readActiveDiff(this.getSessionContext().spaceId)?.openFileKey || fallbackOpenKey || this.open;
+    const rowSide = rowObj.kind === "-" ? "old" : "new";
     this.logger?.action("review.diffRowClick", {
       rowIndex,
       kind: rowObj.kind || "",
       line: rowObj.number ?? null,
+      side: rowSide,
       openKey: activeKey || "",
     }, cx);
     if (rowObj.kind === "@") {
@@ -3486,7 +3047,7 @@ export default class ChangesReview extends View {
         this.expandDiffGap(rowIndex, "all", activeKey, cx);
       }
     } else if (rowObj.number !== undefined) {
-      this.startComment(activeKey, rowObj.number, rowObj.text, cx, rowIndex);
+      this.startComment(activeKey, rowObj.number, rowSide, rowObj.text, cx, rowIndex);
     }
   }
 
@@ -3667,8 +3228,14 @@ export default class ChangesReview extends View {
         ));
     }
     const isCommentable = number !== undefined;
-    const existing = (isCommentable && commentMap) ? commentMap.get(number) : null;
-    const isActive = this.activeComment && this.activeComment.fileKey === openKey && this.activeComment.line === number;
+    const rowSide = kind === "-" ? "old" : "new";
+    const existing = (isCommentable && commentMap) ? commentMap.get(buildCommentKey(openKey, number, rowSide)) : null;
+    const isActive = Boolean(
+      this.activeComment &&
+      this.activeComment.fileKey === openKey &&
+      this.activeComment.line === number &&
+      normalizeCommentSide(this.activeComment.side) === rowSide
+    );
 
     const isAdd = kind === "+";
     const isDel = kind === "-";
@@ -3785,8 +3352,10 @@ export default class ChangesReview extends View {
   renderCommentComposer(t, commentMap, openKey) {
     const active = this.activeComment;
     if (!active || active.fileKey !== openKey) return div();
-    const existing = commentMap ? commentMap.get(active.line) : null;
+    const activeSide = normalizeCommentSide(active.side);
+    const existing = commentMap ? commentMap.get(buildCommentKey(openKey, active.line, activeSide)) : null;
     const canSave = Boolean(this.commentText.trim());
+    const lineTitle = activeSide === "old" ? `Line ${active.line} (removed)` : `Line ${active.line}`;
     return v_flex().id("review-comment-composer").w_full().min_w(0).flex_none()
       .px(12).py(8).gap(6).bg(t.raised).border_t(1).border_color(t.border)
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
@@ -3795,7 +3364,7 @@ export default class ChangesReview extends View {
           .child(
             h_flex().items_center().gap(6).min_w(0).flex_1()
               .child(svg("mods/changes-review/icons/comment.svg").size(11).flex_none().text_color(t.accent))
-              .child(div().flex_none().whitespace_nowrap().text_size(11.5).font_semibold().text_color(t.foreground).child(`Line ${active.line}`))
+              .child(div().flex_none().whitespace_nowrap().text_size(11.5).font_semibold().text_color(t.foreground).child(lineTitle))
               .when(Boolean(active.snippet), (e) =>
                 e.child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(active.snippet))
               )
@@ -3806,7 +3375,7 @@ export default class ChangesReview extends View {
                 .border_1().border_color(t.border).bg(t.background)
                 .text_color(t.muted).text_size(11).cursor_pointer()
                 .hover((s) => s.text_color(t.foreground).bg(t.hover))
-                .on_click((_e, cx) => this.removeComment(openKey, active.line, cx))
+                .on_click((_e, cx) => this.removeComment(openKey, active.line, activeSide, cx))
                 .child(svg("mods/changes-review/icons/trash.svg").size(10).flex_none().text_color(t.muted))
                 .child("Delete")
             )
@@ -3852,7 +3421,6 @@ export default class ChangesReview extends View {
     } catch (err) {
       const ser = this.logger?.recordRenderError(err, {
         mode: this.isViewerMode() ? "viewer" : "panel",
-        viewMode: this.viewMode,
         filesCount: this.files?.length || 0,
         hiddenPreExistingCount: this.hiddenPreExistingCount || 0,
       }, cx);
@@ -3871,7 +3439,6 @@ export default class ChangesReview extends View {
               trigger: "error-card",
               extraState: {
                 mode: this.isViewerMode() ? "viewer" : "panel",
-                viewMode: this.viewMode,
                 filesCount: this.files?.length || 0,
                 hiddenPreExistingCount: this.hiddenPreExistingCount || 0,
                 showAllWorkingChanges: Boolean(this.showAllWorkingChanges),
@@ -3901,12 +3468,9 @@ export default class ChangesReview extends View {
     const services = diff?.services || [];
     const openFile = diff?.openFile || files.find((f) => f.key === diff?.openFileKey) || null;
     const openKey = openFile?.key || diff?.openFileKey || null;
-    const viewMode = diff?.viewMode || "working";
-    const selectedCommit = diff?.selectedCommit || null;
-    const commitHash = viewMode === "commit" ? (selectedCommit?.hash || "") : "";
     const openFilePath = openFile?.path || openFile?.displayPath || "";
     const isMdFile = Boolean(openFile && isMarkdownFile(openFilePath));
-    const currentMdFileId = isMdFile ? computeViewerMarkdownFileId(openFile, viewMode, commitHash) : "";
+    const currentMdFileId = isMdFile ? computeViewerMarkdownFileId(openFile) : "";
     const markdownActive = Boolean(
       isMdFile &&
       this.viewerMarkdownRendered &&
@@ -3915,15 +3479,14 @@ export default class ChangesReview extends View {
 
     const flows = readFlows();
     const flow = ctx.sourceTabId ? (flows[ctx.sourceTabId] || {}) : {};
-    const scope = this.fileReviewScope(viewMode, selectedCommit);
-    const openFileReviewed = openFile ? this.isFileReviewed(openFile, flow, scope) : false;
-    const reviewedFilesCount = files.reduce((n, f) => n + (this.isFileReviewed(f, flow, scope) ? 1 : 0), 0);
+    const openFileReviewed = openFile ? this.isFileReviewed(openFile, flow) : false;
+    const reviewedFilesCount = files.reduce((n, f) => n + (this.isFileReviewed(f, flow) ? 1 : 0), 0);
     const allFilesReviewed = files.length > 0 && reviewedFilesCount === files.length;
     const fileIdx = openKey ? files.findIndex((f) => f.key === openKey) : -1;
 
     const commentMap = this.buildCommentMapForFile(openKey, ctx);
     const wrapCols = markdownActive ? 96 : this.getReviewWrapCols();
-    const diffRowLayout = !markdownActive ? this.computeDiffRowLayout(commentMap, wrapCols) : null;
+    const diffRowLayout = !markdownActive ? this.computeDiffRowLayout(commentMap, wrapCols, openKey) : null;
     const diffViewportH = this.getDiffViewportHeight();
     const diffSlice = diffRowLayout
       ? computeVariableWindowSlice(diffRowLayout, this.diffScrollPx, diffViewportH, 2)
@@ -3935,6 +3498,9 @@ export default class ChangesReview extends View {
     const canStepFiles = files.length > 1;
     const openIcon = openFile ? resolveDiffFileIcon(openFile.path || openFile.displayPath, t) : null;
     const compactViewer = (this.viewerWidth || 900) < 680;
+    const baseBadgeLabel = openFile?.baseRef
+      ? `vs ${openFile.baseRef}`
+      : (openFile?.hasHead === false ? "New repo" : "Session");
 
     const renderFileInfo = () =>
       h_flex()
@@ -3960,10 +3526,10 @@ export default class ChangesReview extends View {
         )
         .when((openFile?.add || 0) > 0, (b) => b.child(div().flex_none().text_size(11).text_color(add).child(`+${openFile.add}`)))
         .when((openFile?.del || 0) > 0, (b) => b.child(div().flex_none().text_size(11).text_color(del).child(`−${openFile.del}`)))
-        .when(!compactViewer || viewMode === "commit", (b) => b.child(
+        .when(!compactViewer, (b) => b.child(
           div().flex_none().px(5).py(1).rounded(4).bg(t.background).border_1().border_color(t.border)
-            .text_size(10).text_color(viewMode === "commit" ? (t.accent || t.foreground) : t.muted)
-            .child(viewMode === "commit" && selectedCommit?.shortHash ? selectedCommit.shortHash : "Working")
+            .text_size(10).text_color(t.muted)
+            .child(baseBadgeLabel)
         ));
 
     const renderReviewControls = () =>
@@ -4291,7 +3857,7 @@ export default class ChangesReview extends View {
                     .when(!openFile, (e) => e.child(
                       h_flex().absolute().inset_0().items_center().justify_center()
                         .child(div().text_size(12).text_color(t.dim).child(
-                          files.length === 0 && viewMode === "working"
+                          files.length === 0
                             ? "No changes in this session yet"
                             : "Select a file from the Changes panel to review its diff"
                         ))
@@ -4305,83 +3871,6 @@ export default class ChangesReview extends View {
       .when(!markdownActive && Boolean(this.activeComment && this.activeComment.fileKey === openKey), (el) =>
         el.child(this.renderCommentComposer(t, commentMap, openKey))
       );
-  }
-
-  getCommitMenuItems(t) {
-    if (!this.showCommitMenu) return [];
-    const selectedHash = this.selectedCommit?.hash || "";
-    const servicesCount = this.services.length;
-    const themeSig = `${t?.accent || ""}|${t?.foreground || ""}|${t?.muted || ""}|${t?.dim || ""}|${t?.background || ""}`;
-    if (
-      this._cachedCommitMenu &&
-      this._cachedCommitMenu.viewMode === this.viewMode &&
-      this._cachedCommitMenu.selectedHash === selectedHash &&
-      this._cachedCommitMenu.workingFilesCount === this.workingFilesCount &&
-      this._cachedCommitMenu.servicesCount === servicesCount &&
-      this._cachedCommitMenu.commits === this.commits &&
-      this._cachedCommitMenu.themeSig === themeSig
-    ) {
-      return this._cachedCommitMenu.items;
-    }
-
-    const items = [
-      {
-        type: "option",
-        id: "select-working-tree",
-        icon: "mods/changes-review/icons/git-commit.svg",
-        iconSize: 13,
-        iconColor: this.viewMode === "working" ? (t.accent || t.foreground) : t.muted,
-        label: "Working Tree",
-        fontMedium: this.viewMode === "working",
-        meta: "Uncommitted",
-        metaColor: t.dim,
-        badge: this.workingFilesCount > 0 ? String(this.workingFilesCount) : undefined,
-        badgeBg: t.raised || t.background,
-        badgeColor: t.muted,
-        selected: this.viewMode === "working",
-        onSelect: (_e, cx) => this.switchMode("working", null, cx),
-      },
-    ];
-
-    if (this.commits.length > 0) {
-      items.push({ type: "divider", id: "commit-menu-divider" });
-      for (let i = 0; i < this.commits.length; i += 1) {
-        const c = this.commits[i];
-        const isSelected = this.viewMode === "commit" && selectedHash === c.hash;
-        items.push({
-          type: "option",
-          id: `commit-item-${c.serviceId || "repo"}-${c.hash || `${c.shortHash}-${i}`}`,
-          icon: "mods/changes-review/icons/git-commit.svg",
-          iconSize: 13,
-          iconColor: isSelected ? (t.accent || t.foreground) : t.muted,
-          label: c.subject || c.shortHash,
-          labelColor: t.foreground,
-          fontMedium: isSelected,
-          subline: [c.author, c.date].filter(Boolean).join(" · ") || undefined,
-          sublineColor: t.dim,
-          sublineBadge: servicesCount > 1 && c.serviceName ? c.serviceName : undefined,
-          sublineBadgeBg: t.raised || t.background,
-          sublineBadgeColor: t.muted,
-          rightText: c.shortHash,
-          rightMono: true,
-          rightColor: isSelected ? t.foreground : t.dim,
-          height: 42,
-          selected: isSelected,
-          onSelect: (_e, cx) => this.switchMode("commit", c, cx),
-        });
-      }
-    }
-
-    this._cachedCommitMenu = {
-      viewMode: this.viewMode,
-      selectedHash,
-      workingFilesCount: this.workingFilesCount,
-      servicesCount,
-      commits: this.commits,
-      themeSig,
-      items,
-    };
-    return items;
   }
 
   renderPanel(cx) {
@@ -4400,6 +3889,11 @@ export default class ChangesReview extends View {
       this.needsRefreshOnShow = true;
     }
 
+    // Zero per-frame allocations when the Changes sidebar panel is hidden.
+    if (!visible) {
+      return div().id("changes");
+    }
+
     const allSpaces = spaces() || [];
     const allPanes = panes() || [];
     const curSpace = allSpaces.find((s) => s.active);
@@ -4414,26 +3908,13 @@ export default class ChangesReview extends View {
     const ctx = this.getSessionContext();
     const activeDiff = readActiveDiff(ctx.spaceId);
     const revTab = findReviewTabInSpace(ctx.spaceId, allSpaces, allPanes);
-    const sharedActive = shared("cognivisor.activeService");
-    const extServiceChanged = Boolean(
-      sharedActive &&
-      normPathStr(sharedActive.workspaceRoot) === normPathStr(this.workspaceRoot) &&
-      typeof sharedActive.ts === "number" &&
-      sharedActive.ts > (this.lastActiveServiceTs || 0) &&
-      sharedActive.serviceId &&
-      sharedActive.serviceId !== this.activeService &&
-      (sharedActive.serviceId === "all" || this.services.some((s) => s.id === sharedActive.serviceId))
-    );
     const diffSyncedFromViewer = Boolean(
       revTab &&
       activeDiff &&
       activeDiff.sourceTabId === ctx.sourceTabId &&
-      (activeDiff.openFileKey !== this.open ||
-        (activeDiff.activeService &&
-          activeDiff.activeService !== this.activeService &&
-          (activeDiff.activeService === "all" || this.services.some((s) => s.id === activeDiff.activeService))))
+      activeDiff.openFileKey !== this.open
     );
-    if (extServiceChanged || diffSyncedFromViewer) {
+    if (diffSyncedFromViewer) {
       this.scheduleSharedSync(cx);
     }
 
@@ -4443,53 +3924,21 @@ export default class ChangesReview extends View {
     const dt = getDiffTheme(t);
     const { add, del } = dt;
     const passColor = t.ansi2 || t.done || t.accent;
-    const noteColor = t.blocked || t.working || t.accent;
 
     const flows = readFlows();
     const flow = ctx.sourceTabId ? (flows[ctx.sourceTabId] || {}) : {};
     const sessionReviews = this.getSessionReviews(ctx);
-    const sortedServices = this.getSortedServices();
-    const soleService = this.services.length === 1 ? (this.services[0] || null) : null;
 
     const targetRepos = this.getTargetRepos();
     const commitEnabled = Boolean(this.message.trim() && targetRepos.length > 0 && !this.busy && !this.loading);
     const agent = this.findActiveAgent();
     const agentName = agent ? (agent.title || agent.app || agent.address) : null;
-    const mono = settings()?.font_family ?? "JetBrains Mono";
     const highlightedOpenKey = (revTab && activeDiff && activeDiff.sourceTabId === ctx.sourceTabId)
       ? activeDiff.openFileKey
       : this.open;
     const reviewedFilesCount = this.files.reduce((n, f) => n + (this.isFileReviewed(f, flow) ? 1 : 0), 0);
     const allFilesReviewed = this.files.length > 0 && reviewedFilesCount === this.files.length;
     const compactPanel = (this.panelWidth || 420) < 380;
-
-    const commitSelectorLabel = this.viewMode === "working"
-      ? "Working Tree"
-      : this.selectedCommit
-        ? `${this.services.length > 1 && this.selectedCommit.serviceName ? `[${this.selectedCommit.serviceName}] ` : ""}${this.selectedCommit.shortHash}: ${this.selectedCommit.subject}`
-        : "Select commit";
-
-    const renderCommitSelector = () =>
-      renderDropdownTrigger({
-        id: "commit-selector-btn",
-        isOpen: this.showCommitMenu,
-        label: commitSelectorLabel,
-        labelColor: t.foreground,
-        fontMedium: true,
-        badge: this.viewMode === "working" && this.workingFilesCount > 0 ? String(this.workingFilesCount) : undefined,
-        leftIcon: "mods/changes-review/icons/git-commit.svg",
-        leftIconSize: 11,
-        leftIconColor: this.viewMode === "working" ? t.muted : (t.accent || t.foreground),
-        chevronIcon: "mods/changes-review/icons/chevron-down.svg",
-        maxW: compactPanel ? undefined : 210,
-        flex1: !compactPanel,
-        fullWidth: compactPanel,
-        t,
-        onClick: (_e, cx) => {
-          this.showCommitMenu = !this.showCommitMenu;
-          cx.notify();
-        },
-      });
 
     const renderPanelHeaderBadges = () =>
       h_flex().flex_none().gap(6).items_center()
@@ -4524,13 +3973,6 @@ export default class ChangesReview extends View {
       })
       .on_key_down((e, cx) => {
         if (e.key === "escape") {
-          if (this.showCommitMenu) {
-            this.showCommitMenu = false;
-            this.handle.focus();
-            cx.stop_propagation();
-            cx.notify();
-            return;
-          }
           if (this.typingCommit) {
             this.typingCommit = false;
             this.handle.focus();
@@ -4540,101 +3982,20 @@ export default class ChangesReview extends View {
           }
         }
       })
-      // Header
+      // Compact unified header (no commit picker, no repo filter bar)
       .child(
-        compactPanel
-          ? v_flex().flex_none().px(10).py(7).gap(6).border_b(1).border_color(t.border)
-              .child(
-                h_flex().w_full().min_w(0).gap(6).items_center().justify_between()
-                  .child(renderPanelHeaderBadges())
-                  .child(
-                    h_flex().flex_none().gap(6).items_center()
-                      .child(div().flex_none().text_size(11).text_color(add).child(`+${addCount}`))
-                      .child(div().flex_none().text_size(11).text_color(del).child(`−${delCount}`))
-                  )
-              )
-              .child(renderCommitSelector())
-          : h_flex().min_h(40).flex_none().px(12).py(6).gap(8).items_center().border_b(1).border_color(t.border)
-              .child(renderPanelHeaderBadges())
-              .child(renderCommitSelector())
-              .child(div().flex_1())
-              .child(div().flex_none().text_size(11).text_color(add).child(`+${addCount}`))
-              .child(div().flex_none().text_size(11).text_color(del).child(`−${delCount}`))
+        h_flex().min_h(40).flex_none().px(compactPanel ? 10 : 12).py(6).gap(8).items_center().border_b(1).border_color(t.border)
+          .child(renderPanelHeaderBadges())
+          .child(div().flex_1())
+          .child(div().flex_none().text_size(11).text_color(add).child(`+${addCount}`))
+          .child(div().flex_none().text_size(11).text_color(del).child(`−${delCount}`))
       )
 
-      // Service filter bar (when workspace contains multiple repositories)
-      .when(this.services.length > 1, (el) => {
-        const isAllActive = this.activeService === "all";
-        return el.child(
-          h_flex().id("service-filter-bar").h(32).flex_none().px(10).gap(6).items_center().border_b(1).border_color(t.border).bg(t.raised).overflow_x_scrollbar().track_scroll(this.serviceFilterScroll)
-            .child(
-              h_flex().id("service-pill-all").h(22).flex_none().px(7).gap(5).items_center().rounded(4).cursor_pointer()
-                .when(isAllActive, (s) => s.bg(t.background).border_1().border_color(t.border).text_color(t.foreground).font_medium(), (s) => s.bg(t.raised).text_color(t.muted).hover((h) => h.bg(t.hover).text_color(t.foreground)))
-                .on_click((_e, cx) => this.selectService("all", cx))
-                .child(div().text_size(11).child("All"))
-                .child(
-                  div().flex_none().px(4).py(0.5).rounded(3).bg(isAllActive ? t.raised : t.background).text_size(9.5).text_color(t.muted).child(String(this.allWorkingFiles.length))
-                )
-            )
-            .children(
-              sortedServices.map((s) => {
-                const isCur = this.activeService === s.id;
-                const count = s.workingCount || 0;
-                const svcStatus = this.getServiceReviewStatus(s.id, flow, sessionReviews);
-                const glyph = svcStatus === "approved" ? "✓" : svcStatus === "has_notes" ? "✎" : "○";
-                const glyphColor = svcStatus === "approved" ? passColor : svcStatus === "has_notes" ? noteColor : t.dim;
-                const branchLabel = s.branch || "";
-                return h_flex().id(`service-pill-${s.id}`).h(22).flex_none().px(7).gap(5).items_center().rounded(4).cursor_pointer()
-                  .when(isCur, (p) => p.bg(t.background).border_1().border_color(t.border).text_color(t.foreground).font_medium(), (p) => p.bg(t.raised).text_color(t.muted).hover((h) => h.bg(t.hover).text_color(t.foreground)))
-                  .on_click((_e, cx) => this.selectService(s.id, cx))
-                  .child(div().flex_none().text_size(10).text_color(glyphColor).child(glyph))
-                  .child(div().flex_none().text_size(11).child(s.name))
-                  .when(Boolean(branchLabel), (p) => p.child(
-                    div().max_w(96).truncate().text_size(9.5).text_color(isCur ? t.muted : t.dim).child(branchLabel)
-                  ))
-                  .when(count > 0, (p) => p.child(
-                    div().flex_none().px(4).py(0.5).rounded(3).bg(isCur ? t.raised : t.background).text_size(9.5).text_color(t.muted).child(String(count))
-                  ));
-              })
-            )
-        );
-      })
-
-      // Compact read-only branch bar when workspace contains a single repository
-      .when(Boolean(soleService), (el) => {
-        const svc = soleService;
-        const branchLabel = svc.branch || "HEAD";
-        return el.child(
-          h_flex()
-            .id("microservice-review-bar")
-            .min_h(28)
-            .flex_none()
-            .px(10)
-            .py(4)
-            .gap(6)
-            .items_center()
-            .border_b(1)
-            .border_color(t.border)
-            .bg(t.raised)
-            .child(svg("mods/changes-review/icons/git-branch.svg").size(11).flex_none().text_color(t.muted))
-            .child(
-              div()
-                .flex_1()
-                .min_w(0)
-                .truncate()
-                .text_size(11)
-                .font_medium()
-                .text_color(t.foreground)
-                .child(`${svc.name} · ${branchLabel}`),
-            ),
-        );
-      })
-
       // Pre-existing hidden files banner + toggle + baseline reset
-      .when(this.viewMode === "working" && (this.hiddenPreExistingCount > 0 || this.showAllWorkingChanges), (el) => {
+      .when(this.hiddenPreExistingCount > 0 || this.showAllWorkingChanges, (el) => {
         const n = this.hiddenPreExistingCount;
         const label = this.showAllWorkingChanges
-          ? (n > 0 ? `Showing all working changes (${n} pre-existing)` : "Showing all working changes")
+          ? (n > 0 ? `Showing all changes (${n} pre-existing)` : "Showing all changes")
           : `${n} ${n === 1 ? "file" : "files"} hidden as pre-existing`;
         return el.child(
           h_flex()
@@ -4697,7 +4058,7 @@ export default class ChangesReview extends View {
         );
       })
 
-      // File list (changes-list fills remaining space above the bottom Review | Commit drawer)
+      // Unified changed files list across all session-touched repositories
       .child(v_flex().id("changes-list").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.files.map((f) => {
         const parts = f.path.split("/"), name = parts.pop();
         const isReviewed = this.isFileReviewed(f, flow);
@@ -4724,12 +4085,12 @@ export default class ChangesReview extends View {
               .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
               .on_click((_e, cx) => {
                 cx.stop_propagation();
-                this.toggleFileReviewed(f, cx, false);
+                this.toggleFileReviewed(f, cx);
               })
               .child(div().text_size(9.5).font_semibold().child(isReviewed ? "✓" : ""))
           )
           .child(div().w(14).text_size(11).text_color(f.status === "A" ? add : f.status === "D" || f.status === "U" ? del : t.blocked).child(f.status))
-          .when(this.services.length > 1 && this.activeService === "all", (e) => e.child(
+          .when(this.services.length > 1, (e) => e.child(
             div().flex_none().px(4).py(0.5).rounded(3).bg(t.raised).border_1().border_color(t.border).text_size(9.5).text_color(t.muted).child(f.serviceName)
           ))
           .child(svg(fileIcon.path).size(13).flex_none().text_color(fileIcon.color))
@@ -4741,7 +4102,7 @@ export default class ChangesReview extends View {
           .when(f.add > 0, (e) => e.child(div().text_size(11).text_color(isReviewed ? t.dim : add).child(`+${f.add}`)))
           .when(f.del > 0, (e) => e.child(div().text_size(11).text_color(isReviewed ? t.dim : del).child(`−${f.del}`)));
       })).when(!this.files.length, (e) => e.child(div().p(8).text_color(t.dim).child(
-        this.error || (this.loading ? "Loading changes…" : !this.workspaceRoot ? "No folder" : this.viewMode === "commit" ? "No files changed in this commit" : "No changes in this session yet")
+        this.error || (this.loading ? "Loading changes…" : !this.workspaceRoot ? "No folder" : "No changes in this session yet")
       ))))
 
       .when(this.limited, (el) => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files")))
@@ -4769,9 +4130,9 @@ export default class ChangesReview extends View {
           )
       )
 
-      // Commit section (Working Tree commit input, or switch button if viewing historical commit/branch)
+      // Commit section (strictly targets visible dirty working-tree files)
       .when(this.bottomTab === "commit", (el) => el.child(
-        this.viewMode === "working"
+        targetRepos.length > 0 || this.files.length === 0
           ? h_flex().flex_none().p(10).gap(8).border_t(1).border_color(t.border).bg(t.background)
               .child(
                 div().id("commit-message").flex_1().min_w(0).h(32).px(10).flex().items_center().rounded(8).border_1().border_color(this.typingCommit ? t.accent : t.border).bg(t.background).cursor_text().on_mouse_down("left", (_e, cx) => cx.stop_propagation())
@@ -4788,10 +4149,10 @@ export default class ChangesReview extends View {
               )
           : h_flex().flex_none().px(12).py(8).gap(6).items_center().border_t(1).border_color(t.border).bg(t.background)
               .child(svg("mods/changes-review/icons/git-commit.svg").size(12).flex_none().text_color(t.muted))
-              .child(div().flex_1().min_w(0).text_size(11.5).text_color(t.dim).child("Select Working Tree above to commit."))
+              .child(div().flex_1().min_w(0).text_size(11.5).text_color(t.dim).child("All session changes are already committed (no uncommitted working-tree files)."))
       ))
 
-      // Review section (scrollable list of notes + send to agent without counter)
+      // Review section (scrollable list of side-aware notes + send to agent)
       .when(this.bottomTab === "review", (el) => el.child(
         v_flex().flex_none().p(8).gap(6).border_t(1).border_color(t.border).bg(t.background)
           .when(sessionReviews.length === 0, (h) => h.child(
@@ -4805,17 +4166,19 @@ export default class ChangesReview extends View {
                     const fileName = (r.displayPath || r.file).split("/").pop();
                     const firstLine = String(r.text || "").split(/\r?\n/)[0];
                     const servicePrefix = this.services.length > 1 && r.serviceName ? `[${r.serviceName}] ` : "";
-                    return h_flex().id(`review-${r.fileKey || r.file}-${r.line}`).h(26).flex_none().px(8).gap(8).items_center().rounded(6).bg(t.raised).cursor_pointer()
+                    const noteSide = normalizeCommentSide(r.side);
+                    const sideTag = noteSide === "old" ? " (-)" : "";
+                    return h_flex().id(`review-${r.fileKey || r.file}-${noteSide}-${r.line}`).h(26).flex_none().px(8).gap(8).items_center().rounded(6).bg(t.raised).cursor_pointer()
                       .hover((s) => s.bg(t.hover))
                       .on_click((_e, cx) => this.jumpToComment(r, cx))
                       .child(svg("mods/changes-review/icons/comment.svg").size(11).text_color(t.muted))
-                      .child(div().text_size(11).text_color(t.muted).child(`${servicePrefix}${fileName}:${r.line}`))
+                      .child(div().text_size(11).text_color(t.muted).child(`${servicePrefix}${fileName}:${r.line}${sideTag}`))
                       .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.foreground).child(firstLine))
                       .child(
                         div().p(3).rounded(4).cursor_pointer().hover((s) => s.bg(t.background))
                           .on_click((_e, cx) => {
                             cx.stop_propagation();
-                            this.removeComment(r.fileKey || r.file, r.line, cx);
+                            this.removeComment(r.fileKey || r.file, r.line, noteSide, cx);
                           })
                           .child(svg("mods/changes-review/icons/trash.svg").size(10).text_color(t.dim))
                       );
@@ -4852,31 +4215,6 @@ export default class ChangesReview extends View {
                   )
               )
           )
-      ))
-
-      // Floating commit dropdown overlay
-      .when(this.showCommitMenu, (el) => el.child(
-        renderDropdownPopover({
-          overlayId: "commit-menu-overlay",
-          menuId: "commit-dropdown-floating",
-          triggerId: "commit-selector-btn",
-          top: compactPanel ? 68 : 43,
-          left: 10,
-          anchor: "left",
-          minWidth: 220,
-          maxWidth: 360,
-          maxHeight: 320,
-          panelWidth: this.panelWidth || 420,
-          marginX: 20,
-          items: this.getCommitMenuItems(t),
-          scrollHandle: this.commitDropdownScroll,
-          monoFont: mono,
-          t,
-          onClose: (_e, cx) => {
-            this.showCommitMenu = false;
-            cx.notify();
-          },
-        })
       ));
   }
 }
