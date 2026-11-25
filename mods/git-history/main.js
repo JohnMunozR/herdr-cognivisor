@@ -82,6 +82,7 @@ import {
   resolveSessionAgentTabId,
 } from "./repo-logic.js";
 import { renderDropdownTrigger, renderDropdownPopover } from "./dropdown.js";
+import { filterDropdownItems, findFirstSelectableDropdownOption } from "./dropdown-logic.js";
 import { createModLogger, renderErrorFallbackCard } from "./diagnostics.js";
 
 const ROW_HEIGHT = 30;
@@ -686,6 +687,9 @@ export default class GitHistory extends View {
     this.selectedFileKey = null;
     this.showRepoMenu = false;
     this.showBranchMenu = false;
+    this.branchSearchQuery = "";
+    this.typingBranchSearch = false;
+    this.focusBranchSearchTask = null;
     this.searchQuery = "";
     this.typingSearch = false;
     this.panelWidth = 420;
@@ -807,6 +811,30 @@ export default class GitHistory extends View {
         cx.notify();
       });
 
+      this.branchSearchInput = InputState.new({ placeholder: "Filter branches..." });
+      this.branchSearchInput.on("change", (_e, cx) => {
+        const next = this.branchSearchInput.value() ?? "";
+        if (next === this.branchSearchQuery) return;
+        this.branchSearchQuery = next;
+        cx.notify();
+      });
+      this.branchSearchInput.on("submit", (_e, cx) => {
+        if (!this.showBranchMenu) return;
+        const filtered = filterDropdownItems(this.getBranchMenuItems(theme()), this.branchSearchQuery);
+        const first = findFirstSelectableDropdownOption(filtered);
+        if (first) {
+          first.onSelect(null, cx);
+        }
+      });
+      this.branchSearchInput.on("focus", (_e, cx) => {
+        this.typingBranchSearch = true;
+        cx.notify();
+      });
+      this.branchSearchInput.on("blur", (_e, cx) => {
+        this.typingBranchSearch = false;
+        cx.notify();
+      });
+
       if (this.wasVisible) {
         this.refresh(cx);
       }
@@ -853,6 +881,8 @@ export default class GitHistory extends View {
     this.watchDebounceTask = null;
     try { this.searchDebounceTask?.cancel?.(); } catch {}
     this.searchDebounceTask = null;
+    try { this.focusBranchSearchTask?.cancel?.(); } catch {}
+    this.focusBranchSearchTask = null;
     try { this.agentTabSyncTask?.cancel?.(); } catch {}
     this.agentTabSyncTask = null;
     try { this.sharedSyncTask?.cancel?.(); } catch {}
@@ -868,6 +898,7 @@ export default class GitHistory extends View {
 
     try { this.unifiedDiffPane?.release?.(); } catch {}
     try { this.searchInput?.release?.(); } catch {}
+    try { this.branchSearchInput?.release?.(); } catch {}
     try { this.commitsScroll?.release?.(); } catch {}
     try { this.filesScroll?.release?.(); } catch {}
     try { this.uniScroll?.release?.(); } catch {}
@@ -1277,9 +1308,49 @@ export default class GitHistory extends View {
     cx.notify();
   }
 
+  resetBranchSearch() {
+    if (this.focusBranchSearchTask) {
+      try { this.focusBranchSearchTask.cancel(); } catch {}
+      this.focusBranchSearchTask = null;
+    }
+    this.branchSearchQuery = "";
+    this.typingBranchSearch = false;
+    try { this.branchSearchInput?.set_value?.(""); } catch {}
+  }
+
+  closeDropdowns(cx = null, restoreFocus = false) {
+    this.showRepoMenu = false;
+    this.showBranchMenu = false;
+    this.resetBranchSearch();
+    if (restoreFocus) {
+      try { this.handle?.focus?.(); } catch {}
+    }
+    cx?.notify?.();
+  }
+
+  toggleBranchMenu(cx) {
+    const nextOpen = !this.showBranchMenu;
+    this.showRepoMenu = false;
+    this.showBranchMenu = nextOpen;
+    this.resetBranchSearch();
+    if (nextOpen) {
+      try { this.branchSearchInput?.focus?.(); } catch {}
+      if (cx?.timer) {
+        this.focusBranchSearchTask = cx.timer.after(20, () => {
+          this.focusBranchSearchTask = null;
+          if (!this.closed && this.showBranchMenu) {
+            try { this.branchSearchInput?.focus?.(); } catch {}
+          }
+        });
+      }
+    }
+    cx?.notify?.();
+  }
+
   selectBranch(branchName, cx) {
     this.showBranchMenu = false;
     this.showRepoMenu = false;
+    this.resetBranchSearch();
     const next = branchName || "__all__";
     if (this.selectedBranch === next) {
       cx.notify();
@@ -4064,11 +4135,8 @@ export default class GitHistory extends View {
       })
       .on_key_down((e, cx) => {
         if (e.key === "escape" && (this.showRepoMenu || this.showBranchMenu)) {
-          this.showRepoMenu = false;
-          this.showBranchMenu = false;
-          this.handle.focus();
+          this.closeDropdowns(cx, true);
           cx.stop_propagation();
-          cx.notify();
         }
       })
       // Header bar
@@ -4105,6 +4173,7 @@ export default class GitHistory extends View {
                   onClick: (_e, cx) => {
                     this.showRepoMenu = !this.showRepoMenu;
                     this.showBranchMenu = false;
+                    this.resetBranchSearch();
                     cx.notify();
                   },
                 })
@@ -4120,9 +4189,7 @@ export default class GitHistory extends View {
                   maxW: 140,
                   t,
                   onClick: (_e, cx) => {
-                    this.showBranchMenu = !this.showBranchMenu;
-                    this.showRepoMenu = false;
-                    cx.notify();
+                    this.toggleBranchMenu(cx);
                   },
                 })
               )
@@ -4487,19 +4554,29 @@ export default class GitHistory extends View {
             top: 38,
             right: 10,
             anchor: "right",
-            minWidth: 180,
+            minWidth: 230,
             maxWidth: 340,
-            maxHeight: 320,
+            maxHeight: 340,
             panelWidth: this.panelWidth || 420,
             marginX: 20,
             items: this.getBranchMenuItems(t),
+            search: {
+              inputState: this.branchSearchInput,
+              value: this.branchSearchQuery,
+              focused: this.typingBranchSearch,
+              emptyLabel: "No matching branches",
+              onClear: (_e, clearCx) => {
+                this.branchSearchQuery = "";
+                try { this.branchSearchInput?.set_value?.(""); } catch {}
+                try { this.branchSearchInput?.focus?.(); } catch {}
+                clearCx.notify();
+              },
+            },
             scrollHandle: this.branchDropdownScroll,
             monoFont: mono,
             t,
             onClose: (_e, cx) => {
-              this.showRepoMenu = false;
-              this.showBranchMenu = false;
-              cx.notify();
+              this.closeDropdowns(cx, false);
             },
           })
         )

@@ -1,6 +1,7 @@
 // Pure zero-UI geometry and scrolling metrics for shared GPUI dropdown menus.
 
 export const DEFAULT_REOPEN_GUARD_MS = 80;
+export const DEFAULT_SEARCH_BAR_HEIGHT = 38;
 
 /**
  * Clamp a numeric value into [min, max] safely.
@@ -282,4 +283,113 @@ export function shouldSuppressDropdownReopen(dismissedAt, nowMs, guardMs = DEFAU
   if (closedTs <= 0 || windowMs <= 0) return false;
   const elapsed = currentTs - closedTs;
   return elapsed >= 0 && elapsed < windowMs;
+}
+
+function getDropdownItemSearchText(item) {
+  if (!item || typeof item !== "object") return "";
+  if (typeof item.searchText === "string") return item.searchText.toLowerCase();
+  const parts = [];
+  if (hasBadgeValue(item.label)) parts.push(String(item.label));
+  if (hasBadgeValue(item.meta)) parts.push(String(item.meta));
+  if (hasBadgeValue(item.subline)) parts.push(String(item.subline));
+  if (hasBadgeValue(item.sublineBadge)) parts.push(String(item.sublineBadge));
+  if (hasBadgeValue(item.badge)) parts.push(String(item.badge));
+  if (hasBadgeValue(item.rightText)) parts.push(String(item.rightText));
+  return parts.join(" ").toLowerCase();
+}
+
+/**
+ * Filter dropdown items by case-insensitive multi-token substring match while
+ * automatically pruning empty sections and leading/trailing/consecutive dividers.
+ * Returns the original array reference unchanged when `query` is blank.
+ * @param {Array<Record<string, any>>} items
+ * @param {string} query
+ * @param {{ emptyId?: string, emptyLabel?: string }} [opts]
+ * @returns {Array<Record<string, any>>}
+ */
+export function filterDropdownItems(items, query, opts = {}) {
+  const list = Array.isArray(items) ? items : [];
+  const rawQuery = typeof query === "string" ? query.trim().toLowerCase() : "";
+  if (!rawQuery) return list;
+
+  const tokens = rawQuery.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return list;
+
+  const matchesTokens = (item) => {
+    if (item.alwaysVisible === true) return true;
+    const hay = getDropdownItemSearchText(item);
+    if (!hay) return false;
+    for (let i = 0; i < tokens.length; i += 1) {
+      if (!hay.includes(tokens[i])) return false;
+    }
+    return true;
+  };
+
+  const out = [];
+  let pendingSection = null;
+  let pendingDivider = null;
+  let matchedOptionCount = 0;
+
+  for (let i = 0; i < list.length; i += 1) {
+    const item = list[i];
+    if (!item || typeof item !== "object") continue;
+    const kind = item.type || "option";
+
+    if (kind === "divider") {
+      if (matchedOptionCount > 0) {
+        pendingDivider = item;
+      }
+      pendingSection = null;
+      continue;
+    }
+
+    if (kind === "section") {
+      pendingSection = item;
+      continue;
+    }
+
+    if (kind === "empty") {
+      continue;
+    }
+
+    if (!matchesTokens(item)) continue;
+
+    if (pendingDivider && out.length > 0) {
+      out.push(pendingDivider);
+      pendingDivider = null;
+    }
+    if (pendingSection) {
+      out.push(pendingSection);
+      pendingSection = null;
+    }
+    out.push(item);
+    matchedOptionCount += 1;
+  }
+
+  if (matchedOptionCount === 0) {
+    return [
+      {
+        type: "empty",
+        id: opts?.emptyId || "dropdown-search-empty",
+        label: opts?.emptyLabel || "No matches",
+      },
+    ];
+  }
+  return out;
+}
+
+/**
+ * Return the first enabled option item in a dropdown list (used for Enter-to-select).
+ * @param {Array<Record<string, any>>} items
+ * @returns {Record<string, any>|null}
+ */
+export function findFirstSelectableDropdownOption(items) {
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item || typeof item !== "object") continue;
+    const kind = item.type || "option";
+    if (kind === "option" && !item.disabled && typeof item.onSelect === "function") {
+      return item;
+    }
+  }
+  return null;
 }

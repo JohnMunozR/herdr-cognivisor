@@ -1,9 +1,11 @@
 // Shared reusable GPUI dropdown trigger and adaptive shrink-wrapping popover component.
 import { div, svg } from "gpui-kit";
-import { v_flex, h_flex, Scrollbar } from "gpui-base";
+import { v_flex, h_flex, Input, Scrollbar } from "gpui-base";
 import {
   DEFAULT_REOPEN_GUARD_MS,
+  DEFAULT_SEARCH_BAR_HEIGHT,
   computeDropdownMetrics,
+  filterDropdownItems,
   shouldSuppressDropdownReopen,
 } from "./dropdown-logic.js";
 
@@ -313,15 +315,29 @@ export function renderDropdownPopover({
   header = null,
   headerHeight = 34,
   headerTitle = "",
+  search = null,
   scrollHandle = null,
   monoFont = "monospace",
   t,
   onClose,
 } = {}) {
   const themeObj = t || {};
-  const listItems = Array.isArray(items) ? items : [];
+  const resolvedMenuId = menuId || "dropdown-menu";
+  const rawItems = Array.isArray(items) ? items : [];
+  const hasSearch = Boolean(search && search.inputState);
+  const searchQuery = hasSearch ? String(search.value ?? "") : "";
+  const listItems = hasSearch
+    ? filterDropdownItems(rawItems, searchQuery, {
+        emptyId: `${resolvedMenuId}-empty`,
+        emptyLabel: search.emptyLabel || "No matches",
+      })
+    : rawItems;
   const hasHeader = Boolean(header);
   const fixedHeaderH = hasHeader && Number.isFinite(headerHeight) && headerHeight > 0 ? headerHeight : 0;
+  const searchBarH = hasSearch
+    ? (Number.isFinite(Number(search.height)) && Number(search.height) > 0 ? Number(search.height) : DEFAULT_SEARCH_BAR_HEIGHT)
+    : 0;
+  const totalTopChromeH = fixedHeaderH + searchBarH;
   const guardKey = triggerId || menuId || overlayId || "dropdown-trigger";
   const metrics = computeDropdownMetrics({
     items: listItems,
@@ -330,14 +346,14 @@ export function renderDropdownPopover({
     maxWidth,
     maxHeight,
     marginX,
-    chromeTopHeight: fixedHeaderH,
+    chromeTopHeight: totalTopChromeH,
     headerTitle,
   });
 
   const children = [];
   if (listItems.length === 0) {
     children.push(
-      renderDropdownItem({ type: "empty", id: `${menuId}-empty`, label: "No options" }, 0, monoFont, themeObj)
+      renderDropdownItem({ type: "empty", id: `${resolvedMenuId}-empty`, label: "No options" }, 0, monoFont, themeObj)
     );
   } else {
     for (let i = 0; i < listItems.length; i += 1) {
@@ -346,9 +362,68 @@ export function renderDropdownPopover({
     }
   }
 
-  const resolvedMenuId = menuId || "dropdown-menu";
   const scrollAreaId = `${resolvedMenuId}-scroll`;
-  const scrollViewportH = Math.max(48, metrics.bodyHeight - fixedHeaderH);
+  const scrollViewportH = Math.max(48, metrics.bodyHeight - totalTopChromeH);
+  const hasSearchText = Boolean(searchQuery.trim());
+
+  const searchBarNode = hasSearch
+    ? h_flex()
+        .id(`${resolvedMenuId}-search-bar`)
+        .h(searchBarH)
+        .w_full()
+        .flex_none()
+        .px(6)
+        .py(6)
+        .items_center()
+        .border_b(1)
+        .border_color(themeObj.border)
+        .child(
+          h_flex()
+            .id(`${resolvedMenuId}-search-box`)
+            .flex_1()
+            .min_w(0)
+            .h(Math.max(22, searchBarH - 12))
+            .px(7)
+            .gap(4)
+            .items_center()
+            .rounded(6)
+            .border_1()
+            .border_color(search.focused ? (themeObj.accent || themeObj.border) : themeObj.border)
+            .bg(themeObj.background)
+            .cursor_text()
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .child(
+              Input.new(search.inputState)
+                .flex_1()
+                .min_w(0)
+                .h_full()
+                .text_size(11.5)
+                .text_color(themeObj.foreground)
+            )
+            .when(hasSearchText && typeof search.onClear === "function", (el) =>
+              el.child(
+                h_flex()
+                  .id(`${resolvedMenuId}-search-clear`)
+                  .h(16)
+                  .w(16)
+                  .flex_none()
+                  .items_center()
+                  .justify_center()
+                  .rounded(3)
+                  .text_size(11)
+                  .text_color(themeObj.dim)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(themeObj.hover).text_color(themeObj.foreground))
+                  .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                  .on_click((e, cx) => {
+                    cx.stop_propagation();
+                    search.onClear(e, cx);
+                  })
+                  .child("×")
+              )
+            )
+        )
+    : null;
 
   return div()
     .id(overlayId || "dropdown-overlay")
@@ -379,6 +454,7 @@ export function renderDropdownPopover({
         .on_scroll_wheel((_e, cx) => cx.stop_propagation())
         .on_click((_e, cx) => cx.stop_propagation())
         .when(hasHeader, (el) => el.child(header))
+        .when(hasSearch, (el) => el.child(searchBarNode))
         .child(
           metrics.shouldScroll === true
             ? div()

@@ -5,10 +5,13 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   DEFAULT_REOPEN_GUARD_MS,
+  DEFAULT_SEARCH_BAR_HEIGHT,
   clampDropdownNumber,
   computeDropdownMetrics,
   computeAnchoredPopoverPosition,
   shouldSuppressDropdownReopen,
+  filterDropdownItems,
+  findFirstSelectableDropdownOption,
 } from "../shared/dropdown-logic.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -283,5 +286,65 @@ describe("shared dropdown engine & git-history sync parity", () => {
     const popoverSrc = src.slice(popoverIdx);
     const wheelStopMatches = popoverSrc.match(/\.on_scroll_wheel\(\(_e,\s*cx\)\s*=>\s*cx\.stop_propagation\(\)\)/g) || [];
     assert.equal(wheelStopMatches.length, 2, "both overlay backdrop and menu card must stop scroll wheel propagation");
+  });
+
+  test("filterDropdownItems filters multi-token queries across label/rightText, prunes empty sections/dividers, and returns empty state", () => {
+    const branchItems = [
+      { type: "option", id: "all", label: "All Branches", rightText: "--all", onSelect: () => "all" },
+      { type: "divider", id: "d1" },
+      { type: "section", id: "s1", label: "Local branches" },
+      { type: "option", id: "l1", label: "main", rightText: "885a77d", onSelect: () => "main" },
+      { type: "option", id: "l2", label: "nmunoz/dev/extract-accounts-with-mirror", rightText: "a1b2c3d", onSelect: () => "local-mirror" },
+      { type: "divider", id: "d2" },
+      { type: "section", id: "s2", label: "Remote branches" },
+      { type: "option", id: "r1", label: "origin/development", rightText: "02e93d6", onSelect: () => "origin/development" },
+      { type: "option", id: "r2", label: "origin/nmunoz/prod/BMB-4364-validate", rightText: "f00ba12", onSelect: () => "origin/prod" },
+    ];
+
+    // Blank query returns exact original reference (O(1) fast path)
+    assert.strictEqual(filterDropdownItems(branchItems, ""), branchItems);
+    assert.strictEqual(filterDropdownItems(branchItems, "   "), branchItems);
+
+    // Multi-token match only inside Remote branches drops Local section & leading divider
+    const remoteOnly = filterDropdownItems(branchItems, "prod 4364");
+    assert.deepEqual(
+      remoteOnly.map((it) => `${it.type}:${it.id}`),
+      ["section:s2", "option:r2"],
+    );
+    assert.equal(findFirstSelectableDropdownOption(remoteOnly)?.id, "r2");
+
+    // Match by short SHA (rightText) works cleanly
+    const bySha = filterDropdownItems(branchItems, "a1b2");
+    assert.deepEqual(
+      bySha.map((it) => `${it.type}:${it.id}`),
+      ["section:s1", "option:l2"],
+    );
+
+    // Match spanning Local + Remote keeps divider between them cleanly
+    const bothGroups = filterDropdownItems(branchItems, "dev");
+    assert.deepEqual(
+      bothGroups.map((it) => `${it.type}:${it.id}`),
+      ["section:s1", "option:l2", "divider:d2", "section:s2", "option:r1"],
+    );
+
+    // Zero matches emits a single empty row and findFirstSelectableDropdownOption returns null
+    const none = filterDropdownItems(branchItems, "nonexistent-xyz", {
+      emptyId: "git-branch-dropdown-empty",
+      emptyLabel: "No matching branches",
+    });
+    assert.deepEqual(none, [{ type: "empty", id: "git-branch-dropdown-empty", label: "No matching branches" }]);
+    assert.equal(findFirstSelectableDropdownOption(none), null);
+
+    // Search bar height constant is positive and integrates cleanly with chromeTopHeight
+    assert.ok(DEFAULT_SEARCH_BAR_HEIGHT > 0);
+    const metricsWithSearch = computeDropdownMetrics({
+      items: remoteOnly,
+      minWidth: 230,
+      maxWidth: 340,
+      maxHeight: 340,
+      chromeTopHeight: DEFAULT_SEARCH_BAR_HEIGHT,
+    });
+    assert.equal(metricsWithSearch.shouldScroll, false);
+    assert.ok(metricsWithSearch.contentHeight > DEFAULT_SEARCH_BAR_HEIGHT);
   });
 });
