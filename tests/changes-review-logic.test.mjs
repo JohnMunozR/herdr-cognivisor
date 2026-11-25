@@ -65,6 +65,13 @@ import {
   syncBottomGapWithTotalLines,
   expandDiffGapInRows,
   computeAnchorPreservedScrollPx,
+  formatReviewAgentMessage,
+  parseHcJsonOutput,
+  formatHcErrorMessage,
+  resolveAgentSubmitKey,
+  screenLooksBlockedOrPrompting,
+  detectUnsubmittedReviewInScreen,
+  decideSendSubmitAction,
 } from "../mods/changes-review/review-logic.js";
 import {
   statFileEntry as filesSearchStatFileEntry,
@@ -1506,5 +1513,135 @@ describe("changes-review review-logic", () => {
     assert.deepEqual(splitSourceFileLines("a\r\nb\r\nc\r\n"), ["a", "b", "c"]);
     assert.equal(splitSourceFileLines("abc\0def"), null);
     assert.equal(splitSourceFileLines("hello\nworld\n", 5).join("\n"), "hello");
+  });
+
+  test("formatReviewAgentMessage strips trailing newlines and groups comments cleanly by service", () => {
+    const msg = formatReviewAgentMessage(
+      [
+        {
+          serviceId: "ms-card",
+          serviceName: "ms-card",
+          repoRoot: "C:\\Dev\\ms-card",
+          displayPath: "src/CardLimit.java",
+          line: 22,
+          text: "Add unique index\r\nand verify rollback",
+          snippet: "@Entity\npublic class CardLimit",
+        },
+      ],
+      { viewMode: "working" },
+    );
+    assert.ok(msg.startsWith("Review comments on uncommitted changes:\n\n### Service: ms-card (C:\\Dev\\ms-card)"));
+    assert.ok(msg.includes("- `src/CardLimit.java:22`:\n  Add unique index\n  and verify rollback\n  > @Entity public class CardLimit"));
+    assert.equal(msg.endsWith("\n"), false, "message must not end with trailing blank newline");
+    assert.equal(msg.includes("\r"), false, "message must normalize CRLF to LF");
+  });
+
+  test("parseHcJsonOutput, formatHcErrorMessage, and resolveAgentSubmitKey handle hc JSON responses cleanly", () => {
+    assert.deepEqual(parseHcJsonOutput('{"turn":4,"status":"done","started":false}\n'), {
+      turn: 4,
+      status: "done",
+      started: false,
+    });
+    assert.equal(
+      formatHcErrorMessage({ code: 9, stderr: '{"error":{"kind":"blocked","message":"terminal is blocked"}}' }),
+      "Agent is blocked waiting for input. Respond to its prompt first.",
+    );
+    assert.equal(
+      formatHcErrorMessage({ code: 1, stderr: '{"error":{"kind":"unavailable","message":"offline","hint":"retry"}}' }),
+      "offline (retry)",
+    );
+    assert.equal(resolveAgentSubmitKey({ submit: "ctrl+enter" }), "ctrl+enter");
+    assert.equal(resolveAgentSubmitKey({ submit: null }), "enter");
+  });
+
+  test("decideSendSubmitAction nudges stuck multiline pastes safely and never submits on working/blocked/advanced turns", () => {
+    const message = "Review comments on uncommitted changes:\n\n### Service: ms-card (/ws)\n- `A.java:10`:\n  Fix race";
+    const preScreen = "Done.\n\n❯ ";
+    const stuckChipScreen = "Done.\n\n❯ [Pasted text #1 +34 lines]\n";
+    const stuckTextScreen = "Done.\n\n❯ Review comments on uncommitted changes:\n  Fix race";
+    const blockedScreen = "Allow once\nDo you want to proceed? (y/n)";
+
+    // 1. Agent already started working -> never nudge
+    assert.equal(
+      decideSendSubmitAction({
+        sendResult: { turn: 5, status: "done", started: true },
+        liveTerminal: { state: "live", status: "working", turn: 5 },
+        preScreen,
+        postScreen: stuckChipScreen,
+        message,
+      }).shouldNudge,
+      false,
+    );
+
+    // 2. hc reported started: false and terminal is still idle/done at same turn -> nudge with submit key
+    const nudge1 = decideSendSubmitAction({
+      sendResult: { turn: 5, status: "done", started: false },
+      liveTerminal: { state: "live", status: "done", turn: 5, submit: "enter" },
+      preScreen,
+      postScreen: stuckChipScreen,
+      message,
+    });
+    assert.equal(nudge1.shouldNudge, true);
+    assert.equal(nudge1.submitKey, "enter");
+
+    // 3. Turn already advanced (fast completion) -> never double-submit
+    assert.equal(
+      decideSendSubmitAction({
+        sendResult: { turn: 5, status: "done", started: false },
+        liveTerminal: { state: "live", status: "done", turn: 6 },
+        preScreen,
+        postScreen: preScreen,
+        message,
+      }).shouldNudge,
+      false,
+    );
+
+    // 4. Blocked status or permission dialog on screen -> NEVER press Enter
+    assert.equal(screenLooksBlockedOrPrompting(blockedScreen), true);
+    assert.equal(
+      decideSendSubmitAction({
+        sendResult: { turn: 5, status: "done", started: false },
+        liveTerminal: { state: "live", status: "blocked", turn: 5 },
+        preScreen,
+        postScreen: stuckChipScreen,
+        message,
+      }).shouldNudge,
+      false,
+    );
+    assert.equal(
+      decideSendSubmitAction({
+        sendResult: { turn: 5, status: "done", started: false },
+        liveTerminal: { state: "live", status: "idle", turn: 5 },
+        preScreen,
+        postScreen: blockedScreen,
+        message,
+      }).shouldNudge,
+      false,
+    );
+
+    // 5. Non-7501 agent (started: null) -> nudges ONLY when screen positively shows fresh unsubmitted paste
+    assert.equal(detectUnsubmittedReviewInScreen(preScreen, stuckChipScreen, message), true);
+    assert.equal(detectUnsubmittedReviewInScreen(preScreen, stuckTextScreen, message), true);
+    assert.equal(detectUnsubmittedReviewInScreen(preScreen, preScreen, message), false);
+    assert.equal(
+      decideSendSubmitAction({
+        sendResult: { turn: 0, status: null, started: null },
+        liveTerminal: { state: "live", status: null, turn: 0 },
+        preScreen,
+        postScreen: stuckChipScreen,
+        message,
+      }).shouldNudge,
+      true,
+    );
+    assert.equal(
+      decideSendSubmitAction({
+        sendResult: { turn: 0, status: null, started: null },
+        liveTerminal: { state: "live", status: null, turn: 0 },
+        preScreen,
+        postScreen: "Agent replying now...\nWorking on CardLimit...",
+        message,
+      }).shouldNudge,
+      false,
+    );
   });
 });

@@ -1023,46 +1023,47 @@ export default class GitHistory extends View {
     });
   }
 
-  async watchSelectedRepoGitDir(repo, cx) {
+  watchSelectedRepoGitDir(repo, cx) {
     if (this.isViewerMode() || this.on || !repo?.root) {
       this.stopAllWatchers();
       return;
     }
     const repoRoot = normPathStr(repo.root);
-    let gitDir = join(repo.root, ".git");
-    try {
-      const hasHeadInside = await safeExists(join(gitDir, "HEAD"));
-      if (!hasHeadInside) {
-        const res = await exec("git", [...READ_GIT, "rev-parse", "--git-dir"], {
-          cwd: repo.root,
-          on: null,
-          timeout: GIT_EXEC_TIMEOUT_MS,
-        }).catch(() => null);
-        if (res && res.code === 0 && res.stdout.trim()) {
-          const rawDir = res.stdout.trim();
-          gitDir = rawDir.startsWith("/") || /^[A-Za-z]:/.test(rawDir) ? rawDir : join(repo.root, rawDir);
+    const runWatch = async (asyncCx) => {
+      let gitDir = join(repo.root, ".git");
+      try {
+        const hasHeadInside = await safeExists(join(gitDir, "HEAD"));
+        if (!hasHeadInside) {
+          const res = await exec("git", [...READ_GIT, "rev-parse", "--git-dir"], {
+            cwd: repo.root,
+            on: null,
+            timeout: GIT_EXEC_TIMEOUT_MS,
+          }).catch(() => null);
+          if (res && res.code === 0 && res.stdout.trim()) {
+            const rawDir = res.stdout.trim();
+            gitDir = rawDir.startsWith("/") || /^[A-Za-z]:/.test(rawDir) ? rawDir : join(repo.root, rawDir);
+          }
         }
+      } catch {}
+
+      if (this.closed) return;
+      const normGitDir = normPathStr(gitDir);
+      if (!normGitDir || this.watchedGitDirs.has(normGitDir)) {
+        for (const existing of [...this.watchedGitDirs.keys()]) {
+          if (existing !== normGitDir) this.watchedGitDirs.delete(existing);
+        }
+        return;
       }
-    } catch {}
 
-    const normGitDir = normPathStr(gitDir);
-    if (!normGitDir || this.watchedGitDirs.has(normGitDir)) {
-      for (const existing of [...this.watchedGitDirs.keys()]) {
-        if (existing !== normGitDir) this.watchedGitDirs.delete(existing);
-      }
-      return;
-    }
+      this.stopAllWatchers();
+      const token = Symbol(normGitDir);
+      this.watchedGitDirs.set(normGitDir, token);
+      const ctxKey = this.context;
 
-    this.stopAllWatchers();
-    const token = Symbol(normGitDir);
-    this.watchedGitDirs.set(normGitDir, token);
-    const ctxKey = this.context;
-
-    cx.spawn(async (cx) => {
-      while (this.watchedGitDirs.get(normGitDir) === token && this.context === ctxKey) {
+      while (this.watchedGitDirs.get(normGitDir) === token && this.context === ctxKey && !this.closed) {
         try {
           const changed = await watchFolder(gitDir);
-          if (this.watchedGitDirs.get(normGitDir) !== token || this.context !== ctxKey) break;
+          if (this.watchedGitDirs.get(normGitDir) !== token || this.context !== ctxKey || this.closed) break;
           if (normPathStr(this.selectedRepo?.root) !== repoRoot) break;
           const paths = Array.isArray(changed) ? changed : (changed ? [changed] : []);
           const hasRelevant = paths.length === 0 || paths.some((p) => !shouldIgnoreGitWatchEvent(p));
@@ -1071,13 +1072,19 @@ export default class GitHistory extends View {
             this.needsRefreshOnShow = true;
             continue;
           }
-          this.scheduleWatchRefresh(cx, WATCH_DEBOUNCE_MS);
+          this.scheduleWatchRefresh(asyncCx, WATCH_DEBOUNCE_MS);
         } catch {
-          if (this.watchedGitDirs.get(normGitDir) !== token || this.context !== ctxKey) break;
-          await cx.sleep(5000);
+          if (this.watchedGitDirs.get(normGitDir) !== token || this.context !== ctxKey || this.closed) break;
+          await asyncCx.sleep(5000);
         }
       }
-    });
+    };
+
+    if (cx?.spawn) {
+      cx.spawn(runWatch);
+    } else {
+      runWatch(cx);
+    }
   }
 
   refresh(cx, opts = {}) {
@@ -1292,198 +1299,215 @@ export default class GitHistory extends View {
     cx.notify();
   }
 
-  async loadBranchesAndCommits(repo, cx, opts = {}) {
+  loadBranchesAndCommits(repo, cx, opts = {}) {
     if (!repo?.root) return;
     const gen = ++this.logGen;
     const repoRoot = repo.root;
     const on = this.on;
     const targetBranch = this.selectedBranch || "__all__";
     const refSigKey = `${normPathStr(repoRoot)}|${on || ""}|${targetBranch}`;
-    let prefetchedRefSig = null;
 
-    if (
-      opts.backgroundRefresh &&
-      this.commits.length > 0 &&
-      !this.error &&
-      this.lastRefSigKey === refSigKey &&
-      this.lastRefSig
-    ) {
-      const sigRes = await exec("git", [...READ_GIT, "show-ref", "--head"], {
-        cwd: repoRoot,
-        on,
-        timeout: 10000,
-      }).catch(() => null);
-      if (gen !== this.logGen) return;
-      if (sigRes && sigRes.code === 0) {
-        if (sigRes.stdout === this.lastRefSig) {
-          return;
+    const runLoad = async (asyncCx) => {
+      let prefetchedRefSig = null;
+
+      if (
+        opts.backgroundRefresh &&
+        this.commits.length > 0 &&
+        !this.error &&
+        this.lastRefSigKey === refSigKey &&
+        this.lastRefSig
+      ) {
+        const sigRes = await exec("git", [...READ_GIT, "show-ref", "--head"], {
+          cwd: repoRoot,
+          on,
+          timeout: 10000,
+        }).catch(() => null);
+        if (this.closed || gen !== this.logGen) return;
+        if (sigRes && sigRes.code === 0) {
+          if (sigRes.stdout === this.lastRefSig) {
+            return;
+          }
+          prefetchedRefSig = sigRes.stdout;
         }
-        prefetchedRefSig = sigRes.stdout;
-      }
-    }
-
-    this.error = null;
-    if (this.commits.length === 0) {
-      this.loadingCommits = true;
-      cx?.notify();
-    } else {
-      this.loadingCommits = true;
-    }
-
-    try {
-      const branchPromise = exec(
-        "git",
-        [...READ_GIT, "for-each-ref", `--format=${GIT_BRANCH_FORMAT}`, "refs/heads", "refs/remotes"],
-        { cwd: repoRoot, on, timeout: GIT_EXEC_TIMEOUT_MS }
-      ).catch(() => null);
-
-      const refArgs =
-        this.selectedBranch && this.selectedBranch !== "__all__"
-          ? [this.selectedBranch]
-          : ["--all", "HEAD"];
-      const logArgs = [
-        ...READ_GIT,
-        "log",
-        ...refArgs,
-        "--topo-order",
-        "--decorate=short",
-        "--date=unix",
-        "-n",
-        String(COMMIT_PAGE_SIZE),
-        "--skip=0",
-        `--format=${GIT_LOG_FORMAT}`,
-      ];
-      const logPromise = exec("git", logArgs, {
-        cwd: repoRoot,
-        on,
-        timeout: GIT_EXEC_TIMEOUT_MS,
-      }).catch((e) => ({ code: 1, stderr: String(e?.message || e), stdout: "" }));
-      const sigPromise =
-        prefetchedRefSig !== null
-          ? Promise.resolve({ code: 0, stdout: prefetchedRefSig })
-          : exec("git", [...READ_GIT, "show-ref", "--head"], {
-              cwd: repoRoot,
-              on,
-              timeout: 10000,
-            }).catch(() => null);
-
-      const [branchRes, logRes, freshSigRes] = await Promise.all([branchPromise, logPromise, sigPromise]);
-      if (gen !== this.logGen) return;
-
-      if (freshSigRes && freshSigRes.code === 0) {
-        this.lastRefSigKey = refSigKey;
-        this.lastRefSig = freshSigRes.stdout || "";
       }
 
-      if (branchRes && branchRes.code === 0) {
-        this.branches = parseBranchesOutput(branchRes.stdout || "");
+      this.error = null;
+      if (this.commits.length === 0) {
+        this.loadingCommits = true;
+        try { asyncCx?.notify(); } catch {}
       } else {
-        this.branches = [];
+        this.loadingCommits = true;
       }
 
-      if (!logRes || logRes.code !== 0) {
-        const stderr = (logRes?.stderr || "").toLowerCase();
-        if (stderr.includes("does not have any commits yet") || stderr.includes("bad default revision")) {
-          this.commits = [];
-          this.graphLayout = { rows: [], maxLaneCount: 1 };
-          this.hasMore = false;
-          this.error = null;
-          return;
+      try {
+        const branchPromise = exec(
+          "git",
+          [...READ_GIT, "for-each-ref", `--format=${GIT_BRANCH_FORMAT}`, "refs/heads", "refs/remotes"],
+          { cwd: repoRoot, on, timeout: GIT_EXEC_TIMEOUT_MS }
+        ).catch(() => null);
+
+        const refArgs =
+          this.selectedBranch && this.selectedBranch !== "__all__"
+            ? [this.selectedBranch]
+            : ["--all", "HEAD"];
+        const logArgs = [
+          ...READ_GIT,
+          "log",
+          ...refArgs,
+          "--topo-order",
+          "--decorate=short",
+          "--date=unix",
+          "-n",
+          String(COMMIT_PAGE_SIZE),
+          "--skip=0",
+          `--format=${GIT_LOG_FORMAT}`,
+        ];
+        const logPromise = exec("git", logArgs, {
+          cwd: repoRoot,
+          on,
+          timeout: GIT_EXEC_TIMEOUT_MS,
+        }).catch((e) => ({ code: 1, stderr: String(e?.message || e), stdout: "" }));
+        const sigPromise =
+          prefetchedRefSig !== null
+            ? Promise.resolve({ code: 0, stdout: prefetchedRefSig })
+            : exec("git", [...READ_GIT, "show-ref", "--head"], {
+                cwd: repoRoot,
+                on,
+                timeout: 10000,
+              }).catch(() => null);
+
+        const [branchRes, logRes, freshSigRes] = await Promise.all([branchPromise, logPromise, sigPromise]);
+        if (this.closed || gen !== this.logGen) return;
+
+        if (freshSigRes && freshSigRes.code === 0) {
+          this.lastRefSigKey = refSigKey;
+          this.lastRefSig = freshSigRes.stdout || "";
         }
-        throw new Error(logRes?.stderr || "Failed to load git log");
-      }
 
-      const parsed = parseGitLogOutput(logRes.stdout || "");
-      this.commits = parsed;
-      this.graphLayout = computeCommitGraphLayout(parsed);
-      this.hasMore = parsed.length >= COMMIT_PAGE_SIZE;
+        if (branchRes && branchRes.code === 0) {
+          this.branches = parseBranchesOutput(branchRes.stdout || "");
+        } else {
+          this.branches = [];
+        }
 
-      if (opts.preserveSelection && this.selectedCommitHash) {
-        const found = parsed.find((c) => c.hash === this.selectedCommitHash);
-        if (found) {
-          this.selectedCommit = found;
-        } else if (parsed.length > 0) {
+        if (!logRes || logRes.code !== 0) {
+          const stderr = (logRes?.stderr || "").toLowerCase();
+          if (stderr.includes("does not have any commits yet") || stderr.includes("bad default revision")) {
+            this.commits = [];
+            this.graphLayout = { rows: [], maxLaneCount: 1 };
+            this.hasMore = false;
+            this.error = null;
+            return;
+          }
+          throw new Error(logRes?.stderr || "Failed to load git log");
+        }
+
+        const parsed = parseGitLogOutput(logRes.stdout || "");
+        this.commits = parsed;
+        this.graphLayout = computeCommitGraphLayout(parsed);
+        this.hasMore = parsed.length >= COMMIT_PAGE_SIZE;
+
+        if (opts.preserveSelection && this.selectedCommitHash) {
+          const found = parsed.find((c) => c.hash === this.selectedCommitHash);
+          if (found) {
+            this.selectedCommit = found;
+          } else if (parsed.length > 0) {
+            this.selectedCommitHash = parsed[0].hash;
+            this.selectedCommit = parsed[0];
+            this.loadCommitFiles(parsed[0], asyncCx, { openViewer: false });
+          } else {
+            this.selectedCommitHash = null;
+            this.selectedCommit = null;
+            this.commitFiles = [];
+          }
+        } else if (parsed.length > 0 && !this.selectedCommitHash) {
           this.selectedCommitHash = parsed[0].hash;
           this.selectedCommit = parsed[0];
-          this.loadCommitFiles(parsed[0], cx, { openViewer: false });
-        } else {
-          this.selectedCommitHash = null;
-          this.selectedCommit = null;
-          this.commitFiles = [];
+          this.loadCommitFiles(parsed[0], asyncCx, { openViewer: false });
         }
-      } else if (parsed.length > 0 && !this.selectedCommitHash) {
-        this.selectedCommitHash = parsed[0].hash;
-        this.selectedCommit = parsed[0];
-        this.loadCommitFiles(parsed[0], cx, { openViewer: false });
+      } catch (e) {
+        if (!this.closed && gen === this.logGen) {
+          this.error = String(e?.message || e);
+        }
+      } finally {
+        if (!this.closed && gen === this.logGen) {
+          this.loadingCommits = false;
+          try { asyncCx?.notify(); } catch {}
+        }
       }
-    } catch (e) {
-      if (gen === this.logGen) {
-        this.error = String(e?.message || e);
-      }
-    } finally {
-      if (gen === this.logGen) {
-        this.loadingCommits = false;
-        cx?.notify();
-      }
+    };
+
+    if (cx?.spawn) {
+      cx.spawn(runLoad);
+    } else {
+      runLoad(cx);
     }
   }
 
-  async loadMoreCommits(cx) {
+  loadMoreCommits(cx) {
     if (!this.selectedRepo?.root || this.loadingMore || this.loadingCommits || !this.hasMore) return;
     const gen = this.logGen;
     const repoRoot = this.selectedRepo.root;
     const on = this.on;
     const skip = this.commits.length;
     this.loadingMore = true;
-    cx.notify();
+    cx?.notify();
 
-    try {
-      const refArgs =
-        this.selectedBranch && this.selectedBranch !== "__all__"
-          ? [this.selectedBranch]
-          : ["--all", "HEAD"];
-      const logArgs = [
-        ...READ_GIT,
-        "log",
-        ...refArgs,
-        "--topo-order",
-        "--decorate=short",
-        "--date=unix",
-        "-n",
-        String(COMMIT_PAGE_SIZE),
-        `--skip=${skip}`,
-        `--format=${GIT_LOG_FORMAT}`,
-      ];
-      const res = await exec("git", logArgs, { cwd: repoRoot, on, timeout: GIT_EXEC_TIMEOUT_MS });
-      if (gen !== this.logGen) return;
-      if (res.code !== 0) {
-        throw new Error(res.stderr || "Failed to load older commits");
-      }
-      const nextChunk = parseGitLogOutput(res.stdout || "");
-      const seen = new Set(this.commits.map((c) => c.hash));
-      const merged = [...this.commits];
-      for (const c of nextChunk) {
-        if (!seen.has(c.hash)) {
-          seen.add(c.hash);
-          merged.push(c);
+    const runMore = async (asyncCx) => {
+      try {
+        const refArgs =
+          this.selectedBranch && this.selectedBranch !== "__all__"
+            ? [this.selectedBranch]
+            : ["--all", "HEAD"];
+        const logArgs = [
+          ...READ_GIT,
+          "log",
+          ...refArgs,
+          "--topo-order",
+          "--decorate=short",
+          "--date=unix",
+          "-n",
+          String(COMMIT_PAGE_SIZE),
+          `--skip=${skip}`,
+          `--format=${GIT_LOG_FORMAT}`,
+        ];
+        const res = await exec("git", logArgs, { cwd: repoRoot, on, timeout: GIT_EXEC_TIMEOUT_MS });
+        if (this.closed || gen !== this.logGen) return;
+        if (res.code !== 0) {
+          throw new Error(res.stderr || "Failed to load older commits");
+        }
+        const nextChunk = parseGitLogOutput(res.stdout || "");
+        const seen = new Set(this.commits.map((c) => c.hash));
+        const merged = [...this.commits];
+        for (const c of nextChunk) {
+          if (!seen.has(c.hash)) {
+            seen.add(c.hash);
+            merged.push(c);
+          }
+        }
+        this.commits = merged;
+        this.graphLayout = computeCommitGraphLayout(merged);
+        this.hasMore = nextChunk.length >= COMMIT_PAGE_SIZE;
+      } catch (e) {
+        if (!this.closed && gen === this.logGen) {
+          this.error = String(e?.message || e);
+        }
+      } finally {
+        if (!this.closed && gen === this.logGen) {
+          this.loadingMore = false;
+          try { asyncCx?.notify(); } catch {}
         }
       }
-      this.commits = merged;
-      this.graphLayout = computeCommitGraphLayout(merged);
-      this.hasMore = nextChunk.length >= COMMIT_PAGE_SIZE;
-    } catch (e) {
-      if (gen === this.logGen) {
-        this.error = String(e?.message || e);
-      }
-    } finally {
-      if (gen === this.logGen) {
-        this.loadingMore = false;
-        cx.notify();
-      }
+    };
+
+    if (cx?.spawn) {
+      cx.spawn(runMore);
+    } else {
+      runMore(cx);
     }
   }
 
-  async loadCommitFiles(commit, cx, opts = {}) {
+  loadCommitFiles(commit, cx, opts = {}) {
     if (!commit?.hash || !this.selectedRepo?.root) return;
     const gen = ++this.commitFilesGen;
     const repo = this.selectedRepo;
@@ -1506,61 +1530,71 @@ export default class GitHistory extends View {
     }
 
     this.loadingCommitFiles = true;
-    try {
-      const numArgs = [
-        ...READ_GIT,
-        "diff-tree",
-        "-r",
-        "--no-commit-id",
-        "--root",
-        "--first-parent",
-        "-M",
-        "--numstat",
-        "-z",
-        commit.hash,
-      ];
-      const statArgs = [
-        ...READ_GIT,
-        "diff-tree",
-        "-r",
-        "--no-commit-id",
-        "--root",
-        "--first-parent",
-        "-M",
-        "--name-status",
-        "-z",
-        commit.hash,
-      ];
-      const [numRes, statRes] = await Promise.all([
-        exec("git", numArgs, { cwd: repo.root, on, timeout: GIT_EXEC_TIMEOUT_MS }),
-        exec("git", statArgs, { cwd: repo.root, on, timeout: GIT_EXEC_TIMEOUT_MS }),
-      ]);
-      if (gen !== this.commitFilesGen) return;
-      if (numRes.code !== 0) {
-        throw new Error(numRes.stderr || "Failed to inspect commit files");
-      }
-      const parsedFiles = parseCommitFiles(numRes.stdout || "", statRes?.stdout || "");
-      lruSet(this.commitFilesCache, cacheKey, parsedFiles, MAX_COMMIT_FILES_CACHE);
-      this.commitFiles = parsedFiles;
-      const firstFile = parsedFiles[0] || null;
-      this.selectedFileKey = firstFile ? makeCommitFileKey(commit, firstFile) : null;
+    cx?.notify();
 
-      if (opts.openViewer) {
-        this.openGitDiffTabForCommit(repo, commit, firstFile, parsedFiles, {
-          create: true,
-          select: true,
-        });
+    const runFiles = async (asyncCx) => {
+      try {
+        const numArgs = [
+          ...READ_GIT,
+          "diff-tree",
+          "-r",
+          "--no-commit-id",
+          "--root",
+          "--first-parent",
+          "-M",
+          "--numstat",
+          "-z",
+          commit.hash,
+        ];
+        const statArgs = [
+          ...READ_GIT,
+          "diff-tree",
+          "-r",
+          "--no-commit-id",
+          "--root",
+          "--first-parent",
+          "-M",
+          "--name-status",
+          "-z",
+          commit.hash,
+        ];
+        const [numRes, statRes] = await Promise.all([
+          exec("git", numArgs, { cwd: repo.root, on, timeout: GIT_EXEC_TIMEOUT_MS }),
+          exec("git", statArgs, { cwd: repo.root, on, timeout: GIT_EXEC_TIMEOUT_MS }),
+        ]);
+        if (this.closed || gen !== this.commitFilesGen) return;
+        if (numRes.code !== 0) {
+          throw new Error(numRes.stderr || "Failed to inspect commit files");
+        }
+        const parsedFiles = parseCommitFiles(numRes.stdout || "", statRes?.stdout || "");
+        lruSet(this.commitFilesCache, cacheKey, parsedFiles, MAX_COMMIT_FILES_CACHE);
+        this.commitFiles = parsedFiles;
+        const firstFile = parsedFiles[0] || null;
+        this.selectedFileKey = firstFile ? makeCommitFileKey(commit, firstFile) : null;
+
+        if (opts.openViewer) {
+          this.openGitDiffTabForCommit(repo, commit, firstFile, parsedFiles, {
+            create: true,
+            select: true,
+          });
+        }
+      } catch (e) {
+        if (!this.closed && gen === this.commitFilesGen) {
+          this.commitFiles = [];
+          this.error = String(e?.message || e);
+        }
+      } finally {
+        if (!this.closed && gen === this.commitFilesGen) {
+          this.loadingCommitFiles = false;
+          try { asyncCx?.notify(); } catch {}
+        }
       }
-    } catch (e) {
-      if (gen === this.commitFilesGen) {
-        this.commitFiles = [];
-        this.error = String(e?.message || e);
-      }
-    } finally {
-      if (gen === this.commitFilesGen) {
-        this.loadingCommitFiles = false;
-        cx?.notify();
-      }
+    };
+
+    if (cx?.spawn) {
+      cx.spawn(runFiles);
+    } else {
+      runFiles(cx);
     }
   }
 
@@ -1715,7 +1749,7 @@ export default class GitHistory extends View {
     this.markdownRenderCache?.clear?.();
   }
 
-  async loadViewerMarkdownNow(diff, openFile, cx, opts = {}) {
+  loadViewerMarkdownNow(diff, openFile, cx, opts = {}) {
     const gen = ++this.viewerMarkdownGen;
     if (this.closed || !openFile) return;
 
@@ -1794,49 +1828,57 @@ export default class GitHistory extends View {
     this.viewerMarkdownPrepared = null;
     cx?.notify();
 
-    try {
-      const res = await exec("git", [...READ_GIT, "show", "--no-textconv", spec.blobSpec], {
-        cwd: repoRoot,
-        on,
-        timeout: GIT_EXEC_TIMEOUT_MS,
-      });
-      if (this.closed || gen !== this.viewerMarkdownGen || !this.viewerMarkdownRendered) return;
-      if (this.viewerMarkdownFileIdentity !== fileIdentity) return;
-      const latestDiff = readActiveDiff(this.getSessionContext().spaceId);
-      if (latestDiff) {
-        const latestOpen =
-          latestDiff.openFile || (latestDiff.files || []).find((f) => f.key === latestDiff.openFileKey) || null;
-        if (makeViewerFileIdentity(latestDiff, latestOpen) !== fileIdentity) return;
-      }
+    const runMd = async (asyncCx) => {
+      try {
+        const res = await exec("git", [...READ_GIT, "show", "--no-textconv", spec.blobSpec], {
+          cwd: repoRoot,
+          on,
+          timeout: GIT_EXEC_TIMEOUT_MS,
+        });
+        if (this.closed || gen !== this.viewerMarkdownGen || !this.viewerMarkdownRendered) return;
+        if (this.viewerMarkdownFileIdentity !== fileIdentity) return;
+        const latestDiff = readActiveDiff(this.getSessionContext().spaceId);
+        if (latestDiff) {
+          const latestOpen =
+            latestDiff.openFile || (latestDiff.files || []).find((f) => f.key === latestDiff.openFileKey) || null;
+          if (makeViewerFileIdentity(latestDiff, latestOpen) !== fileIdentity) return;
+        }
 
-      if (!res || res.code !== 0) {
-        cacheAndFail((res?.stderr || "").trim() || `Cannot read ${spec.path} from commit`);
-        return;
-      }
+        if (!res || res.code !== 0) {
+          cacheAndFail((res?.stderr || "").trim() || `Cannot read ${spec.path} from commit`);
+          return;
+        }
 
-      const rawText = typeof res.stdout === "string" ? res.stdout : "";
-      if (rawText.includes("\0")) {
-        cacheAndFail("Binary file cannot be rendered as Markdown");
-        return;
-      }
+        const rawText = typeof res.stdout === "string" ? res.stdout : "";
+        if (rawText.includes("\0")) {
+          cacheAndFail("Binary file cannot be rendered as Markdown");
+          return;
+        }
 
-      lruSet(
-        this.viewerMarkdownBlobCache,
-        cacheKey,
-        { rawText, error: "", notice: spec.notice || "", path: spec.path },
-        MAX_VIEWER_MARKDOWN_CACHE
-      );
-      this.viewerMarkdownPrepared = prepareCached(rawText);
-      this.viewerMarkdownError = "";
-    } catch (e) {
-      if (this.closed || gen !== this.viewerMarkdownGen || !this.viewerMarkdownRendered) return;
-      if (this.viewerMarkdownFileIdentity !== fileIdentity) return;
-      cacheAndFail(`Cannot load Markdown: ${e?.message || e}`);
-    } finally {
-      if (!this.closed && gen === this.viewerMarkdownGen) {
-        this.viewerMarkdownLoading = false;
-        cx?.notify();
+        lruSet(
+          this.viewerMarkdownBlobCache,
+          cacheKey,
+          { rawText, error: "", notice: spec.notice || "", path: spec.path },
+          MAX_VIEWER_MARKDOWN_CACHE
+        );
+        this.viewerMarkdownPrepared = prepareCached(rawText);
+        this.viewerMarkdownError = "";
+      } catch (e) {
+        if (this.closed || gen !== this.viewerMarkdownGen || !this.viewerMarkdownRendered) return;
+        if (this.viewerMarkdownFileIdentity !== fileIdentity) return;
+        cacheAndFail(`Cannot load Markdown: ${e?.message || e}`);
+      } finally {
+        if (!this.closed && gen === this.viewerMarkdownGen) {
+          this.viewerMarkdownLoading = false;
+          try { asyncCx?.notify(); } catch {}
+        }
       }
+    };
+
+    if (cx?.spawn) {
+      cx.spawn(runMd);
+    } else {
+      runMd(cx);
     }
   }
 
@@ -2004,7 +2046,7 @@ export default class GitHistory extends View {
     }
   }
 
-  async loadViewerDiffNow(diff, cx, opts = {}) {
+  loadViewerDiffNow(diff, cx, opts = {}) {
     if (this.viewerLoadTask) {
       try { this.viewerLoadTask.cancel(); } catch {}
       this.viewerLoadTask = null;
@@ -2148,16 +2190,51 @@ export default class GitHistory extends View {
     this.viewerLoading = true;
     cx?.notify();
 
-    try {
-      const { patchText, isBinary } = await this.fetchCommitFilePatch(diff, openFile, isExpanded, opts);
-      if (gen !== this.viewerLoadGen) return;
+    const runDiff = async (asyncCx) => {
+      try {
+        const { patchText, isBinary } = await this.fetchCommitFilePatch(diff, openFile, isExpanded, opts);
+        if (this.closed || gen !== this.viewerLoadGen) return;
 
-      if (isBinary || openFile.binary) {
+        if (isBinary || openFile.binary) {
+          this.loadedPatchSource = null;
+          this.loadedFileExt = "";
+          this.sbsBuilt = false;
+          this.uniBuilt = false;
+          this.isBinaryDiff = true;
+          this.sbsRows = [];
+          this.sbsPage = 0;
+          this.sbsPageInfo = paginateDiffRows([], 0, DEFAULT_SBS_PAGE_ROWS);
+          this.sbsWaveLayout = null;
+          this.sbsBlocks = null;
+          this.uniRows = [];
+          this.uniRowHeights = [];
+          this.diffTruncated = false;
+          this.diffTotalLines = 0;
+        } else {
+          this.sbsBuilt = false;
+          this.uniBuilt = false;
+          this.sbsRows = [];
+          this.sbsWaveLayout = null;
+          this.uniRows = [];
+          this.uniRowHeights = [];
+          this.isBinaryDiff = false;
+          this.diffTruncated = false;
+          this.diffTotalLines = 0;
+          this.loadedPatchSource = { patchText, filePath: openFile.path, maxLines };
+          this.loadedFileExt = getFileExt(openFile.path);
+          this.buildActiveDiffModeData();
+        }
+
+        if (prevOpenKey !== openFile.key || opts.forceScrollTop) {
+          try { this.diffScroll?.scroll_to_item(0); } catch {}
+          try { this.uniScroll?.scroll_to_item(0); } catch {}
+        }
+      } catch (e) {
+        if (this.closed || gen !== this.viewerLoadGen) return;
         this.loadedPatchSource = null;
         this.loadedFileExt = "";
         this.sbsBuilt = false;
         this.uniBuilt = false;
-        this.isBinaryDiff = true;
         this.sbsRows = [];
         this.sbsPage = 0;
         this.sbsPageInfo = paginateDiffRows([], 0, DEFAULT_SBS_PAGE_ROWS);
@@ -2165,47 +2242,20 @@ export default class GitHistory extends View {
         this.sbsBlocks = null;
         this.uniRows = [];
         this.uniRowHeights = [];
-        this.diffTruncated = false;
-        this.diffTotalLines = 0;
-      } else {
-        this.sbsBuilt = false;
-        this.uniBuilt = false;
-        this.sbsRows = [];
-        this.sbsWaveLayout = null;
-        this.uniRows = [];
-        this.uniRowHeights = [];
-        this.isBinaryDiff = false;
-        this.diffTruncated = false;
-        this.diffTotalLines = 0;
-        this.loadedPatchSource = { patchText, filePath: openFile.path, maxLines };
-        this.loadedFileExt = getFileExt(openFile.path);
-        this.buildActiveDiffModeData();
+        this.viewerError = `Cannot load diff: ${e?.message || e}`;
+      } finally {
+        if (!this.closed && gen === this.viewerLoadGen) {
+          this.viewerLoading = false;
+          try { asyncCx?.notify(); } catch {}
+          try { this.notifyViewerChildren(asyncCx, "all"); } catch {}
+        }
       }
+    };
 
-      if (prevOpenKey !== openFile.key || opts.forceScrollTop) {
-        try { this.diffScroll?.scroll_to_item(0); } catch {}
-        try { this.uniScroll?.scroll_to_item(0); } catch {}
-      }
-    } catch (e) {
-      if (gen !== this.viewerLoadGen) return;
-      this.loadedPatchSource = null;
-      this.loadedFileExt = "";
-      this.sbsBuilt = false;
-      this.uniBuilt = false;
-      this.sbsRows = [];
-      this.sbsPage = 0;
-      this.sbsPageInfo = paginateDiffRows([], 0, DEFAULT_SBS_PAGE_ROWS);
-      this.sbsWaveLayout = null;
-      this.sbsBlocks = null;
-      this.uniRows = [];
-      this.uniRowHeights = [];
-      this.viewerError = `Cannot load diff: ${e?.message || e}`;
-    } finally {
-      if (gen === this.viewerLoadGen) {
-        this.viewerLoading = false;
-        cx?.notify();
-        this.notifyViewerChildren(cx, "all");
-      }
+    if (cx?.spawn) {
+      cx.spawn(runDiff);
+    } else {
+      runDiff(cx);
     }
   }
 

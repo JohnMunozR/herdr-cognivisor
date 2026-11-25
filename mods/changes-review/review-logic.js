@@ -2221,3 +2221,228 @@ export function computeAnchorPreservedScrollPx(
   const newMaxScrollPx = Math.max(0, (Number(newLayout?.totalHeight) || 0) - vpH);
   return Math.max(0, Math.min(newMaxScrollPx, effectiveOldScrollPx + deltaPx));
 }
+
+/**
+ * Format session review notes into a clean Markdown payload for agent dispatch
+ * without trailing blank lines that can disrupt TUI bracketed-paste submission.
+ */
+export function formatReviewAgentMessage(
+  sessionReviews,
+  { viewMode = "working", selectedCommit = null, workspaceRoot = "", fallbackRoot = "" } = {},
+) {
+  const list = Array.isArray(sessionReviews) ? sessionReviews : [];
+  let header = "Review comments on uncommitted changes:";
+  if (viewMode === "commit" && selectedCommit) {
+    header = `Review comments on commit ${selectedCommit.shortHash} ("${selectedCommit.subject}"):`;
+  }
+  const parts = [header, ""];
+
+  const byService = new Map();
+  for (const r of list) {
+    if (!r) continue;
+    const sId = r.serviceId || "default";
+    if (!byService.has(sId)) byService.set(sId, []);
+    byService.get(sId).push(r);
+  }
+
+  for (const [sId, revs] of byService) {
+    const sName = revs[0].serviceName || sId;
+    const sRoot = revs[0].repoRoot || workspaceRoot || fallbackRoot || "";
+    parts.push(`### Service: ${sName} (${sRoot})`, "");
+    for (const r of revs) {
+      const filePath = r.displayPath || r.file;
+      parts.push(`- \`${filePath}:${r.line}\`:`);
+      const normalizedText = String(r.text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      for (const line of normalizedText.split("\n")) {
+        parts.push(`  ${line}`);
+      }
+      if (r.snippet) {
+        const cleanSnippet = String(r.snippet).replace(/\r?\n/g, " ").trim();
+        if (cleanSnippet) {
+          parts.push(`  > ${cleanSnippet}`);
+        }
+      }
+      parts.push("");
+    }
+  }
+
+  return parts.join("\n").replace(/\r\n/g, "\n").replace(/\n+$/, "");
+}
+
+/**
+ * Safely parse JSON output emitted by `hc ... --json`.
+ */
+export function parseHcJsonOutput(text) {
+  if (typeof text !== "string") return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const firstBrace = trimmed.indexOf("{");
+    const lastBrace = trimmed.lastIndexOf("}");
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      try {
+        return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+      } catch {}
+    }
+    return null;
+  }
+}
+
+/**
+ * Format an `hc` CLI error (including JSON `{error: {kind, message, hint}}` stderr) into a readable UI message.
+ */
+export function formatHcErrorMessage(execResult, fallback = "Failed to send review to agent") {
+  const stderr = String(execResult?.stderr || "").trim();
+  const stdout = String(execResult?.stdout || "").trim();
+  const parsed = parseHcJsonOutput(stderr) || parseHcJsonOutput(stdout);
+  const errObj = parsed?.error;
+  if (errObj && typeof errObj === "object") {
+    if (errObj.kind === "blocked") {
+      return "Agent is blocked waiting for input. Respond to its prompt first.";
+    }
+    if (errObj.kind === "finished") {
+      return "Target agent session has already finished.";
+    }
+    if (errObj.kind === "not_found") {
+      return "Target agent terminal is no longer available.";
+    }
+    const msg = String(errObj.message || errObj.kind || "").trim();
+    const hint = String(errObj.hint || "").trim();
+    if (msg) return hint ? `${msg} (${hint})` : msg;
+  }
+  return stderr || stdout || fallback;
+}
+
+/**
+ * Resolve the terminal's configured submit key from `hc get --json` (default `"enter"`).
+ */
+export function resolveAgentSubmitKey(terminalInfo) {
+  const raw = typeof terminalInfo?.submit === "string" ? terminalInfo.submit.trim() : "";
+  return raw || "enter";
+}
+
+const BLOCKED_PROMPT_PATTERNS = [
+  /\bdo you want to proceed\b/i,
+  /\ballow once\b/i,
+  /\ballow always\b/i,
+  /\bapprove this\b/i,
+  /\bconfirm.*\((?:y\/n|yes\/no)\)/i,
+  /\[y\/n\]/i,
+  /\(y\/n\)/i,
+  /\byes,\s*allow\b/i,
+];
+
+const PASTE_CHIP_RE = /\[Pasted text #\d+|\[\d+\s+lines?\s+pasted|\bpasted\s+\d+\s+lines?\b/i;
+const PROMPT_INPUT_LINE_RE = /^\s*(?:[❯›>│┃┆]|─+\s*[❯›>])/;
+
+function getBottomNonEmptyLines(screenText, count = 14) {
+  if (typeof screenText !== "string" || !screenText) return [];
+  const lines = screenText.replace(/\r\n/g, "\n").split("\n");
+  const out = [];
+  for (let i = lines.length - 1; i >= 0 && out.length < count; i -= 1) {
+    const t = lines[i].trim();
+    if (t) out.push(t);
+  }
+  out.reverse();
+  return out;
+}
+
+/**
+ * Guard against pressing Enter when an interactive confirmation or permission dialog is on screen.
+ */
+export function screenLooksBlockedOrPrompting(screenText) {
+  const bottom = getBottomNonEmptyLines(screenText, 12);
+  if (bottom.length === 0) return false;
+  const joined = bottom.join("\n");
+  return BLOCKED_PROMPT_PATTERNS.some((re) => re.test(joined));
+}
+
+/**
+ * Detect whether a review paste is freshly sitting unsubmitted inside the agent's bottom input box.
+ */
+export function detectUnsubmittedReviewInScreen(preScreen, postScreen, message) {
+  if (typeof postScreen !== "string" || !postScreen.trim()) return false;
+  if (screenLooksBlockedOrPrompting(postScreen)) return false;
+
+  const postBottom = getBottomNonEmptyLines(postScreen, 12);
+  if (postBottom.length === 0) return false;
+  const preBottom = getBottomNonEmptyLines(preScreen, 12);
+
+  // 1. Collapsed bracketed-paste chip (e.g., Claude Code `[Pasted text #1 +34 lines]`) newly present in input area.
+  const countChips = (arr) => arr.filter((l) => PASTE_CHIP_RE.test(l)).length;
+  const postChips = countChips(postBottom);
+  const preChips = countChips(preBottom);
+  if (postChips > preChips) {
+    return true;
+  }
+
+  // 2. Review header or last meaningful line freshly sitting on a prompt input line near the bottom.
+  const msgLines = String(message || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const firstLine = msgLines[0] || "";
+  const firstAnchor = firstLine.slice(0, 36);
+  const lastLine = msgLines.length > 1 ? msgLines[msgLines.length - 1] : "";
+  const lastAnchor = lastLine.length >= 12 ? lastLine.slice(0, 36) : "";
+
+  const preBottomSet = new Set(preBottom);
+  const inputRegion = postBottom.slice(-8);
+  for (const line of inputRegion) {
+    if (preBottomSet.has(line)) continue;
+    const hasMarker =
+      (firstAnchor && line.includes(firstAnchor)) ||
+      (lastAnchor && line.includes(lastAnchor));
+    if (hasMarker && (PROMPT_INPUT_LINE_RE.test(line) || inputRegion.indexOf(line) >= inputRegion.length - 4)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Decide whether `sendReview` should send a follow-up submit key nudge after `hc send --json`.
+ * Never nudges when the agent is working, blocked, errored, finished, already advanced a turn,
+ * or showing a confirmation dialog.
+ */
+export function decideSendSubmitAction({
+  sendResult = null,
+  liveTerminal = null,
+  preScreen = "",
+  postScreen = "",
+  message = "",
+  requireScreenMatch = false,
+} = {}) {
+  const submitKey = resolveAgentSubmitKey(liveTerminal);
+  if (liveTerminal?.state && liveTerminal.state !== "live") {
+    return { shouldNudge: false, reason: "not-live", submitKey };
+  }
+  const liveStatus = liveTerminal?.status ?? null;
+  if (liveStatus === "working") {
+    return { shouldNudge: false, reason: "already-working", submitKey };
+  }
+  if (liveStatus === "blocked" || liveStatus === "error") {
+    return { shouldNudge: false, reason: `status-${liveStatus}`, submitKey };
+  }
+  if (sendResult?.started === true) {
+    return { shouldNudge: false, reason: "started-true", submitKey };
+  }
+  if (
+    Number.isFinite(Number(sendResult?.turn)) &&
+    Number.isFinite(Number(liveTerminal?.turn)) &&
+    Number(liveTerminal.turn) > Number(sendResult.turn)
+  ) {
+    return { shouldNudge: false, reason: "turn-advanced", submitKey };
+  }
+  if (screenLooksBlockedOrPrompting(postScreen)) {
+    return { shouldNudge: false, reason: "screen-blocked-prompt", submitKey };
+  }
+
+  const pasteVisible = detectUnsubmittedReviewInScreen(preScreen, postScreen, message);
+  if (pasteVisible) {
+    return { shouldNudge: true, reason: "screen-unsubmitted-paste", submitKey };
+  }
+  if (!requireScreenMatch && sendResult?.started === false) {
+    return { shouldNudge: true, reason: "hc-reported-not-started", submitKey };
+  }
+  return { shouldNudge: false, reason: "no-unsubmitted-signal", submitKey };
+}

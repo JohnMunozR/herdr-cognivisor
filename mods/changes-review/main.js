@@ -65,6 +65,10 @@ import {
   syncBottomGapWithTotalLines,
   expandDiffGapInRows,
   computeAnchorPreservedScrollPx,
+  formatReviewAgentMessage,
+  parseHcJsonOutput,
+  formatHcErrorMessage,
+  decideSendSubmitAction,
 } from "./review-logic.js";
 import { computeWrapColumns, countWrappedLines, wrapPlainText, wrapStyledSpans } from "./code-wrap.js";
 import { renderDropdownTrigger, renderDropdownPopover } from "./dropdown.js";
@@ -1432,69 +1436,125 @@ export default class ChangesReview extends View {
     return allAgents.find((a) => !isRunner(a.address, null)) || allAgents[0] || null;
   }
 
-  async sendReview(cx) {
+  sendReview(cx) {
     const ctx = this.getSessionContext();
     const sessionReviews = this.getSessionReviews(ctx);
     if (this.sendingReview || sessionReviews.length === 0) return;
     const agent = this.findActiveAgent();
     if (!agent) {
       this.panelNote = "No active agent found to send review notes to.";
-      cx.notify();
+      cx?.notify();
       return;
     }
+
+    const diff = this.isViewerMode() ? readActiveDiff(ctx.spaceId) : null;
+    const curViewMode = diff?.viewMode || this.viewMode;
+    const curCommit = diff?.selectedCommit || this.selectedCommit;
+    const message = formatReviewAgentMessage(sessionReviews, {
+      viewMode: curViewMode,
+      selectedCommit: curCommit,
+      workspaceRoot: ctx.workspaceRoot,
+      fallbackRoot: this.root,
+    });
+    const reviewCount = sessionReviews.length;
+
     this.sendingReview = true;
     this.panelNote = null;
-    cx.notify();
+    this.logger?.action("review.sendStarted", {
+      agentAddress: agent.address,
+      reviewCount,
+      messageLength: message.length,
+      viewMode: curViewMode,
+    }, cx);
+    cx?.notify();
 
-    try {
-      const diff = this.isViewerMode() ? readActiveDiff(ctx.spaceId) : null;
-      const curViewMode = diff?.viewMode || this.viewMode;
-      const curCommit = diff?.selectedCommit || this.selectedCommit;
-      let header = "Review comments on uncommitted changes:";
-      if (curViewMode === "commit" && curCommit) {
-        header = `Review comments on commit ${curCommit.shortHash} ("${curCommit.subject}"):`;
-      }
-      const parts = [
-        header,
-        "",
-      ];
+    const runSend = async (asyncCx) => {
+      try {
+        const preScreenRes = await hc(["read", "--lines", "0", agent.address]).catch(() => null);
+        const preScreen = preScreenRes && preScreenRes.code === 0 && typeof preScreenRes.stdout === "string"
+          ? preScreenRes.stdout
+          : "";
 
-      const byService = new Map();
-      for (const r of sessionReviews) {
-        const sId = r.serviceId || "default";
-        if (!byService.has(sId)) byService.set(sId, []);
-        byService.get(sId).push(r);
-      }
+        const r = await hc(["send", "--json", agent.address, message]);
+        if (this._viewerClosed) return;
+        if (!r || r.code !== 0) {
+          throw new Error(formatHcErrorMessage(r, "Failed to send review to agent"));
+        }
 
-      for (const [sId, revs] of byService) {
-        const sName = revs[0].serviceName || sId;
-        const sRoot = revs[0].repoRoot || ctx.workspaceRoot || this.root;
-        parts.push(`### Service: ${sName} (${sRoot})`, "");
-        for (const r of revs) {
-          const filePath = r.displayPath || r.file;
-          parts.push(`- \`${filePath}:${r.line}\`:`);
-          for (const line of String(r.text || "").split(/\r?\n/)) {
-            parts.push(`  ${line}`);
+        const sendResult = parseHcJsonOutput(r.stdout || "");
+        let nudges = 0;
+
+        if (sendResult?.started !== true) {
+          const maxNudges = sendResult?.started === false ? 2 : 1;
+          for (let attempt = 0; attempt < maxNudges; attempt += 1) {
+            const waitMs = attempt === 0 ? (sendResult?.started === false ? 250 : 350) : 450;
+            if (asyncCx?.sleep) {
+              await asyncCx.sleep(waitMs);
+            }
+            if (this._viewerClosed) return;
+
+            const [termRes, screenRes] = await Promise.all([
+              hc(["get", "--json", agent.address]).catch(() => null),
+              hc(["read", "--lines", "0", agent.address]).catch(() => null),
+            ]);
+            if (this._viewerClosed) return;
+
+            const liveTerminal = termRes && termRes.code === 0 ? parseHcJsonOutput(termRes.stdout || "") : null;
+            const postScreen = screenRes && screenRes.code === 0 && typeof screenRes.stdout === "string"
+              ? screenRes.stdout
+              : "";
+
+            const decision = decideSendSubmitAction({
+              sendResult,
+              liveTerminal,
+              preScreen,
+              postScreen,
+              message,
+              requireScreenMatch: attempt > 0,
+            });
+            if (!decision.shouldNudge) {
+              break;
+            }
+
+            nudges += 1;
+            this.logger?.action("review.sendSubmitNudge", {
+              agentAddress: agent.address,
+              attempt: nudges,
+              reason: decision.reason,
+              submitKey: decision.submitKey,
+            }, asyncCx);
+            await hc(["keys", agent.address, decision.submitKey]).catch(() => null);
           }
-          if (r.snippet) {
-            parts.push(`  > ${r.snippet}`);
-          }
-          parts.push("");
+        }
+
+        if (this._viewerClosed) return;
+        this.logger?.action("review.sendSuccess", {
+          agentAddress: agent.address,
+          reviewCount,
+          started: sendResult?.started ?? null,
+          nudges,
+        }, asyncCx);
+        notify({ title: "Review notes sent to agent", level: "success" });
+        this.clearComments(asyncCx);
+      } catch (e) {
+        if (this._viewerClosed) return;
+        this.logger?.error("review.sendFailed", e, {
+          agentAddress: agent.address,
+          reviewCount,
+        }, asyncCx);
+        this.panelNote = `Failed to send review: ${e?.message || e}`;
+      } finally {
+        if (!this._viewerClosed) {
+          this.sendingReview = false;
+          try { asyncCx?.notify(); } catch {}
         }
       }
+    };
 
-      const message = parts.join("\n");
-      const r = await hc(["send", agent.address, message]);
-      if (r.code !== 0) {
-        throw new Error(r.stderr || r.stdout || "Failed to send review to agent");
-      }
-      notify({ title: "Review notes sent to agent", level: "success" });
-      this.clearComments(cx);
-    } catch (e) {
-      this.panelNote = `Failed to send review: ${e.message || e}`;
-    } finally {
-      this.sendingReview = false;
-      cx.notify();
+    if (cx?.spawn) {
+      cx.spawn(runSend);
+    } else {
+      runSend(cx);
     }
   }
 
@@ -2822,7 +2882,7 @@ export default class ChangesReview extends View {
     return computeViewerMarkdownFileId(curOpen, curMode, curHash) === fileId;
   }
 
-  async loadViewerMarkdownNow(diff, cx, opts = {}) {
+  loadViewerMarkdownNow(diff, cx, opts = {}) {
     if (this._viewerClosed) return;
     const ctx = this.getSessionContext();
     const latestDiff = diff || readActiveDiff(ctx.spaceId);
@@ -2909,50 +2969,58 @@ export default class ChangesReview extends View {
     this.viewerMarkdownLoadedToken = loadToken;
     cx?.notify();
 
-    try {
-      let rawText = null;
-      if (spec.kind === "file") {
-        rawText = await readTextFile(spec.absPath, { on: spec.on }).catch(() => null);
-        if (!this.isMarkdownLoadStillCurrent(ctx.spaceId, fileId, gen)) return;
-      } else if (spec.kind === "git") {
-        const res = await exec("git", spec.args, { cwd: spec.cwd, on: spec.on }).catch((e) => ({
-          code: -1,
-          stdout: "",
-          stderr: String(e?.message || e || ""),
-        }));
-        if (!this.isMarkdownLoadStillCurrent(ctx.spaceId, fileId, gen)) return;
-        if (!res || res.code !== 0) {
-          this.viewerMarkdownError = formatGitShowMarkdownError(res?.stderr, spec);
+    const runLoad = async (asyncCx) => {
+      try {
+        let rawText = null;
+        if (spec.kind === "file") {
+          rawText = await readTextFile(spec.absPath, { on: spec.on }).catch(() => null);
+          if (!this.isMarkdownLoadStillCurrent(ctx.spaceId, fileId, gen)) return;
+        } else if (spec.kind === "git") {
+          const res = await exec("git", spec.args, { cwd: spec.cwd, on: spec.on }).catch((e) => ({
+            code: -1,
+            stdout: "",
+            stderr: String(e?.message || e || ""),
+          }));
+          if (!this.isMarkdownLoadStillCurrent(ctx.spaceId, fileId, gen)) return;
+          if (!res || res.code !== 0) {
+            this.viewerMarkdownError = formatGitShowMarkdownError(res?.stderr, spec);
+            this.viewerMarkdownPrepared = null;
+            return;
+          }
+          rawText = typeof res.stdout === "string" ? res.stdout : String(res.stdout ?? "");
+        }
+
+        const checked = validateMarkdownTextContent(rawText, spec.unavailableMessage);
+        if (!checked.ok) {
+          this.viewerMarkdownError = checked.error;
           this.viewerMarkdownPrepared = null;
           return;
         }
-        rawText = typeof res.stdout === "string" ? res.stdout : String(res.stdout ?? "");
-      }
 
-      const checked = validateMarkdownTextContent(rawText, spec.unavailableMessage);
-      if (!checked.ok) {
-        this.viewerMarkdownError = checked.error;
+        this.setMarkdownRawCacheEntry(cacheKey, { text: checked.text, notice: spec.notice || "" });
+        this.viewerMarkdownPrepared = this.viewerMarkdownRenderCache.getOrPrepare(cacheKey, checked.text, { filePath });
+        this.viewerMarkdownError = "";
+        this.viewerMarkdownNotice = spec.notice || "";
+      } catch (e) {
+        if (!this.isMarkdownLoadStillCurrent(ctx.spaceId, fileId, gen)) return;
+        this.viewerMarkdownError = String(e?.message || e || spec.unavailableMessage || "Cannot preview Markdown file.");
         this.viewerMarkdownPrepared = null;
-        return;
+      } finally {
+        if (!this._viewerClosed && gen === this.viewerMarkdownLoadGen) {
+          this.viewerMarkdownLoading = false;
+          try { asyncCx?.notify(); } catch {}
+        }
       }
+    };
 
-      this.setMarkdownRawCacheEntry(cacheKey, { text: checked.text, notice: spec.notice || "" });
-      this.viewerMarkdownPrepared = this.viewerMarkdownRenderCache.getOrPrepare(cacheKey, checked.text, { filePath });
-      this.viewerMarkdownError = "";
-      this.viewerMarkdownNotice = spec.notice || "";
-    } catch (e) {
-      if (!this.isMarkdownLoadStillCurrent(ctx.spaceId, fileId, gen)) return;
-      this.viewerMarkdownError = String(e?.message || e || spec.unavailableMessage || "Cannot preview Markdown file.");
-      this.viewerMarkdownPrepared = null;
-    } finally {
-      if (!this._viewerClosed && gen === this.viewerMarkdownLoadGen) {
-        this.viewerMarkdownLoading = false;
-        cx?.notify();
-      }
+    if (cx?.spawn) {
+      cx.spawn(runLoad);
+    } else {
+      runLoad(cx);
     }
   }
 
-  async loadViewerDiffNow(diff, cx, opts = {}) {
+  loadViewerDiffNow(diff, cx, opts = {}) {
     if (this._viewerClosed) return;
     if (this.viewerLoadTask) {
       try { this.viewerLoadTask.cancel(); } catch {}
@@ -3014,60 +3082,68 @@ export default class ChangesReview extends View {
     this.viewerLoading = true;
     cx?.notify();
 
-    try {
-      const lines = await this.fetchFileDiffLines(
-        openFile,
-        diff?.viewMode || "working",
-        diff?.selectedCommit || null,
-        diff?.on ?? null,
-      );
-      if (this._viewerClosed || gen !== this.viewerLoadGen) return;
-      const canExpandBottom = Boolean(
-        !openFile.fresh &&
-        !openFile.binary &&
-        openFile.status !== "D" &&
-        !(!openFile.hasHead && openFile.status === "A")
-      );
-      this.setLines(lines, openFile.path, { canExpandBottom });
-
-      const shouldConsumeDirectives = Boolean(seq && seq !== this.lastHandledSeq) || Boolean(opts.forceScrollTop);
-      if (seq && seq !== this.lastHandledSeq) {
-        this.lastHandledSeq = seq;
-      }
-
-      if (shouldConsumeDirectives && diff?.focusLine != null) {
-        const rowIdx = this.rows.findIndex((r) => r.number === diff.focusLine);
-        if (rowIdx >= 0) {
-          const ctxNow = this.getSessionContext();
-          const cMap = this.buildCommentMapForFile(openFile.key, ctxNow);
-          const layout = this.computeDiffRowLayout(cMap, this.getReviewWrapCols());
-          this.diffScrollPx = computeDiffScrollOffsetForRow(layout, rowIdx, this.getDiffViewportHeight(), "center");
-        }
-      } else if (prevOpenKey !== openFile.key || opts.forceScrollTop) {
-        this.diffScrollPx = 0;
-      }
-
-      if (diff?.openCommentLine != null && diff?.openCommentLine !== undefined && shouldConsumeDirectives) {
-        const row = this.rows.find((r) => r.number === diff.openCommentLine);
-        const ctx = this.getSessionContext();
-        const cur = this.getComment(openFile.key, diff.openCommentLine, ctx);
-        this.openCommentEditor(
+    const runLoad = async (asyncCx) => {
+      try {
+        const lines = await this.fetchFileDiffLines(
           openFile,
-          diff.openCommentLine,
-          cur?.snippet || row?.text || "",
-          cur ? cur.text : "",
-          cx,
+          diff?.viewMode || "working",
+          diff?.selectedCommit || null,
+          diff?.on ?? null,
         );
+        if (this._viewerClosed || gen !== this.viewerLoadGen) return;
+        const canExpandBottom = Boolean(
+          !openFile.fresh &&
+          !openFile.binary &&
+          openFile.status !== "D" &&
+          !(!openFile.hasHead && openFile.status === "A")
+        );
+        this.setLines(lines, openFile.path, { canExpandBottom });
+
+        const shouldConsumeDirectives = Boolean(seq && seq !== this.lastHandledSeq) || Boolean(opts.forceScrollTop);
+        if (seq && seq !== this.lastHandledSeq) {
+          this.lastHandledSeq = seq;
+        }
+
+        if (shouldConsumeDirectives && diff?.focusLine != null) {
+          const rowIdx = this.rows.findIndex((r) => r.number === diff.focusLine);
+          if (rowIdx >= 0) {
+            const ctxNow = this.getSessionContext();
+            const cMap = this.buildCommentMapForFile(openFile.key, ctxNow);
+            const layout = this.computeDiffRowLayout(cMap, this.getReviewWrapCols());
+            this.diffScrollPx = computeDiffScrollOffsetForRow(layout, rowIdx, this.getDiffViewportHeight(), "center");
+          }
+        } else if (prevOpenKey !== openFile.key || opts.forceScrollTop) {
+          this.diffScrollPx = 0;
+        }
+
+        if (diff?.openCommentLine != null && diff?.openCommentLine !== undefined && shouldConsumeDirectives) {
+          const row = this.rows.find((r) => r.number === diff.openCommentLine);
+          const ctxNow = this.getSessionContext();
+          const cur = this.getComment(openFile.key, diff.openCommentLine, ctxNow);
+          this.openCommentEditor(
+            openFile,
+            diff.openCommentLine,
+            cur?.snippet || row?.text || "",
+            cur ? cur.text : "",
+            asyncCx,
+          );
+        }
+      } catch (e) {
+        if (this._viewerClosed || gen !== this.viewerLoadGen) return;
+        this.setLines([]);
+        this.viewerNote = `Cannot preview this diff (too large or unreadable): ${e.message || e}`;
+      } finally {
+        if (!this._viewerClosed && gen === this.viewerLoadGen) {
+          this.viewerLoading = false;
+          try { asyncCx?.notify(); } catch {}
+        }
       }
-    } catch (e) {
-      if (this._viewerClosed || gen !== this.viewerLoadGen) return;
-      this.setLines([]);
-      this.viewerNote = `Cannot preview this diff (too large or unreadable): ${e.message || e}`;
-    } finally {
-      if (!this._viewerClosed && gen === this.viewerLoadGen) {
-        this.viewerLoading = false;
-        cx?.notify();
-      }
+    };
+
+    if (cx?.spawn) {
+      cx.spawn(runLoad);
+    } else {
+      runLoad(cx);
     }
   }
 
