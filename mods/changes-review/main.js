@@ -45,6 +45,11 @@ import {
   filterUnbaselinedRepoEntries,
   resolveWorkspaceRoot,
   READ_GIT_FLAGS,
+  DEFAULT_GIT_EXEC_TIMEOUT_MS,
+  DEFAULT_HC_READ_TIMEOUT_MS,
+  DEFAULT_REFRESH_WATCHDOG_MS,
+  raceWithTimeout,
+  formatRefreshTimeoutError,
   mergeBusCandidateServices,
   collectServiceSessionSnapshot,
   computeFileReviewFingerprint,
@@ -97,6 +102,14 @@ function safeShared(key, fallback = null) {
   } catch {
     return fallback;
   }
+}
+
+function hcReadBounded(args, cx = null, timeoutMs = DEFAULT_HC_READ_TIMEOUT_MS) {
+  return raceWithTimeout(
+    hc(args).catch(() => null),
+    timeoutMs,
+    { fallback: null, timer: cx?.timer || null },
+  );
 }
 
 function getSafeAppHome() {
@@ -199,7 +212,7 @@ function getLiveTabIdsSet() {
   return ids;
 }
 
-async function peekExistingSessionBaseline(sessionTabId, workspaceRoot, tabTermAddrs = []) {
+async function peekExistingSessionBaseline(sessionTabId, workspaceRoot, tabTermAddrs = [], cx = null) {
   if (!sessionTabId) return null;
   const normWs = normPathStr(workspaceRoot || "");
   const flows = safeReadFlows();
@@ -242,7 +255,7 @@ async function peekExistingSessionBaseline(sessionTabId, workspaceRoot, tabTermA
     }
     if (Array.isArray(tabTermAddrs) && tabTermAddrs.length > 0) {
       const reads = await Promise.all(
-        tabTermAddrs.slice(0, 2).map((addr) => hc(["read", "--lines", "100", addr]).catch(() => null))
+        tabTermAddrs.slice(0, 2).map((addr) => hcReadBounded(["read", "--lines", "100", addr], cx))
       );
       const transcript = reads.map(extractHcReadText).filter(Boolean).join("\n");
       const resumeKey = extractResumeKeyFromTranscript(transcript, workspaceRoot);
@@ -266,7 +279,7 @@ async function peekExistingSessionBaseline(sessionTabId, workspaceRoot, tabTermA
   return null;
 }
 
-async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTermAddrs, workspaceRoot, preloaded = null) {
+async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTermAddrs, workspaceRoot, preloaded = null, cx = null) {
   if (!sessionTabId) return { baseline: null, isFresh: false, anchored: false, dirtyChanged: false, primaryBranch: "" };
   const normWs = normPathStr(workspaceRoot || "");
   const isWinWs = /^[a-zA-Z]:\//.test(normWs) || /^[a-zA-Z]:$/.test(normWs);
@@ -278,7 +291,7 @@ async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTer
     new Set((serviceResults || []).map((r) => String(r.branch || r.service?.branch || "").trim()).filter(Boolean))
   );
 
-  const existingHit = preloaded || await peekExistingSessionBaseline(sessionTabId, workspaceRoot, tabTermAddrs);
+  const existingHit = preloaded || await peekExistingSessionBaseline(sessionTabId, workspaceRoot, tabTermAddrs, cx);
   if (existingHit?.baseline) {
     return {
       baseline: existingHit.baseline,
@@ -294,7 +307,7 @@ async function resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTer
   let resumeKey = "";
   if (appHomeDir && Array.isArray(tabTermAddrs) && tabTermAddrs.length > 0) {
     const reads = await Promise.all(
-      tabTermAddrs.slice(0, 2).map((addr) => hc(["read", "--lines", "100", addr]).catch(() => null))
+      tabTermAddrs.slice(0, 2).map((addr) => hcReadBounded(["read", "--lines", "100", addr], cx))
     );
     const transcript = reads.map(extractHcReadText).filter(Boolean).join("\n");
     resumeKey = extractResumeKeyFromTranscript(transcript, workspaceRoot);
@@ -533,7 +546,7 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
           } | ForEach-Object { $res += $_.FullName };
           $res | Select-Object -Unique
         `.trim();
-        const r = await exec("powershell", ["-NoProfile", "-Command", psScript], { on }).catch(() => null);
+        const r = await exec("powershell", ["-NoProfile", "-Command", psScript], { on, timeout: DEFAULT_GIT_EXEC_TIMEOUT_MS }).catch(() => null);
         if (r && r.code === 0 && r.stdout) {
           return r.stdout.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
         }
@@ -544,7 +557,7 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
       ? 'root="$1"; if [ -e "$root/.git" ]; then printf "%s\\n" "$root"; fi; for d in "$root"/* "$root"/*/*; do [ -e "$d/.git" ] || continue; case "$d" in */node_modules/*|*/target/*|*/dist/*|*/build/*|*/.git/*|*/vendor/*|*/.venv/*) continue ;; esac; printf "%s\\n" "$d"; done'
       : 'root="$1"; for d in "$root"/*; do [ -e "$d/.git" ] || continue; case "$d" in */node_modules/*|*/target/*|*/dist/*|*/build/*|*/.git/*|*/vendor/*|*/.venv/*) continue ;; esac; printf "%s\\n" "$d"; done';
     try {
-      const r = await exec("sh", ["-c", script, "repos", targetRoot], { on }).catch(() => null);
+      const r = await exec("sh", ["-c", script, "repos", targetRoot], { on, timeout: DEFAULT_GIT_EXEC_TIMEOUT_MS }).catch(() => null);
       if (r && r.code === 0 && r.stdout) {
         return r.stdout.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
       }
@@ -567,7 +580,7 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
     if (localTop) {
       repoPaths = [localTop];
     } else {
-      const top = await exec("git", [...READ, "rev-parse", "--show-toplevel"], { cwd: workspaceRoot, on }).catch(() => null);
+      const top = await exec("git", [...READ, "rev-parse", "--show-toplevel"], { cwd: workspaceRoot, on, timeout: DEFAULT_GIT_EXEC_TIMEOUT_MS }).catch(() => null);
       if (top && top.code === 0 && top.stdout.trim()) {
         repoPaths = [normPathStr(top.stdout.trim())];
       }
@@ -601,7 +614,7 @@ async function discoverRepos(workspaceRoot, on, isWindows = false, extraCwds = [
       if (!repoPaths.some(r => normCmpStr(r, isWindows) === normCmpStr(localTop, isWindows))) repoPaths.push(localTop);
       continue;
     }
-    const top = await exec("git", [...READ, "rev-parse", "--show-toplevel"], { cwd: extra, on }).catch(() => null);
+    const top = await exec("git", [...READ, "rev-parse", "--show-toplevel"], { cwd: extra, on, timeout: DEFAULT_GIT_EXEC_TIMEOUT_MS }).catch(() => null);
     if (top && top.code === 0 && top.stdout.trim()) {
       const normTop = normPathStr(top.stdout.trim());
       if (normTop && !repoPaths.some(r => normCmpStr(r, isWindows) === normCmpStr(normTop, isWindows))) repoPaths.push(normTop);
@@ -808,6 +821,9 @@ export default class ChangesReview extends View {
     this.busy = false;
     this.pendingRefresh = false;
     this.pendingRefreshForce = false;
+    this.refreshGen = 0;
+    this.refreshPhase = "";
+    this.refreshWatchdogTask = null;
     this.viewerSourceLines = null;
     this.viewerSourceKey = "";
     this.viewerSourceFilePath = "";
@@ -900,6 +916,8 @@ export default class ChangesReview extends View {
     this.resetViewerMarkdownState(true);
     try { this.renderRefreshTask?.cancel?.(); } catch {}
     this.renderRefreshTask = null;
+    try { this.refreshWatchdogTask?.cancel?.(); } catch {}
+    this.refreshWatchdogTask = null;
     try { this.watchDebounceTask?.cancel?.(); } catch {}
     this.watchDebounceTask = null;
     try { this.agentTabSyncTask?.cancel?.(); } catch {}
@@ -1908,6 +1926,30 @@ export default class ChangesReview extends View {
     }
 
     this.loading = true;
+    const gen = ++this.refreshGen;
+    this.refreshPhase = "discover";
+    if (this.refreshWatchdogTask) {
+      try { this.refreshWatchdogTask.cancel(); } catch {}
+      this.refreshWatchdogTask = null;
+    }
+    if (cx?.timer) {
+      this.refreshWatchdogTask = cx.timer.after(DEFAULT_REFRESH_WATCHDOG_MS, (wdCx) => {
+        this.refreshWatchdogTask = null;
+        if (this._viewerClosed || gen !== this.refreshGen || !this.loading) return;
+        const stalledPhase = this.refreshPhase || "refresh";
+        this.refreshGen += 1;
+        this.loading = false;
+        const msg = formatRefreshTimeoutError(stalledPhase, DEFAULT_REFRESH_WATCHDOG_MS);
+        this.error = msg;
+        this.logger?.error("review.refreshTimeout", new Error(msg), {
+          phase: stalledPhase,
+          workspaceRoot,
+          elapsedMs: DEFAULT_REFRESH_WATCHDOG_MS,
+        }, wdCx);
+        try { wdCx?.notify(); } catch {}
+      });
+    }
+    const isStale = () => this._viewerClosed || gen !== this.refreshGen || key() !== context;
     const isWindows = this.isWindows;
     const allPanesList = panes() || [];
     const extraCwds = sessionTabId
@@ -1937,8 +1979,9 @@ export default class ChangesReview extends View {
           if (!force && this.candidateCache && this.candidateCache.key === cacheKey && (now - this.candidateCache.ts) < REPO_CACHE_TTL_MS) {
             candidateServices = this.candidateCache.services.map((s) => ({ ...s }));
           } else {
+            this.refreshPhase = "discover";
             candidateServices = await discoverRepos(workspaceRoot, on, isWindows, extraCwds);
-            if (key() !== context) return;
+            if (isStale()) return;
             this.candidateCache = { key: cacheKey, services: candidateServices.map((s) => ({ ...s })), ts: Date.now() };
           }
         }
@@ -1954,11 +1997,13 @@ export default class ChangesReview extends View {
         }
 
         // Pre-load existing session baseline so snapshots receive startHead & dirtyFiles upfront.
+        this.refreshPhase = "baseline-peek";
         const preloadedBaseline = sessionTabId
-          ? await peekExistingSessionBaseline(sessionTabId, workspaceRoot, tabTermAddrs)
+          ? await peekExistingSessionBaseline(sessionTabId, workspaceRoot, tabTermAddrs, cx)
           : null;
-        if (key() !== context) return;
+        if (isStale()) return;
 
+        this.refreshPhase = "snapshots";
         const serviceResults = [];
         const SNAPSHOT_CONCURRENCY = 4;
         for (let i = 0; i < candidateServices.length; i += SNAPSHOT_CONCURRENCY) {
@@ -1969,7 +2014,7 @@ export default class ChangesReview extends View {
               return loadServiceSessionSnapshot(service, on, { baselineRepo });
             })
           );
-          if (key() !== context) return;
+          if (isStale()) return;
           for (const item of batchRes) serviceResults.push(item);
         }
 
@@ -1990,10 +2035,11 @@ export default class ChangesReview extends View {
           }, cx);
         }
 
+        this.refreshPhase = "baseline-init";
         const baselineInit = sessionTabId
-          ? await resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTermAddrs, workspaceRoot, preloadedBaseline)
+          ? await resolveOrInitSessionBaseline(sessionTabId, serviceResults, tabTermAddrs, workspaceRoot, preloadedBaseline, cx)
           : { baseline: null, isFresh: false, dirtyChanged: false, primaryBranch: "" };
-        if (key() !== context) return;
+        if (isStale()) return;
 
         const sessionBaseline = baselineInit.baseline;
         let baselineDirtyChanged = Boolean(baselineInit.dirtyChanged);
@@ -2044,10 +2090,11 @@ export default class ChangesReview extends View {
             if (this.lastTranscriptScan && this.lastTranscriptScan.sig === trSig && (nowTs - this.lastTranscriptScan.ts) < TRANSCRIPT_THROTTLE_MS) {
               sessionTranscript = this.lastTranscriptScan.text;
             } else {
+              this.refreshPhase = "transcript";
               const reads = await Promise.all(
-                tabTermAddrs.map((addr) => hc(["read", "--lines", "150", addr]).catch(() => null))
+                tabTermAddrs.map((addr) => hcReadBounded(["read", "--lines", "150", addr], cx))
               );
-              if (key() !== context) return;
+              if (isStale()) return;
               sessionTranscript = reads.map(extractHcReadText).filter(Boolean).join("\n").replace(/\\/g, "/");
               this.lastTranscriptScan = { sig: trSig, ts: nowTs, text: sessionTranscript };
             }
@@ -2162,6 +2209,7 @@ export default class ChangesReview extends View {
             sessionBaseline.rev = Math.max(Number(sessionBaseline.rev) || 0, curFlowRev) + 1;
           }
           if (appHomeDir && baselineDirtyChanged) {
+            this.refreshPhase = "write-baseline";
             await writeDiskSessionBaseline(
               appHomeDir,
               sessionTabId,
@@ -2171,9 +2219,9 @@ export default class ChangesReview extends View {
               baselineInit.resumeKey || "",
               fsPromises
             );
-            if (key() !== context) return;
+            if (isStale()) return;
             diskMtime = await getDiskBaselineMtimeMs(appHomeDir, sessionTabId);
-            if (key() !== context) return;
+            if (isStale()) return;
           }
           mergeSessionBaselineIntoFlow(sessionTabId, sessionBaseline, sessionRepos, false, diskMtime);
         } else {
@@ -2357,23 +2405,32 @@ export default class ChangesReview extends View {
           }
         }
       } catch (e) {
+        if (gen !== this.refreshGen) return;
         this.logger?.error("review.refreshFailed", e, {
+          phase: this.refreshPhase || "",
           workspaceRoot,
           showAllWorkingChanges: this.showAllWorkingChanges,
         }, cx);
         if (key() === context) this.error = String(e.message || e);
       } finally {
-        this.loading = false;
-        cx.notify();
-        if (this.pendingRefresh && !this._viewerClosed && key() === context) {
-          const nextForce = Boolean(this.pendingRefreshForce);
-          this.pendingRefresh = false;
-          this.pendingRefreshForce = false;
-          cx.timer.after(0, (nextCx) => {
-            if (!this._viewerClosed && key() === context) {
-              this.refresh(nextCx, nextForce ? { force: true } : { fromWatch: true });
-            }
-          });
+        if (gen === this.refreshGen) {
+          if (this.refreshWatchdogTask) {
+            try { this.refreshWatchdogTask.cancel(); } catch {}
+            this.refreshWatchdogTask = null;
+          }
+          this.refreshPhase = "";
+          this.loading = false;
+          try { cx.notify(); } catch {}
+          if (this.pendingRefresh && !this._viewerClosed && key() === context) {
+            const nextForce = Boolean(this.pendingRefreshForce);
+            this.pendingRefresh = false;
+            this.pendingRefreshForce = false;
+            cx.timer.after(0, (nextCx) => {
+              if (!this._viewerClosed && key() === context) {
+                this.refresh(nextCx, nextForce ? { force: true } : { fromWatch: true });
+              }
+            });
+          }
         }
       }
     });
@@ -2395,14 +2452,14 @@ export default class ChangesReview extends View {
       }
     } else if (!file.hasHead) {
       const diffArgs = ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color", "--", path];
-      const r = await exec("git", [...READ, ...diffArgs], { cwd: root, on });
+      const r = await exec("git", [...READ, ...diffArgs], { cwd: root, on, timeout: DEFAULT_GIT_EXEC_TIMEOUT_MS });
       if (r.code !== 0) throw new Error(r.stderr || "git diff --cached failed");
       const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
       lines = first < 0 ? [file.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);
     } else {
       const baseTarget = file.baseHash || "HEAD";
       const diffArgs = ["diff", baseTarget, "--no-ext-diff", "--no-textconv", "--no-color", "--", path];
-      const r = await exec("git", [...READ, ...diffArgs], { cwd: root, on });
+      const r = await exec("git", [...READ, ...diffArgs], { cwd: root, on, timeout: DEFAULT_GIT_EXEC_TIMEOUT_MS });
       if (r.code !== 0) throw new Error(r.stderr || "git diff failed");
       const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
       lines = first < 0 ? [file.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);
@@ -4200,9 +4257,36 @@ export default class ChangesReview extends View {
           )
           .when(f.add > 0, (e) => e.child(div().text_size(11).text_color(isReviewed ? t.dim : add).child(`+${f.add}`)))
           .when(f.del > 0, (e) => e.child(div().text_size(11).text_color(isReviewed ? t.dim : del).child(`−${f.del}`)));
-      })).when(!this.files.length, (e) => e.child(div().p(8).text_color(t.dim).child(
-        this.error || (this.loading ? "Loading changes…" : !this.workspaceRoot ? "No folder" : "No changes in this session yet")
-      ))))
+      })).when(!this.files.length, (e) => e.child(
+        v_flex().p(8).gap(8).items_start()
+          .child(
+            div().text_color(this.error ? del : t.dim).child(
+              this.error || (this.loading ? "Loading changes…" : !this.workspaceRoot ? "No folder" : "No changes in this session yet")
+            )
+          )
+          .when(Boolean(this.error) && !this.loading, (box) => box.child(
+            div()
+              .id("changes-retry-btn")
+              .px(8)
+              .py(3)
+              .rounded(5)
+              .border_1()
+              .border_color(t.border)
+              .bg(t.raised)
+              .text_size(11)
+              .font_medium()
+              .text_color(t.foreground)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover))
+              .on_click((_ev, retryCx) => {
+                this.error = null;
+                this.candidateCache = null;
+                this.refresh(retryCx, { force: true });
+                retryCx.notify();
+              })
+              .child("Retry")
+          ))
+      )))
 
       .when(this.limited, (el) => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files")))
       .when(Boolean(this.panelNote), (e) => e.child(div().px(10).py(4).text_size(11).text_color(del).child(this.panelNote)))

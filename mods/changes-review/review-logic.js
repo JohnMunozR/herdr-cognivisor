@@ -1469,6 +1469,64 @@ export function filterUnbaselinedRepoEntries(entries, sessionStartedAt, opts = {
 export const READ_GIT_FLAGS = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
 export const BASE_BRANCH_NAMES = new Set(["main", "master", "development", "develop", "release", "ci", "HEAD", ""]);
 export const MAX_UNTRACKED_COUNT_BYTES = 400_000;
+export const DEFAULT_GIT_EXEC_TIMEOUT_MS = 10_000;
+export const DEFAULT_HC_READ_TIMEOUT_MS = 2_500;
+export const DEFAULT_REFRESH_WATCHDOG_MS = 18_000;
+
+/**
+ * Race an async operation against a bounded timeout, cancelling the timer immediately
+ * upon settlement so GPUI QuickJS never leaks stranded timers. Returns `fallback`
+ * on timeout or rejection so hung IPC/CLI calls degrade cleanly without deadlocking UI state.
+ */
+export function raceWithTimeout(promise, timeoutMs, { fallback = null, timer = null, onTimeout = null } = {}) {
+  const safeMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Math.trunc(Number(timeoutMs)) : 0;
+  const wrapped = Promise.resolve(promise).catch(() => fallback);
+  if (safeMs <= 0) return wrapped;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let handle = null;
+    const cancelTimer = () => {
+      if (!handle) return;
+      try {
+        if (typeof handle.cancel === "function") handle.cancel();
+        else clearTimeout(handle);
+      } catch {
+        // non-fatal
+      }
+      handle = null;
+    };
+    const finish = (val, timedOut = false) => {
+      if (settled) return;
+      settled = true;
+      cancelTimer();
+      if (timedOut && typeof onTimeout === "function") {
+        try { onTimeout(); } catch {}
+      }
+      resolve(val);
+    };
+
+    if (timer && typeof timer.after === "function") {
+      handle = timer.after(safeMs, () => finish(fallback, true));
+    } else if (typeof setTimeout === "function") {
+      handle = setTimeout(() => finish(fallback, true), safeMs);
+    }
+
+    wrapped.then(
+      (val) => finish(val, false),
+      () => finish(fallback, false),
+    );
+  });
+}
+
+/**
+ * Format an actionable user-facing timeout message naming the stalled refresh phase.
+ */
+export function formatRefreshTimeoutError(phase, timeoutMs = DEFAULT_REFRESH_WATCHDOG_MS) {
+  const sec = Math.max(1, Math.round((Number(timeoutMs) || DEFAULT_REFRESH_WATCHDOG_MS) / 1000));
+  const cleanPhase = String(phase || "refresh").trim() || "refresh";
+  return `Timed out loading changes during "${cleanPhase}" (${sec}s). Click Retry or restart herdr-core if it persists.`;
+}
 
 /**
  * Merge `cognivisor.services` candidates with any already-enriched service metadata so
@@ -1693,7 +1751,10 @@ export async function resolveRepoBaseRefWithExec(root, branch, headHash, on, exe
     return { hasHead: false, baseRef: "", baseHash: "", baseSource: "unborn" };
   }
 
-  const git = (args) => execFn("git", [...readFlags, ...args], { cwd: root, on }).catch(() => null);
+  const execTimeout = Number.isFinite(Number(opts.execTimeoutMs)) && Number(opts.execTimeoutMs) > 0
+    ? Math.trunc(Number(opts.execTimeoutMs))
+    : DEFAULT_GIT_EXEC_TIMEOUT_MS;
+  const git = (args) => execFn("git", [...readFlags, ...args], { cwd: root, on, timeout: execTimeout }).catch(() => null);
   const forEachArgs = [
     "for-each-ref",
     "--format=%(refname:short)",
@@ -1916,7 +1977,10 @@ export async function collectServiceSessionSnapshot(service, on, opts = {}, deps
 
   try {
     if (typeof execFn !== "function") throw new Error("Missing exec helper");
-    const git = (args) => execFn("git", [...readFlags, ...args], { cwd: service.root, on });
+    const execTimeout = Number.isFinite(Number(opts?.execTimeoutMs)) && Number(opts.execTimeoutMs) > 0
+      ? Math.trunc(Number(opts.execTimeoutMs))
+      : DEFAULT_GIT_EXEC_TIMEOUT_MS;
+    const git = (args) => execFn("git", [...readFlags, ...args], { cwd: service.root, on, timeout: execTimeout });
     const [status, head] = await Promise.all([
       git(["status", "--porcelain=v1", "-b", "-z", "--no-renames", "--untracked-files=normal"]),
       git(["rev-parse", "--verify", "--quiet", "HEAD"]).catch(() => ({ code: 1, stdout: "", stderr: "" })),

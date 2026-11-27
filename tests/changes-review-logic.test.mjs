@@ -53,6 +53,11 @@ import {
   isHomeDirectoryRoot,
   resolveWorkspaceRoot,
   READ_GIT_FLAGS,
+  DEFAULT_GIT_EXEC_TIMEOUT_MS,
+  DEFAULT_HC_READ_TIMEOUT_MS,
+  DEFAULT_REFRESH_WATCHDOG_MS,
+  raceWithTimeout,
+  formatRefreshTimeoutError,
   mergeBusCandidateServices,
   countUntrackedFileLines,
   parseNameStatusZ,
@@ -2094,5 +2099,62 @@ describe("changes-review review-logic", () => {
       }),
       true,
     );
+  });
+
+  test("regression: raceWithTimeout, formatRefreshTimeoutError, and git exec timeout prevent infinite Loading changes deadlocks", async () => {
+    assert.ok(DEFAULT_GIT_EXEC_TIMEOUT_MS > 0);
+    assert.ok(DEFAULT_HC_READ_TIMEOUT_MS > 0);
+    assert.ok(DEFAULT_REFRESH_WATCHDOG_MS > DEFAULT_GIT_EXEC_TIMEOUT_MS);
+
+    // 1. Fast promise resolves immediately and cancels timer
+    let cancelled = false;
+    const fakeTimer = {
+      after(_ms, _cb) {
+        return { cancel() { cancelled = true; } };
+      },
+    };
+    const fast = await raceWithTimeout(Promise.resolve({ code: 0, stdout: "ok" }), 500, { fallback: null, timer: fakeTimer });
+    assert.deepEqual(fast, { code: 0, stdout: "ok" });
+    assert.equal(cancelled, true);
+
+    // 2. Hung promise times out cleanly to fallback and fires onTimeout
+    let timedOutCalled = false;
+    const never = new Promise(() => {});
+    const timed = await raceWithTimeout(never, 20, {
+      fallback: "FALLBACK",
+      onTimeout: () => { timedOutCalled = true; },
+    });
+    assert.equal(timed, "FALLBACK");
+    assert.equal(timedOutCalled, true);
+
+    // 3. Rejected promise resolves cleanly to fallback without throwing
+    const rejected = await raceWithTimeout(Promise.reject(new Error("ipc dead")), 500, { fallback: null });
+    assert.equal(rejected, null);
+
+    // 4. Timeout error message names the stalled phase and seconds
+    const errMsg = formatRefreshTimeoutError("transcript", 18000);
+    assert.match(errMsg, /transcript/);
+    assert.match(errMsg, /18s/);
+    assert.match(errMsg, /Retry/);
+
+    // 5. resolveRepoBaseRefWithExec and collectServiceSessionSnapshot pass explicit timeout to execFn
+    const seenTimeouts = [];
+    const mockExec = async (_cmd, args, opts) => {
+      seenTimeouts.push(opts?.timeout);
+      if (args.includes("status")) return { code: 0, stdout: "## main\0", stderr: "" };
+      if (args.includes("rev-parse")) return { code: 0, stdout: "aaaa\n", stderr: "" };
+      if (args.includes("symbolic-ref")) return { code: 0, stdout: "refs/remotes/origin/main\n", stderr: "" };
+      if (args.includes("for-each-ref")) return { code: 0, stdout: "origin/main\n", stderr: "" };
+      if (args.includes("merge-base")) return { code: 0, stdout: "aaaa\n", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    await collectServiceSessionSnapshot(
+      { id: ".", name: "svc", root: "/ws/svc", relPath: "", isSibling: false },
+      null,
+      {},
+      { exec: mockExec },
+    );
+    assert.ok(seenTimeouts.length >= 4);
+    assert.ok(seenTimeouts.every((t) => t === DEFAULT_GIT_EXEC_TIMEOUT_MS));
   });
 });

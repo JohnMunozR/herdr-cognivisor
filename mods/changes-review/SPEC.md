@@ -117,8 +117,8 @@ Docked Sidebar (#changes, role !== "viewer")          Main Review Tab (#review-t
    All internal file references (`openFileKey`, `reviewedFiles`, `cognivisor.reviewNotes`) index files via composite `${serviceId}::${path}` keys, index review comments via `buildCommentKey(fileKey, line, side)`, and scope review notes via `getSessionNotesKey(spaceId, sourceTabId)` (`"${spaceId}::${sourceTabId}"`).
 5. **Zero `localStorage`, Zero Hidden Allocations & Non-Reentrant Shared Updates:**
    Never call `localStorage`, `cx.notify()`, or `setShared()` synchronously inside `render()`. Short-circuit `renderPanel()` immediately when `!visible`. Defer refreshes, `cognivisor.spaceAgentTabs` updates, `viewerLoadedKey` diff fetches, and cross-mode syncs via `cx.timer.after(0, ...)`. Keep `cognivisor.services` deduplicated via `sig` and merge `cognivisor.flows[sessionTabId]` mutations onto the latest snapshot.
-6. **Stale-Context Cancellation, Always-On Watchers & Cleanup:**
-   Watch discovered candidate repositories even when no files are currently modified, queue a follow-up refresh (`pendingRefresh`) if watch events arrive while `loading === true`, validate context/generation across awaits, and cancel all active tasks in `close()`.
+6. **Stale-Context Cancellation, Bounded Timeouts, Always-On Watchers & Cleanup:**
+   Watch discovered candidate repositories even when no files are currently modified, queue a follow-up refresh (`pendingRefresh`) if watch events arrive while `loading === true`, validate context/generation (`refreshGen`) across awaits, enforce bounded timeouts on all `exec` calls (`DEFAULT_GIT_EXEC_TIMEOUT_MS = 10000`), `hc read` calls (`DEFAULT_HC_READ_TIMEOUT_MS = 2500` via `raceWithTimeout`), and overall refresh (`DEFAULT_REFRESH_WATCHDOG_MS = 18000` logging `review.refreshTimeout` and surfacing `#changes-retry-btn`), and cancel all active tasks in `close()`.
 
 ## Multi-Repo & Cognivisor Implementation
 
